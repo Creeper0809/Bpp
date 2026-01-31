@@ -171,6 +171,7 @@ struct BuilderCtx {
     var_map: u64;         // hashmap: name -> var_id
     const_map: u64;       // hashmap: name -> const value
     func_ptr_map: u64;    // hashmap: name -> [func_name_ptr, func_name_len]
+    addr_taken_map: u64;  // hashmap: name -> 1
     symtab: u64;           // symtab for type/offset lookup
     next_reg: u64;
     next_var_id: u64;
@@ -191,6 +192,7 @@ func builder_ctx_new(ssa_ctx: *SSAContext) -> u64 {
     ctx->var_map = 0;
     ctx->const_map = 0;
     ctx->func_ptr_map = 0;
+    ctx->addr_taken_map = 0;
     ctx->symtab = 0;
     ctx->next_reg = 1;
     ctx->next_var_id = 1;
@@ -236,6 +238,7 @@ func builder_reset_func(ctx: *BuilderCtx) -> u64 {
     ctx->var_map = hashmap_new(16);
     ctx->const_map = 0;
     ctx->func_ptr_map = 0;
+    ctx->addr_taken_map = hashmap_new(16);
     ctx->symtab = symtab_new();
     ctx->next_reg = 1;
     ctx->next_var_id = 1;
@@ -248,6 +251,177 @@ func builder_reset_func(ctx: *BuilderCtx) -> u64 {
         vec_pop(ctx->continue_stack);
     }
     return 0;
+}
+
+func builder_mark_addr_taken(ctx: *BuilderCtx, name_ptr: u64, name_len: u64) -> u64 {
+    if (ctx->addr_taken_map == 0) { ctx->addr_taken_map = hashmap_new(16); }
+    hashmap_put(ctx->addr_taken_map, name_ptr, name_len, 1);
+    return 0;
+}
+
+func builder_is_addr_taken(ctx: *BuilderCtx, name_ptr: u64, name_len: u64) -> u64 {
+    if (ctx->addr_taken_map == 0) { return 0; }
+    return hashmap_get(ctx->addr_taken_map, name_ptr, name_len);
+}
+
+func builder_scan_addr_taken_expr(ctx: *BuilderCtx, expr: u64) -> u64 {
+    if (expr == 0) { return 0; }
+    var kind: u64 = ast_kind(expr);
+    switch (kind) {
+        case AST_ADDR_OF:
+            var ao: *AstAddrOf = (*AstAddrOf)expr;
+            if (ao->operand != 0 && ast_kind(ao->operand) == AST_IDENT) {
+                var idn: *AstIdent = (*AstIdent)ao->operand;
+                builder_mark_addr_taken(ctx, idn->name_ptr, idn->name_len);
+            } else if (ao->operand != 0) {
+                builder_scan_addr_taken_expr(ctx, ao->operand);
+            }
+            return 0;
+        case AST_BINARY:
+            var bin: *AstBinary = (*AstBinary)expr;
+            builder_scan_addr_taken_expr(ctx, bin->left);
+            builder_scan_addr_taken_expr(ctx, bin->right);
+            return 0;
+        case AST_UNARY:
+            var un: *AstUnary = (*AstUnary)expr;
+            builder_scan_addr_taken_expr(ctx, un->operand);
+            return 0;
+        case AST_CAST:
+            var cs: *AstCast = (*AstCast)expr;
+            builder_scan_addr_taken_expr(ctx, cs->expr);
+            return 0;
+        case AST_INDEX:
+            var ix: *AstIndex = (*AstIndex)expr;
+            builder_scan_addr_taken_expr(ctx, ix->base);
+            builder_scan_addr_taken_expr(ctx, ix->index);
+            return 0;
+        case AST_MEMBER_ACCESS:
+            var ma: *AstMemberAccess = (*AstMemberAccess)expr;
+            builder_scan_addr_taken_expr(ctx, ma->object);
+            return 0;
+        case AST_CALL:
+            var call: *AstCall = (*AstCall)expr;
+            var args: u64 = call->args_vec;
+            if (args != 0) {
+                var n: u64 = vec_len(args);
+                for (var i: u64 = 0; i < n; i++) {
+                    builder_scan_addr_taken_expr(ctx, vec_get(args, i));
+                }
+            }
+            return 0;
+        case AST_METHOD_CALL:
+            var mc: *AstMethodCall = (*AstMethodCall)expr;
+            builder_scan_addr_taken_expr(ctx, mc->receiver);
+            var args2: u64 = mc->args_vec;
+            if (args2 != 0) {
+                var n2: u64 = vec_len(args2);
+                for (var i2: u64 = 0; i2 < n2; i2++) {
+                    builder_scan_addr_taken_expr(ctx, vec_get(args2, i2));
+                }
+            }
+            return 0;
+        case AST_CALL_PTR:
+            var cp: *AstCallPtr = (*AstCallPtr)expr;
+            builder_scan_addr_taken_expr(ctx, cp->callee);
+            var args3: u64 = cp->args_vec;
+            if (args3 != 0) {
+                var n3: u64 = vec_len(args3);
+                for (var i3: u64 = 0; i3 < n3; i3++) {
+                    builder_scan_addr_taken_expr(ctx, vec_get(args3, i3));
+                }
+            }
+            return 0;
+        case AST_SLICE:
+            var sl: *AstSlice = (*AstSlice)expr;
+            builder_scan_addr_taken_expr(ctx, sl->ptr_expr);
+            builder_scan_addr_taken_expr(ctx, sl->len_expr);
+            return 0;
+        case AST_SIZEOF_EXPR:
+            var se: *AstSizeofExpr = (*AstSizeofExpr)expr;
+            builder_scan_addr_taken_expr(ctx, se->expr);
+            return 0;
+        case AST_STRUCT_LITERAL:
+            var st: *AstStructLiteral = (*AstStructLiteral)expr;
+            var vals: u64 = st->values_vec;
+            if (vals != 0) {
+                var vn: u64 = vec_len(vals);
+                for (var vi: u64 = 0; vi < vn; vi++) {
+                    builder_scan_addr_taken_expr(ctx, vec_get(vals, vi));
+                }
+            }
+            return 0;
+        default:
+            return 0;
+    }
+}
+
+func builder_scan_addr_taken_stmt(ctx: *BuilderCtx, stmt: u64) -> u64 {
+    if (stmt == 0) { return 0; }
+    var kind: u64 = ast_kind(stmt);
+    switch (kind) {
+        case AST_VAR_DECL:
+            var vd: *AstVarDecl = (*AstVarDecl)stmt;
+            builder_scan_addr_taken_expr(ctx, vd->init_expr);
+            return 0;
+        case AST_ASSIGN:
+            var asn: *AstAssign = (*AstAssign)stmt;
+            builder_scan_addr_taken_expr(ctx, asn->target);
+            builder_scan_addr_taken_expr(ctx, asn->value);
+            return 0;
+        case AST_EXPR_STMT:
+            var es: *AstExprStmt = (*AstExprStmt)stmt;
+            builder_scan_addr_taken_expr(ctx, es->expr);
+            return 0;
+        case AST_RETURN:
+            var ret: *AstReturn = (*AstReturn)stmt;
+            builder_scan_addr_taken_expr(ctx, ret->expr);
+            return 0;
+        case AST_IF:
+            var ifs: *AstIf = (*AstIf)stmt;
+            builder_scan_addr_taken_expr(ctx, ifs->cond);
+            builder_scan_addr_taken_stmt(ctx, ifs->then_block);
+            builder_scan_addr_taken_stmt(ctx, ifs->else_block);
+            return 0;
+        case AST_WHILE:
+            var wl: *AstWhile = (*AstWhile)stmt;
+            builder_scan_addr_taken_expr(ctx, wl->cond);
+            builder_scan_addr_taken_stmt(ctx, wl->body);
+            return 0;
+        case AST_FOR:
+            var fr: *AstFor = (*AstFor)stmt;
+            builder_scan_addr_taken_stmt(ctx, fr->init);
+            builder_scan_addr_taken_expr(ctx, fr->cond);
+            builder_scan_addr_taken_expr(ctx, fr->update);
+            builder_scan_addr_taken_stmt(ctx, fr->body);
+            return 0;
+        case AST_SWITCH:
+            var sw: *AstSwitch = (*AstSwitch)stmt;
+            builder_scan_addr_taken_expr(ctx, sw->expr);
+            var cases: u64 = sw->cases_vec;
+            if (cases != 0) {
+                var cn: u64 = vec_len(cases);
+                for (var ci: u64 = 0; ci < cn; ci++) {
+                    builder_scan_addr_taken_stmt(ctx, vec_get(cases, ci));
+                }
+            }
+            return 0;
+        case AST_CASE:
+            var cs: *AstCase = (*AstCase)stmt;
+            builder_scan_addr_taken_stmt(ctx, cs->body);
+            return 0;
+        case AST_BLOCK:
+            var blk: *AstBlock = (*AstBlock)stmt;
+            var stmts: u64 = blk->stmts_vec;
+            if (stmts != 0) {
+                var n: u64 = vec_len(stmts);
+                for (var i: u64 = 0; i < n; i++) {
+                    builder_scan_addr_taken_stmt(ctx, vec_get(stmts, i));
+                }
+            }
+            return 0;
+        default:
+            return 0;
+    }
 }
 
 // ============================================
@@ -1957,6 +2131,11 @@ func build_expr(ctx: *BuilderCtx, node: u64) -> u64 {
                     }
                 }
             }
+            if (builder_is_addr_taken(ctx, idn->name_ptr, idn->name_len) != 0) {
+                var addr_reg: u64 = builder_new_lea_local(ctx, offset);
+                var size: u64 = builder_type_size_from_expr(ctx, node);
+                return builder_load_by_size(ctx, addr_reg, size);
+            }
             var var_id: u64 = builder_get_var_id(ctx, idn->name_ptr, idn->name_len);
             var reg_id: u64 = builder_new_reg(ctx);
             var inst_ptr: u64 = ssa_new_inst(ctx->ssa_ctx, SSA_OP_LOAD, reg_id, ssa_operand_const(var_id), 0);
@@ -2446,7 +2625,22 @@ func build_expr(ctx: *BuilderCtx, node: u64) -> u64 {
 
     if (kind == AST_SIZEOF) {
         var sz: *AstSizeof = (*AstSizeof)node;
-        var size_val: u64 = sizeof_type(sz->type_kind, sz->ptr_depth, sz->struct_name_ptr, sz->struct_name_len);
+        var size_val: u64 = 0;
+        if (sz->type_kind == TYPE_ARRAY || sz->type_kind == TYPE_SLICE) {
+            if (sz->array_len_is_param != 0) {
+                emit_stderr("[ERROR] sizeof array with unresolved generic length\n", 56);
+                panic("SSA build error");
+            }
+            var ti_ptr: u64 = 0;
+            if (sz->type_kind == TYPE_ARRAY) {
+                ti_ptr = typeinfo_make_array(sz->ptr_depth, sz->elem_type_kind, sz->elem_ptr_depth, sz->struct_name_ptr, sz->struct_name_len, 0, sz->array_len);
+            } else {
+                ti_ptr = typeinfo_make_slice(sz->ptr_depth, sz->elem_type_kind, sz->elem_ptr_depth, sz->struct_name_ptr, sz->struct_name_len, 0);
+            }
+            size_val = sizeof_type_ex(ti_ptr);
+        } else {
+            size_val = sizeof_type(sz->type_kind, sz->ptr_depth, sz->struct_name_ptr, sz->struct_name_len);
+        }
         return build_const(ctx, size_val);
     }
 
@@ -3194,6 +3388,25 @@ func build_stmt(ctx: *BuilderCtx, node: u64) -> u64 {
                     }
                 }
             }
+            if (builder_is_addr_taken(ctx, vd->name_ptr, vd->name_len) != 0) {
+                var offset_addr: u64 = symtab_find(ctx->symtab, vd->name_ptr, vd->name_len);
+                if (offset_addr != 0) {
+                    var base_addr3: u64 = builder_new_lea_local(ctx, offset_addr);
+                    var val_reg2: u64 = build_expr(ctx, vd->init_expr);
+                    var size_at: u64 = 0;
+                    if (vd->type_kind == TYPE_ARRAY) {
+                        var elem_size_at: u64 = sizeof_type(vd->elem_type_kind, vd->elem_ptr_depth, vd->struct_name_ptr, vd->struct_name_len);
+                        size_at = elem_size_at * vd->array_len;
+                    } else if (vd->type_kind == TYPE_SLICE) {
+                        size_at = 16;
+                    } else {
+                        size_at = sizeof_type(vd->type_kind, vd->ptr_depth, vd->struct_name_ptr, vd->struct_name_len);
+                    }
+                    if (size_at == 0) { size_at = 8; }
+                    builder_store_by_size(ctx, base_addr3, val_reg2, size_at);
+                    return 0;
+                }
+            }
             var val_reg: u64 = build_expr(ctx, vd->init_expr);
             var st_ptr: u64 = ssa_new_inst(ctx->ssa_ctx, SSA_OP_STORE, 0, ssa_operand_const(var_id), ssa_operand_reg(val_reg));
             ssa_inst_append(ctx->cur_block, (*SSAInstruction)st_ptr);
@@ -3241,6 +3454,28 @@ func build_stmt(ctx: *BuilderCtx, node: u64) -> u64 {
                 }
             } else {
                 builder_set_func_ptr(ctx, idn_tgt->name_ptr, idn_tgt->name_len, 0, 0);
+            }
+        }
+        if (target_kind == AST_IDENT) {
+            var idn_at: *AstIdent = (*AstIdent)asn->target;
+            if (builder_is_addr_taken(ctx, idn_at->name_ptr, idn_at->name_len) != 0) {
+                var ti_at_ptr: u64 = get_expr_type_with_symtab(asn->target, ctx->symtab);
+                if (ti_at_ptr != 0) {
+                    var ti_at: *TypeInfo = (*TypeInfo)ti_at_ptr;
+                    if (!(ti_at->type_kind == TYPE_SLICE && ti_at->ptr_depth == 0)) {
+                        var addr_at: u64 = builder_lvalue_addr(ctx, asn->target);
+                        var val_reg_at: u64 = build_expr(ctx, asn->value);
+                        var size_at2: u64 = builder_type_size_from_expr(ctx, asn->target);
+                        builder_store_by_size(ctx, addr_at, val_reg_at, size_at2);
+                        return 0;
+                    }
+                } else {
+                    var addr_at2: u64 = builder_lvalue_addr(ctx, asn->target);
+                    var val_reg_at2: u64 = build_expr(ctx, asn->value);
+                    var size_at3: u64 = builder_type_size_from_expr(ctx, asn->target);
+                    builder_store_by_size(ctx, addr_at2, val_reg_at2, size_at3);
+                    return 0;
+                }
             }
         }
         var tgt_ti_ptr: u64 = 0;

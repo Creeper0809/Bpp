@@ -657,6 +657,16 @@ struct 상속 → trait 정의 → impl → VTable 생성 → 다형성
   - DoD: 컴파일타임 상수 배열
   - 참조: v4_roadmap.md 섹션 0.17
 
+- [x] **v1 backport (bootstrap) 완료**
+  - [x] 타입 추론 + Value generics 구현
+  - [x] 모노모피제이션/이름 맹글링 파이프라인
+  - [x] value generic array/sizeof/addr-of/중첩 멤버 접근 안정화
+  - [x] 모노모피제이션 이후 템플릿 제거로 SSA 경로 정합 확보
+  - [x] SSA 모드 제네릭 스트레스/sizeof/포인터 산술/중첩 호출 테스트 추가
+  - [x] SSA addr-taken 변수는 명시적 메모리 경로로 처리 (이중 포인터 포함)
+  - [x] SSA O1 제네릭 스트레스/sizeof/포인터 산술/중첩 호출/이중 포인터 테스트 추가
+  - [x] 제네릭 스트레스 테스트 포함 전체 테스트 통과
+
 #### Phase 4.1.2: 기본 Comptime (3-4개월)
 
 **Note**: v3에서 comptime은 컴파일 타임 평가 복잡도로 인해 제거됨. v4에서는 CTFE 인터프리터와 통합하여 재설계.

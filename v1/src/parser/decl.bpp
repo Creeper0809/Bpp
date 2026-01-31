@@ -200,9 +200,102 @@ func parse_skip_block(p: u64) -> u64 {
     return 0;
 }
 
+func parse_is_generic_param_list(p: u64) -> u64 {
+    if (parse_peek_kind(p) != TOKEN_LT) { return 0; }
+    var saved: u64 = parser_pos(p);
+    parse_adv(p);
+    var depth: u64 = 1;
+    while (1) {
+        var k: u64 = parse_peek_kind(p);
+        if (k == TOKEN_EOF) {
+            parser_set_pos(p, saved);
+            return 0;
+        }
+        if (k == TOKEN_LPAREN) {
+            parser_set_pos(p, saved);
+            return 0;
+        }
+        if (k == TOKEN_LT) { depth = depth + 1; }
+        if (k == TOKEN_GT) {
+            depth = depth - 1;
+            if (depth == 0) {
+                var saved2: u64 = parser_pos(p);
+                parse_adv(p);
+                var next_kind: u64 = parse_peek_kind(p);
+                parser_set_pos(p, saved2);
+                parser_set_pos(p, saved);
+                if (next_kind == TOKEN_LPAREN) { return 1; }
+                return 0;
+            }
+        }
+        parse_adv(p);
+    }
+}
+
+// Parse generic parameter list: <T, U, const N: u64>
+func parse_generic_params(p: u64) -> u64 {
+    var tok: u64 = parse_peek(p);
+    if (tok == 0) { return 0; }
+    if (parse_peek_kind(p) != TOKEN_LT) { return 0; }
+    if (parse_is_generic_param_list(p) == 0) { return 0; }
+    parse_consume(p, TOKEN_LT);
+
+    var params: u64 = vec_new(4);
+    while (1) {
+        var is_value: u64 = 0;
+        if (parse_match(p, TOKEN_CONST)) { is_value = 1; }
+
+        if (parse_peek_kind(p) != TOKEN_IDENTIFIER) {
+            emit_stderr("[ERROR] Expected generic parameter name\n", 43);
+            panic("Parse error");
+        }
+
+        var name_tok: u64 = parse_peek(p);
+        var name_ptr: u64 = ((*Token)name_tok)->ptr;
+        var name_len: u64 = ((*Token)name_tok)->len;
+        parse_consume(p, TOKEN_IDENTIFIER);
+
+        var value_type_kind: u64 = 0;
+        if (parse_match(p, TOKEN_COLON)) {
+            value_type_kind = parse_base_type(p);
+            if (value_type_kind == TYPE_STRUCT || value_type_kind == TYPE_VOID) {
+                emit_stderr("[ERROR] Invalid value generic type\n", 40);
+                panic("Parse error");
+            }
+            if (value_type_kind != TYPE_U64) {
+                emit_stderr("[ERROR] Value generic type must be u64\n", 44);
+                panic("Parse error");
+            }
+            is_value = 1;
+        } else if (is_value == 1) {
+            emit_stderr("[ERROR] const generic requires type annotation\n", 50);
+            panic("Parse error");
+        }
+
+        var gp: *GenericParam = (*GenericParam)heap_alloc(sizeof(GenericParam));
+        if (is_value == 1) { gp->kind = GENERIC_KIND_VALUE; }
+        else { gp->kind = GENERIC_KIND_TYPE; }
+        gp->name_ptr = name_ptr;
+        gp->name_len = name_len;
+        gp->value_type_kind = value_type_kind;
+        vec_push(params, (u64)gp);
+
+        if (parse_match(p, TOKEN_COMMA)) { continue; }
+        break;
+    }
+
+    parse_consume(p, TOKEN_GT);
+    return params;
+}
+
 func parse_param(p: u64) -> u64 {
     var name_tok: u64 = parse_peek(p);
     parse_consume(p, TOKEN_IDENTIFIER);
+
+    var generic_params: u64 = parse_generic_params(p);
+    if (generic_params != 0) {
+        type_parser_set_generic_params(generic_params);
+    }
     
     var type_kind: u64 = 0;
     var ptr_depth: u64 = 0;
@@ -214,6 +307,9 @@ func parse_param(p: u64) -> u64 {
     var elem_type_kind: u64 = 0;
     var elem_ptr_depth: u64 = 0;
     var array_len: u64 = 0;
+    var array_len_is_param: u64 = 0;
+    var array_len_param_ptr: u64 = 0;
+    var array_len_param_len: u64 = 0;
     
     if (parse_match(p, TOKEN_COLON)) {
         var ty: *TypeInfo = (*TypeInfo)parse_type_ex(p);
@@ -227,6 +323,9 @@ func parse_param(p: u64) -> u64 {
         elem_type_kind = ty->elem_type_kind;
         elem_ptr_depth = ty->elem_ptr_depth;
         array_len = ty->array_len;
+        array_len_is_param = ty->array_len_is_param;
+        array_len_param_ptr = ty->array_len_param_ptr;
+        array_len_param_len = ty->array_len_param_len;
         if (type_kind == TYPE_ARRAY) {
             // Array parameter decays to pointer to first element
             type_kind = elem_type_kind;
@@ -234,6 +333,9 @@ func parse_param(p: u64) -> u64 {
             is_tagged = 0;
             tag_layout_ptr = 0;
             tag_layout_len = 0;
+            array_len_is_param = 0;
+            array_len_param_ptr = 0;
+            array_len_param_len = 0;
         }
     }
     
@@ -250,6 +352,9 @@ func parse_param(p: u64) -> u64 {
     param->elem_type_kind = elem_type_kind;
     param->elem_ptr_depth = elem_ptr_depth;
     param->array_len = array_len;
+    param->array_len_is_param = array_len_is_param;
+    param->array_len_param_ptr = array_len_param_ptr;
+    param->array_len_param_len = array_len_param_len;
     return param;
 }
 
@@ -260,6 +365,11 @@ func parse_func_decl(p: u64) -> u64 {
     
     var name_tok: u64 = parse_peek(p);
     parse_consume(p, TOKEN_IDENTIFIER);
+
+    var generic_params: u64 = parse_generic_params(p);
+    if (generic_params != 0) {
+        type_parser_set_generic_params(generic_params);
+    }
     
     // Set parsing context for better error messages
     set_parsing_context(((*Token)name_tok)->ptr, ((*Token)name_tok)->len, ((*Token)name_tok)->line);
@@ -307,9 +417,16 @@ func parse_func_decl(p: u64) -> u64 {
     }
     
     var body: u64 = parse_block(p);
-    
+
+    var func_node: u64 = ast_func_ex(((*Token)name_tok)->ptr, ((*Token)name_tok)->len, params, ret_type, ret_ptr_depth, ret_is_tagged, ret_struct_name_ptr, ret_struct_name_len, ret_tag_layout_ptr, ret_tag_layout_len, body);
+
+    if (generic_params != 0) {
+        type_parser_clear_generic_params();
+        compiler_register_generic_func_def(((*Token)name_tok)->ptr, ((*Token)name_tok)->len, generic_params, func_node);
+    }
+
     pop_trace();
-    return ast_func_ex(((*Token)name_tok)->ptr, ((*Token)name_tok)->len, params, ret_type, ret_ptr_depth, ret_is_tagged, ret_struct_name_ptr, ret_struct_name_len, ret_tag_layout_ptr, ret_tag_layout_len, body);
+    return func_node;
 }
 
 // Parse function signature only (skip body)
@@ -320,6 +437,11 @@ func parse_func_decl_signature(p: u64) -> u64 {
 
     var name_tok: u64 = parse_peek(p);
     parse_consume(p, TOKEN_IDENTIFIER);
+
+    var generic_params: u64 = parse_generic_params(p);
+    if (generic_params != 0) {
+        type_parser_set_generic_params(generic_params);
+    }
 
     set_parsing_context(((*Token)name_tok)->ptr, ((*Token)name_tok)->len, ((*Token)name_tok)->line);
 
@@ -365,8 +487,17 @@ func parse_func_decl_signature(p: u64) -> u64 {
     // Skip function body
     parse_skip_block(p);
 
+    var func_sig: u64 = ast_func_ex(((*Token)name_tok)->ptr, ((*Token)name_tok)->len, params, ret_type, ret_ptr_depth, ret_is_tagged, ret_struct_name_ptr, ret_struct_name_len, ret_tag_layout_ptr, ret_tag_layout_len, 0);
+
+    if (generic_params != 0) {
+        type_parser_clear_generic_params();
+        compiler_register_generic_func_sig(((*Token)name_tok)->ptr, ((*Token)name_tok)->len, generic_params, func_sig);
+        pop_trace();
+        return 0;
+    }
+
     pop_trace();
-    return ast_func_ex(((*Token)name_tok)->ptr, ((*Token)name_tok)->len, params, ret_type, ret_ptr_depth, ret_is_tagged, ret_struct_name_ptr, ret_struct_name_len, ret_tag_layout_ptr, ret_tag_layout_len, 0);
+    return func_sig;
 }
 
 // ============================================
@@ -664,7 +795,11 @@ func parse_impl_block_signature(p: u64) -> u64 {
         }
 
         if (parse_peek_kind(p) == TOKEN_FUNC) {
-            var func_node: *AstFunc = (*AstFunc)parse_func_decl_signature(p);
+            var func_ptr: u64 = parse_func_decl_signature(p);
+            if (func_ptr == 0) {
+                continue;
+            }
+            var func_node: *AstFunc = (*AstFunc)func_ptr;
 
             var original_name_ptr: u64 = func_node->name_ptr;
             var original_name_len: u64 = func_node->name_len;
@@ -718,7 +853,10 @@ func parse_program(p: u64) -> u64 {
         var k: u64 = parse_peek_kind(p);
         switch (k) {
             case TOKEN_FUNC:
-                vec_push(funcs, parse_func_decl(p));
+                var fn_ptr: u64 = parse_func_decl(p);
+                if (fn_ptr != 0) {
+                    vec_push(funcs, fn_ptr);
+                }
                 break;
             case TOKEN_CONST:
                 vec_push(consts, parse_const_decl(p));
@@ -788,13 +926,19 @@ func parse_program_pass1(p: u64) -> u64 {
         var k: u64 = parse_peek_kind(p);
         switch (k) {
             case TOKEN_FUNC:
-                vec_push(funcs, parse_func_decl_signature(p));
+                var sig_ptr: u64 = parse_func_decl_signature(p);
+                if (sig_ptr != 0) {
+                    vec_push(funcs, sig_ptr);
+                }
                 break;
             case TOKEN_IMPL:
                 var impl_funcs: u64 = parse_impl_block_signature(p);
                 var num_impl_funcs: u64 = vec_len(impl_funcs);
                 for (var i: u64 = 0; i < num_impl_funcs; i++) {
-                    vec_push(funcs, vec_get(impl_funcs, i));
+                    var impl_fn_ptr: u64 = vec_get(impl_funcs, i);
+                    if (impl_fn_ptr != 0) {
+                        vec_push(funcs, impl_fn_ptr);
+                    }
                 }
                 break;
             case TOKEN_STRUCT:

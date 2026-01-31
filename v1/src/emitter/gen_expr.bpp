@@ -357,50 +357,52 @@ func cg_expr(node: u64) -> u64 {
     if (kind == AST_ADDR_OF) {
         var addr_of: *AstAddrOf = (*AstAddrOf)node;
         var operand: u64 = addr_of->operand;
-        var ident: *AstIdent = (*AstIdent)operand;
-        var name_ptr: u64 = ident->name_ptr;
-        var name_len: u64 = ident->name_len;
-        var offset: u64 = symtab_find(symtab, name_ptr, name_len);
+        if (ast_kind(operand) == AST_IDENT) {
+            var ident: *AstIdent = (*AstIdent)operand;
+            var name_ptr: u64 = ident->name_ptr;
+            var name_len: u64 = ident->name_len;
+            var offset: u64 = symtab_find(symtab, name_ptr, name_len);
 
-        if (offset != 0) {
-            emit("    lea rax, [rbp", 17);
-            if (offset < 0) { emit_i64(offset); }
-            else { emit("+", 1); emit_u64(offset); }
-            emit("]\n", 2);
-            return;
-        }
-
-        if (compiler_func_exists(name_ptr, name_len) != 0) {
-            var resolved_ptr: u64 = name_ptr;
-            var resolved_len: u64 = name_len;
-            var resolved: u64 = resolve_name(name_ptr, name_len);
-            if (resolved != 0) {
-                var resolved_info: *NameInfo = (*NameInfo)resolved;
-                resolved_ptr = resolved_info->ptr;
-                resolved_len = resolved_info->len;
+            if (offset != 0) {
+                emit("    lea rax, [rbp", 17);
+                if (offset < 0) { emit_i64(offset); }
+                else { emit("+", 1); emit_u64(offset); }
+                emit("]\n", 2);
+                return;
             }
-            emit("    lea rax, [rel ", 19);
-            emit(resolved_ptr, resolved_len);
-            emit("]\n", 2);
-            return;
+
+            if (compiler_func_exists(name_ptr, name_len) != 0) {
+                var resolved_ptr: u64 = name_ptr;
+                var resolved_len: u64 = name_len;
+                var resolved: u64 = resolve_name(name_ptr, name_len);
+                if (resolved != 0) {
+                    var resolved_info: *NameInfo = (*NameInfo)resolved;
+                    resolved_ptr = resolved_info->ptr;
+                    resolved_len = resolved_info->len;
+                }
+                emit("    lea rax, [rel ", 19);
+                emit(resolved_ptr, resolved_len);
+                emit("]\n", 2);
+                return;
+            }
+
+            if (compiler_global_exists(name_ptr, name_len) != 0) {
+                var resolved_ptr2: u64 = name_ptr;
+                var resolved_len2: u64 = name_len;
+                var resolved2: u64 = resolve_name(name_ptr, name_len);
+                if (resolved2 != 0) {
+                    var resolved_info2: *NameInfo = (*NameInfo)resolved2;
+                    resolved_ptr2 = resolved_info2->ptr;
+                    resolved_len2 = resolved_info2->len;
+                }
+                emit("    lea rax, [rel _gvar_", 22);
+                emit(resolved_ptr2, resolved_len2);
+                emit("]\n", 2);
+                return;
+            }
         }
 
-        if (compiler_global_exists(name_ptr, name_len) != 0) {
-            var resolved_ptr2: u64 = name_ptr;
-            var resolved_len2: u64 = name_len;
-            var resolved2: u64 = resolve_name(name_ptr, name_len);
-            if (resolved2 != 0) {
-                var resolved_info2: *NameInfo = (*NameInfo)resolved2;
-                resolved_ptr2 = resolved_info2->ptr;
-                resolved_len2 = resolved_info2->len;
-            }
-            emit("    lea rax, [rel _gvar_", 22);
-            emit(resolved_ptr2, resolved_len2);
-            emit("]\n", 2);
-            return;
-        }
-        emit("    lea rax, [rbp]", 18);
-        emit_nl();
+        cg_lvalue(operand);
         return;
     }
     
@@ -492,9 +494,23 @@ func cg_expr(node: u64) -> u64 {
         var ptr_depth: u64 = sizeof_node->ptr_depth;
         var struct_name_ptr: u64 = sizeof_node->struct_name_ptr;
         var struct_name_len: u64 = sizeof_node->struct_name_len;
-        
-        // Calculate size at compile time
-        var size: u64 = sizeof_type(type_kind, ptr_depth, struct_name_ptr, struct_name_len);
+        var size: u64 = 0;
+        if (type_kind == TYPE_ARRAY || type_kind == TYPE_SLICE) {
+            if (sizeof_node->array_len_is_param != 0) {
+                emit_stderr("[ERROR] sizeof array with unresolved generic length\n", 56);
+                panic("Codegen error");
+            }
+            var ti_ptr: u64 = 0;
+            if (type_kind == TYPE_ARRAY) {
+                ti_ptr = typeinfo_make_array(ptr_depth, sizeof_node->elem_type_kind, sizeof_node->elem_ptr_depth, struct_name_ptr, struct_name_len, 0, sizeof_node->array_len);
+            } else {
+                ti_ptr = typeinfo_make_slice(ptr_depth, sizeof_node->elem_type_kind, sizeof_node->elem_ptr_depth, struct_name_ptr, struct_name_len, 0);
+            }
+            size = sizeof_type_ex(ti_ptr);
+        } else {
+            // Calculate size at compile time
+            size = sizeof_type(type_kind, ptr_depth, struct_name_ptr, struct_name_len);
+        }
         
         // Emit as literal constant
         emit("    mov rax, ", 13);
@@ -705,48 +721,36 @@ func cg_member_access_expr(node: u64, symtab: u64) -> u64 {
     
     // Handle nested member access: outer.inner.field
     if (obj_kind == AST_MEMBER_ACCESS) {
-        // Recursively get the address of the nested object
+        var nested_type: u64 = get_expr_type_with_symtab(object, symtab);
+        if (nested_type == 0) {
+            emit("    ; ERROR: Nested member access type not found\n", 49);
+            return;
+        }
+        var nt: *TypeInfo = (*TypeInfo)nested_type;
+        if (nt->type_kind != TYPE_STRUCT || nt->struct_def == 0) {
+            emit("    ; ERROR: Nested member access on non-struct\n", 50);
+            return;
+        }
+
+        var field_offset_n: u64 = get_field_offset(nt->struct_def, member_ptr, member_len);
+        var field_desc_n: u64 = get_field_desc(nt->struct_def, member_ptr, member_len);
+
         cg_lvalue(object);
-        emit("    push rax\n", 13);
-        
-        // Get the type of the nested object
-        var obj_type: u64 = get_expr_type_with_symtab(object, symtab);
-        if (obj_type == 0) {
-            emit("    ; ERROR: Cannot determine type of nested member access\n", 55);
-            return;
-        }
-        
-        var obj_ti: *TypeInfo = (*TypeInfo)obj_type;
-        var base_type: u64 = obj_ti->type_kind;
-        if (base_type != TYPE_STRUCT) {
-            emit("    ; ERROR: Nested member access on non-struct\n", 44);
-            return;
-        }
-        
-        var struct_def: u64 = obj_ti->struct_def;
-        if (struct_def == 0) {
-            emit("    ; ERROR: Struct definition not found for nested access\n", 55);
-            return;
-        }
-        
-        var field_offset: u64 = get_field_offset(struct_def, member_ptr, member_len);
-        var field_desc: u64 = get_field_desc(struct_def, member_ptr, member_len);
-        
-        // Pop base address and add field offset
-        emit("    pop rax\n", 12);
-        if (field_offset > 0) {
+        if (field_offset_n > 0) {
             emit("    add rax, ", 13);
-            emit_u64(field_offset);
+            emit_u64(field_offset_n);
             emit("\n", 1);
         }
-        if (field_desc == 0) { return; }
-        var fd2: *FieldDesc = (*FieldDesc)field_desc;
-        if (fd2->type_kind == TYPE_ARRAY) { return; }
-        if (fd2->type_kind == TYPE_SLICE) { emit("    mov rax, [rax]\n", 19); return; }
-        if (fd2->ptr_depth == 0) {
-            if (fd2->type_kind == TYPE_U8) { emit("    movzx rax, byte [rax]\n", 26); return; }
-            if (fd2->type_kind == TYPE_U16) { emit("    movzx rax, word [rax]\n", 26); return; }
-            if (fd2->type_kind == TYPE_U32) { emit("    mov eax, [rax]\n", 19); return; }
+
+        if (field_desc_n != 0) {
+            var fdn: *FieldDesc = (*FieldDesc)field_desc_n;
+            if (fdn->type_kind == TYPE_ARRAY) { return; }
+            if (fdn->type_kind == TYPE_SLICE) { emit("    mov rax, [rax]\n", 19); return; }
+            if (fdn->ptr_depth == 0) {
+                if (fdn->type_kind == TYPE_U8) { emit("    movzx rax, byte [rax]\n", 26); return; }
+                if (fdn->type_kind == TYPE_U16) { emit("    movzx rax, word [rax]\n", 26); return; }
+                if (fdn->type_kind == TYPE_U32) { emit("    mov eax, [rax]\n", 19); return; }
+            }
         }
         emit("    mov rax, [rax]\n", 19);
         return;

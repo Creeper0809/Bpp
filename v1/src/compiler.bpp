@@ -26,6 +26,8 @@ struct StatLocal {
     size: u64;
 }
 
+const GENERIC_DEBUG = 1;
+
 // ============================================
 // Global Module State
 // ============================================
@@ -41,6 +43,12 @@ var g_base_dir_len;
 var g_lib_dir;           // Library root directory for compiler/runtime modules
 var g_lib_dir_len;
 
+// Generic templates and instantiations
+var g_generic_funcs;          // HashMap: base name -> GenericFuncTemplate
+var g_generic_funcs_mangled;  // HashMap: mangled name -> GenericFuncTemplate
+var g_generic_func_ptrs;      // Vec of generic template AstFunc pointers
+var g_generic_instantiations; // HashMap: mangled instantiation name -> 1
+
 var g_file_ptr;
 var g_file_len;
 var g_module_aliases;     // HashMap: module_id -> alias_map
@@ -49,6 +57,26 @@ var g_module_exports;     // HashMap: module_id -> exports vec
 var g_func_module_map;    // HashMap: mangled func -> module_id
 var g_current_module_ptr;
 var g_current_module_len;
+
+// Generic function template (48 bytes)
+struct GenericFuncTemplate {
+    name_ptr: u64;
+    name_len: u64;
+    mangled_ptr: u64;
+    mangled_len: u64;
+    params_vec: u64;
+    func_sig: u64;
+    func_def: u64;
+}
+
+// Generic binding (40 bytes)
+struct GenericBinding {
+    kind: u64;
+    name_ptr: u64;
+    name_len: u64;
+    type_ptr: u64;
+    value: u64;
+}
 
 // ============================================
 // File Reading
@@ -850,6 +878,7 @@ func load_module(file_path: u64, file_path_len: u64) -> u64 {
 
     // Register exports + mangle symbols
     register_module_exports(prog, module_ptr, module_len, prefix_ptr, prefix_len);
+    compiler_generic_update_mangled_names(prog);
 
     // Process imports recursively
     var prog_info2: *AstProgram = (*AstProgram)prog;
@@ -891,10 +920,11 @@ func load_module(file_path: u64, file_path_len: u64) -> u64 {
     }
 
     // Add funcs
-        var funcs: u64 = prog_info2->funcs_vec;
+    var funcs: u64 = prog_info2->funcs_vec;
     var num_funcs: u64 = vec_len(funcs);
-    for (var fi: u64 = 0;fi < num_funcs; fi++){
-         vec_push(g_all_funcs, vec_get(funcs, fi));
+    for (var fi: u64 = 0; fi < num_funcs; fi++){
+        var fn_ptr: u64 = vec_get(funcs, fi);
+        vec_push(g_all_funcs, fn_ptr);
     }
 
     // Add globals
@@ -956,6 +986,1109 @@ func register_struct_type(struct_def: u64) -> u64 {
 }
 
 // ============================================
+// Generic Template Registry
+// ============================================
+
+func compiler_get_or_create_generic_template(name_ptr: u64, name_len: u64, params_vec: u64) -> u64 {
+    if (g_generic_funcs == 0) { g_generic_funcs = hashmap_new(64); }
+    var existing: u64 = hashmap_get(g_generic_funcs, name_ptr, name_len);
+    if (existing != 0) { return existing; }
+
+    var tpl: *GenericFuncTemplate = (*GenericFuncTemplate)heap_alloc(sizeof(GenericFuncTemplate));
+    tpl->name_ptr = name_ptr;
+    tpl->name_len = name_len;
+    tpl->mangled_ptr = 0;
+    tpl->mangled_len = 0;
+    tpl->params_vec = params_vec;
+    tpl->func_sig = 0;
+    tpl->func_def = 0;
+    hashmap_put(g_generic_funcs, name_ptr, name_len, (u64)tpl);
+    return (u64)tpl;
+}
+
+func compiler_register_generic_func_sig(name_ptr: u64, name_len: u64, params_vec: u64, func_sig: u64) -> u64 {
+    if (params_vec == 0 || vec_len(params_vec) == 0) { return 0; }
+    var tpl_ptr: u64 = compiler_get_or_create_generic_template(name_ptr, name_len, params_vec);
+    var tpl: *GenericFuncTemplate = (*GenericFuncTemplate)tpl_ptr;
+    tpl->params_vec = params_vec;
+    tpl->func_sig = func_sig;
+    return 0;
+}
+
+func compiler_register_generic_func_def(name_ptr: u64, name_len: u64, params_vec: u64, func_def: u64) -> u64 {
+    if (params_vec == 0 || vec_len(params_vec) == 0) { return 0; }
+    var tpl_ptr: u64 = compiler_get_or_create_generic_template(name_ptr, name_len, params_vec);
+    var tpl: *GenericFuncTemplate = (*GenericFuncTemplate)tpl_ptr;
+    tpl->params_vec = params_vec;
+    tpl->func_def = func_def;
+    if (g_generic_func_ptrs == 0) { g_generic_func_ptrs = vec_new(16); }
+    vec_push(g_generic_func_ptrs, tpl_ptr);
+    if (GENERIC_DEBUG != 0) {
+        emit_stderr("[DEBUG] generic template: ", 28);
+        emit_stderr(name_ptr, name_len);
+        emit_stderr("\n", 1);
+    }
+    return 0;
+}
+
+func compiler_is_generic_func_ptr(fn_ptr: u64) -> u64 {
+    if (g_generic_func_ptrs == 0) { return 0; }
+    var n: u64 = vec_len(g_generic_func_ptrs);
+    for (var i: u64 = 0; i < n; i++) {
+        var tpl: *GenericFuncTemplate = (*GenericFuncTemplate)vec_get(g_generic_func_ptrs, i);
+        if (tpl->func_def == fn_ptr) { return 1; }
+    }
+    return 0;
+}
+
+func compiler_find_generic_template_by_name(name_ptr: u64, name_len: u64) -> u64 {
+    if (g_generic_funcs == 0) { return 0; }
+    return hashmap_get(g_generic_funcs, name_ptr, name_len);
+}
+
+func compiler_find_generic_template_by_mangled(name_ptr: u64, name_len: u64) -> u64 {
+    if (g_generic_funcs_mangled == 0) { return 0; }
+    return hashmap_get(g_generic_funcs_mangled, name_ptr, name_len);
+}
+
+func compiler_find_generic_template_by_func_ptr(fn_ptr: u64) -> u64 {
+    if (g_generic_func_ptrs == 0) { return 0; }
+    var n: u64 = vec_len(g_generic_func_ptrs);
+    for (var i: u64 = 0; i < n; i++) {
+        var tpl_ptr: u64 = vec_get(g_generic_func_ptrs, i);
+        var tpl: *GenericFuncTemplate = (*GenericFuncTemplate)tpl_ptr;
+        if (tpl->func_def == fn_ptr) { return tpl_ptr; }
+    }
+    return 0;
+}
+
+func compiler_generic_update_mangled_names(prog: u64) -> u64 {
+    if (g_generic_func_ptrs == 0) { return 0; }
+    var prog_info: *AstProgram = (*AstProgram)prog;
+    var funcs: u64 = prog_info->funcs_vec;
+    if (funcs == 0) { return 0; }
+    var n: u64 = vec_len(funcs);
+    for (var i: u64 = 0; i < n; i++) {
+        var fn_ptr: u64 = vec_get(funcs, i);
+        var tpl_ptr: u64 = compiler_find_generic_template_by_func_ptr(fn_ptr);
+        if (tpl_ptr == 0) { continue; }
+        var tpl: *GenericFuncTemplate = (*GenericFuncTemplate)tpl_ptr;
+        var fn: *AstFunc = (*AstFunc)fn_ptr;
+        tpl->mangled_ptr = fn->name_ptr;
+        tpl->mangled_len = fn->name_len;
+        if (g_generic_funcs_mangled == 0) { g_generic_funcs_mangled = hashmap_new(64); }
+        hashmap_put(g_generic_funcs_mangled, tpl->mangled_ptr, tpl->mangled_len, tpl_ptr);
+    }
+    return 0;
+}
+
+// ============================================
+// Generic Monomorphization
+// ============================================
+
+// Append a string to a vec<u8>
+func generic_vec_append_str(v: u64, s_ptr: u64, s_len: u64) -> u64 {
+    for (var i: u64 = 0; i < s_len; i++) {
+        vec_push(v, *(*u8)(s_ptr + i));
+    }
+    return 0;
+}
+
+// Append unsigned integer to vec as decimal
+func generic_vec_append_u64(v: u64, value: u64) -> u64 {
+    if (value == 0) {
+        vec_push(v, 48);
+        return 0;
+    }
+    var buf: u64 = heap_alloc(32 * sizeof(u8));
+    var idx: u64 = 0;
+    var x: u64 = value;
+    while (x > 0) {
+        var digit: u64 = x % 10;
+        *(*u8)(buf + idx) = 48 + digit;
+        idx = idx + 1;
+        x = x / 10;
+    }
+    for (var i: u64 = 0; i < idx; i++) {
+        vec_push(v, *(*u8)(buf + (idx - 1 - i)));
+    }
+    return 0;
+}
+
+func generic_type_equal(a: u64, b: u64) -> u64 {
+    var ta: *TypeInfo = (*TypeInfo)a;
+    var tb: *TypeInfo = (*TypeInfo)b;
+    if (ta->type_kind != tb->type_kind) { return 0; }
+    if (ta->ptr_depth != tb->ptr_depth) { return 0; }
+    if (ta->type_kind == TYPE_STRUCT) {
+        if (!str_eq(ta->struct_name_ptr, ta->struct_name_len, tb->struct_name_ptr, tb->struct_name_len)) { return 0; }
+    }
+    if (ta->type_kind == TYPE_ARRAY || ta->type_kind == TYPE_SLICE) {
+        if (ta->elem_type_kind != tb->elem_type_kind) { return 0; }
+        if (ta->elem_ptr_depth != tb->elem_ptr_depth) { return 0; }
+        if (ta->type_kind == TYPE_ARRAY && ta->array_len != tb->array_len) { return 0; }
+        if (!str_eq(ta->struct_name_ptr, ta->struct_name_len, tb->struct_name_ptr, tb->struct_name_len)) { return 0; }
+    }
+    return 1;
+}
+
+func generic_find_binding(bindings: u64, kind: u64, name_ptr: u64, name_len: u64) -> u64 {
+    if (bindings == 0) { return 0; }
+    var n: u64 = vec_len(bindings);
+    for (var i: u64 = 0; i < n; i++) {
+        var b: *GenericBinding = (*GenericBinding)vec_get(bindings, i);
+        if (b->kind == kind && str_eq(b->name_ptr, b->name_len, name_ptr, name_len)) {
+            return (u64)b;
+        }
+    }
+    return 0;
+}
+
+func generic_bind_type(bindings: u64, name_ptr: u64, name_len: u64, type_ptr: u64) -> u64 {
+    var existing: u64 = generic_find_binding(bindings, GENERIC_KIND_TYPE, name_ptr, name_len);
+    if (existing != 0) {
+        var b: *GenericBinding = (*GenericBinding)existing;
+        if (!generic_type_equal(b->type_ptr, type_ptr)) {
+            return 1;
+        }
+        return 0;
+    }
+    var nb: *GenericBinding = (*GenericBinding)heap_alloc(sizeof(GenericBinding));
+    nb->kind = GENERIC_KIND_TYPE;
+    nb->name_ptr = name_ptr;
+    nb->name_len = name_len;
+    nb->type_ptr = type_ptr;
+    nb->value = 0;
+    vec_push(bindings, (u64)nb);
+    return 0;
+}
+
+func generic_bind_value(bindings: u64, name_ptr: u64, name_len: u64, value: u64) -> u64 {
+    var existing: u64 = generic_find_binding(bindings, GENERIC_KIND_VALUE, name_ptr, name_len);
+    if (existing != 0) {
+        var b: *GenericBinding = (*GenericBinding)existing;
+        if (b->value != value) {
+            return 1;
+        }
+        return 0;
+    }
+    var nb: *GenericBinding = (*GenericBinding)heap_alloc(sizeof(GenericBinding));
+    nb->kind = GENERIC_KIND_VALUE;
+    nb->name_ptr = name_ptr;
+    nb->name_len = name_len;
+    nb->type_ptr = 0;
+    nb->value = value;
+    vec_push(bindings, (u64)nb);
+    return 0;
+}
+
+func generic_make_typeinfo_from_fields(type_kind: u64, ptr_depth: u64, is_tagged: u64, struct_name_ptr: u64, struct_name_len: u64, tag_layout_ptr: u64, tag_layout_len: u64, elem_type_kind: u64, elem_ptr_depth: u64, array_len: u64, array_len_is_param: u64, array_len_param_ptr: u64, array_len_param_len: u64) -> u64 {
+    var ti: *TypeInfo = (*TypeInfo)heap_alloc(sizeof(TypeInfo));
+    ti->type_kind = type_kind;
+    ti->ptr_depth = ptr_depth;
+    ti->is_tagged = is_tagged;
+    ti->struct_name_ptr = struct_name_ptr;
+    ti->struct_name_len = struct_name_len;
+    ti->tag_layout_ptr = tag_layout_ptr;
+    ti->tag_layout_len = tag_layout_len;
+    ti->struct_def = 0;
+    ti->elem_type_kind = elem_type_kind;
+    ti->elem_ptr_depth = elem_ptr_depth;
+    ti->array_len = array_len;
+    ti->array_len_is_param = array_len_is_param;
+    ti->array_len_param_ptr = array_len_param_ptr;
+    ti->array_len_param_len = array_len_param_len;
+    return (u64)ti;
+}
+
+func generic_subst_typeinfo(type_kind: u64, ptr_depth: u64, is_tagged: u64, struct_name_ptr: u64, struct_name_len: u64, tag_layout_ptr: u64, tag_layout_len: u64, elem_type_kind: u64, elem_ptr_depth: u64, array_len: u64, array_len_is_param: u64, array_len_param_ptr: u64, array_len_param_len: u64, bindings: u64) -> u64 {
+    if (type_kind == TYPE_GENERIC) {
+        var b_ptr: u64 = generic_find_binding(bindings, GENERIC_KIND_TYPE, struct_name_ptr, struct_name_len);
+        if (b_ptr == 0) {
+            emit_stderr("[ERROR] Missing generic type binding\n", 39);
+            panic("Parse error");
+        }
+        var b: *GenericBinding = (*GenericBinding)b_ptr;
+        var bt: *TypeInfo = (*TypeInfo)b->type_ptr;
+        var merged_ptr_depth: u64 = bt->ptr_depth + ptr_depth;
+        return generic_make_typeinfo_from_fields(bt->type_kind, merged_ptr_depth, bt->is_tagged, bt->struct_name_ptr, bt->struct_name_len, bt->tag_layout_ptr, bt->tag_layout_len, bt->elem_type_kind, bt->elem_ptr_depth, bt->array_len, bt->array_len_is_param, bt->array_len_param_ptr, bt->array_len_param_len);
+    }
+
+    if (type_kind == TYPE_ARRAY || type_kind == TYPE_SLICE) {
+        var new_array_len: u64 = array_len;
+        var new_array_len_is_param: u64 = array_len_is_param;
+        var new_array_param_ptr: u64 = array_len_param_ptr;
+        var new_array_param_len: u64 = array_len_param_len;
+        if (array_len_is_param != 0) {
+            var vb_ptr: u64 = generic_find_binding(bindings, GENERIC_KIND_VALUE, array_len_param_ptr, array_len_param_len);
+            if (vb_ptr == 0) {
+                emit_stderr("[ERROR] Missing generic value binding\n", 40);
+                panic("Parse error");
+            }
+            var vb: *GenericBinding = (*GenericBinding)vb_ptr;
+            new_array_len = vb->value;
+            new_array_len_is_param = 0;
+            new_array_param_ptr = 0;
+            new_array_param_len = 0;
+        }
+
+        var elem_sub: u64 = generic_subst_typeinfo(elem_type_kind, elem_ptr_depth, 0, struct_name_ptr, struct_name_len, 0, 0, 0, 0, 0, 0, 0, 0, bindings);
+        var et: *TypeInfo = (*TypeInfo)elem_sub;
+        return generic_make_typeinfo_from_fields(type_kind, ptr_depth, is_tagged, et->struct_name_ptr, et->struct_name_len, tag_layout_ptr, tag_layout_len, et->type_kind, et->ptr_depth, new_array_len, new_array_len_is_param, new_array_param_ptr, new_array_param_len);
+    }
+
+    return generic_make_typeinfo_from_fields(type_kind, ptr_depth, is_tagged, struct_name_ptr, struct_name_len, tag_layout_ptr, tag_layout_len, elem_type_kind, elem_ptr_depth, array_len, array_len_is_param, array_len_param_ptr, array_len_param_len);
+}
+
+func generic_append_type_repr(v: u64, ti_ptr: u64) -> u64 {
+    var ti: *TypeInfo = (*TypeInfo)ti_ptr;
+    if (ti->ptr_depth > 0) {
+        vec_push(v, 112); // 'p'
+        generic_vec_append_u64(v, ti->ptr_depth);
+        vec_push(v, 95); // '_'
+        var base: u64 = generic_make_typeinfo_from_fields(ti->type_kind, 0, ti->is_tagged, ti->struct_name_ptr, ti->struct_name_len, ti->tag_layout_ptr, ti->tag_layout_len, ti->elem_type_kind, ti->elem_ptr_depth, ti->array_len, ti->array_len_is_param, ti->array_len_param_ptr, ti->array_len_param_len);
+        return generic_append_type_repr(v, base);
+    }
+
+    switch (ti->type_kind) {
+        case TYPE_U8: generic_vec_append_str(v, "u8", 2); break;
+        case TYPE_U16: generic_vec_append_str(v, "u16", 3); break;
+        case TYPE_U32: generic_vec_append_str(v, "u32", 3); break;
+        case TYPE_U64: generic_vec_append_str(v, "u64", 3); break;
+        case TYPE_I64: generic_vec_append_str(v, "i64", 3); break;
+        case TYPE_STRUCT:
+            vec_push(v, 83); // 'S'
+            for (var i: u64 = 0; i < ti->struct_name_len; i++) {
+                var c: u64 = *(*u8)(ti->struct_name_ptr + i);
+                if (c == 47 || c == 46) { c = 95; }
+                vec_push(v, c);
+            }
+            break;
+        case TYPE_ARRAY:
+            vec_push(v, 97); // 'a'
+            generic_vec_append_u64(v, ti->array_len);
+            vec_push(v, 95);
+            var elem: u64 = generic_make_typeinfo_from_fields(ti->elem_type_kind, ti->elem_ptr_depth, 0, ti->struct_name_ptr, ti->struct_name_len, 0, 0, 0, 0, 0, 0, 0, 0);
+            generic_append_type_repr(v, elem);
+            break;
+        case TYPE_SLICE:
+            vec_push(v, 115); // 's'
+            vec_push(v, 95);
+            var elem2: u64 = generic_make_typeinfo_from_fields(ti->elem_type_kind, ti->elem_ptr_depth, 0, ti->struct_name_ptr, ti->struct_name_len, 0, 0, 0, 0, 0, 0, 0, 0);
+            generic_append_type_repr(v, elem2);
+            break;
+        default:
+            generic_vec_append_str(v, "t", 1);
+            break;
+    }
+    return 0;
+}
+
+func generic_mangle_name(base_ptr: u64, base_len: u64, params_vec: u64, bindings: u64) -> u64 {
+    var v: u64 = vec_new(base_len + 32);
+    generic_vec_append_str(v, base_ptr, base_len);
+    generic_vec_append_str(v, "__G__", 5);
+    var n: u64 = vec_len(params_vec);
+    for (var i: u64 = 0; i < n; i++) {
+        var gp: *GenericParam = (*GenericParam)vec_get(params_vec, i);
+        if (gp->kind == GENERIC_KIND_TYPE) {
+            vec_push(v, 84); // 'T'
+            vec_push(v, 95);
+            var b_ptr: u64 = generic_find_binding(bindings, GENERIC_KIND_TYPE, gp->name_ptr, gp->name_len);
+            if (b_ptr == 0) {
+                emit_stderr("[ERROR] Missing generic type binding\n", 39);
+                panic("Parse error");
+            }
+            var b: *GenericBinding = (*GenericBinding)b_ptr;
+            generic_append_type_repr(v, b->type_ptr);
+        } else {
+            vec_push(v, 86); // 'V'
+            vec_push(v, 95);
+            var b2_ptr: u64 = generic_find_binding(bindings, GENERIC_KIND_VALUE, gp->name_ptr, gp->name_len);
+            if (b2_ptr == 0) {
+                emit_stderr("[ERROR] Missing generic value binding\n", 40);
+                panic("Parse error");
+            }
+            var b2: *GenericBinding = (*GenericBinding)b2_ptr;
+            generic_vec_append_u64(v, b2->value);
+        }
+
+        if (i + 1 < n) { vec_push(v, 95); }
+    }
+
+    var out_len: u64 = vec_len(v);
+    var out_ptr: u64 = heap_alloc((out_len + 1) * sizeof(u8));
+    for (var i2: u64 = 0; i2 < out_len; i2++) {
+        *(*u8)(out_ptr + i2) = vec_get(v, i2);
+    }
+    *(*u8)(out_ptr + out_len) = 0;
+    var info: *NameInfo = (*NameInfo)heap_alloc(sizeof(NameInfoLocal));
+    info->ptr = out_ptr;
+    info->len = out_len;
+    return (u64)info;
+}
+
+func generic_make_typeinfo_from_param(param: *Param) -> u64 {
+    return generic_make_typeinfo_from_fields(param->type_kind, param->ptr_depth, param->is_tagged, param->struct_name_ptr, param->struct_name_len, param->tag_layout_ptr, param->tag_layout_len, param->elem_type_kind, param->elem_ptr_depth, param->array_len, param->array_len_is_param, param->array_len_param_ptr, param->array_len_param_len);
+}
+
+func generic_make_typeinfo_from_vardecl(decl: *AstVarDecl) -> u64 {
+    return generic_make_typeinfo_from_fields(decl->type_kind, decl->ptr_depth, decl->is_tagged, decl->struct_name_ptr, decl->struct_name_len, decl->tag_layout_ptr, decl->tag_layout_len, decl->elem_type_kind, decl->elem_ptr_depth, decl->array_len, decl->array_len_is_param, decl->array_len_param_ptr, decl->array_len_param_len);
+}
+
+func generic_infer_from_typeinfo(tk: u64, pd: u64, sn_ptr: u64, sn_len: u64, elem_k: u64, elem_pd: u64, array_len: u64, array_len_is_param: u64, array_param_ptr: u64, array_param_len: u64, arg_ti_ptr: u64, bindings: u64) -> u64 {
+    var arg_ti: *TypeInfo = (*TypeInfo)arg_ti_ptr;
+    if (tk == TYPE_GENERIC) {
+        if (arg_ti->ptr_depth < pd) {
+            return 1;
+        }
+        var adj_ptr_depth: u64 = arg_ti->ptr_depth - pd;
+        var bound: u64 = generic_make_typeinfo_from_fields(arg_ti->type_kind, adj_ptr_depth, arg_ti->is_tagged, arg_ti->struct_name_ptr, arg_ti->struct_name_len, arg_ti->tag_layout_ptr, arg_ti->tag_layout_len, arg_ti->elem_type_kind, arg_ti->elem_ptr_depth, arg_ti->array_len, arg_ti->array_len_is_param, arg_ti->array_len_param_ptr, arg_ti->array_len_param_len);
+        if (generic_bind_type(bindings, sn_ptr, sn_len, bound) != 0) { return 1; }
+        return 0;
+    }
+
+    if (tk == TYPE_ARRAY || tk == TYPE_SLICE) {
+        if (arg_ti->type_kind != tk) {
+            return 1;
+        }
+        if (array_len_is_param != 0) {
+            if (generic_bind_value(bindings, array_param_ptr, array_param_len, arg_ti->array_len) != 0) { return 1; }
+        } else if (tk == TYPE_ARRAY && array_len != arg_ti->array_len) {
+            return 1;
+        }
+
+        return generic_infer_from_typeinfo(elem_k, elem_pd, sn_ptr, sn_len, 0, 0, 0, 0, 0, 0, generic_make_typeinfo_from_fields(arg_ti->elem_type_kind, arg_ti->elem_ptr_depth, 0, arg_ti->struct_name_ptr, arg_ti->struct_name_len, 0, 0, 0, 0, 0, 0, 0, 0), bindings);
+    }
+
+    if (tk != arg_ti->type_kind || pd != arg_ti->ptr_depth) {
+        return 1;
+    }
+    if (tk == TYPE_STRUCT && !str_eq(sn_ptr, sn_len, arg_ti->struct_name_ptr, arg_ti->struct_name_len)) {
+        return 1;
+    }
+    return 0;
+}
+
+func generic_infer_expr_type(expr: u64, symtab: u64) -> u64 {
+    var kind: u64 = ast_kind(expr);
+    switch (kind) {
+        case AST_LITERAL:
+            return generic_make_typeinfo_from_fields(TYPE_U64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        case AST_STRING:
+            return generic_make_typeinfo_from_fields(TYPE_U8, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        case AST_IDENT:
+            var id: *AstIdent = (*AstIdent)expr;
+            var t_ptr: u64 = 0;
+            if (symtab != 0) {
+                t_ptr = hashmap_get(symtab, id->name_ptr, id->name_len);
+            }
+            if (t_ptr != 0) { return t_ptr; }
+            // fallback: consts assumed u64
+            return generic_make_typeinfo_from_fields(TYPE_U64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        case AST_ADDR_OF:
+            var a: *AstAddrOf = (*AstAddrOf)expr;
+            var base_t: *TypeInfo = (*TypeInfo)generic_infer_expr_type(a->operand, symtab);
+            return generic_make_typeinfo_from_fields(base_t->type_kind, base_t->ptr_depth + 1, base_t->is_tagged, base_t->struct_name_ptr, base_t->struct_name_len, base_t->tag_layout_ptr, base_t->tag_layout_len, base_t->elem_type_kind, base_t->elem_ptr_depth, base_t->array_len, base_t->array_len_is_param, base_t->array_len_param_ptr, base_t->array_len_param_len);
+        case AST_DEREF:
+            var d: *AstDeref = (*AstDeref)expr;
+            var dt: *TypeInfo = (*TypeInfo)generic_infer_expr_type(d->operand, symtab);
+            if (dt->ptr_depth == 0) { return generic_make_typeinfo_from_fields(TYPE_U64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0); }
+            return generic_make_typeinfo_from_fields(dt->type_kind, dt->ptr_depth - 1, dt->is_tagged, dt->struct_name_ptr, dt->struct_name_len, dt->tag_layout_ptr, dt->tag_layout_len, dt->elem_type_kind, dt->elem_ptr_depth, dt->array_len, dt->array_len_is_param, dt->array_len_param_ptr, dt->array_len_param_len);
+        case AST_CAST:
+            var c: *AstCast = (*AstCast)expr;
+            return generic_make_typeinfo_from_fields(c->target_type, c->target_ptr_depth, c->target_is_tagged, c->struct_name_ptr, c->struct_name_len, c->tag_layout_ptr, c->tag_layout_len, 0, 0, 0, 0, 0, 0);
+        case AST_INDEX:
+            var ix: *AstIndex = (*AstIndex)expr;
+            var bt: *TypeInfo = (*TypeInfo)generic_infer_expr_type(ix->base, symtab);
+            if (bt->type_kind == TYPE_ARRAY || bt->type_kind == TYPE_SLICE) {
+                return generic_make_typeinfo_from_fields(bt->elem_type_kind, bt->elem_ptr_depth, 0, bt->struct_name_ptr, bt->struct_name_len, 0, 0, 0, 0, 0, 0, 0, 0);
+            }
+            if (bt->ptr_depth > 0) {
+                return generic_make_typeinfo_from_fields(bt->type_kind, bt->ptr_depth - 1, bt->is_tagged, bt->struct_name_ptr, bt->struct_name_len, bt->tag_layout_ptr, bt->tag_layout_len, bt->elem_type_kind, bt->elem_ptr_depth, bt->array_len, bt->array_len_is_param, bt->array_len_param_ptr, bt->array_len_param_len);
+            }
+            return generic_make_typeinfo_from_fields(TYPE_U64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        case AST_CALL:
+            // Try function signatures
+            var call: *AstCall = (*AstCall)expr;
+            var resolved_ptr: u64 = call->name_ptr;
+            var resolved_len: u64 = call->name_len;
+            var resolved: u64 = resolve_name(call->name_ptr, call->name_len);
+            if (resolved != 0) {
+                var info: *NameInfo = (*NameInfo)resolved;
+                resolved_ptr = info->ptr;
+                resolved_len = info->len;
+            }
+            if (g_all_func_sigs != 0) {
+                var n: u64 = vec_len(g_all_func_sigs);
+                for (var i2: u64 = 0; i2 < n; i2++) {
+                    var fn_ptr: u64 = vec_get(g_all_func_sigs, i2);
+                    var fn: *AstFunc = (*AstFunc)fn_ptr;
+                    if (str_eq(fn->name_ptr, fn->name_len, resolved_ptr, resolved_len)) {
+                        return generic_make_typeinfo_from_fields(fn->ret_type, fn->ret_ptr_depth, fn->ret_is_tagged, fn->ret_struct_name_ptr, fn->ret_struct_name_len, fn->ret_tag_layout_ptr, fn->ret_tag_layout_len, 0, 0, 0, 0, 0, 0);
+                    }
+                }
+            }
+            return generic_make_typeinfo_from_fields(TYPE_U64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        default:
+            return generic_make_typeinfo_from_fields(TYPE_U64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    }
+}
+
+func generic_collect_var_decls(stmt: u64, symtab: u64) -> u64 {
+    var kind: u64 = ast_kind(stmt);
+    switch (kind) {
+        case AST_VAR_DECL:
+            var vd: *AstVarDecl = (*AstVarDecl)stmt;
+            var t_ptr: u64 = generic_make_typeinfo_from_vardecl(vd);
+            hashmap_put(symtab, vd->name_ptr, vd->name_len, t_ptr);
+            break;
+        case AST_BLOCK:
+            var blk: *AstBlock = (*AstBlock)stmt;
+            var stmts: u64 = blk->stmts_vec;
+            var n: u64 = vec_len(stmts);
+            for (var i: u64 = 0; i < n; i++) {
+                generic_collect_var_decls(vec_get(stmts, i), symtab);
+            }
+            break;
+        case AST_IF:
+            var ifs: *AstIf = (*AstIf)stmt;
+            if (ifs->then_block != 0) { generic_collect_var_decls(ifs->then_block, symtab); }
+            if (ifs->else_block != 0) { generic_collect_var_decls(ifs->else_block, symtab); }
+            break;
+        case AST_WHILE:
+            var wl: *AstWhile = (*AstWhile)stmt;
+            if (wl->body != 0) { generic_collect_var_decls(wl->body, symtab); }
+            break;
+        case AST_FOR:
+            var fr: *AstFor = (*AstFor)stmt;
+            if (fr->init != 0) { generic_collect_var_decls(fr->init, symtab); }
+            if (fr->body != 0) { generic_collect_var_decls(fr->body, symtab); }
+            break;
+        case AST_SWITCH:
+            var sw: *AstSwitch = (*AstSwitch)stmt;
+            var cases: u64 = sw->cases_vec;
+            var cn: u64 = vec_len(cases);
+            for (var j: u64 = 0; j < cn; j++) {
+                generic_collect_var_decls(vec_get(cases, j), symtab);
+            }
+            break;
+        case AST_CASE:
+            var cs: *AstCase = (*AstCase)stmt;
+            if (cs->body != 0) { generic_collect_var_decls(cs->body, symtab); }
+            break;
+        default:
+            break;
+    }
+    return 0;
+}
+
+func generic_build_symtab_for_func(fn_ptr: u64) -> u64 {
+    var symtab: u64 = hashmap_new(64);
+    var fn: *AstFunc = (*AstFunc)fn_ptr;
+    var params: u64 = fn->params_vec;
+    if (params != 0) {
+        var n: u64 = vec_len(params);
+        for (var i: u64 = 0; i < n; i++) {
+            var p: *Param = (*Param)vec_get(params, i);
+            var t_ptr: u64 = generic_make_typeinfo_from_param(p);
+            hashmap_put(symtab, p->name_ptr, p->name_len, t_ptr);
+        }
+    }
+    if (fn->body != 0) {
+        generic_collect_var_decls(fn->body, symtab);
+    }
+    return symtab;
+}
+
+func generic_clone_args_vec(args: u64, bindings: u64) -> u64 {
+    var out: u64 = vec_new(8);
+    var n: u64 = vec_len(args);
+    for (var i: u64 = 0; i < n; i++) {
+        var expr: u64 = vec_get(args, i);
+        vec_push(out, generic_clone_expr(expr, bindings));
+    }
+    return out;
+}
+
+func generic_clone_expr(node: u64, bindings: u64) -> u64 {
+    if (node == 0) { return 0; }
+    var kind: u64 = ast_kind(node);
+    switch (kind) {
+        case AST_LITERAL:
+            var lit: *AstLiteral = (*AstLiteral)node;
+            return ast_literal(lit->value);
+        case AST_IDENT:
+            var id: *AstIdent = (*AstIdent)node;
+            return ast_ident(id->name_ptr, id->name_len);
+        case AST_STRING:
+            var st: *AstString = (*AstString)node;
+            return ast_string(st->str_ptr, st->str_len);
+        case AST_BINARY:
+            var bin: *AstBinary = (*AstBinary)node;
+            return ast_binary(bin->op, generic_clone_expr(bin->left, bindings), generic_clone_expr(bin->right, bindings));
+        case AST_UNARY:
+            var un: *AstUnary = (*AstUnary)node;
+            return ast_unary(un->op, generic_clone_expr(un->operand, bindings));
+        case AST_CALL:
+            var call: *AstCall = (*AstCall)node;
+            var args: u64 = generic_clone_args_vec(call->args_vec, bindings);
+            return ast_call(call->name_ptr, call->name_len, args);
+        case AST_GENERIC_CALL:
+            var gc: *AstGenericCall = (*AstGenericCall)node;
+            var gargs: u64 = vec_new(4);
+            var gn: u64 = vec_len(gc->generic_args_vec);
+            for (var i: u64 = 0; i < gn; i++) {
+                var ga: *GenericArg = (*GenericArg)vec_get(gc->generic_args_vec, i);
+                var ng: *GenericArg = (*GenericArg)heap_alloc(sizeof(GenericArg));
+                ng->kind = ga->kind;
+                ng->value = ga->value;
+                if (ga->kind == GENERIC_KIND_TYPE) {
+                    var ti: *TypeInfo = (*TypeInfo)ga->type_ptr;
+                    var subst: u64 = generic_subst_typeinfo(ti->type_kind, ti->ptr_depth, ti->is_tagged, ti->struct_name_ptr, ti->struct_name_len, ti->tag_layout_ptr, ti->tag_layout_len, ti->elem_type_kind, ti->elem_ptr_depth, ti->array_len, ti->array_len_is_param, ti->array_len_param_ptr, ti->array_len_param_len, bindings);
+                    ng->type_ptr = subst;
+                } else {
+                    ng->type_ptr = 0;
+                }
+                vec_push(gargs, (u64)ng);
+            }
+            var args_g: u64 = generic_clone_args_vec(gc->args_vec, bindings);
+            return ast_generic_call(gc->name_ptr, gc->name_len, gargs, args_g);
+        case AST_ADDR_OF:
+            var ao: *AstAddrOf = (*AstAddrOf)node;
+            return ast_addr_of(generic_clone_expr(ao->operand, bindings));
+        case AST_DEREF:
+            var dr: *AstDeref = (*AstDeref)node;
+            return ast_deref(generic_clone_expr(dr->operand, bindings));
+        case AST_DEREF8:
+            var dr8: *AstDeref8 = (*AstDeref8)node;
+            return ast_deref8(generic_clone_expr(dr8->operand, bindings));
+        case AST_CAST:
+            var cs: *AstCast = (*AstCast)node;
+            var sub: u64 = generic_subst_typeinfo(cs->target_type, cs->target_ptr_depth, cs->target_is_tagged, cs->struct_name_ptr, cs->struct_name_len, cs->tag_layout_ptr, cs->tag_layout_len, 0, 0, 0, 0, 0, 0, bindings);
+            var ti: *TypeInfo = (*TypeInfo)sub;
+            return ast_cast_ex(generic_clone_expr(cs->expr, bindings), ti->type_kind, ti->ptr_depth, ti->is_tagged, ti->struct_name_ptr, ti->struct_name_len, ti->tag_layout_ptr, ti->tag_layout_len);
+        case AST_MEMBER_ACCESS:
+            var ma: *AstMemberAccess = (*AstMemberAccess)node;
+            return ast_member_access(generic_clone_expr(ma->object, bindings), ma->member_ptr, ma->member_len);
+        case AST_METHOD_CALL:
+            var mc: *AstMethodCall = (*AstMethodCall)node;
+            var args2: u64 = generic_clone_args_vec(mc->args_vec, bindings);
+            return ast_method_call(generic_clone_expr(mc->receiver, bindings), mc->method_ptr, mc->method_len, args2);
+        case AST_STRUCT_LITERAL:
+            var sl: *AstStructLiteral = (*AstStructLiteral)node;
+            var vals: u64 = generic_clone_args_vec(sl->values_vec, bindings);
+            return ast_struct_literal(sl->struct_def, vals);
+        case AST_SIZEOF:
+            var sz: *AstSizeof = (*AstSizeof)node;
+            var sub2: u64 = generic_subst_typeinfo(sz->type_kind, sz->ptr_depth, 0, sz->struct_name_ptr, sz->struct_name_len, 0, 0, sz->elem_type_kind, sz->elem_ptr_depth, sz->array_len, sz->array_len_is_param, sz->array_len_param_ptr, sz->array_len_param_len, bindings);
+            var ti2: *TypeInfo = (*TypeInfo)sub2;
+            return ast_sizeof(ti2->type_kind, ti2->ptr_depth, ti2->struct_name_ptr, ti2->struct_name_len, ti2->elem_type_kind, ti2->elem_ptr_depth, ti2->array_len, ti2->array_len_is_param, ti2->array_len_param_ptr, ti2->array_len_param_len);
+        case AST_SIZEOF_EXPR:
+            var se: *AstSizeofExpr = (*AstSizeofExpr)node;
+            return ast_sizeof_expr(generic_clone_expr(se->expr, bindings));
+        case AST_INDEX:
+            var ix: *AstIndex = (*AstIndex)node;
+            return ast_index(generic_clone_expr(ix->base, bindings), generic_clone_expr(ix->index, bindings));
+        case AST_SLICE:
+            var sl2: *AstSlice = (*AstSlice)node;
+            return ast_slice(generic_clone_expr(sl2->ptr_expr, bindings), generic_clone_expr(sl2->len_expr, bindings));
+        case AST_CALL_PTR:
+            var cp: *AstCallPtr = (*AstCallPtr)node;
+            var args3: u64 = generic_clone_args_vec(cp->args_vec, bindings);
+            return ast_call_ptr(generic_clone_expr(cp->callee, bindings), args3);
+        default:
+            return node;
+    }
+}
+
+func generic_clone_stmt(node: u64, bindings: u64) -> u64 {
+    if (node == 0) { return 0; }
+    var kind: u64 = ast_kind(node);
+    switch (kind) {
+        case AST_RETURN:
+            var r: *AstReturn = (*AstReturn)node;
+            return ast_return(generic_clone_expr(r->expr, bindings));
+        case AST_VAR_DECL:
+            var vd: *AstVarDecl = (*AstVarDecl)node;
+            var sub: u64 = generic_subst_typeinfo(vd->type_kind, vd->ptr_depth, vd->is_tagged, vd->struct_name_ptr, vd->struct_name_len, vd->tag_layout_ptr, vd->tag_layout_len, vd->elem_type_kind, vd->elem_ptr_depth, vd->array_len, vd->array_len_is_param, vd->array_len_param_ptr, vd->array_len_param_len, bindings);
+            var ti: *TypeInfo = (*TypeInfo)sub;
+            var decl: *AstVarDecl = (*AstVarDecl)ast_var_decl(vd->name_ptr, vd->name_len, ti->type_kind, ti->ptr_depth, generic_clone_expr(vd->init_expr, bindings));
+            decl->is_tagged = ti->is_tagged;
+            decl->struct_name_ptr = ti->struct_name_ptr;
+            decl->struct_name_len = ti->struct_name_len;
+            decl->tag_layout_ptr = ti->tag_layout_ptr;
+            decl->tag_layout_len = ti->tag_layout_len;
+            decl->elem_type_kind = ti->elem_type_kind;
+            decl->elem_ptr_depth = ti->elem_ptr_depth;
+            decl->array_len = ti->array_len;
+            decl->array_len_is_param = ti->array_len_is_param;
+            decl->array_len_param_ptr = ti->array_len_param_ptr;
+            decl->array_len_param_len = ti->array_len_param_len;
+            return (u64)decl;
+        case AST_ASSIGN:
+            var assign_node: *AstAssign = (*AstAssign)node;
+            return ast_assign(generic_clone_expr(assign_node->target, bindings), generic_clone_expr(assign_node->value, bindings));
+        case AST_EXPR_STMT:
+            var es: *AstExprStmt = (*AstExprStmt)node;
+            return ast_expr_stmt(generic_clone_expr(es->expr, bindings));
+        case AST_IF:
+            var ifs: *AstIf = (*AstIf)node;
+            return ast_if(generic_clone_expr(ifs->cond, bindings), generic_clone_stmt(ifs->then_block, bindings), generic_clone_stmt(ifs->else_block, bindings));
+        case AST_WHILE:
+            var wl: *AstWhile = (*AstWhile)node;
+            return ast_while(generic_clone_expr(wl->cond, bindings), generic_clone_stmt(wl->body, bindings));
+        case AST_FOR:
+            var fr: *AstFor = (*AstFor)node;
+            return ast_for(generic_clone_stmt(fr->init, bindings), generic_clone_expr(fr->cond, bindings), generic_clone_expr(fr->update, bindings), generic_clone_stmt(fr->body, bindings));
+        case AST_SWITCH:
+            var sw: *AstSwitch = (*AstSwitch)node;
+            var cases_out: u64 = vec_new(4);
+            var cn: u64 = vec_len(sw->cases_vec);
+            for (var i: u64 = 0; i < cn; i++) {
+                vec_push(cases_out, generic_clone_stmt(vec_get(sw->cases_vec, i), bindings));
+            }
+            return ast_switch(generic_clone_expr(sw->expr, bindings), cases_out);
+        case AST_CASE:
+            var cs: *AstCase = (*AstCase)node;
+            return ast_case(cs->value, generic_clone_stmt(cs->body, bindings), cs->is_default);
+        case AST_BREAK:
+            return ast_break();
+        case AST_CONTINUE:
+            return ast_continue();
+        case AST_BLOCK:
+            var blk: *AstBlock = (*AstBlock)node;
+            var stmts_out: u64 = vec_new(8);
+            var n: u64 = vec_len(blk->stmts_vec);
+            for (var i: u64 = 0; i < n; i++) {
+                vec_push(stmts_out, generic_clone_stmt(vec_get(blk->stmts_vec, i), bindings));
+            }
+            return ast_block(stmts_out);
+        case AST_ASM:
+            var asmnode: *AstAsm = (*AstAsm)node;
+            var text_vec: u64 = vec_new(16);
+            var tn: u64 = vec_len(asmnode->text_vec);
+            for (var i2: u64 = 0; i2 < tn; i2++) { vec_push(text_vec, vec_get(asmnode->text_vec, i2)); }
+            return ast_asm(text_vec);
+        default:
+            return node;
+    }
+}
+
+func generic_clone_func(template_ptr: u64, bindings: u64, new_name_ptr: u64, new_name_len: u64) -> u64 {
+    var fn: *AstFunc = (*AstFunc)template_ptr;
+    var params_out: u64 = vec_new(8);
+    var pn: u64 = vec_len(fn->params_vec);
+    for (var i: u64 = 0; i < pn; i++) {
+        var p: *Param = (*Param)vec_get(fn->params_vec, i);
+        var sub: u64 = generic_subst_typeinfo(p->type_kind, p->ptr_depth, p->is_tagged, p->struct_name_ptr, p->struct_name_len, p->tag_layout_ptr, p->tag_layout_len, p->elem_type_kind, p->elem_ptr_depth, p->array_len, p->array_len_is_param, p->array_len_param_ptr, p->array_len_param_len, bindings);
+        var ti: *TypeInfo = (*TypeInfo)sub;
+        var np: *Param = (*Param)heap_alloc(sizeof(Param));
+        np->name_ptr = p->name_ptr;
+        np->name_len = p->name_len;
+        np->type_kind = ti->type_kind;
+        np->ptr_depth = ti->ptr_depth;
+        np->is_tagged = ti->is_tagged;
+        np->struct_name_ptr = ti->struct_name_ptr;
+        np->struct_name_len = ti->struct_name_len;
+        np->tag_layout_ptr = ti->tag_layout_ptr;
+        np->tag_layout_len = ti->tag_layout_len;
+        np->elem_type_kind = ti->elem_type_kind;
+        np->elem_ptr_depth = ti->elem_ptr_depth;
+        np->array_len = ti->array_len;
+        np->array_len_is_param = ti->array_len_is_param;
+        np->array_len_param_ptr = ti->array_len_param_ptr;
+        np->array_len_param_len = ti->array_len_param_len;
+        vec_push(params_out, (u64)np);
+    }
+
+    var ret_sub: u64 = generic_subst_typeinfo(fn->ret_type, fn->ret_ptr_depth, fn->ret_is_tagged, fn->ret_struct_name_ptr, fn->ret_struct_name_len, fn->ret_tag_layout_ptr, fn->ret_tag_layout_len, 0, 0, 0, 0, 0, 0, bindings);
+    var rt: *TypeInfo = (*TypeInfo)ret_sub;
+    var body_out: u64 = generic_clone_stmt(fn->body, bindings);
+    return ast_func_ex(new_name_ptr, new_name_len, params_out, rt->type_kind, rt->ptr_depth, rt->is_tagged, rt->struct_name_ptr, rt->struct_name_len, rt->tag_layout_ptr, rt->tag_layout_len, body_out);
+}
+
+func generic_clone_func_sig(template_ptr: u64, bindings: u64, new_name_ptr: u64, new_name_len: u64) -> u64 {
+    var fn: *AstFunc = (*AstFunc)template_ptr;
+    var params_out: u64 = vec_new(8);
+    var pn: u64 = vec_len(fn->params_vec);
+    for (var i: u64 = 0; i < pn; i++) {
+        var p: *Param = (*Param)vec_get(fn->params_vec, i);
+        var sub: u64 = generic_subst_typeinfo(p->type_kind, p->ptr_depth, p->is_tagged, p->struct_name_ptr, p->struct_name_len, p->tag_layout_ptr, p->tag_layout_len, p->elem_type_kind, p->elem_ptr_depth, p->array_len, p->array_len_is_param, p->array_len_param_ptr, p->array_len_param_len, bindings);
+        var ti: *TypeInfo = (*TypeInfo)sub;
+        var np: *Param = (*Param)heap_alloc(sizeof(Param));
+        np->name_ptr = p->name_ptr;
+        np->name_len = p->name_len;
+        np->type_kind = ti->type_kind;
+        np->ptr_depth = ti->ptr_depth;
+        np->is_tagged = ti->is_tagged;
+        np->struct_name_ptr = ti->struct_name_ptr;
+        np->struct_name_len = ti->struct_name_len;
+        np->tag_layout_ptr = ti->tag_layout_ptr;
+        np->tag_layout_len = ti->tag_layout_len;
+        np->elem_type_kind = ti->elem_type_kind;
+        np->elem_ptr_depth = ti->elem_ptr_depth;
+        np->array_len = ti->array_len;
+        np->array_len_is_param = ti->array_len_is_param;
+        np->array_len_param_ptr = ti->array_len_param_ptr;
+        np->array_len_param_len = ti->array_len_param_len;
+        vec_push(params_out, (u64)np);
+    }
+
+    var ret_sub: u64 = generic_subst_typeinfo(fn->ret_type, fn->ret_ptr_depth, fn->ret_is_tagged, fn->ret_struct_name_ptr, fn->ret_struct_name_len, fn->ret_tag_layout_ptr, fn->ret_tag_layout_len, 0, 0, 0, 0, 0, 0, bindings);
+    var rt: *TypeInfo = (*TypeInfo)ret_sub;
+    return ast_func_ex(new_name_ptr, new_name_len, params_out, rt->type_kind, rt->ptr_depth, rt->is_tagged, rt->struct_name_ptr, rt->struct_name_len, rt->tag_layout_ptr, rt->tag_layout_len, 0);
+}
+
+func generic_get_or_create_instance(tpl_ptr: u64, bindings: u64) -> u64 {
+    var tpl: *GenericFuncTemplate = (*GenericFuncTemplate)tpl_ptr;
+    var base_ptr: u64 = tpl->mangled_ptr;
+    var base_len: u64 = tpl->mangled_len;
+    if (base_ptr == 0) {
+        base_ptr = tpl->name_ptr;
+        base_len = tpl->name_len;
+    }
+
+    var name_info: *NameInfo = (*NameInfo)generic_mangle_name(base_ptr, base_len, tpl->params_vec, bindings);
+    var inst_ptr: u64 = name_info->ptr;
+    var inst_len: u64 = name_info->len;
+
+    if (g_generic_instantiations != 0) {
+        var exists: u64 = hashmap_get(g_generic_instantiations, inst_ptr, inst_len);
+        if (exists != 0) { return (u64)name_info; }
+    }
+
+    var def_src: u64 = tpl->func_def;
+    if (def_src == 0 && tpl->func_sig != 0) { def_src = tpl->func_sig; }
+    if (def_src == 0) {
+        emit_stderr("[ERROR] Missing generic function body\n", 43);
+        panic("Parse error");
+    }
+
+    var fn_new: u64 = generic_clone_func(def_src, bindings, inst_ptr, inst_len);
+    var sig_new: u64 = generic_clone_func_sig(def_src, bindings, inst_ptr, inst_len);
+    vec_push(g_all_funcs, fn_new);
+    vec_push(g_all_func_sigs, sig_new);
+
+    if (g_generic_instantiations == 0) { g_generic_instantiations = hashmap_new(64); }
+    hashmap_put(g_generic_instantiations, inst_ptr, inst_len, 1);
+
+    // Map new function to template module
+    if (g_func_module_map != 0 && tpl->mangled_ptr != 0) {
+        var mod_info: u64 = hashmap_get(g_func_module_map, tpl->mangled_ptr, tpl->mangled_len);
+        if (mod_info != 0) {
+            hashmap_put(g_func_module_map, inst_ptr, inst_len, mod_info);
+        }
+    }
+
+    return (u64)name_info;
+}
+
+func generic_build_bindings_for_explicit(tpl_ptr: u64, gargs: u64) -> u64 {
+    var tpl: *GenericFuncTemplate = (*GenericFuncTemplate)tpl_ptr;
+    var bindings: u64 = vec_new(4);
+    var pn: u64 = vec_len(tpl->params_vec);
+    var an: u64 = vec_len(gargs);
+    if (pn != an) {
+        emit_stderr("[ERROR] Generic argument count mismatch\n", 46);
+        panic("Parse error");
+    }
+    for (var i: u64 = 0; i < pn; i++) {
+        var gp: *GenericParam = (*GenericParam)vec_get(tpl->params_vec, i);
+        var ga: *GenericArg = (*GenericArg)vec_get(gargs, i);
+        if (gp->kind == GENERIC_KIND_TYPE) {
+            if (ga->kind != GENERIC_KIND_TYPE) {
+                emit_stderr("[ERROR] Expected type generic argument\n", 47);
+                panic("Parse error");
+            }
+            if (generic_bind_type(bindings, gp->name_ptr, gp->name_len, ga->type_ptr) != 0) {
+                emit_stderr("[ERROR] Conflicting generic type bindings\n", 45);
+                panic("Parse error");
+            }
+        } else {
+            if (ga->kind != GENERIC_KIND_VALUE) {
+                emit_stderr("[ERROR] Expected value generic argument\n", 48);
+                panic("Parse error");
+            }
+            if (generic_bind_value(bindings, gp->name_ptr, gp->name_len, ga->value) != 0) {
+                emit_stderr("[ERROR] Conflicting generic value bindings\n", 46);
+                panic("Parse error");
+            }
+        }
+    }
+    return bindings;
+}
+
+func generic_build_bindings_by_infer(tpl_ptr: u64, call_args: u64, symtab: u64) -> u64 {
+    var tpl: *GenericFuncTemplate = (*GenericFuncTemplate)tpl_ptr;
+    var bindings: u64 = vec_new(4);
+    var def_src: u64 = tpl->func_def;
+    if (def_src == 0) { def_src = tpl->func_sig; }
+    if (def_src == 0) {
+        emit_stderr("[ERROR] Missing generic signature for inference\n", 51);
+        panic("Parse error");
+    }
+    var fn: *AstFunc = (*AstFunc)def_src;
+    var params: u64 = fn->params_vec;
+    var pn: u64 = vec_len(params);
+    var an: u64 = vec_len(call_args);
+    if (pn != an) {
+        emit_stderr("[ERROR] Generic inference arg count mismatch\n", 49);
+        panic("Parse error");
+    }
+
+    for (var i: u64 = 0; i < pn; i++) {
+        var p: *Param = (*Param)vec_get(params, i);
+        var arg_expr: u64 = vec_get(call_args, i);
+        var arg_ti: u64 = generic_infer_expr_type(arg_expr, symtab);
+        if (generic_infer_from_typeinfo(p->type_kind, p->ptr_depth, p->struct_name_ptr, p->struct_name_len, p->elem_type_kind, p->elem_ptr_depth, p->array_len, p->array_len_is_param, p->array_len_param_ptr, p->array_len_param_len, arg_ti, bindings) != 0) {
+            return 0;
+        }
+    }
+
+    return bindings;
+}
+
+func generic_resolve_template(name_ptr: u64, name_len: u64) -> u64 {
+    var tpl: u64 = compiler_find_generic_template_by_name(name_ptr, name_len);
+    if (tpl != 0) {
+        var t: *GenericFuncTemplate = (*GenericFuncTemplate)tpl;
+        if (t->params_vec != 0 && vec_len(t->params_vec) > 0) { return tpl; }
+    }
+    var resolved: u64 = resolve_name(name_ptr, name_len);
+    if (resolved != 0) {
+        var info: *NameInfo = (*NameInfo)resolved;
+        tpl = compiler_find_generic_template_by_mangled(info->ptr, info->len);
+        if (tpl != 0) {
+            var t2: *GenericFuncTemplate = (*GenericFuncTemplate)tpl;
+            if (t2->params_vec != 0 && vec_len(t2->params_vec) > 0) { return tpl; }
+            tpl = 0;
+        }
+    }
+    return tpl;
+}
+
+func generic_process_expr(expr: u64, symtab: u64) -> u64 {
+    if (expr == 0) { return 0; }
+    var kind: u64 = ast_kind(expr);
+    switch (kind) {
+        case AST_GENERIC_CALL:
+            var gc: *AstGenericCall = (*AstGenericCall)expr;
+            var tpl_ptr: u64 = generic_resolve_template(gc->name_ptr, gc->name_len);
+            if (tpl_ptr == 0) {
+                emit_stderr("[ERROR] Generic function not found\n", 36);
+                panic("Parse error");
+            }
+            var bindings: u64 = generic_build_bindings_for_explicit(tpl_ptr, gc->generic_args_vec);
+            var name_info: *NameInfo = (*NameInfo)generic_get_or_create_instance(tpl_ptr, bindings);
+            var args_new: u64 = vec_new(4);
+            var an: u64 = vec_len(gc->args_vec);
+            for (var i: u64 = 0; i < an; i++) {
+                vec_push(args_new, generic_process_expr(vec_get(gc->args_vec, i), symtab));
+            }
+            return ast_call(name_info->ptr, name_info->len, args_new);
+        case AST_CALL:
+            var call: *AstCall = (*AstCall)expr;
+            var tpl_ptr2: u64 = generic_resolve_template(call->name_ptr, call->name_len);
+            if (tpl_ptr2 == 0) {
+                var args_new2: u64 = vec_new(4);
+                var an2: u64 = vec_len(call->args_vec);
+                for (var i2: u64 = 0; i2 < an2; i2++) {
+                    vec_push(args_new2, generic_process_expr(vec_get(call->args_vec, i2), symtab));
+                }
+                return ast_call(call->name_ptr, call->name_len, args_new2);
+            }
+            var bindings2: u64 = generic_build_bindings_by_infer(tpl_ptr2, call->args_vec, symtab);
+            if (bindings2 == 0) {
+                var args_fallback: u64 = vec_new(4);
+                var an_fallback: u64 = vec_len(call->args_vec);
+                for (var ifb: u64 = 0; ifb < an_fallback; ifb++) {
+                    vec_push(args_fallback, generic_process_expr(vec_get(call->args_vec, ifb), symtab));
+                }
+                return ast_call(call->name_ptr, call->name_len, args_fallback);
+            }
+            var name_info2: *NameInfo = (*NameInfo)generic_get_or_create_instance(tpl_ptr2, bindings2);
+            var args_new3: u64 = vec_new(4);
+            var an3: u64 = vec_len(call->args_vec);
+            for (var i3: u64 = 0; i3 < an3; i3++) {
+                vec_push(args_new3, generic_process_expr(vec_get(call->args_vec, i3), symtab));
+            }
+            return ast_call(name_info2->ptr, name_info2->len, args_new3);
+        case AST_BINARY:
+            var bin: *AstBinary = (*AstBinary)expr;
+            bin->left = generic_process_expr(bin->left, symtab);
+            bin->right = generic_process_expr(bin->right, symtab);
+            return expr;
+        case AST_UNARY:
+            var un: *AstUnary = (*AstUnary)expr;
+            un->operand = generic_process_expr(un->operand, symtab);
+            return expr;
+        case AST_ADDR_OF:
+            var ao: *AstAddrOf = (*AstAddrOf)expr;
+            ao->operand = generic_process_expr(ao->operand, symtab);
+            return expr;
+        case AST_DEREF:
+            var dr: *AstDeref = (*AstDeref)expr;
+            dr->operand = generic_process_expr(dr->operand, symtab);
+            return expr;
+        case AST_DEREF8:
+            var dr8: *AstDeref8 = (*AstDeref8)expr;
+            dr8->operand = generic_process_expr(dr8->operand, symtab);
+            return expr;
+        case AST_CAST:
+            var cs: *AstCast = (*AstCast)expr;
+            cs->expr = generic_process_expr(cs->expr, symtab);
+            return expr;
+        case AST_MEMBER_ACCESS:
+            var ma: *AstMemberAccess = (*AstMemberAccess)expr;
+            ma->object = generic_process_expr(ma->object, symtab);
+            return expr;
+        case AST_METHOD_CALL:
+            var mc: *AstMethodCall = (*AstMethodCall)expr;
+            mc->receiver = generic_process_expr(mc->receiver, symtab);
+            var args: u64 = vec_new(4);
+            var an4: u64 = vec_len(mc->args_vec);
+            for (var i4: u64 = 0; i4 < an4; i4++) {
+                vec_push(args, generic_process_expr(vec_get(mc->args_vec, i4), symtab));
+            }
+            mc->args_vec = args;
+            return expr;
+        case AST_INDEX:
+            var ix: *AstIndex = (*AstIndex)expr;
+            ix->base = generic_process_expr(ix->base, symtab);
+            ix->index = generic_process_expr(ix->index, symtab);
+            return expr;
+        case AST_SLICE:
+            var sl: *AstSlice = (*AstSlice)expr;
+            sl->ptr_expr = generic_process_expr(sl->ptr_expr, symtab);
+            sl->len_expr = generic_process_expr(sl->len_expr, symtab);
+            return expr;
+        case AST_CALL_PTR:
+            var cp: *AstCallPtr = (*AstCallPtr)expr;
+            cp->callee = generic_process_expr(cp->callee, symtab);
+            var args5: u64 = vec_new(4);
+            var an5: u64 = vec_len(cp->args_vec);
+            for (var i5: u64 = 0; i5 < an5; i5++) {
+                vec_push(args5, generic_process_expr(vec_get(cp->args_vec, i5), symtab));
+            }
+            cp->args_vec = args5;
+            return expr;
+        case AST_SIZEOF_EXPR:
+            var se: *AstSizeofExpr = (*AstSizeofExpr)expr;
+            se->expr = generic_process_expr(se->expr, symtab);
+            return expr;
+        default:
+            return expr;
+    }
+}
+
+func generic_process_stmt(stmt: u64, symtab: u64) -> u64 {
+    if (stmt == 0) { return 0; }
+    var kind: u64 = ast_kind(stmt);
+    switch (kind) {
+        case AST_RETURN:
+            var r: *AstReturn = (*AstReturn)stmt;
+            r->expr = generic_process_expr(r->expr, symtab);
+            return stmt;
+        case AST_VAR_DECL:
+            var vd: *AstVarDecl = (*AstVarDecl)stmt;
+            vd->init_expr = generic_process_expr(vd->init_expr, symtab);
+            return stmt;
+        case AST_ASSIGN:
+            var assign_stmt: *AstAssign = (*AstAssign)stmt;
+            assign_stmt->target = generic_process_expr(assign_stmt->target, symtab);
+            assign_stmt->value = generic_process_expr(assign_stmt->value, symtab);
+            return stmt;
+        case AST_EXPR_STMT:
+            var es: *AstExprStmt = (*AstExprStmt)stmt;
+            es->expr = generic_process_expr(es->expr, symtab);
+            return stmt;
+        case AST_IF:
+            var ifs: *AstIf = (*AstIf)stmt;
+            ifs->cond = generic_process_expr(ifs->cond, symtab);
+            generic_process_stmt(ifs->then_block, symtab);
+            generic_process_stmt(ifs->else_block, symtab);
+            return stmt;
+        case AST_WHILE:
+            var wl: *AstWhile = (*AstWhile)stmt;
+            wl->cond = generic_process_expr(wl->cond, symtab);
+            generic_process_stmt(wl->body, symtab);
+            return stmt;
+        case AST_FOR:
+            var fr: *AstFor = (*AstFor)stmt;
+            generic_process_stmt(fr->init, symtab);
+            fr->cond = generic_process_expr(fr->cond, symtab);
+            fr->update = generic_process_expr(fr->update, symtab);
+            generic_process_stmt(fr->body, symtab);
+            return stmt;
+        case AST_SWITCH:
+            var sw: *AstSwitch = (*AstSwitch)stmt;
+            sw->expr = generic_process_expr(sw->expr, symtab);
+            var cases: u64 = sw->cases_vec;
+            var cn: u64 = vec_len(cases);
+            for (var i: u64 = 0; i < cn; i++) {
+                generic_process_stmt(vec_get(cases, i), symtab);
+            }
+            return stmt;
+        case AST_CASE:
+            var cs: *AstCase = (*AstCase)stmt;
+            generic_process_stmt(cs->body, symtab);
+            return stmt;
+        case AST_BLOCK:
+            var blk: *AstBlock = (*AstBlock)stmt;
+            var stmts: u64 = blk->stmts_vec;
+            var n: u64 = vec_len(stmts);
+            for (var i2: u64 = 0; i2 < n; i2++) {
+                generic_process_stmt(vec_get(stmts, i2), symtab);
+            }
+            return stmt;
+        default:
+            return stmt;
+    }
+}
+
+func compiler_is_generic_template(fn_ptr: u64) -> u64 {
+    if (compiler_is_generic_func_ptr(fn_ptr) != 0) { return 1; }
+    var fn: *AstFunc = (*AstFunc)fn_ptr;
+    if (fn->ret_type == TYPE_GENERIC) { return 1; }
+
+    var params: u64 = fn->params_vec;
+    if (params == 0) { return 0; }
+
+    var n: u64 = vec_len(params);
+    for (var i: u64 = 0; i < n; i++) {
+        var p: *Param = (*Param)vec_get(params, i);
+        if (p->type_kind == TYPE_GENERIC) { return 1; }
+        if (p->elem_type_kind == TYPE_GENERIC) { return 1; }
+        if (p->array_len_is_param != 0) { return 1; }
+    }
+    return 0;
+}
+
+func compiler_monomorphize_generics() -> u64 {
+    if (g_generic_func_ptrs == 0 || vec_len(g_generic_func_ptrs) == 0) {
+        return 0;
+    }
+    if (g_all_funcs == 0) { return 0; }
+    for (var i2: u64 = 0; i2 < vec_len(g_all_funcs); i2++) {
+        var fn_ptr: u64 = vec_get(g_all_funcs, i2);
+        var fn: *AstFunc = (*AstFunc)fn_ptr;
+        var symtab: u64 = generic_build_symtab_for_func(fn_ptr);
+        generic_process_stmt(fn->body, symtab);
+    }
+
+    var filtered_funcs: u64 = vec_new(vec_len(g_all_funcs));
+    var total_funcs: u64 = vec_len(g_all_funcs);
+    for (var fi: u64 = 0; fi < total_funcs; fi++) {
+        var fn_ptr2: u64 = vec_get(g_all_funcs, fi);
+        if (compiler_is_generic_template(fn_ptr2) != 0) { continue; }
+        vec_push(filtered_funcs, fn_ptr2);
+    }
+    g_all_funcs = filtered_funcs;
+    return 0;
+}
+
+// ============================================
 // Driver helpers
 // ============================================
 
@@ -967,6 +2100,10 @@ func init_compiler_globals() -> u64 {
     g_all_globals = vec_new(64);
     g_all_structs = hashmap_new(64);
     g_all_structs_vec = vec_new(16);
+    g_generic_funcs = hashmap_new(64);
+    g_generic_funcs_mangled = hashmap_new(64);
+    g_generic_func_ptrs = vec_new(16);
+    g_generic_instantiations = hashmap_new(64);
     g_module_aliases = hashmap_new(128);
     g_prelude_aliases = hashmap_new(128);
     g_module_exports = hashmap_new(64);
