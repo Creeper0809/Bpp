@@ -46,6 +46,17 @@ TOTAL=0
 PASSED=0
 FAILED=0
 
+# Stress/Stability settings (override via env)
+STRESS_RUNS=${STRESS_RUNS:-20}
+STABILITY_RUNS=${STABILITY_RUNS:-5}
+STRESS_PASSED=0
+STRESS_FAILED=0
+STABILITY_PASSED=0
+STABILITY_FAILED=0
+
+# De-dup by content (ignore directive headers)
+declare -A SEEN_HASH
+
 echo "========================================"
 echo "${VERSION} Compiler Test Suite"
 echo "========================================"
@@ -60,72 +71,129 @@ if [ -z "$TEST_FILES" ]; then
 fi
 
 for TEST_FILE in $TEST_FILES; do
-    TOTAL=$((TOTAL + 1))
     TEST_NAME=$(basename "$TEST_FILE" .bpp)
-    
-    echo -n "[$TOTAL] Testing $TEST_NAME... "
+
+    CONTENT_HASH=$(awk '{if ($0 !~ /^\/\/ (Covers:|Mode:|Opt:|Expect exit code:)/) print}' "$TEST_FILE" | md5sum | awk '{print $1}')
+    if [ -n "${SEEN_HASH[$CONTENT_HASH]}" ]; then
+        echo "[SKIP] Duplicate content: $TEST_NAME (same as ${SEEN_HASH[$CONTENT_HASH]})"
+        continue
+    fi
+    SEEN_HASH[$CONTENT_HASH]="$TEST_NAME"
 
     # Parse test directives from the test file using awk for cleaner extraction.
     EXPECTED=$(grep -m1 -E '^// Expect exit code:' "$TEST_FILE" | awk -F': ' '{print $2}' | tr -d ' ' || echo "0")
-    MODE=$(grep -m1 -E '^// Mode:' "$TEST_FILE" | awk -F': ' '{print $2}' | tr -d ' ' || echo "nossa")
-    OPT=$(grep -m1 -E '^// Opt:' "$TEST_FILE" | awk -F': ' '{print $2}' | tr -d ' ' || echo "O0")
-    
-    
+
     # Fallback to 0 if EXPECTED is empty after parsing.
     if [ -z "$EXPECTED" ]; then
         EXPECTED=0
     fi
-    
-    ASM_FILE="$BUILD_DIR/${TEST_NAME}.asm"
-    OBJ_FILE="$BUILD_DIR/${TEST_NAME}.o"
-    BIN_FILE="$BUILD_DIR/${TEST_NAME}"
-    OUT_FILE="$RESULTS_DIR/${TEST_NAME}.out"
-    ERR_FILE="$RESULTS_DIR/${TEST_NAME}.err"
-    
-    # Set compiler flags based on parsed directives.
-    IR_FLAG=""
-    if [ "$MODE" = "ssa" ]; then
-        IR_FLAG="-dump-ssa"
-    fi
-    
-    OPT_FLAG=""
-    if [ "$OPT" = "O1" ]; then
-        OPT_FLAG="-O1"
-    fi
-    if ! $COMPILER $OPT_FLAG $IR_FLAG -asm "$TEST_FILE" 2>/dev/null > "$ASM_FILE"; then
-        echo -e "${RED}FAIL (compile)${NC}"
-        echo "Compilation failed" > "$ERR_FILE"
-        FAILED=$((FAILED + 1))
-        continue
-    fi
-    
-    # Assemble
-    if ! nasm -f elf64 "$ASM_FILE" -o "$OBJ_FILE" 2>"$ERR_FILE"; then
-        echo -e "${RED}FAIL (assemble)${NC}"
-        FAILED=$((FAILED + 1))
-        continue
-    fi
-    
-    # Link
-    if ! ld "$OBJ_FILE" -o "$BIN_FILE" 2>>"$ERR_FILE"; then
-        echo -e "${RED}FAIL (link)${NC}"
-        FAILED=$((FAILED + 1))
-        continue
-    fi
-    
-    # Run (compare exit code with expected)
-    set +e
-    timeout 5s "$BIN_FILE" > "$OUT_FILE" 2>&1
-    EXIT_CODE=$?
-    set -e
 
-    if [ "$EXIT_CODE" -eq "$EXPECTED" ]; then
-        echo -e "${GREEN}PASS${NC} (exit=$EXIT_CODE)"
-        PASSED=$((PASSED + 1))
-    else
-        echo -e "${RED}FAIL${NC} (exit=$EXIT_CODE, expect=$EXPECTED)"
-        FAILED=$((FAILED + 1))
-    fi
+    for MODE in nossa ssa; do
+        for OPT in O0 O1; do
+            TOTAL=$((TOTAL + 1))
+            echo -n "[$TOTAL] Testing $TEST_NAME ($MODE $OPT)... "
+
+            ASM_FILE="$BUILD_DIR/${TEST_NAME}.${MODE}.${OPT}.asm"
+            OBJ_FILE="$BUILD_DIR/${TEST_NAME}.${MODE}.${OPT}.o"
+            BIN_FILE="$BUILD_DIR/${TEST_NAME}.${MODE}.${OPT}"
+            OUT_FILE="$RESULTS_DIR/${TEST_NAME}.${MODE}.${OPT}.out"
+            ERR_FILE="$RESULTS_DIR/${TEST_NAME}.${MODE}.${OPT}.err"
+
+            # Set compiler flags based on mode/opt matrix.
+            IR_FLAG=""
+            if [ "$MODE" = "ssa" ]; then
+                IR_FLAG="-dump-ssa"
+            fi
+
+            OPT_FLAG=""
+            if [ "$OPT" = "O1" ]; then
+                OPT_FLAG="-O1"
+            fi
+
+            if ! $COMPILER $OPT_FLAG $IR_FLAG -asm "$TEST_FILE" 2>/dev/null > "$ASM_FILE"; then
+                echo -e "${RED}FAIL (compile)${NC}"
+                echo "Compilation failed" > "$ERR_FILE"
+                FAILED=$((FAILED + 1))
+                continue
+            fi
+
+            # Assemble
+            if ! nasm -f elf64 "$ASM_FILE" -o "$OBJ_FILE" 2>"$ERR_FILE"; then
+                echo -e "${RED}FAIL (assemble)${NC}"
+                FAILED=$((FAILED + 1))
+                continue
+            fi
+
+            # Link
+            if ! ld "$OBJ_FILE" -o "$BIN_FILE" 2>>"$ERR_FILE"; then
+                echo -e "${RED}FAIL (link)${NC}"
+                FAILED=$((FAILED + 1))
+                continue
+            fi
+
+            # Run (compare exit code with expected)
+            set +e
+            timeout 5s "$BIN_FILE" > "$OUT_FILE" 2>&1
+            EXIT_CODE=$?
+            set -e
+
+            if [ "$EXIT_CODE" -eq "$EXPECTED" ]; then
+                echo -e "${GREEN}PASS${NC} (exit=$EXIT_CODE)"
+                PASSED=$((PASSED + 1))
+            else
+                echo -e "${RED}FAIL${NC} (exit=$EXIT_CODE, expect=$EXPECTED)"
+                FAILED=$((FAILED + 1))
+                continue
+            fi
+
+            # Stress test: run the binary multiple times to catch flakiness.
+            if [ "$STRESS_RUNS" -gt 0 ]; then
+                STRESS_OK=1
+                for ((i=1; i<=STRESS_RUNS; i++)); do
+                    set +e
+                    timeout 5s "$BIN_FILE" > "$OUT_FILE" 2>&1
+                    STRESS_EXIT=$?
+                    set -e
+                    if [ "$STRESS_EXIT" -ne "$EXPECTED" ]; then
+                        STRESS_OK=0
+                        break
+                    fi
+                done
+                if [ "$STRESS_OK" -eq 1 ]; then
+                    echo -e "${GREEN}STRESS PASS${NC} (runs=$STRESS_RUNS)"
+                    STRESS_PASSED=$((STRESS_PASSED + 1))
+                else
+                    echo -e "${RED}STRESS FAIL${NC} (run=$i, exit=$STRESS_EXIT, expect=$EXPECTED)"
+                    STRESS_FAILED=$((STRESS_FAILED + 1))
+                    FAILED=$((FAILED + 1))
+                    continue
+                fi
+            fi
+
+            # Stability test: shorter loop with an explicit label.
+            if [ "$STABILITY_RUNS" -gt 0 ]; then
+                STABILITY_OK=1
+                for ((i=1; i<=STABILITY_RUNS; i++)); do
+                    set +e
+                    timeout 5s "$BIN_FILE" > "$OUT_FILE" 2>&1
+                    STABILITY_EXIT=$?
+                    set -e
+                    if [ "$STABILITY_EXIT" -ne "$EXPECTED" ]; then
+                        STABILITY_OK=0
+                        break
+                    fi
+                done
+                if [ "$STABILITY_OK" -eq 1 ]; then
+                    echo -e "${GREEN}STABILITY PASS${NC} (runs=$STABILITY_RUNS)"
+                    STABILITY_PASSED=$((STABILITY_PASSED + 1))
+                else
+                    echo -e "${RED}STABILITY FAIL${NC} (run=$i, exit=$STABILITY_EXIT, expect=$EXPECTED)"
+                    STABILITY_FAILED=$((STABILITY_FAILED + 1))
+                    FAILED=$((FAILED + 1))
+                fi
+            fi
+        done
+    done
 done
 
 IR_TEST_FILES=$(ls $IR_TEST_DIR/*.bpp 2>/dev/null | sort -V)
@@ -179,6 +247,8 @@ echo "========================================"
 echo "Total:  $TOTAL"
 echo -e "Passed: ${GREEN}$PASSED${NC}"
 echo -e "Failed: ${RED}$FAILED${NC}"
+echo -e "Stress: ${GREEN}$STRESS_PASSED${NC} passed, ${RED}$STRESS_FAILED${NC} failed"
+echo -e "Stability: ${GREEN}$STABILITY_PASSED${NC} passed, ${RED}$STABILITY_FAILED${NC} failed"
 echo ""
 
 if [ $FAILED -eq 0 ]; then
