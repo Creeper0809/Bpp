@@ -26,7 +26,7 @@ struct StatLocal {
     size: u64;
 }
 
-const GENERIC_DEBUG = 1;
+const GENERIC_DEBUG = 0;
 
 // ============================================
 // Global Module State
@@ -51,6 +51,7 @@ var g_generic_instantiations; // HashMap: mangled instantiation name -> 1
 var g_generic_structs;         // HashMap: base name -> GenericStructTemplate
 var g_generic_struct_ptrs;     // Vec of generic struct template pointers
 var g_generic_struct_instantiations; // HashMap: instantiation name -> struct_def
+var g_generic_struct_bindings; // HashMap: instantiation name -> bindings
 
 var g_file_ptr;
 var g_file_len;
@@ -601,6 +602,29 @@ func resolve_prelude_alias_lazy(name_ptr: u64, name_len: u64) -> u64 {
 }
 
 func resolve_name(name_ptr: u64, name_len: u64) -> u64 {
+    var suffix_idx: u64 = compiler_find_generic_suffix_index(name_ptr, name_len);
+    if (suffix_idx < name_len) {
+        var base_ptr: u64 = name_ptr;
+        var base_len: u64 = suffix_idx;
+        var resolved_base: u64 = resolve_name(base_ptr, base_len);
+        if (resolved_base != 0) {
+            var base_info: *NameInfo = (*NameInfo)resolved_base;
+            var suffix_len: u64 = name_len - suffix_idx;
+            var combined_len: u64 = base_info->len + suffix_len;
+            var combined_ptr: u64 = heap_alloc((combined_len + 1) * sizeof(u8));
+            for (var i: u64 = 0; i < base_info->len; i++) {
+                *(*u8)(combined_ptr + i) = *(*u8)(base_info->ptr + i);
+            }
+            for (var j: u64 = 0; j < suffix_len; j++) {
+                *(*u8)(combined_ptr + base_info->len + j) = *(*u8)(name_ptr + suffix_idx + j);
+            }
+            *(*u8)(combined_ptr + combined_len) = 0;
+            var info_out: *NameInfo = (*NameInfo)heap_alloc(sizeof(NameInfoLocal));
+            info_out->ptr = combined_ptr;
+            info_out->len = combined_len;
+            return (u64)info_out;
+        }
+    }
     if (g_current_module_ptr != 0 && g_current_module_len != 0) {
         var alias: u64 = resolve_import_alias(g_current_module_ptr, g_current_module_len, name_ptr, name_len);
         if (alias != 0) { return alias; }
@@ -1070,6 +1094,27 @@ func compiler_is_generic_struct_def(struct_def: u64) -> u64 {
     return 0;
 }
 
+func compiler_register_generic_struct_bindings(inst_ptr: u64, inst_len: u64, bindings: u64) -> u64 {
+    if (inst_ptr == 0 || inst_len == 0 || bindings == 0) { return 0; }
+    if (g_generic_struct_bindings == 0) { g_generic_struct_bindings = hashmap_new(64); }
+    if (hashmap_has(g_generic_struct_bindings, inst_ptr, inst_len) != 0) { return 0; }
+    hashmap_put(g_generic_struct_bindings, inst_ptr, inst_len, bindings);
+    return 0;
+}
+
+func compiler_get_generic_struct_bindings(inst_ptr: u64, inst_len: u64) -> u64 {
+    if (g_generic_struct_bindings == 0) { return 0; }
+    return hashmap_get(g_generic_struct_bindings, inst_ptr, inst_len);
+}
+
+func compiler_find_generic_suffix_index(name_ptr: u64, name_len: u64) -> u64 {
+    if (name_ptr == 0 || name_len < 5) { return name_len; }
+    for (var i: u64 = 0; i + 5 <= name_len; i++) {
+        if (str_eq(name_ptr + i, 5, "__G__", 5)) { return i; }
+    }
+    return name_len;
+}
+
 func compiler_register_generic_func_sig(name_ptr: u64, name_len: u64, params_vec: u64, func_sig: u64) -> u64 {
     if (params_vec == 0 || vec_len(params_vec) == 0) { return 0; }
     var tpl_ptr: u64 = compiler_get_or_create_generic_template(name_ptr, name_len, params_vec);
@@ -1276,6 +1321,17 @@ func generic_subst_typeinfo(type_kind: u64, ptr_depth: u64, is_tagged: u64, stru
         var bt: *TypeInfo = (*TypeInfo)b->type_ptr;
         var merged_ptr_depth: u64 = bt->ptr_depth + ptr_depth;
         return generic_make_typeinfo_from_fields(bt->type_kind, merged_ptr_depth, bt->is_tagged, bt->struct_name_ptr, bt->struct_name_len, bt->tag_layout_ptr, bt->tag_layout_len, bt->elem_type_kind, bt->elem_ptr_depth, bt->array_len, bt->array_len_is_param, bt->array_len_param_ptr, bt->array_len_param_len);
+    }
+
+    if (type_kind == TYPE_STRUCT && bindings != 0) {
+        var base_len: u64 = compiler_find_generic_suffix_index(struct_name_ptr, struct_name_len);
+        if (base_len < struct_name_len) {
+            var tpl_ptr: u64 = compiler_find_generic_struct_template_by_name(struct_name_ptr, base_len);
+            if (tpl_ptr != 0) {
+                var name_info: *NameInfo = (*NameInfo)generic_struct_get_or_create_instance(tpl_ptr, bindings);
+                return generic_make_typeinfo_from_fields(type_kind, ptr_depth, is_tagged, name_info->ptr, name_info->len, tag_layout_ptr, tag_layout_len, elem_type_kind, elem_ptr_depth, array_len, array_len_is_param, array_len_param_ptr, array_len_param_len);
+            }
+        }
     }
 
     if (type_kind == TYPE_ARRAY || type_kind == TYPE_SLICE) {
@@ -1954,7 +2010,10 @@ func generic_struct_get_or_create_instance(tpl_ptr: u64, bindings: u64) -> u64 {
 
     if (g_generic_struct_instantiations != 0) {
         var exists: u64 = hashmap_get(g_generic_struct_instantiations, inst_ptr, inst_len);
-        if (exists != 0) { return (u64)name_info; }
+        if (exists != 0) {
+            compiler_register_generic_struct_bindings(inst_ptr, inst_len, bindings);
+            return (u64)name_info;
+        }
     }
 
     var def_src: u64 = tpl->struct_def;
@@ -1968,6 +2027,7 @@ func generic_struct_get_or_create_instance(tpl_ptr: u64, bindings: u64) -> u64 {
 
     if (g_generic_struct_instantiations == 0) { g_generic_struct_instantiations = hashmap_new(64); }
     hashmap_put(g_generic_struct_instantiations, inst_ptr, inst_len, struct_new);
+    compiler_register_generic_struct_bindings(inst_ptr, inst_len, bindings);
     return (u64)name_info;
 }
 
@@ -2104,6 +2164,44 @@ func generic_process_expr(expr: u64, symtab: u64) -> u64 {
                 vec_push(args, generic_process_expr(vec_get(mc->args_vec, i4), symtab));
             }
             mc->args_vec = args;
+            var recv_ti_ptr: u64 = generic_infer_expr_type(mc->receiver, symtab);
+            if (recv_ti_ptr != 0) {
+                var recv_ti: *TypeInfo = (*TypeInfo)recv_ti_ptr;
+                if (recv_ti->type_kind == TYPE_STRUCT) {
+                    var struct_ptr: u64 = recv_ti->struct_name_ptr;
+                    var struct_len: u64 = recv_ti->struct_name_len;
+                    var base_len: u64 = compiler_find_generic_suffix_index(struct_ptr, struct_len);
+                    var full_len2: u64 = base_len + 1 + mc->method_len;
+                    var full_ptr2: u64 = heap_alloc((full_len2 + 1) * sizeof(u8));
+                    for (var bi: u64 = 0; bi < base_len; bi++) {
+                        *(*u8)(full_ptr2 + bi) = *(*u8)(struct_ptr + bi);
+                    }
+                    *(*u8)(full_ptr2 + base_len) = 95;
+                    for (var mj: u64 = 0; mj < mc->method_len; mj++) {
+                        *(*u8)(full_ptr2 + base_len + 1 + mj) = *(*u8)(mc->method_ptr + mj);
+                    }
+                    *(*u8)(full_ptr2 + full_len2) = 0;
+
+                    var tpl_ptr3: u64 = compiler_find_generic_template_by_name(full_ptr2, full_len2);
+                    if (tpl_ptr3 != 0) {
+                        var bindings3: u64 = 0;
+                        if (base_len != struct_len) {
+                            bindings3 = compiler_get_generic_struct_bindings(struct_ptr, struct_len);
+                        }
+                        if (bindings3 == 0) {
+                            var infer_args: u64 = vec_new(an4 + 1);
+                            vec_push(infer_args, ast_addr_of(mc->receiver));
+                            for (var ai: u64 = 0; ai < an4; ai++) {
+                                vec_push(infer_args, vec_get(args, ai));
+                            }
+                            bindings3 = generic_build_bindings_by_infer(tpl_ptr3, infer_args, symtab);
+                        }
+                        if (bindings3 != 0) {
+                            generic_get_or_create_instance(tpl_ptr3, bindings3);
+                        }
+                    }
+                }
+            }
             return expr;
         case AST_INDEX:
             var ix: *AstIndex = (*AstIndex)expr;
@@ -2259,6 +2357,7 @@ func init_compiler_globals() -> u64 {
     g_generic_structs = hashmap_new(64);
     g_generic_struct_ptrs = vec_new(16);
     g_generic_struct_instantiations = hashmap_new(64);
+    g_generic_struct_bindings = hashmap_new(64);
     g_module_aliases = hashmap_new(128);
     g_prelude_aliases = hashmap_new(128);
     g_module_exports = hashmap_new(64);

@@ -30,6 +30,10 @@ v4_roadmap.md의 실행 계획. 기능을 의존성과 우선순위에 따라 �
 - [x] v2 impl prefix 기반 제네릭 등록 적용 후 빌드 재검증 (2026-02-01)
 - [x] v2 제네릭 템플릿 처리 스킵 수정 후 빌드 재검증 (2026-02-01)
 - [x] v2 제네릭 struct sizeof 정합성(템플릿 등록) 재검증 (2026-02-01)
+- [x] v2 impl-lowered 직접 호출 차단 + Vec/HashMap 래퍼 메서드 호출 전환 (2026-02-01)
+- [x] v2 force_instantiations direct call 제거 (2026-02-01)
+- [x] v2 HashMap 내부 직접 호출 제거 + GENERIC_DEBUG off (2026-02-01)
+- [x] v2 generic struct typeinfo 치환 보강 (2026-02-01)
 
 ---
 
