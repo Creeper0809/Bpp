@@ -197,6 +197,28 @@ func cg_return_stmt(node: u64, symtab: u64) -> u64 {
                             emit("], rax\n", 7);
                         }
                     }
+                } else if (expr_kind == AST_CALL) {
+                    var call_expr: *AstCall = (*AstCall)expr;
+                    var args_call: u64 = call_expr->args_vec;
+                    var nargs_call: u64 = 0;
+                    if (args_call != 0) { nargs_call = vec_len(args_call); }
+
+                    emit("    push rdi\n", 13);
+                    var total_arg_words_call: u64 = 0;
+                    if (nargs_call > 0) {
+                        for (var ci: i64 = (i64)nargs_call - 1; ci >= 0; ci = ci - 1) {
+                            var carg: u64 = vec_get(args_call, (u64)ci);
+                            total_arg_words_call = total_arg_words_call + _cg_sysv_push_call_arg(carg, symtab);
+                        }
+                    }
+                    var stack_words_call: u64 = _cg_sysv_pop_arg_regs_sret(total_arg_words_call);
+                    emit("    pop rdi\n", 12);
+                    emit_call_resolved(call_expr->name_ptr, call_expr->name_len);
+                    if (stack_words_call > 0) {
+                        emit("    add rsp, ", 13);
+                        emit_u64(stack_words_call * 8);
+                        emit_nl();
+                    }
                 } else {
                     emit("    push rdi\n", 13);
                     cg_lvalue(expr);
@@ -392,6 +414,12 @@ func cg_var_decl_stmt(node: u64, symtab: u64, g_structs_vec: u64) -> u64 {
         size = 16;
     } else {
         size = sizeof_type(type_kind, ptr_depth, struct_name_ptr, struct_name_len);
+        if (type_kind == TYPE_STRUCT && ptr_depth == 0) {
+            var align_rem: u64 = size % 8;
+            if (align_rem != 0) {
+                size = size + (8 - align_rem);
+            }
+        }
     }
     
     var offset: u64 = symtab_add(symtab, name_ptr, name_len, type_kind, ptr_depth, size);
@@ -532,6 +560,57 @@ func cg_var_decl_stmt(node: u64, symtab: u64, g_structs_vec: u64) -> u64 {
             if (off3 < 0) { emit_i64(off3); }
             else { emit("+", 1); emit_u64(off3); }
             emit("], rcx\n", 7);
+            return;
+        }
+
+        if (type_kind == TYPE_STRUCT && ptr_depth == 0 && init_kind != AST_CALL && init_kind != AST_STRUCT_LITERAL) {
+            var struct_size_copy: u64 = sizeof_type(type_kind, ptr_depth, struct_name_ptr, struct_name_len);
+            cg_lvalue(init);
+            emit("    mov rbx, rax\n", 19);
+            emit("    lea r8, [rbp", 17);
+            if (offset < 0) { emit_i64(offset); }
+            else { emit("+", 1); emit_u64(offset); }
+            emit("]\n", 2);
+
+            var off_copy: u64 = 0;
+            while (off_copy + 8 <= struct_size_copy) {
+                emit("    mov rcx, [rbx", 18);
+                if (off_copy != 0) { emit("+", 1); emit_u64(off_copy); }
+                emit("]\n", 2);
+                emit("    mov [r8", 11);
+                if (off_copy != 0) { emit("+", 1); emit_u64(off_copy); }
+                emit("], rcx\n", 7);
+                off_copy = off_copy + 8;
+            }
+            var rem_copy: u64 = struct_size_copy - off_copy;
+            if (rem_copy >= 4) {
+                emit("    mov ecx, [rbx", 18);
+                if (off_copy != 0) { emit("+", 1); emit_u64(off_copy); }
+                emit("]\n", 2);
+                emit("    mov [r8", 11);
+                if (off_copy != 0) { emit("+", 1); emit_u64(off_copy); }
+                emit("], ecx\n", 7);
+                off_copy = off_copy + 4;
+                rem_copy = rem_copy - 4;
+            }
+            if (rem_copy >= 2) {
+                emit("    mov cx, [rbx", 16);
+                if (off_copy != 0) { emit("+", 1); emit_u64(off_copy); }
+                emit("]\n", 2);
+                emit("    mov [r8", 11);
+                if (off_copy != 0) { emit("+", 1); emit_u64(off_copy); }
+                emit("], cx\n", 6);
+                off_copy = off_copy + 2;
+                rem_copy = rem_copy - 2;
+            }
+            if (rem_copy >= 1) {
+                emit("    mov cl, [rbx", 16);
+                if (off_copy != 0) { emit("+", 1); emit_u64(off_copy); }
+                emit("]\n", 2);
+                emit("    mov [r8", 11);
+                if (off_copy != 0) { emit("+", 1); emit_u64(off_copy); }
+                emit("], cl\n", 6);
+            }
             return;
         }
 
@@ -718,6 +797,36 @@ func cg_assign_stmt(node: u64, symtab: u64) -> u64 {
                     var total_bits2: u64 = get_packed_layout_total_bits(ot->struct_def);
                     var field_offset2: u64 = get_packed_field_bit_offset(ot->struct_def, member_ptr, member_len);
                     var field_width2: u64 = get_packed_field_bit_width(ot->struct_def, member_ptr, member_len);
+                    if (total_bits2 > 64 || (field_offset2 + field_width2) > 64) {
+                        var byte_offset2: u64 = field_offset2 / 8;
+                        var bit_shift2: u64 = field_offset2 % 8;
+                        var byte_width2: u64 = (field_width2 + 7) / 8;
+
+                        if (bit_shift2 != 0) {
+                            emit("[ERROR] Packed field write requires byte alignment\n", 56);
+                            panic("Codegen error");
+                        }
+
+                        cg_expr(value);
+                        emit("    mov r9, rax\n", 16);
+                        cg_lvalue(obj);
+                        if (byte_offset2 > 0) {
+                            emit("    add rax, ", 13);
+                            emit_u64(byte_offset2);
+                            emit("\n", 1);
+                        }
+
+                        if (byte_width2 == 1) {
+                            emit("    mov [rax], r9b\n", 22);
+                        } else if (byte_width2 == 2) {
+                            emit("    mov [rax], r9w\n", 22);
+                        } else if (byte_width2 == 4) {
+                            emit("    mov [rax], r9d\n", 22);
+                        } else {
+                            emit("    mov [rax], r9\n", 21);
+                        }
+                        return;
+                    }
                     var shift_bits2: u64 = field_offset2;
                     var size_bytes2: u64 = (total_bits2 + 7) / 8;
 
@@ -967,7 +1076,8 @@ func cg_assign_stmt(node: u64, symtab: u64) -> u64 {
                 
                 // Now: rax = source address, r8 = dest address
                 // Copy struct_size bytes (8 bytes at a time)
-                for (var off: u64 = 0; off < struct_size; off = off + 8) {
+                var off: u64 = 0;
+                while (off + 8 <= struct_size) {
                     emit("    mov rcx, [rax", 17);
                     if (off > 0) {
                         emit("+", 1);
@@ -980,6 +1090,54 @@ func cg_assign_stmt(node: u64, symtab: u64) -> u64 {
                         emit_u64(off);
                     }
                     emit("], rcx\n", 7);
+                    off = off + 8;
+                }
+                var rem: u64 = struct_size - off;
+                if (rem >= 4) {
+                    emit("    mov ecx, [rax", 17);
+                    if (off > 0) {
+                        emit("+", 1);
+                        emit_u64(off);
+                    }
+                    emit("]\n", 2);
+                    emit("    mov [r8", 11);
+                    if (off > 0) {
+                        emit("+", 1);
+                        emit_u64(off);
+                    }
+                    emit("], ecx\n", 7);
+                    off = off + 4;
+                    rem = rem - 4;
+                }
+                if (rem >= 2) {
+                    emit("    mov cx, [rax", 16);
+                    if (off > 0) {
+                        emit("+", 1);
+                        emit_u64(off);
+                    }
+                    emit("]\n", 2);
+                    emit("    mov [r8", 11);
+                    if (off > 0) {
+                        emit("+", 1);
+                        emit_u64(off);
+                    }
+                    emit("], cx\n", 6);
+                    off = off + 2;
+                    rem = rem - 2;
+                }
+                if (rem >= 1) {
+                    emit("    mov cl, [rax", 16);
+                    if (off > 0) {
+                        emit("+", 1);
+                        emit_u64(off);
+                    }
+                    emit("]\n", 2);
+                    emit("    mov [r8", 11);
+                    if (off > 0) {
+                        emit("+", 1);
+                        emit_u64(off);
+                    }
+                    emit("], cl\n", 6);
                 }
                 return;
             }
