@@ -31,7 +31,11 @@ const GENERIC_DEBUG = 0;
 // ============================================
 // Global Module State
 // ============================================
-var g_loaded_modules;    // HashMap: path -> 1 (tracks loaded files)
+var g_loaded_modules;          // HashMap: path -> 1 (tracks fully loaded files)
+var g_loaded_modules_pass1;    // HashMap: path -> 1 (tracks pass1 signature scan)
+var g_module_imports_pass1;    // HashMap: path -> imports vec from pass1
+var g_module_imports_pass2;    // HashMap: path -> imports vec from pass2 (stable copies)
+var g_loaded_modules_vec;      // Vec<NameInfo> of fully loaded module paths
 var g_all_funcs;         // Vec of all function ASTs
 var g_all_func_sigs;     // Vec of all function signatures (pass 1)
 var g_all_consts;        // Vec of all const ASTs
@@ -730,6 +734,46 @@ func prelude_import_all_from_module(module_ptr: u64, module_len: u64) -> u64 {
     return 1;
 }
 
+// After all modules are loaded, resolve import aliases using stored import lists.
+func finalize_import_aliases() -> u64 {
+    if (g_loaded_modules_vec == 0) { return 0; }
+    var n: u64 = vec_len(g_loaded_modules_vec);
+    for (var i: u64 = 0; i < n; i++) {
+        var info: *NameInfo = (*NameInfo)vec_get(g_loaded_modules_vec, i);
+        var module_path: u64 = info->ptr;
+        var module_path_len: u64 = info->len;
+        var module_id: u64 = module_id_from_path(module_path, module_path_len);
+        var module_info: *NameInfo = (*NameInfo)module_id;
+        var module_ptr: u64 = module_info->ptr;
+        var module_len: u64 = module_info->len;
+
+        var imports: u64 = hashmap_get(g_module_imports_pass2, module_path, module_path_len);
+        if (imports == 0) { continue; }
+        var num_imports: u64 = vec_len(imports);
+        for (var ii: u64 = 0; ii < num_imports; ii++) {
+            var imp: *AstImport = (*AstImport)vec_get(imports, ii);
+            var imp_path: u64 = imp->path_ptr;
+            var imp_len: u64 = imp->path_len;
+            var imp_sym_ptr: u64 = imp->symbol_ptr;
+            var imp_sym_len: u64 = imp->symbol_len;
+            var imp_alias_ptr: u64 = imp->alias_ptr;
+            var imp_alias_len: u64 = imp->alias_len;
+
+            var imp_mod_id: u64 = module_id_from_import(imp_path, imp_len);
+            var imp_mod_info: *NameInfo = (*NameInfo)imp_mod_id;
+            var imp_mod_ptr: u64 = imp_mod_info->ptr;
+            var imp_mod_len: u64 = imp_mod_info->len;
+
+            if (imp_sym_ptr == 0) {
+                import_all_from_module(module_ptr, module_len, imp_mod_ptr, imp_mod_len);
+            } else {
+                import_symbol_from_module(module_ptr, module_len, imp_mod_ptr, imp_mod_len, imp_sym_ptr, imp_sym_len, imp_alias_ptr, imp_alias_len);
+            }
+        }
+    }
+    return 1;
+}
+
 func set_current_module_for_func(func_ptr: u64, func_len: u64) -> u64 {
     g_current_module_ptr = 0;
     g_current_module_len = 0;
@@ -834,6 +878,71 @@ func load_module_by_name(module_path: u64, module_len: u64) -> u64 {
     return load_module(resolved, resolved_len);
 }
 
+// Pass1: scan signatures and register generic templates before full parse.
+func load_module_pass1(file_path: u64, file_path_len: u64) -> u64 {
+    if (g_loaded_modules_pass1 == 0) { g_loaded_modules_pass1 = hashmap_new(64); }
+    if (hashmap_has(g_loaded_modules_pass1, file_path, file_path_len)) {
+        return 1;
+    }
+    hashmap_put(g_loaded_modules_pass1, file_path, file_path_len, 1);
+
+    var content: u64 = read_entire_file(file_path);
+    if (content == 0) {
+        emit_stderr("[ERROR] Cannot open module: ", 29);
+        for (var i: u64 = 0; i < file_path_len; i++) {
+            emit_char(*(*u8)(file_path + i));
+        }
+        emit_nl();
+        return 0;
+    }
+
+    var src: u64 = g_file_ptr;
+    var slen: u64 = g_file_len;
+    var tokens: u64 = lex_all(src, slen);
+
+    // Pre-scan imports to ensure templates are registered before signature parse.
+    var p0: u64 = parse_new(tokens);
+    var imports_only: u64 = parse_program_imports_only(p0);
+    var imports_copy: u64 = vec_new(4);
+    var num_imports: u64 = vec_len(imports_only);
+    for (var ii: u64 = 0; ii < num_imports; ii++) {
+        var imp: *AstImport = (*AstImport)vec_get(imports_only, ii);
+        var imp_path: u64 = imp->path_ptr;
+        var imp_len: u64 = imp->path_len;
+        var path_copy: u64 = heap_alloc((imp_len + 1) * sizeof(u8));
+        for (var ci: u64 = 0; ci < imp_len; ci++) {
+            *(*u8)(path_copy + ci) = *(*u8)(imp_path + ci);
+        }
+        *(*u8)(path_copy + imp_len) = 0;
+        var imp_copy: u64 = ast_import(path_copy, imp_len, 0, 0, 0, 0);
+        vec_push(imports_copy, imp_copy);
+    }
+    if (g_module_imports_pass1 == 0) { g_module_imports_pass1 = hashmap_new(64); }
+    hashmap_put(g_module_imports_pass1, file_path, file_path_len, imports_copy);
+
+    for (var ii2: u64 = 0; ii2 < num_imports; ii2++) {
+        var imp2: *AstImport = (*AstImport)vec_get(imports_copy, ii2);
+        var imp_path2: u64 = imp2->path_ptr;
+        var imp_len2: u64 = imp2->path_len;
+        var resolved: u64 = resolve_module_path(imp_path2, imp_len2);
+        var resolved_len: u64 = str_len(resolved);
+        if (!load_module_pass1(resolved, resolved_len)) {
+            return 0;
+        }
+    }
+
+    var p1: u64 = parse_new(tokens);
+    var prog_sig: u64 = parse_program_pass1(p1);
+
+    var prog_sig_info: *AstProgram = (*AstProgram)prog_sig;
+    var sig_funcs: u64 = prog_sig_info->funcs_vec;
+    var num_sig_funcs: u64 = vec_len(sig_funcs);
+    for (var sfi: u64 = 0; sfi < num_sig_funcs; sfi++) {
+        vec_push(g_all_func_sigs, vec_get(sig_funcs, sfi));
+    }
+    return 1;
+}
+
 func load_std_prelude() -> u64 {
     if (!load_module_by_name("std/io", 6)) { return 0; }
     var id_io: u64 = module_id_from_import("std/io", 6);
@@ -872,7 +981,39 @@ func load_module(file_path: u64, file_path_len: u64) -> u64 {
         return 1;
     }
 
+    if (!load_module_pass1(file_path, file_path_len)) {
+        return 0;
+    }
+
     hashmap_put(g_loaded_modules, file_path, file_path_len, 1);
+
+    var path_copy2: u64 = heap_alloc((file_path_len + 1) * sizeof(u8));
+    for (var pc: u64 = 0; pc < file_path_len; pc++) {
+        *(*u8)(path_copy2 + pc) = *(*u8)(file_path + pc);
+    }
+    *(*u8)(path_copy2 + file_path_len) = 0;
+    var path_info: *NameInfo = (*NameInfo)heap_alloc(sizeof(NameInfoLocal));
+    path_info->ptr = path_copy2;
+    path_info->len = file_path_len;
+    vec_push(g_loaded_modules_vec, (u64)path_info);
+
+    // Ensure imports are fully parsed before this module (type resolution).
+    if (g_module_imports_pass1 != 0) {
+        var imports_p1: u64 = hashmap_get(g_module_imports_pass1, file_path, file_path_len);
+        if (imports_p1 != 0) {
+            var num_imports_p1: u64 = vec_len(imports_p1);
+            for (var pi: u64 = 0; pi < num_imports_p1; pi++) {
+                var imp_p1: *AstImport = (*AstImport)vec_get(imports_p1, pi);
+                var imp_path_p1: u64 = imp_p1->path_ptr;
+                var imp_len_p1: u64 = imp_p1->path_len;
+                var resolved_p1: u64 = resolve_module_path(imp_path_p1, imp_len_p1);
+                var resolved_len_p1: u64 = str_len(resolved_p1);
+                if (!load_module(resolved_p1, resolved_len_p1)) {
+                    return 0;
+                }
+            }
+        }
+    }
 
     var content: u64 = read_entire_file(file_path);
     if (content == 0) {
@@ -918,11 +1059,12 @@ func load_module(file_path: u64, file_path_len: u64) -> u64 {
     register_module_exports(prog, module_ptr, module_len, prefix_ptr, prefix_len);
     compiler_generic_update_mangled_names(prog);
 
-    // Process imports recursively
+    // Store imports for deferred alias resolution
     var prog_info2: *AstProgram = (*AstProgram)prog;
-    var imports: u64  = prog_info2->imports_vec;
+    var imports: u64 = prog_info2->imports_vec;
+    var imports_copy: u64 = vec_new(4);
     var num_imports: u64 = vec_len(imports);
-    for (var ii: u64 = 0; ii<num_imports;ii++){
+    for (var ii: u64 = 0; ii < num_imports; ii++) {
         var imp: *AstImport = (*AstImport)vec_get(imports, ii);
         var imp_path: u64 = imp->path_ptr;
         var imp_len: u64 = imp->path_len;
@@ -931,24 +1073,32 @@ func load_module(file_path: u64, file_path_len: u64) -> u64 {
         var imp_alias_ptr: u64 = imp->alias_ptr;
         var imp_alias_len: u64 = imp->alias_len;
 
-        var resolved: u64 = resolve_module_path(imp_path, imp_len);
-        var resolved_len: u64 = str_len(resolved);
+        var path_copy: u64 = heap_alloc((imp_len + 1) * sizeof(u8));
+        for (var ci: u64 = 0; ci < imp_len; ci++) {
+            *(*u8)(path_copy + ci) = *(*u8)(imp_path + ci);
+        }
+        *(*u8)(path_copy + imp_len) = 0;
 
-        if (!load_module(resolved, resolved_len)) {
-            return 0;
+        var sym_copy: u64 = 0;
+        var alias_copy: u64 = 0;
+        if (imp_sym_ptr != 0) {
+            sym_copy = heap_alloc((imp_sym_len + 1) * sizeof(u8));
+            for (var si: u64 = 0; si < imp_sym_len; si++) {
+                *(*u8)(sym_copy + si) = *(*u8)(imp_sym_ptr + si);
+            }
+            *(*u8)(sym_copy + imp_sym_len) = 0;
+
+            alias_copy = heap_alloc((imp_alias_len + 1) * sizeof(u8));
+            for (var ai: u64 = 0; ai < imp_alias_len; ai++) {
+                *(*u8)(alias_copy + ai) = *(*u8)(imp_alias_ptr + ai);
+            }
+            *(*u8)(alias_copy + imp_alias_len) = 0;
         }
 
-        var imp_mod_id: u64 = module_id_from_import(imp_path, imp_len);
-        var imp_mod_info: *NameInfo = (*NameInfo)imp_mod_id;
-        var imp_mod_ptr: u64 = imp_mod_info->ptr;
-        var imp_mod_len: u64 = imp_mod_info->len;
-
-        if (imp_sym_ptr == 0) {
-            import_all_from_module(module_ptr, module_len, imp_mod_ptr, imp_mod_len);
-        } else {
-            import_symbol_from_module(module_ptr, module_len, imp_mod_ptr, imp_mod_len, imp_sym_ptr, imp_sym_len, imp_alias_ptr, imp_alias_len);
-        }
+        var imp_copy: u64 = ast_import(path_copy, imp_len, sym_copy, imp_sym_len, alias_copy, imp_alias_len);
+        vec_push(imports_copy, imp_copy);
     }
+    hashmap_put(g_module_imports_pass2, file_path, file_path_len, imports_copy);
 
     // Add consts
     var consts: u64 = prog_info2->consts_vec;
@@ -1433,6 +1583,16 @@ func generic_subst_typeinfo(type_kind: u64, ptr_depth: u64, is_tagged: u64, stru
         var bt: *TypeInfo = (*TypeInfo)b->type_ptr;
         var merged_ptr_depth: u64 = bt->ptr_depth + ptr_depth;
         return generic_make_typeinfo_from_fields(bt->type_kind, merged_ptr_depth, bt->is_tagged, bt->struct_name_ptr, bt->struct_name_len, bt->tag_layout_ptr, bt->tag_layout_len, bt->elem_type_kind, bt->elem_ptr_depth, bt->array_len, bt->array_len_is_param, bt->array_len_param_ptr, bt->array_len_param_len);
+    }
+
+    if (bindings != 0 && type_kind == TYPE_STRUCT && struct_name_ptr != 0 && struct_name_len != 0) {
+        var b_ptr2: u64 = generic_find_binding(bindings, GENERIC_KIND_TYPE, struct_name_ptr, struct_name_len);
+        if (b_ptr2 != 0) {
+            var b2: *GenericBinding = (*GenericBinding)b_ptr2;
+            var bt2: *TypeInfo = (*TypeInfo)b2->type_ptr;
+            var merged_ptr_depth2: u64 = bt2->ptr_depth + ptr_depth;
+            return generic_make_typeinfo_from_fields(bt2->type_kind, merged_ptr_depth2, bt2->is_tagged, bt2->struct_name_ptr, bt2->struct_name_len, bt2->tag_layout_ptr, bt2->tag_layout_len, bt2->elem_type_kind, bt2->elem_ptr_depth, bt2->array_len, bt2->array_len_is_param, bt2->array_len_param_ptr, bt2->array_len_param_len);
+        }
     }
 
     if (type_kind == TYPE_STRUCT && bindings != 0) {
@@ -2467,6 +2627,10 @@ func compiler_monomorphize_generics() -> u64 {
 
 func init_compiler_globals() -> u64 {
     g_loaded_modules = hashmap_new(64);
+    g_loaded_modules_pass1 = hashmap_new(64);
+    g_module_imports_pass1 = hashmap_new(64);
+    g_module_imports_pass2 = hashmap_new(64);
+    g_loaded_modules_vec = vec_new(64);
     g_all_funcs = vec_new(64);
     g_all_func_sigs = vec_new(64);
     g_all_consts = vec_new(128);
