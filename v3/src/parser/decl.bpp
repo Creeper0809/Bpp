@@ -1,0 +1,1121 @@
+// parse_decl.b - Declaration parsing
+//
+// Parses top-level declarations:
+// - const declarations
+// - import declarations
+// - function declarations (parameters, return types, body)
+// - struct definitions
+// - enum definitions
+// - impl blocks
+// - parse_program (entry point)
+
+import std.io;
+import std.vec;
+import std.util;
+import std.str;
+import types;
+import lexer;
+import ast;
+import compiler;
+import parser.util;
+import parser.type;
+import parser.expr;
+import parser.stmt;
+
+// ============================================
+// Const Declaration
+// ============================================
+
+func parse_const_decl(p: u64) -> u64 {
+    parse_consume(p, TOKEN_CONST);
+    
+    var name_tok: u64 = parse_peek(p);
+    var name_ptr: u64 = ((*Token)name_tok)->ptr;
+    var name_len: u64 = ((*Token)name_tok)->len;
+
+    parse_consume(p, TOKEN_IDENTIFIER);
+    
+    parse_consume(p, TOKEN_EQ);
+    
+    var value: u64 = 0;
+    var neg: u64 = 0;
+    
+    // Handle negative numbers
+    if (parse_match(p, TOKEN_MINUS)) {
+        neg = 1;
+    }
+    
+    if (parse_peek_kind(p) == TOKEN_NUMBER) {
+        var val_tok: u64 = parse_peek(p);
+        value = parse_num_val(val_tok);
+        parse_consume(p, TOKEN_NUMBER);
+    } else if (parse_peek_kind(p) == TOKEN_CHAR) {
+        var char_tok: u64 = parse_peek(p);
+        var char_ptr: u64 = ((*Token)char_tok)->ptr;
+        value = *(*u8)(char_ptr + 1);
+        // Handle escape sequences
+        if (*(*u8)(char_ptr + 1) == 92) {
+            var escape_char: u64 = *(*u8)(char_ptr + 2);
+            if (escape_char == 110) { value = 10; }       // \n
+            else if (escape_char == 116) { value = 9; }   // \t
+            else if (escape_char == 114) { value = 13; }  // \r
+            else if (escape_char == 48) { value = 0; }    // \0
+            else if (escape_char == 92) { value = 92; }   // \\
+            else if (escape_char == 39) { value = 39; }   // \'
+            else { value = escape_char; }
+        }
+        parse_consume(p, TOKEN_CHAR);
+    } else {
+        emit_stderr("[ERROR] Expected number or char in const\n", 42);
+        panic("Parse error");
+    }
+    
+    if (neg) { value = 0 - value; }
+    
+    parse_consume(p, TOKEN_SEMICOLON);
+    
+    return ast_const_decl(name_ptr, name_len, value);
+}
+
+// ============================================
+// Import Declaration
+// ============================================
+
+func parse_import_decl(p: u64) -> u64 {
+    parse_consume(p, TOKEN_IMPORT);
+    
+    var first_tok: u64 = parse_peek(p);
+    var first_kind: u64 = parse_peek_kind(p);
+    if (first_kind != TOKEN_IDENTIFIER && first_kind != TOKEN_CHAR) {
+        emit_stderr("[ERROR] Expected module identifier in import\n", 45);
+        panic("Parse error");
+    }
+    parse_adv(p);
+
+    // Selective import: import <symbol> [as <alias>] from <module>
+    if (parse_peek_kind(p) == TOKEN_AS || parse_peek_kind(p) == TOKEN_FROM) {
+        var symbol_ptr: u64 = ((*Token)first_tok)->ptr;
+        var symbol_len: u64 = ((*Token)first_tok)->len;
+        var alias_ptr: u64 = symbol_ptr;
+        var alias_len: u64 = symbol_len;
+
+        if (parse_match(p, TOKEN_AS)) {
+            var alias_tok: u64 = parse_peek(p);
+            if (parse_peek_kind(p) != TOKEN_IDENTIFIER) {
+                emit_stderr("[ERROR] Expected alias identifier in import\n", 47);
+                panic("Parse error");
+            }
+            alias_ptr = ((*Token)alias_tok)->ptr;
+            alias_len = ((*Token)alias_tok)->len;
+            parse_consume(p, TOKEN_IDENTIFIER);
+        }
+
+        parse_consume(p, TOKEN_FROM);
+
+        var mod_tok: u64 = parse_peek(p);
+        var mod_kind: u64 = parse_peek_kind(p);
+        if (mod_kind != TOKEN_IDENTIFIER && mod_kind != TOKEN_CHAR) {
+            emit_stderr("[ERROR] Expected module identifier in import\n", 45);
+            panic("Parse error");
+        }
+        parse_adv(p);
+
+        var path_ptr: u64 = ((*Token)mod_tok)->ptr;
+        var path_len: u64 = ((*Token)mod_tok)->len;
+
+        while (parse_match(p, TOKEN_DOT)) {
+            var next_tok: u64 = parse_peek(p);
+            var next_kind: u64 = parse_peek_kind(p);
+            if (next_kind != TOKEN_IDENTIFIER && next_kind != TOKEN_CHAR) {
+                emit_stderr("[ERROR] Expected module identifier in import\n", 45);
+                panic("Parse error");
+            }
+            parse_adv(p);
+
+            var slash: u64 = heap_alloc(sizeof(u8));
+            *(*u8)slash = 47;
+
+            var joined_path: u64 = str_concat(path_ptr, path_len, slash, 1);
+            path_ptr = str_concat(joined_path, path_len + 1, ((*Token)next_tok)->ptr, ((*Token)next_tok)->len);
+            path_len = path_len + 1 + ((*Token)next_tok)->len;
+        }
+
+        parse_consume(p, TOKEN_SEMICOLON);
+
+        return ast_import(path_ptr, path_len, symbol_ptr, symbol_len, alias_ptr, alias_len);
+    }
+
+    // Import module: import <module>;
+    var path_ptr: u64  = ((*Token)first_tok)->ptr;
+    var path_len: u64 = ((*Token)first_tok)->len;
+    
+    while (parse_match(p, TOKEN_DOT)) {
+        var next_tok: u64 = parse_peek(p);
+        var next_kind: u64 = parse_peek_kind(p);
+        if (next_kind != TOKEN_IDENTIFIER && next_kind != TOKEN_CHAR) {
+            emit_stderr("[ERROR] Expected module identifier in import\n", 45);
+            panic("Parse error");
+        }
+        parse_adv(p);
+        
+        var slash2: u64 = heap_alloc(sizeof(u8));
+        *(*u8)slash2 = 47;
+        
+        var joined_path2: u64 = str_concat(path_ptr, path_len, slash2, 1);
+        path_ptr = str_concat(joined_path2, path_len + 1, ((*Token)next_tok)->ptr, ((*Token)next_tok)->len);
+        path_len = path_len + 1 + ((*Token)next_tok)->len;
+    }
+    
+    parse_consume(p, TOKEN_SEMICOLON);
+    
+    return ast_import(path_ptr, path_len, 0, 0, 0, 0);
+}
+
+// ============================================
+// Function Parsing
+// ============================================
+
+// Skip a block without parsing its contents
+func parse_skip_block(p: u64) -> u64 {
+    parse_consume(p, TOKEN_LBRACE);
+    var depth: u64 = 1;
+    while (depth > 0) {
+        var k: u64 = parse_peek_kind(p);
+        switch (k) {
+            case TOKEN_EOF:
+                emit_stderr("[ERROR] Unexpected EOF while skipping block\n", 46);
+                panic("Parse error");
+                break;
+            case TOKEN_LBRACE:
+                depth = depth + 1;
+                break;
+            case TOKEN_RBRACE:
+                depth = depth - 1;
+                break;
+            default:
+                break;
+        }
+        parse_adv(p);
+    }
+    return 0;
+}
+
+func parse_is_generic_param_list(p: u64) -> u64 {
+    if (parse_peek_kind(p) != TOKEN_LT) { return 0; }
+    var saved: u64 = parser_pos(p);
+    parse_adv(p);
+    var depth: u64 = 1;
+    while (1) {
+        var k: u64 = parse_peek_kind(p);
+        if (k == TOKEN_EOF) {
+            parser_set_pos(p, saved);
+            return 0;
+        }
+        if (k == TOKEN_LPAREN) {
+            parser_set_pos(p, saved);
+            return 0;
+        }
+        if (k == TOKEN_LT) { depth = depth + 1; }
+        if (k == TOKEN_GT) {
+            depth = depth - 1;
+            if (depth == 0) {
+                var saved2: u64 = parser_pos(p);
+                parse_adv(p);
+                var next_kind: u64 = parse_peek_kind(p);
+                parser_set_pos(p, saved2);
+                parser_set_pos(p, saved);
+                if (next_kind == TOKEN_LPAREN) { return 1; }
+                return 0;
+            }
+        }
+        parse_adv(p);
+    }
+}
+
+func parse_is_generic_param_list_any(p: u64) -> u64 {
+    if (parse_peek_kind(p) != TOKEN_LT) { return 0; }
+    var saved: u64 = parser_pos(p);
+    parse_adv(p);
+    var depth: u64 = 1;
+    while (1) {
+        var k: u64 = parse_peek_kind(p);
+        if (k == TOKEN_EOF) {
+            parser_set_pos(p, saved);
+            return 0;
+        }
+        if (k == TOKEN_LT) { depth = depth + 1; }
+        if (k == TOKEN_GT) {
+            depth = depth - 1;
+            if (depth == 0) {
+                parser_set_pos(p, saved);
+                return 1;
+            }
+        }
+        parse_adv(p);
+    }
+}
+
+// Parse generic parameter list for structs: <T, U, const N: u64>
+func parse_generic_params_any(p: u64) -> u64 {
+    var tok: u64 = parse_peek(p);
+    if (tok == 0) { return 0; }
+    if (parse_peek_kind(p) != TOKEN_LT) { return 0; }
+    if (parse_is_generic_param_list_any(p) == 0) { return 0; }
+    parse_consume(p, TOKEN_LT);
+
+    var params: u64 = (u64)Vec.new<u64>(4);
+    while (1) {
+        var is_value: u64 = 0;
+        if (parse_match(p, TOKEN_CONST)) { is_value = 1; }
+
+        if (parse_peek_kind(p) != TOKEN_IDENTIFIER) {
+            emit_stderr("[ERROR] Expected generic parameter name\n", 43);
+            panic("Parse error");
+        }
+
+        var name_tok: u64 = parse_peek(p);
+        var name_ptr: u64 = ((*Token)name_tok)->ptr;
+        var name_len: u64 = ((*Token)name_tok)->len;
+        parse_consume(p, TOKEN_IDENTIFIER);
+
+        var value_type_kind: u64 = 0;
+        if (parse_match(p, TOKEN_COLON)) {
+            value_type_kind = parse_base_type(p);
+            if (value_type_kind == TYPE_STRUCT || value_type_kind == TYPE_VOID) {
+                emit_stderr("[ERROR] Invalid value generic type\n", 40);
+                panic("Parse error");
+            }
+            if (value_type_kind != TYPE_U64) {
+                emit_stderr("[ERROR] Value generic type must be u64\n", 44);
+                panic("Parse error");
+            }
+            is_value = 1;
+        } else if (is_value == 1) {
+            emit_stderr("[ERROR] const generic requires type annotation\n", 50);
+            panic("Parse error");
+        }
+
+        var gp: *GenericParam = (*GenericParam)heap_alloc(sizeof(GenericParam));
+        if (is_value == 1) { gp->kind = GENERIC_KIND_VALUE; }
+        else { gp->kind = GENERIC_KIND_TYPE; }
+        gp->name_ptr = name_ptr;
+        gp->name_len = name_len;
+        gp->value_type_kind = value_type_kind;
+        ((*Vec<u64>)params)->push((u64)gp);
+
+        if (parse_match(p, TOKEN_COMMA)) { continue; }
+        break;
+    }
+
+    parse_consume(p, TOKEN_GT);
+    return params;
+}
+
+// Parse generic parameter list: <T, U, const N: u64>
+func parse_generic_params(p: u64) -> u64 {
+    var tok: u64 = parse_peek(p);
+    if (tok == 0) { return 0; }
+    if (parse_peek_kind(p) != TOKEN_LT) { return 0; }
+    if (parse_is_generic_param_list(p) == 0) { return 0; }
+    parse_consume(p, TOKEN_LT);
+
+    var params: u64 = (u64)Vec.new<u64>(4);
+    while (1) {
+        var is_value: u64 = 0;
+        if (parse_match(p, TOKEN_CONST)) { is_value = 1; }
+
+        if (parse_peek_kind(p) != TOKEN_IDENTIFIER) {
+            emit_stderr("[ERROR] Expected generic parameter name\n", 43);
+            panic("Parse error");
+        }
+
+        var name_tok: u64 = parse_peek(p);
+        var name_ptr: u64 = ((*Token)name_tok)->ptr;
+        var name_len: u64 = ((*Token)name_tok)->len;
+        parse_consume(p, TOKEN_IDENTIFIER);
+
+        var value_type_kind: u64 = 0;
+        if (parse_match(p, TOKEN_COLON)) {
+            value_type_kind = parse_base_type(p);
+            if (value_type_kind == TYPE_STRUCT || value_type_kind == TYPE_VOID) {
+                emit_stderr("[ERROR] Invalid value generic type\n", 40);
+                panic("Parse error");
+            }
+            if (value_type_kind != TYPE_U64) {
+                emit_stderr("[ERROR] Value generic type must be u64\n", 44);
+                panic("Parse error");
+            }
+            is_value = 1;
+        } else if (is_value == 1) {
+            emit_stderr("[ERROR] const generic requires type annotation\n", 50);
+            panic("Parse error");
+        }
+
+        var gp: *GenericParam = (*GenericParam)heap_alloc(sizeof(GenericParam));
+        if (is_value == 1) { gp->kind = GENERIC_KIND_VALUE; }
+        else { gp->kind = GENERIC_KIND_TYPE; }
+        gp->name_ptr = name_ptr;
+        gp->name_len = name_len;
+        gp->value_type_kind = value_type_kind;
+        ((*Vec<u64>)params)->push((u64)gp);
+
+        if (parse_match(p, TOKEN_COMMA)) { continue; }
+        break;
+    }
+
+    parse_consume(p, TOKEN_GT);
+    return params;
+}
+
+func parse_param(p: u64) -> u64 {
+    var name_tok: u64 = parse_peek(p);
+    parse_consume(p, TOKEN_IDENTIFIER);
+
+    var generic_params: u64 = parse_generic_params_any(p);
+    if (generic_params != 0) {
+        type_parser_set_generic_params(generic_params);
+    }
+    
+    var type_kind: u64 = 0;
+    var ptr_depth: u64 = 0;
+    var is_tagged: u64 = 0;
+    var struct_name_ptr: u64 = 0;
+    var struct_name_len: u64 = 0;
+    var tag_layout_ptr: u64 = 0;
+    var tag_layout_len: u64 = 0;
+    var elem_type_kind: u64 = 0;
+    var elem_ptr_depth: u64 = 0;
+    var array_len: u64 = 0;
+    var array_len_is_param: u64 = 0;
+    var array_len_param_ptr: u64 = 0;
+    var array_len_param_len: u64 = 0;
+    
+    if (parse_match(p, TOKEN_COLON)) {
+        var ty: *TypeInfo = (*TypeInfo)parse_type_ex(p);
+        type_kind = ty->type_kind;
+        ptr_depth = ty->ptr_depth;
+        is_tagged = ty->is_tagged;
+        struct_name_ptr = ty->struct_name_ptr;
+        struct_name_len = ty->struct_name_len;
+        tag_layout_ptr = ty->tag_layout_ptr;
+        tag_layout_len = ty->tag_layout_len;
+        elem_type_kind = ty->elem_type_kind;
+        elem_ptr_depth = ty->elem_ptr_depth;
+        array_len = ty->array_len;
+        array_len_is_param = ty->array_len_is_param;
+        array_len_param_ptr = ty->array_len_param_ptr;
+        array_len_param_len = ty->array_len_param_len;
+        if (type_kind == TYPE_ARRAY) {
+            // Array parameter decays to pointer to first element
+            type_kind = elem_type_kind;
+            ptr_depth = elem_ptr_depth + 1;
+            is_tagged = 0;
+            tag_layout_ptr = 0;
+            tag_layout_len = 0;
+            array_len_is_param = 0;
+            array_len_param_ptr = 0;
+            array_len_param_len = 0;
+        }
+    }
+    
+    var param: *Param = (*Param)heap_alloc(sizeof(Param));
+    param->name_ptr = ((*Token)name_tok)->ptr;
+    param->name_len = ((*Token)name_tok)->len;
+    param->type_kind = type_kind;
+    param->ptr_depth = ptr_depth;
+    param->is_tagged = is_tagged;
+    param->struct_name_ptr = struct_name_ptr;
+    param->struct_name_len = struct_name_len;
+    param->tag_layout_ptr = tag_layout_ptr;
+    param->tag_layout_len = tag_layout_len;
+    param->elem_type_kind = elem_type_kind;
+    param->elem_ptr_depth = elem_ptr_depth;
+    param->array_len = array_len;
+    param->array_len_is_param = array_len_is_param;
+    param->array_len_param_ptr = array_len_param_ptr;
+    param->array_len_param_len = array_len_param_len;
+    return param;
+}
+
+func parse_func_decl(p: u64) -> u64 {
+    push_trace("parse_func_decl", "parser/decl.b", __LINE__);
+    
+    parse_consume(p, TOKEN_FUNC);
+    
+    var name_tok: u64 = parse_peek(p);
+    parse_consume(p, TOKEN_IDENTIFIER);
+
+    var generic_params: u64 = parse_generic_params_any(p);
+    if (generic_params != 0) {
+        type_parser_set_generic_params(generic_params);
+    }
+    
+    // Set parsing context for better error messages
+    set_parsing_context(((*Token)name_tok)->ptr, ((*Token)name_tok)->len, ((*Token)name_tok)->line);
+    
+    parse_consume(p, TOKEN_LPAREN);
+    
+    var params: u64 = (u64)Vec.new<u64>(8);
+    
+    if (parse_peek_kind(p) != TOKEN_RPAREN) {
+        ((*Vec<u64>)params)->push(parse_param(p));
+        while (parse_match(p, TOKEN_COMMA)) {
+            ((*Vec<u64>)params)->push(parse_param(p));
+        }
+    }
+    
+    parse_consume(p, TOKEN_RPAREN);
+    
+    var ret_type: u64 = TYPE_VOID;
+    var ret_ptr_depth: u64 = 0;
+    var ret_is_tagged: u64 = 0;
+    var ret_struct_name_ptr: u64 = 0;
+    var ret_struct_name_len: u64 = 0;
+    var ret_tag_layout_ptr: u64 = 0;
+    var ret_tag_layout_len: u64 = 0;
+    
+    if (parse_match(p, TOKEN_ARROW)) {
+        var ty: *TypeInfo = (*TypeInfo)parse_type_ex(p);
+        ret_type = ty->type_kind;
+        ret_ptr_depth = ty->ptr_depth;
+        ret_is_tagged = ty->is_tagged;
+        ret_struct_name_ptr = ty->struct_name_ptr;
+        ret_struct_name_len = ty->struct_name_len;
+        ret_tag_layout_ptr = ty->tag_layout_ptr;
+        ret_tag_layout_len = ty->tag_layout_len;
+        if (ret_type == TYPE_ARRAY) {
+            // Array return decays to pointer to first element
+            ret_type = ty->elem_type_kind;
+            ret_ptr_depth = ty->elem_ptr_depth + 1;
+            ret_is_tagged = 0;
+            ret_struct_name_ptr = ty->struct_name_ptr;
+            ret_struct_name_len = ty->struct_name_len;
+            ret_tag_layout_ptr = 0;
+            ret_tag_layout_len = 0;
+        }
+    }
+    
+    var body: u64 = parse_block(p);
+
+    var func_node: u64 = ast_func_ex(((*Token)name_tok)->ptr, ((*Token)name_tok)->len, params, ret_type, ret_ptr_depth, ret_is_tagged, ret_struct_name_ptr, ret_struct_name_len, ret_tag_layout_ptr, ret_tag_layout_len, body);
+
+    if (generic_params != 0) {
+        type_parser_clear_generic_params();
+        compiler_register_generic_func_def(((*Token)name_tok)->ptr, ((*Token)name_tok)->len, generic_params, func_node);
+    }
+
+    pop_trace();
+    return func_node;
+}
+
+// Parse function signature only (skip body)
+func parse_func_decl_signature(p: u64) -> u64 {
+    push_trace("parse_func_decl_signature", "parser/decl.b", __LINE__);
+
+    parse_consume(p, TOKEN_FUNC);
+
+    var name_tok: u64 = parse_peek(p);
+    parse_consume(p, TOKEN_IDENTIFIER);
+
+    var generic_params: u64 = parse_generic_params_any(p);
+    if (generic_params != 0) {
+        type_parser_set_generic_params(generic_params);
+    }
+
+    set_parsing_context(((*Token)name_tok)->ptr, ((*Token)name_tok)->len, ((*Token)name_tok)->line);
+
+    parse_consume(p, TOKEN_LPAREN);
+
+    var params: u64 = (u64)Vec.new<u64>(8);
+    if (parse_peek_kind(p) != TOKEN_RPAREN) {
+        ((*Vec<u64>)params)->push(parse_param(p));
+        while (parse_match(p, TOKEN_COMMA)) {
+            ((*Vec<u64>)params)->push(parse_param(p));
+        }
+    }
+    parse_consume(p, TOKEN_RPAREN);
+
+    var ret_type: u64 = TYPE_VOID;
+    var ret_ptr_depth: u64 = 0;
+    var ret_is_tagged: u64 = 0;
+    var ret_struct_name_ptr: u64 = 0;
+    var ret_struct_name_len: u64 = 0;
+    var ret_tag_layout_ptr: u64 = 0;
+    var ret_tag_layout_len: u64 = 0;
+
+    if (parse_match(p, TOKEN_ARROW)) {
+        var ty: *TypeInfo = (*TypeInfo)parse_type_ex(p);
+        ret_type = ty->type_kind;
+        ret_ptr_depth = ty->ptr_depth;
+        ret_is_tagged = ty->is_tagged;
+        ret_struct_name_ptr = ty->struct_name_ptr;
+        ret_struct_name_len = ty->struct_name_len;
+        ret_tag_layout_ptr = ty->tag_layout_ptr;
+        ret_tag_layout_len = ty->tag_layout_len;
+        if (ret_type == TYPE_ARRAY) {
+            ret_type = ty->elem_type_kind;
+            ret_ptr_depth = ty->elem_ptr_depth + 1;
+            ret_is_tagged = 0;
+            ret_struct_name_ptr = ty->struct_name_ptr;
+            ret_struct_name_len = ty->struct_name_len;
+            ret_tag_layout_ptr = 0;
+            ret_tag_layout_len = 0;
+        }
+    }
+
+    // Skip function body
+    parse_skip_block(p);
+
+    var func_sig: u64 = ast_func_ex(((*Token)name_tok)->ptr, ((*Token)name_tok)->len, params, ret_type, ret_ptr_depth, ret_is_tagged, ret_struct_name_ptr, ret_struct_name_len, ret_tag_layout_ptr, ret_tag_layout_len, 0);
+
+    if (generic_params != 0) {
+        type_parser_clear_generic_params();
+        compiler_register_generic_func_sig(((*Token)name_tok)->ptr, ((*Token)name_tok)->len, generic_params, func_sig);
+    }
+
+    pop_trace();
+    return func_sig;
+}
+
+// ============================================
+// Struct Parsing
+// ============================================
+
+func parse_uwidth_from_ident(ptr: u64, len: u64) -> u64 {
+    if (len < 2) { return 0; }
+    var first: u64 = *(*u8)ptr;
+    if (first != 117) { return 0; }
+    var value: u64 = 0;
+    for (var i: u64 = 1; i < len; i++) {
+        var c: u64 = *(*u8)(ptr + i);
+        if (c < 48 || c > 57) { return 0; }
+        value = value * 10 + (c - 48);
+    }
+    return value;
+}
+
+func parse_struct_def(p: u64) -> u64 {
+    var is_packed: u64 = 0;
+    if (parse_match(p, TOKEN_PACKED)) {
+        is_packed = 1;
+    }
+    parse_consume(p, TOKEN_STRUCT);
+    
+    var name_tok: u64 = parse_peek(p);
+    var name_ptr: u64 = ((*Token)name_tok)->ptr;
+    var name_len: u64 = ((*Token)name_tok)->len;
+    parse_consume(p, TOKEN_IDENTIFIER);
+
+    var generic_params: u64 = parse_generic_params_any(p);
+    if (generic_params != 0) {
+        type_parser_set_generic_params(generic_params);
+    }
+    
+    parse_consume(p, TOKEN_LBRACE);
+    
+    var fields: u64 = (u64)Vec.new<u64>(8);
+    
+    // Parse fields: field_name : type ;
+    while (parse_peek_kind(p) != TOKEN_RBRACE) {
+        var field_name_tok: u64 = parse_peek(p);
+        var field_name_ptr: u64 = ((*Token)field_name_tok)->ptr;
+        var field_name_len: u64 = ((*Token)field_name_tok)->len;
+        parse_consume(p, TOKEN_IDENTIFIER);
+        
+        parse_consume(p, TOKEN_COLON);
+        
+        var field_type_kind: u64 = 0;
+        var field_ptr_depth: u64 = 0;
+        var field_struct_name_ptr: u64 = 0;
+        var field_struct_name_len: u64 = 0;
+        var field_tag_layout_ptr: u64 = 0;
+        var field_tag_layout_len: u64 = 0;
+        var field_elem_type_kind: u64 = 0;
+        var field_elem_ptr_depth: u64 = 0;
+        var field_array_len: u64 = 0;
+        var field_is_tagged: u64 = 0;
+        var field_bit_width: u64 = 0;
+
+        if (is_packed == 1) {
+            var k: u64 = parse_peek_kind(p);
+            switch (k) {
+                case TOKEN_U8:
+                    parse_adv(p);
+                    field_type_kind = TYPE_U8;
+                    field_bit_width = 8;
+                    break;
+                case TOKEN_U16:
+                    parse_adv(p);
+                    field_type_kind = TYPE_U16;
+                    field_bit_width = 16;
+                    break;
+                case TOKEN_U32:
+                    parse_adv(p);
+                    field_type_kind = TYPE_U32;
+                    field_bit_width = 32;
+                    break;
+                case TOKEN_U64:
+                    parse_adv(p);
+                    field_type_kind = TYPE_U64;
+                    field_bit_width = 64;
+                    break;
+                case TOKEN_IDENTIFIER:
+                    var bw_tok: u64 = parse_peek(p);
+                    var bw_ptr: u64 = ((*Token)bw_tok)->ptr;
+                    var bw_len: u64 = ((*Token)bw_tok)->len;
+                    parse_adv(p);
+                    var bw: u64 = parse_uwidth_from_ident(bw_ptr, bw_len);
+                    if (bw == 0 || bw > 64) {
+                        emit_stderr("[ERROR] packed field must be u1..u64\n", 43);
+                        panic("Parse error");
+                    }
+                    field_type_kind = TYPE_U64;
+                    field_bit_width = bw;
+                    break;
+                default:
+                    emit_stderr("[ERROR] packed field must be u1..u64\n", 43);
+                    panic("Parse error");
+            }
+        } else {
+            var field_type: *TypeInfo = (*TypeInfo)parse_type_ex(p);
+            field_type_kind = field_type->type_kind;
+            field_struct_name_ptr = field_type->struct_name_ptr;
+            field_struct_name_len = field_type->struct_name_len;
+            field_tag_layout_ptr = field_type->tag_layout_ptr;
+            field_tag_layout_len = field_type->tag_layout_len;
+            field_ptr_depth = field_type->ptr_depth;
+            field_is_tagged = field_type->is_tagged;
+            field_elem_type_kind = field_type->elem_type_kind;
+            field_elem_ptr_depth = field_type->elem_ptr_depth;
+            field_array_len = field_type->array_len;
+        }
+        
+        parse_consume(p, TOKEN_SEMICOLON);
+        
+        var field_desc: *FieldDesc = (*FieldDesc)heap_alloc(sizeof(FieldDesc));
+        field_desc->name_ptr = field_name_ptr;
+        field_desc->name_len = field_name_len;
+        field_desc->type_kind =  field_type_kind;
+        field_desc->struct_name_ptr = field_struct_name_ptr;
+        field_desc->struct_name_len = field_struct_name_len;
+        field_desc->ptr_depth = field_ptr_depth;
+        field_desc->is_tagged = field_is_tagged;
+        field_desc->tag_layout_ptr = field_tag_layout_ptr;
+        field_desc->tag_layout_len = field_tag_layout_len;
+        field_desc->bit_width = field_bit_width;
+        field_desc->elem_type_kind = field_elem_type_kind;
+        field_desc->elem_ptr_depth = field_elem_ptr_depth;
+        field_desc->array_len = field_array_len;
+        
+        ((*Vec<u64>)fields)->push(field_desc);
+    }
+    
+    parse_consume(p, TOKEN_RBRACE);
+    
+    var struct_def: u64 = ast_struct_def(name_ptr, name_len, fields, is_packed);
+    if (generic_params != 0) {
+        type_parser_clear_generic_params();
+        compiler_register_generic_struct_def(name_ptr, name_len, generic_params, struct_def);
+    }
+    return struct_def;
+}
+
+// ============================================
+// Enum Parsing
+// ============================================
+
+func parse_enum_def(p: u64) -> u64 {
+    parse_consume(p, TOKEN_ENUM);
+    
+    var enum_name_tok: u64 = parse_peek(p);
+    var enum_name_ptr: u64 = ((*Token)enum_name_tok)->ptr;
+    var enum_name_len: u64 = ((*Token)enum_name_tok)->len;
+    parse_consume(p, TOKEN_IDENTIFIER);
+    
+    parse_consume(p, TOKEN_LBRACE);
+    
+    var consts: u64 = (u64)Vec.new<u64>(16);
+    var current_value: u64 = 0;
+    
+    while (parse_peek_kind(p) != TOKEN_RBRACE) {
+        if (parse_peek_kind(p) == TOKEN_EOF) { break; }
+        
+        var member_tok: u64 = parse_peek(p);
+        var member_ptr: u64 = ((*Token)member_tok)->ptr;
+        var member_len: u64 = ((*Token)member_tok)->len;
+        parse_consume(p, TOKEN_IDENTIFIER);
+        
+        // Check for explicit value
+        if (parse_match(p, TOKEN_EQ)) {
+            var val_tok: u64 = parse_peek(p);
+            parse_consume(p, TOKEN_NUMBER);
+            current_value = parse_num_val(val_tok);
+        }
+        
+        // Create EnumName_MemberName
+        var full_name: u64 = (u64)Vec.new<u64>(64);
+        for (var i: u64 = 0; i < enum_name_len; i++) {
+            ((*Vec<u64>)full_name)->push(*(*u8)(enum_name_ptr + i));
+        }
+        ((*Vec<u64>)full_name)->push(95);  // '_'
+        for (var i: u64 = 0; i < member_len; i++) {
+            ((*Vec<u64>)full_name)->push(*(*u8)(member_ptr + i));
+        }
+        
+        // Copy to permanent heap storage
+        var full_name_len: u64 = ((*Vec<u64>)full_name)->len();
+        var full_name_ptr: u64 = heap_alloc((full_name_len + 1) * sizeof(u8));
+        var full_name_buf: u64 = *(full_name);  // vec buf_ptr (array of i64)
+        for (var i: u64 = 0; i < full_name_len; i++) {
+            var ch: u64 = ((*Vec<u64>)full_name)->get(i);  // Get i64 value
+            *(*u8)(full_name_ptr + i) = ch;  // Store as u8
+        }
+        *(*u8)(full_name_ptr + full_name_len) = 0;
+        
+        var const_node: u64 = ast_const_decl(full_name_ptr, full_name_len, current_value);
+        ((*Vec<u64>)consts)->push(const_node);
+        
+        current_value = current_value + 1;
+        
+        // Optional comma
+        if (parse_peek_kind(p) == TOKEN_COMMA) {
+            parse_consume(p, TOKEN_COMMA);
+        }
+    }
+    
+    parse_consume(p, TOKEN_RBRACE);
+    
+    return consts;
+}
+
+// ============================================
+// Impl Block Parsing
+// ============================================
+
+func parse_impl_block(p: u64) -> u64 {
+    parse_consume(p, TOKEN_IMPL);
+    
+    // Get struct name
+    var struct_name_tok: u64 = parse_peek(p);
+    var struct_name_ptr: u64 = ((*Token)struct_name_tok)->ptr;
+    var struct_name_len: u64 = ((*Token)struct_name_tok)->len;
+    parse_consume(p, TOKEN_IDENTIFIER);
+    
+    parse_consume(p, TOKEN_LBRACE);
+    
+    var funcs: u64 = (u64)Vec.new<u64>(8);
+    compiler_set_impl_prefix(struct_name_ptr, struct_name_len);
+    
+    // Parse all functions in impl block
+    while (parse_peek_kind(p) != TOKEN_RBRACE) {
+        if (parse_peek_kind(p) == TOKEN_EOF) { break; }
+        
+        // Check for static keyword
+        var is_static: u64 = 0;
+        if (parse_peek_kind(p) == TOKEN_STATIC) {
+            is_static = 1;
+            parse_adv(p);  // consume 'static'
+        }
+        
+        if (parse_peek_kind(p) == TOKEN_FUNC) {
+            var func_node: *AstFunc = (*AstFunc)parse_func_decl(p);
+            
+            // Rename function: methodName -> StructName_methodName
+            var original_name_ptr: u64 = func_node->name_ptr;
+            var original_name_len: u64 = func_node->name_len;
+            
+            // Create new name: StructName_methodName
+            var new_name: u64 = (u64)Vec.new<u64>(64);
+            for (var i: u64 = 0; i < struct_name_len; i++) {
+                ((*Vec<u64>)new_name)->push(*(*u8)(struct_name_ptr + i));
+            }
+            ((*Vec<u64>)new_name)->push(95);  // '_'
+            for (var i: u64 = 0; i < original_name_len; i++) {
+                ((*Vec<u64>)new_name)->push(*(*u8)(original_name_ptr + i));
+            }
+            
+            // Copy to permanent heap storage
+            var new_name_len: u64 = ((*Vec<u64>)new_name)->len();
+            var new_name_ptr: u64 = heap_alloc((new_name_len + 1) * sizeof(u8));
+            for (var i: u64 = 0; i < new_name_len; i++) {
+                var ch: u64 = ((*Vec<u64>)new_name)->get(i);
+                *(*u8)(new_name_ptr + i) = ch;
+            }
+            *(*u8)(new_name_ptr + new_name_len) = 0;
+            
+            // Update function name
+            func_node->name_ptr = new_name_ptr;
+            func_node->name_len = new_name_len;
+
+            compiler_register_impl_method(new_name_ptr, new_name_len);
+            
+            ((*Vec<u64>)funcs)->push((u64)func_node);
+        } else {
+            emit_stderr("[ERROR] impl block can only contain functions\n", 48);
+            break;
+        }
+    }
+    
+    parse_consume(p, TOKEN_RBRACE);
+    compiler_clear_impl_prefix();
+    
+    return funcs;
+}
+
+// Impl block parsing for signature-only pass
+func parse_impl_block_signature(p: u64) -> u64 {
+    parse_consume(p, TOKEN_IMPL);
+
+    var struct_name_tok: u64 = parse_peek(p);
+    var struct_name_ptr: u64 = ((*Token)struct_name_tok)->ptr;
+    var struct_name_len: u64 = ((*Token)struct_name_tok)->len;
+    parse_consume(p, TOKEN_IDENTIFIER);
+
+    parse_consume(p, TOKEN_LBRACE);
+
+    var funcs: u64 = (u64)Vec.new<u64>(8);
+    compiler_set_impl_prefix(struct_name_ptr, struct_name_len);
+
+    while (parse_peek_kind(p) != TOKEN_RBRACE) {
+        if (parse_peek_kind(p) == TOKEN_EOF) { break; }
+
+        var is_static: u64 = 0;
+        if (parse_peek_kind(p) == TOKEN_STATIC) {
+            is_static = 1;
+            parse_adv(p);
+        }
+
+        if (parse_peek_kind(p) == TOKEN_FUNC) {
+            var func_ptr: u64 = parse_func_decl_signature(p);
+            if (func_ptr == 0) {
+                continue;
+            }
+            var func_node: *AstFunc = (*AstFunc)func_ptr;
+
+            var original_name_ptr: u64 = func_node->name_ptr;
+            var original_name_len: u64 = func_node->name_len;
+
+            var new_name: u64 = (u64)Vec.new<u64>(64);
+            for (var i: u64 = 0; i < struct_name_len; i++) {
+                ((*Vec<u64>)new_name)->push(*(*u8)(struct_name_ptr + i));
+            }
+            ((*Vec<u64>)new_name)->push(95);
+            for (var i: u64 = 0; i < original_name_len; i++) {
+                ((*Vec<u64>)new_name)->push(*(*u8)(original_name_ptr + i));
+            }
+
+            var new_name_len: u64 = ((*Vec<u64>)new_name)->len();
+            var new_name_ptr: u64 = heap_alloc((new_name_len + 1) * sizeof(u8));
+            for (var i: u64 = 0; i < new_name_len; i++) {
+                var ch: u64 = ((*Vec<u64>)new_name)->get(i);
+                *(*u8)(new_name_ptr + i) = ch;
+            }
+            *(*u8)(new_name_ptr + new_name_len) = 0;
+
+            func_node->name_ptr = new_name_ptr;
+            func_node->name_len = new_name_len;
+
+            compiler_register_impl_method(new_name_ptr, new_name_len);
+
+            ((*Vec<u64>)funcs)->push((u64)func_node);
+        } else {
+            emit_stderr("[ERROR] impl block can only contain functions\n", 48);
+            break;
+        }
+    }
+
+    parse_consume(p, TOKEN_RBRACE);
+    compiler_clear_impl_prefix();
+
+    return funcs;
+}
+
+// ============================================
+// Program Parsing (Entry Point)
+// ============================================
+
+func parse_program(p: u64) -> u64 {
+    push_trace("parse_program", "parser/decl.b", __LINE__);
+    
+    var funcs: u64 = (u64)Vec.new<u64>(16);
+    var consts: u64 = (u64)Vec.new<u64>(64);
+    var imports: u64 = (u64)Vec.new<u64>(16);
+    var globals: u64 = (u64)Vec.new<u64>(32);
+    var structs: u64 = (u64)Vec.new<u64>(16);
+    
+    while (parse_peek_kind(p) != TOKEN_EOF) {
+        var k: u64 = parse_peek_kind(p);
+        switch (k) {
+            case TOKEN_FUNC:
+                var fn_ptr: u64 = parse_func_decl(p);
+                if (fn_ptr != 0) {
+                    ((*Vec<u64>)funcs)->push(fn_ptr);
+                }
+                break;
+            case TOKEN_CONST:
+                ((*Vec<u64>)consts)->push(parse_const_decl(p));
+                break;
+            case TOKEN_ENUM:
+                // Enum을 여러 const로 변환
+                var enum_consts: u64 = parse_enum_def(p);
+                var num_enum_consts: u64 = ((*Vec<u64>)enum_consts)->len();
+                for (var i: u64 = 0; i < num_enum_consts; i++) {
+                    ((*Vec<u64>)consts)->push(((*Vec<u64>)enum_consts)->get(i));
+                }
+                break;
+            case TOKEN_STRUCT:
+            case TOKEN_PACKED:
+                var struct_def: u64 = parse_struct_def(p);
+                if (compiler_is_generic_struct_def(struct_def) == 0) {
+                    ((*Vec<u64>)structs)->push(struct_def);
+                }
+                register_struct_type(struct_def);  // Register immediately for type checking/sizeof
+                break;
+            case TOKEN_IMPL:
+                // impl 블록: 내부 함수들을 StructName_methodName으로 변환
+                var impl_funcs: u64 = parse_impl_block(p);
+                var num_impl_funcs: u64 = ((*Vec<u64>)impl_funcs)->len();
+                for (var i: u64 = 0; i < num_impl_funcs; i++) {
+                    ((*Vec<u64>)funcs)->push(((*Vec<u64>)impl_funcs)->get(i));
+                }
+                break;
+            case TOKEN_VAR:
+                parse_consume(p, TOKEN_VAR);
+                var tok: u64 = parse_peek(p);
+
+                parse_consume(p, TOKEN_IDENTIFIER);
+                if (parse_match(p, TOKEN_COLON)) {
+                    // Allow typed globals; current backend stores only name.
+                    parse_type_ex(p);
+                }
+                parse_consume(p, TOKEN_SEMICOLON);
+                var ginfo: *GlobalInfo = (*GlobalInfo)heap_alloc(sizeof(GlobalInfo));
+                ginfo->name_ptr = ((*Token)tok)->ptr;
+                ginfo->name_len = ((*Token)tok)->len;
+                ((*Vec<u64>)globals)->push(ginfo);
+                break;
+            case TOKEN_IMPORT:
+                ((*Vec<u64>)imports)->push(parse_import_decl(p));
+                break;
+            default:
+                var err_tok: u64 = parse_peek(p);
+                var err_ptr: u64 = ((*Token)err_tok)->ptr;
+                var err_len: u64 = ((*Token)err_tok)->len;
+                emit_stderr("[ERROR] Expected function, const, or import. Got token kind=", 67);
+                print_u64(parse_peek_kind(p));
+                emit_stderr(" text=", 6);
+                emit_stderr(err_ptr, err_len);
+                emit_stderr("\n", 1);
+                parse_adv(p);
+                break;
+        }
+    }
+    
+    var prog: *AstProgram = (*AstProgram)ast_program(funcs, consts, imports);
+    prog->globals_vec = globals;
+    prog->structs_vec = structs;
+    
+    pop_trace();
+    return (u64)prog;
+}
+
+// ============================================
+// Program Parsing (Signature Pass)
+// ============================================
+
+func parse_program_pass1(p: u64) -> u64 {
+    push_trace("parse_program_pass1", "parser/decl.b", __LINE__);
+
+    var funcs: u64 = (u64)Vec.new<u64>(16);
+    var consts: u64 = (u64)Vec.new<u64>(1);
+    var imports: u64 = (u64)Vec.new<u64>(1);
+
+    while (parse_peek_kind(p) != TOKEN_EOF) {
+        var k: u64 = parse_peek_kind(p);
+        switch (k) {
+            case TOKEN_FUNC:
+                var sig_ptr: u64 = parse_func_decl_signature(p);
+                if (sig_ptr != 0 && compiler_is_generic_template(sig_ptr) == 0) {
+                    ((*Vec<u64>)funcs)->push(sig_ptr);
+                }
+                break;
+            case TOKEN_IMPL:
+                var impl_funcs: u64 = parse_impl_block_signature(p);
+                var num_impl_funcs: u64 = ((*Vec<u64>)impl_funcs)->len();
+                for (var i: u64 = 0; i < num_impl_funcs; i++) {
+                    var impl_fn_ptr: u64 = ((*Vec<u64>)impl_funcs)->get(i);
+                    if (impl_fn_ptr != 0) {
+                        ((*Vec<u64>)funcs)->push(impl_fn_ptr);
+                    }
+                }
+                break;
+            case TOKEN_STRUCT:
+            case TOKEN_PACKED:
+                parse_struct_def(p);
+                break;
+            case TOKEN_ENUM:
+                parse_consume(p, TOKEN_ENUM);
+                parse_consume(p, TOKEN_IDENTIFIER);
+                parse_skip_block(p);
+                break;
+            case TOKEN_CONST:
+                // const 선언은 ; 까지 스킵
+                parse_consume(p, TOKEN_CONST);
+                parse_consume(p, TOKEN_IDENTIFIER);
+                if (parse_match(p, TOKEN_EQ)) {
+                    while (parse_peek_kind(p) != TOKEN_SEMICOLON && parse_peek_kind(p) != TOKEN_EOF) {
+                        parse_adv(p);
+                    }
+                }
+                parse_consume(p, TOKEN_SEMICOLON);
+                break;
+            case TOKEN_IMPORT:
+                ((*Vec<u64>)imports)->push(parse_import_decl(p));
+                break;
+            case TOKEN_VAR:
+                // 전역 var 선언은 ; 까지 스킵
+                parse_consume(p, TOKEN_VAR);
+                parse_consume(p, TOKEN_IDENTIFIER);
+                if (parse_match(p, TOKEN_COLON)) {
+                    parse_type_ex(p);
+                }
+                parse_consume(p, TOKEN_SEMICOLON);
+                break;
+            default:
+                var err_tok2: u64 = parse_peek(p);
+                var err_ptr2: u64 = ((*Token)err_tok2)->ptr;
+                var err_len2: u64 = ((*Token)err_tok2)->len;
+                emit_stderr("[ERROR] Expected function, const, or import. Got token kind=", 67);
+                print_u64(parse_peek_kind(p));
+                emit_stderr(" text=", 6);
+                emit_stderr(err_ptr2, err_len2);
+                emit_stderr("\n", 1);
+                parse_adv(p);
+                break;
+        }
+    }
+
+    var prog: *AstProgram = (*AstProgram)ast_program(funcs, consts, imports);
+    pop_trace();
+    return (u64)prog;
+}
+
+// ============================================
+// Program Parsing (Imports Only)
+// ============================================
+
+func parse_program_imports_only(p: u64) -> u64 {
+    push_trace("parse_program_imports_only", "parser/decl.b", __LINE__);
+
+    var imports: u64 = (u64)Vec.new<u64>(8);
+    while (parse_peek_kind(p) != TOKEN_EOF) {
+        if (parse_peek_kind(p) == TOKEN_IMPORT) {
+            ((*Vec<u64>)imports)->push(parse_import_decl(p));
+        } else {
+            parse_adv(p);
+        }
+    }
+
+    pop_trace();
+    return imports;
+}

@@ -47,6 +47,8 @@ v4_roadmap.md의 실행 계획. 기능을 의존성과 우선순위에 따라 �
 - [x] v2 Vec struct stress 기대값 정정 (2026-02-02)
 - [x] v2 HashMap 로직 테스트(기본/리해시) 추가 (2026-02-02)
 - [x] v2 HashMap struct value 저장/반환 정합성 수정 + 테스트 추가 (2026-02-02)
+- [x] v3 폴더 v2 복제 + Vec struct 기반 상태 확인 및 빌드/테스트 통과 (2026-02-02)
+- [x] v3 vec_* 래퍼 제거 + Vec 메서드 전환 + std vec/hashmap 테스트 수정 (2026-02-02)
 
 ---
 
