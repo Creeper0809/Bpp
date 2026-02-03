@@ -12,6 +12,7 @@ v4_roadmap.md의 실행 계획. 기능을 의존성과 우선순위에 따라 �
 
 ## Maintenance
 
+- [x] v4 SSA opt O1 uses map returns Vec pointer (remove u64 handle) (2026-02-03)
 - [x] v4 mem2reg def blocks returns Vec pointer (remove u64 handle) (2026-02-03)
 - [x] v4 SSA codegen AST ident/addr-of helper cleanup (remove inline casts) (2026-02-03)
 - [x] v4 SSA codegen resolve/func lookup pointer helpers (remove u64 casts) (2026-02-03)
