@@ -12,6 +12,7 @@ v4_roadmap.md의 실행 계획. 기능을 의존성과 우선순위에 따라 �
 
 ## Maintenance
 
+- [x] v4 SSA ret slice heap map Vec access 구조체화 + len 접근 버그 수정 + build_and_test 통과 (2026-02-03)
 - [x] v4 SSA opt O1 const map helpers take Vec pointer (remove u64 handle) + build_and_test 통과 (2026-02-03)
 - [x] v4 SSA opt O1 const map Vec cast regression fix (_len/_get/_set/_push) + build_and_test 통과 (2026-02-03)
 - [x] v4 SSA opt O1 uses map returns Vec pointer (remove u64 handle) (2026-02-03)
