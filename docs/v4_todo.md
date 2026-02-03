@@ -12,6 +12,11 @@ v4_roadmap.md의 실행 계획. 기능을 의존성과 우선순위에 따라 �
 
 ## Maintenance
 
+- [x] v4 emitter: remove Vec/u64 casts in emitter state helpers (2026-02-04)
+- [x] v4 gen_stmt loop labels use *Vec<u64> (remove u64 casts) (2026-02-04)
+- [x] v4 cg_assign_stmt takes *AstAssign (2026-02-04)
+- [x] v4 resolve_name returns *NameInfo (remove u64 casts) (2026-02-04)
+- [x] v4 extract_version_from_compiler_path returns *NameInfo (2026-02-03)
 - [x] v4 lexer takes *Lexer (remove u64 handle params) (2026-02-03)
 - [x] v4 parser parse_skip_block token advance regression fix (2026-02-03)
 - [x] v4 typeinfo pointerization (GlobalInfo.typeinfo_ptr, sizeof_type_ex, get_expr_type_with_symtab callsites) (2026-02-03)
