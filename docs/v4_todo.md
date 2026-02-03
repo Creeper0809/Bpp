@@ -12,6 +12,9 @@ v4_roadmap.md의 실행 계획. 기능을 의존성과 우선순위에 따라 �
 
 ## Maintenance
 
+- [x] v4 SSA builder addr-taken scan uses typed Vec pointers (args/values/cases/stmts) (2026-02-03)
+- [x] v4 cg_program_with_sigs accepts *AstProgram (remove call-site casts) (2026-02-03)
+- [x] v4 build_merged_program returns *AstProgram (remove u64 return) and main uses pointer (2026-02-03)
 - [x] v4 SSA codegen stmt/switch Vec 포인터화 (stmts/cases) + build_and_test 확인 필요 (2026-02-03)
 - [x] v4 SSA codegen supported-expr args Vec 포인터화 (AST call/method/call_ptr) + build_and_test 통과 (2026-02-03)
 - [x] v4 SSA codegen support checks take globals Vec pointer (remove u64 handle) + build_and_test 통과 (2026-02-03)
