@@ -12,6 +12,10 @@ v4_roadmap.md의 실행 계획. 기능을 의존성과 우선순위에 따라 �
 
 ## Maintenance
 
+- [x] v4 symtab APIs take *Symtab (remove u64 handle casts) (2026-02-03)
+- [x] v4 symtab_get_type takes *Symtab (remove caller-side casts in symtab) (2026-02-03)
+- [x] v4 symtab_get_type uses typed Vec params (remove internal casts) (2026-02-03)
+- [x] v4 symtab_get_type returns *TypeInfo (remove u64 casts in codegen/SSA/emitter) (2026-02-03)
 - [x] v4 compiler generic checks take *AstFunc (remove u64 casts in codegen/parser/monomorphize) (2026-02-03)
 - [x] v4 codegen/SSA func handles switched to *AstFunc (remove u64 fn_ptr casts) (2026-02-03)
 - [x] v4 emitter globals/consts accessors typed Vec pointers (remove u64 casts in codegen/emitter/ssa) (2026-02-03)
