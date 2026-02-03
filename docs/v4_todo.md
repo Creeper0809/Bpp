@@ -12,6 +12,9 @@ v4_roadmap.md의 실행 계획. 기능을 의존성과 우선순위에 따라 �
 
 ## Maintenance
 
+- [x] v4 parser parse_skip_block token advance regression fix (2026-02-03)
+- [x] v4 typeinfo pointerization (GlobalInfo.typeinfo_ptr, sizeof_type_ex, get_expr_type_with_symtab callsites) (2026-02-03)
+- [x] v4 symtab remove local layout structs (use NameInfo directly) (2026-02-03)
 - [x] v4 symtab APIs take *Symtab (remove u64 handle casts) (2026-02-03)
 - [x] v4 symtab_get_type takes *Symtab (remove caller-side casts in symtab) (2026-02-03)
 - [x] v4 symtab_get_type uses typed Vec params (remove internal casts) (2026-02-03)
