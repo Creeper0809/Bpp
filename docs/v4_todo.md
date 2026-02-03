@@ -12,6 +12,10 @@ v4_roadmap.md의 실행 계획. 기능을 의존성과 우선순위에 따라 �
 
 ## Maintenance
 
+- [x] v4 SSA live map Vec 접근 캐스팅 제거 정리 (2026-02-03)
+- [x] v4 SSA codegen inst 수집 Vec 포인터 타입 정리 (2026-02-03)
+- [x] v4 SSA phi arg 생성/append 포인터 리턴 정리 + build_and_test 통과 (2026-02-03)
+- [x] v4 SSA ssa_new_inst/ssa_phi_new 포인터 리턴 정리 + build_and_test 통과 (2026-02-03)
 - [x] v4 SSA builder break/continue 스택 Vec 포인터화 정리 (2026-02-03)
 - [x] v4 codegen used-name 수집 API를 Vec 포인터로 명확화 (2026-02-03)
 - [x] v4 컴파일러 스크립트: 제네릭 Vec/컨테이너 요소 타입을 *struct로 명시 (SSA 포함, 테스트 제외, 2026-02-03)
