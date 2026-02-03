@@ -12,6 +12,8 @@ v4_roadmap.md의 실행 계획. 기능을 의존성과 우선순위에 따라 �
 
 ## Maintenance
 
+- [x] v4 SSA codegen stmt/switch Vec 포인터화 (stmts/cases) + build_and_test 확인 필요 (2026-02-03)
+- [x] v4 SSA codegen supported-expr args Vec 포인터화 (AST call/method/call_ptr) + build_and_test 통과 (2026-02-03)
 - [x] v4 SSA codegen support checks take globals Vec pointer (remove u64 handle) + build_and_test 통과 (2026-02-03)
 - [x] v4 SSA codegen global lookup takes Vec pointer (remove u64 handle) + build_and_test 통과 (2026-02-03)
 - [x] v4 SSA ret slice heap map Vec access 구조체화 + len 접근 버그 수정 + build_and_test 통과 (2026-02-03)
