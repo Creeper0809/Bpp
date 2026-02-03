@@ -12,6 +12,14 @@ v4_roadmap.md의 실행 계획. 기능을 의존성과 우선순위에 따라 �
 
 ## Maintenance
 
+- [x] v4 compiler generic checks take *AstFunc (remove u64 casts in codegen/parser/monomorphize) (2026-02-03)
+- [x] v4 codegen/SSA func handles switched to *AstFunc (remove u64 fn_ptr casts) (2026-02-03)
+- [x] v4 emitter globals/consts accessors typed Vec pointers (remove u64 casts in codegen/emitter/ssa) (2026-02-03)
+- [x] v4 codegen used-name scan uses typed Vec pointers (remove u64 casts) (2026-02-03)
+- [x] v4 codegen used-name filter regression fix (restore _cg_used_has_name) (2026-02-03)
+- [x] v4 typeinfo globals remove initializer to satisfy stage1 parser (2026-02-03)
+- [x] v4 typeinfo structs/funcs globals typed Vec pointers (remove u64 handles) (2026-02-03)
+- [x] v4 SSA builder g_structs_vec uses typed Vec pointer (remove casts) (2026-02-03)
 - [x] v4 SSA builder addr-taken scan uses typed Vec pointers (args/values/cases/stmts) (2026-02-03)
 - [x] v4 cg_program_with_sigs accepts *AstProgram (remove call-site casts) (2026-02-03)
 - [x] v4 build_merged_program returns *AstProgram (remove u64 return) and main uses pointer (2026-02-03)
