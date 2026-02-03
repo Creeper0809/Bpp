@@ -12,6 +12,11 @@ v4_roadmap.md의 실행 계획. 기능을 의존성과 우선순위에 따라 �
 
 ## Maintenance
 
+- [x] v4 mem2reg def blocks returns Vec pointer (remove u64 handle) (2026-02-03)
+- [x] v4 SSA codegen AST ident/addr-of helper cleanup (remove inline casts) (2026-02-03)
+- [x] v4 SSA codegen resolve/func lookup pointer helpers (remove u64 casts) (2026-02-03)
+- [x] v4 SSA live map builder returns Vec pointer (remove u64 handle) (2026-02-03)
+- [x] v4 SSA codegen block/successor pointer access helper cleanup (manual pointer arithmetic removal, 2026-02-03)
 - [x] v4 SSA live map Vec 접근 캐스팅 제거 정리 (2026-02-03)
 - [x] v4 SSA codegen inst 수집 Vec 포인터 타입 정리 (2026-02-03)
 - [x] v4 SSA phi arg 생성/append 포인터 리턴 정리 + build_and_test 통과 (2026-02-03)
