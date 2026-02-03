@@ -61,7 +61,7 @@ echo "Stage 1 Build Completed"
 echo ""
 
 # Step 3: 셀프 호스팅 (2단계)
-echo "[3/6 ] Self-Hosting Stage 2..."
+echo "[3/6] Self-Hosting Stage 2..."
 ./bin/${VERSION}_stage1 -asm ${SRC_FILE} > build/${VERSION}_stage2.asm
 echo "Stage 2 Build Completed"
 echo ""
