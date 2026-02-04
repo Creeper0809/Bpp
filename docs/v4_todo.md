@@ -12,6 +12,13 @@ v4_roadmap.md의 실행 계획. 기능을 의존성과 우선순위에 따라 �
 
 ## Maintenance
 
+- [x] v4 compiler generic helpers pointerized (bindings/typeinfo/clone) + casts cleanup + build_and_test pass (2026-02-04)
+- [x] v4 compiler forces HashMap instantiations for exports/aliases (build fix) (2026-02-04)
+- [x] v4 impl methods inherit generic struct params (fix HashMap get/put instantiation) (2026-02-04)
+- [x] v3 impl methods inherit generic struct params (fix HashMap get/put instantiation) (2026-02-04)
+- [x] v4 module_id/mangle helpers return *NameInfo (remove u64 returns) (2026-02-04)
+- [x] v4 compiler restores StatLocal for fstat size access (2026-02-04)
+- [x] v4 compiler removes local layout mirrors (use SIZEOF_* and stat size offset) (2026-02-04)
 - [x] v3 bootstrap compiler infers AST_MEMBER_ACCESS field types for Vec<T> methods (v4 build fix) (2026-02-04)
 - [x] v4 compiler generic_infer handles AST_MEMBER_ACCESS field types (fix Vec<*Token> method instantiation) (2026-02-04)
 - [x] v4 parser util functions take *Parser params (remove u64 handles) (2026-02-04)
