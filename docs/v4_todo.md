@@ -12,7 +12,8 @@ v4_roadmap.md의 실행 계획. 기능을 의존성과 우선순위에 따라 �
 
 ## Maintenance
 
-- [x] v4 parser util forces Vec<*Token> len/get instantiation (fix missing symbols) (2026-02-04)
+- [x] v3 bootstrap compiler infers AST_MEMBER_ACCESS field types for Vec<T> methods (v4 build fix) (2026-02-04)
+- [x] v4 compiler generic_infer handles AST_MEMBER_ACCESS field types (fix Vec<*Token> method instantiation) (2026-02-04)
 - [x] v4 parser util functions take *Parser params (remove u64 handles) (2026-02-04)
 - [x] v4 parse_new returns *Parser (2026-02-04)
 - [x] v4 parse_generic_args_type returns *Vec<*GenericArg> (2026-02-04)
