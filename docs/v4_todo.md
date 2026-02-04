@@ -12,6 +12,18 @@ v4_roadmap.md의 실행 계획. 기능을 의존성과 우선순위에 따라 �
 
 ## Maintenance
 
+- [x] v4 ExportEntry heap_alloc uses SIZEOF_EXPORT_ENTRY (fix stage0 segfault) (2026-02-05)
+- [x] v4 NameInfo heap_alloc uses SIZEOF_NAME_INFO (fix stage0 segfault) (2026-02-05)
+- [x] v4 fix generic struct template lookup in parser type/expr (2026-02-05)
+- [x] v4 force HashMap/Vec instantiations for generic templates/imports (2026-02-05)
+- [x] v4 generic_type_equal takes *TypeInfo params (remove u64 casts) (2026-02-05)
+- [x] v4 compiler_generic_update_mangled_names takes *AstProgram (2026-02-05)
+- [x] v4 generic func template find returns *GenericFuncTemplate (2026-02-05)
+- [x] v4 generic struct template find returns *GenericStructTemplate (2026-02-05)
+- [x] v4 generic struct template params/return pointerized (2026-02-05)
+- [x] v4 generic func template params/return pointerized (2026-02-05)
+- [x] v4 prelude_try_symbol returns *NameInfo (remove u64 return) (2026-02-05)
+- [x] v4 compiler_get_func returns *AstFunc (remove u64 casts in SSA) (2026-02-04)
 - [x] v4 test 26_global_vars uses global initializers + build_and_test pass (2026-02-04)
 - [x] v4 global var init: parse + data emission + tests + build_and_test pass (2026-02-04)
 - [x] v4 global init supports struct/generic struct literals + tests (2026-02-04)
