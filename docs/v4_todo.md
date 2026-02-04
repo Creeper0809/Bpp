@@ -12,6 +12,8 @@ v4_roadmap.md의 실행 계획. 기능을 의존성과 우선순위에 따라 �
 
 ## Maintenance
 
+- [x] v4 global var init: parse + data emission + tests + build_and_test pass (2026-02-04)
+- [x] v4 global init supports struct/generic struct literals + tests (2026-02-04)
 - [x] v4 compiler generic helpers pointerized (bindings/typeinfo/clone) + casts cleanup + build_and_test pass (2026-02-04)
 - [x] v4 compiler forces HashMap instantiations for exports/aliases (build fix) (2026-02-04)
 - [x] v4 impl methods inherit generic struct params (fix HashMap get/put instantiation) (2026-02-04)
