@@ -12,6 +12,7 @@ v4_roadmap.md의 실행 계획. 기능을 의존성과 우선순위에 따라 �
 
 ## Maintenance
 
+- [x] v4 parser generic params return *Vec<*GenericParam> (2026-02-04)
 - [x] v4 cg_switch_* takes *Vec<u64> cases (2026-02-04)
 - [x] v4 cg_method_call_sret_to_offset takes *AstMethodCall (2026-02-04)
 - [x] v4 generic infer uses globals for method instantiation (fix Vec<*ConstInfo> symbols) (2026-02-04)
