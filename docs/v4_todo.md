@@ -12,6 +12,8 @@ v4_roadmap.md의 실행 계획. 기능을 의존성과 우선순위에 따라 �
 
 ## Maintenance
 
+- [x] v4 remove redundant u64 casts (generic/symtab/templates/get_struct_def) + build_and_test pass (2026-02-05)
+- [x] v4 tagged layout uses layout_info pointer in gen_expr/gen_stmt (2026-02-05)
 - [x] v4 ExportEntry heap_alloc uses SIZEOF_EXPORT_ENTRY (fix stage0 segfault) (2026-02-05)
 - [x] v4 NameInfo heap_alloc uses SIZEOF_NAME_INFO (fix stage0 segfault) (2026-02-05)
 - [x] v4 fix generic struct template lookup in parser type/expr (2026-02-05)
