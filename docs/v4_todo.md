@@ -12,6 +12,11 @@ v4_roadmap.md의 실행 계획. 기능을 의존성과 우선순위에 따라 �
 
 ## Maintenance
 
+- [x] v4 parser util forces Vec<*Token> len/get instantiation (fix missing symbols) (2026-02-04)
+- [x] v4 parser util functions take *Parser params (remove u64 handles) (2026-02-04)
+- [x] v4 parse_new returns *Parser (2026-02-04)
+- [x] v4 parse_generic_args_type returns *Vec<*GenericArg> (2026-02-04)
+- [x] v4 type_parser_find_generic_param returns *GenericParam (2026-02-04)
 - [x] v4 parser generic params return *Vec<*GenericParam> (2026-02-04)
 - [x] v4 cg_switch_* takes *Vec<u64> cases (2026-02-04)
 - [x] v4 cg_method_call_sret_to_offset takes *AstMethodCall (2026-02-04)
