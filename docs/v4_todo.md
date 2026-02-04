@@ -12,6 +12,11 @@ v4_roadmap.md의 실행 계획. 기능을 의존성과 우선순위에 따라 �
 
 ## Maintenance
 
+- [x] v4 force HashMap<u64,*AstStructDef> instantiations (build fix) (2026-02-05)
+- [x] v4 GenericBinding.type_ptr -> type (*TypeInfo) rename (2026-02-05)
+- [x] v4 emitter method call receivers use *AstNode to reduce casts (2026-02-05)
+- [x] v4 emitter call arg handling uses typed Vec pointers (reduce casts) (2026-02-05)
+- [x] v4 emitter gen_expr resolve_name + _cg_find_global_info pointer usage fix (2026-02-05)
 - [x] v4 remove redundant u64 casts (generic/symtab/templates/get_struct_def) + build_and_test pass (2026-02-05)
 - [x] v4 tagged layout uses layout_info pointer in gen_expr/gen_stmt (2026-02-05)
 - [x] v4 ExportEntry heap_alloc uses SIZEOF_EXPORT_ENTRY (fix stage0 segfault) (2026-02-05)
