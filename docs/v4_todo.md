@@ -62,6 +62,9 @@ v4_roadmap.md의 실행 계획. 기능을 의존성과 우선순위에 따라 �
 - [x] v4 test 26_global_vars uses global initializers + build_and_test pass (2026-02-04)
 - [x] v4 global var init: parse + data emission + tests + build_and_test pass (2026-02-04)
 - [x] v4 global init supports struct/generic struct literals + tests (2026-02-04)
+- [x] v4 global init const resolution uses per-global module context (fix 27_global_init_struct_generic O0 segfault) (2026-02-05)
+- [x] v4 test new/delete without constructor (2026-02-05)
+- [x] v4 merge test 31/32 new/delete coverage + complex flow (2026-02-05)
 - [x] v4 compiler generic helpers pointerized (bindings/typeinfo/clone) + casts cleanup + build_and_test pass (2026-02-04)
 - [x] v4 compiler forces HashMap instantiations for exports/aliases (build fix) (2026-02-04)
 - [x] v4 impl methods inherit generic struct params (fix HashMap get/put instantiation) (2026-02-04)
@@ -621,19 +624,18 @@ struct 상속 → trait 정의 → impl → VTable 생성 → 다형성
   - DoD: safe indexing 가능
   - 의존성: Option<T> 구현 필요 (Phase 4.0.3)
 
-- [ ] **new/delete 키워드**
-  - [ ] 파서: new <Type>, delete ptr
-  - [ ] Codegen: new → malloc + memset, delete → free
-  - DoD: 모든 타입 힙 할당 가능
+- [x] **new/delete 키워드** (2026-02-05)
+  - [x] 파서: new <Type>, delete ptr
+  - [x] Codegen: new → malloc + memset, delete → free
+  - [x] DoD: 모든 타입 힙 할당 가능
   - 참조: v4_roadmap.md 섹션 0.0
 
-- [ ] **constructor/destructor**
-  - [ ] 파서: constructor/destructor 키워드
-  - [ ] Auto-Self: var self 자동 생성
-  - [ ] Auto-Return: return self 자동 삽입
-  - [ ] new T(...) → malloc + constructor 호출
-  - [ ] delete ptr → destructor + free 호출
-  - DoD: 객체 생명주기 관리, defer delete 패턴
+- [x] **constructor/destructor** (2026-02-05)
+  - [x] 파서: constructor/destructor 키워드
+  - [x] Auto-Self: self 파라미터 자동 삽입
+  - [x] new T(...) → malloc + constructor 호출
+  - [x] delete ptr → destructor + free 호출
+  - [x] DoD: 객체 생명주기 관리, defer delete 패턴
   - 참조: v4_roadmap.md 섹션 0.0
 
 #### Phase 4.0.3: 표준 타입 (1-2개월)

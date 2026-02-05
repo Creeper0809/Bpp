@@ -49,6 +49,7 @@ var g_module_aliases: *HashMap<u64, *HashMap<u64, *NameInfo> >;     // HashMap: 
 var g_prelude_aliases: *HashMap<u64, *NameInfo>;    // HashMap: alias -> [mangled_ptr, mangled_len]
 var g_module_exports: *HashMap<u64, *Vec<*ExportEntry> >;     // HashMap: module_id -> exports vec
 var g_func_module_map: *HashMap<u64, *NameInfo>;    // HashMap: mangled func -> module_id
+var g_global_module_map: *HashMap<u64, *NameInfo>;  // HashMap: mangled global -> module_id
 var g_current_module_ptr;
 var g_current_module_len;
 var g_impl_prefix_ptr;
@@ -608,6 +609,7 @@ func prelude_try_symbol(module_path: u64, module_len: u64, name_ptr: u64, name_l
 
 func load_std_prelude_modules() -> u64 {
     if (!load_module_by_name("std/io", 6)) { return false; }
+    if (!load_module_by_name("std/mem", 7)) { return false; }
     if (!load_module_by_name("std/str", 7)) { return false; }
     if (!load_module_by_name("std/char", 8)) { return false; }
     if (!load_module_by_name("std/util", 8)) { return false; }
@@ -618,6 +620,8 @@ func load_std_prelude_modules() -> u64 {
 
 func resolve_prelude_alias_lazy(name_ptr: u64, name_len: u64) -> *NameInfo {
     var info: *NameInfo = prelude_try_symbol("std/io", 6, name_ptr, name_len);
+    if (info != 0) { return info; }
+    info = prelude_try_symbol("std/mem", 7, name_ptr, name_len);
     if (info != 0) { return info; }
     info = prelude_try_symbol("std/str", 7, name_ptr, name_len);
     if (info != 0) { return info; }
@@ -680,6 +684,9 @@ func resolve_name(name_ptr: u64, name_len: u64) -> *NameInfo {
             }
         }
     }
+
+    var prelude_info: *NameInfo = resolve_prelude_alias_lazy(name_ptr, name_len);
+    if (prelude_info != 0) { return prelude_info; }
 
     return 0;
 }
@@ -831,6 +838,18 @@ func set_current_module_for_func(func_ptr: u64, func_len: u64) -> u64 {
     return 0;
 }
 
+func set_current_module_for_global(name_ptr: u64, name_len: u64) -> u64 {
+    g_current_module_ptr = 0;
+    g_current_module_len = 0;
+    if (g_global_module_map == 0) { return 0; }
+    var info: *NameInfo = g_global_module_map->get(name_ptr, name_len);
+    if (info != 0) {
+        g_current_module_ptr = info->ptr;
+        g_current_module_len = info->len;
+    }
+    return 0;
+}
+
 // ============================================
 // Export Registration + Mangling
 // ============================================
@@ -906,6 +925,14 @@ func register_module_exports(prog: u64, module_ptr: u64, module_len: u64, prefix
                 ginfo->name_len = mangled_len;
             }
             add_module_export(module_ptr, module_len, orig_ptr, orig_len, mangled_ptr, mangled_len);
+
+            if (g_global_module_map == 0) {
+                g_global_module_map = HashMap.new<u64, *NameInfo>(128);
+            }
+            var ginfo_module: *NameInfo = (*NameInfo)heap_alloc(sizeof(NameInfo));
+            ginfo_module->ptr = module_ptr;
+            ginfo_module->len = module_len;
+            g_global_module_map->put(mangled_ptr, mangled_len, ginfo_module);
         }
     }
     return 0;
@@ -989,6 +1016,10 @@ func load_std_prelude() -> u64 {
     if (!load_module_by_name("std/io", 6)) { return false; }
     var id_io: *NameInfo = module_id_from_import("std/io", 6);
     prelude_import_all_from_module(id_io->ptr, id_io->len);
+
+    if (!load_module_by_name("std/mem", 7)) { return false; }
+    var id_mem: *NameInfo = module_id_from_import("std/mem", 7);
+    prelude_import_all_from_module(id_mem->ptr, id_mem->len);
 
     if (!load_module_by_name("std/str", 7)) { return false; }
     var id_str: *NameInfo = module_id_from_import("std/str", 7);
@@ -2108,6 +2139,15 @@ func generic_clone_args_vec(args: *Vec<*AstNode>, bindings: *Vec<*GenericBinding
             var cp: *AstCallPtr = (*AstCallPtr)node;
             var args3: *Vec<*AstNode> = generic_clone_args_vec(cp->args_vec, bindings);
             return ast_call_ptr(generic_clone_expr(cp->callee, bindings), args3);
+        case AST_NEW:
+            var nw: *AstNew = (*AstNew)node;
+            var sub3: *TypeInfo = generic_subst_typeinfo(nw->type_kind, nw->ptr_depth, nw->is_tagged, nw->struct_name_ptr, nw->struct_name_len, nw->tag_layout_ptr, nw->tag_layout_len,
+                                                        nw->elem_type_kind, nw->elem_ptr_depth, nw->array_len, nw->array_len_is_param, nw->array_len_param_ptr, nw->array_len_param_len, bindings);
+            var lit2: *AstNode = generic_clone_expr(nw->literal_expr, bindings);
+            var args4: *Vec<*AstNode> = generic_clone_args_vec(nw->ctor_args_vec, bindings);
+            return (*AstNode)ast_new(sub3->type_kind, sub3->ptr_depth, sub3->is_tagged, sub3->struct_name_ptr, sub3->struct_name_len, sub3->tag_layout_ptr, sub3->tag_layout_len,
+                                     sub3->elem_type_kind, sub3->elem_ptr_depth, sub3->array_len, sub3->array_len_is_param, sub3->array_len_param_ptr, sub3->array_len_param_len,
+                                     lit2, args4);
         default:
             return node;
     }
@@ -2186,6 +2226,9 @@ func generic_clone_stmt(node: *AstNode, bindings: *Vec<*GenericBinding>) -> *Ast
         case AST_DEFER:
             var df: *AstDefer = (*AstDefer)node;
             return (*AstNode)ast_defer(generic_clone_stmt(df->stmt, bindings));
+        case AST_DELETE:
+            var dl: *AstDelete = (*AstDelete)node;
+            return (*AstNode)ast_delete(generic_clone_expr(dl->expr, bindings));
         default:
             return node;
     }
@@ -2820,6 +2863,7 @@ func init_compiler_globals() -> u64 {
     g_prelude_aliases = HashMap.new<u64, *NameInfo>(128);
     g_module_exports = HashMap.new<u64, *Vec<*ExportEntry> >(64);
     g_func_module_map = HashMap.new<u64, *NameInfo>(128);
+    g_global_module_map = HashMap.new<u64, *NameInfo>(128);
     g_current_module_ptr = 0;
     g_current_module_len = 0;
     g_impl_prefix_ptr = 0;
