@@ -12,6 +12,16 @@ v4_roadmap.md의 실행 계획. 기능을 의존성과 우선순위에 따라 �
 
 ## Maintenance
 
+- [x] v4 switch jump table uses range_u64 (remove casts) (2026-02-05)
+- [x] v4 emitter call arg loops remove u64 index casts (2026-02-05)
+- [x] v4 ssa builder slice/struct literal helpers pointerized (reduce casts) (2026-02-05)
+- [x] v4 ssa builder ctx/func ptr map/slice regs pointerize (remove casts) (2026-02-05)
+- [x] v4 ssa_new_inst/ssa_inst_append callsites use *SSAInstruction (remove u64) (2026-02-05)
+- [x] v4 ssa_new_block callsites use *SSABlock (remove casts) (2026-02-05)
+- [x] v4 ssa builder switch case blocks use *SSABlock/*AstCase vecs (2026-02-05)
+- [x] v4 ssa builder struct literal return uses *Vec<*FieldDesc> (2026-02-05)
+- [x] v4 ssa builder packed layout fields use *Vec<*FieldDesc> (remove casts) (2026-02-05)
+- [x] v4 ssa builder struct literal fast-path fields use *Vec<*FieldDesc> (2026-02-05)
 - [x] v4 force HashMap<u64,*AstStructDef> instantiations (build fix) (2026-02-05)
 - [x] v4 GenericBinding.type_ptr -> type (*TypeInfo) rename (2026-02-05)
 - [x] v4 emitter method call receivers use *AstNode to reduce casts (2026-02-05)
