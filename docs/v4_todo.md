@@ -12,6 +12,7 @@ v4_roadmap.md의 실행 계획. 기능을 의존성과 우선순위에 따라 �
 
 ## Maintenance
 
+- [x] v4 compiler byte access uses slices (u8 ptr casts 제거) (2026-02-05)
 - [x] v4 add null literal token/lexer/parser (2026-02-05)
 - [x] v4 predicate returns switched to true/false (parser/ssa/emitter/std) (2026-02-05)
 - [ ] v4 define null literal typing + comparison semantics (todo)
