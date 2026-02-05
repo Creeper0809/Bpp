@@ -12,6 +12,8 @@ v4_roadmap.md의 실행 계획. 기능을 의존성과 우선순위에 따라 �
 
 ## Maintenance
 
+- [x] v4 codegen ssa_funcs slice init fix (stage0 segfault) (2026-02-05)
+- [x] v4 SSA pointer arrays refactored to slices (funcs/blocks/preds/succs/df) (2026-02-05)
 - [x] v4 switch jump table uses range_u64 (remove casts) (2026-02-05)
 - [x] v4 emitter call arg loops remove u64 index casts (2026-02-05)
 - [x] v4 ssa builder slice/struct literal helpers pointerized (reduce casts) (2026-02-05)
