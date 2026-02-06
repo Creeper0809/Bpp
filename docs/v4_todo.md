@@ -67,6 +67,7 @@ v4_roadmap.md의 실행 계획. 기능을 의존성과 우선순위에 따라 �
 - [x] v4 merge test 31/32 new/delete coverage + complex flow (2026-02-05)
 - [x] v4 ast remove SIZEOF_AST_* constants (2026-02-05)
 - [x] v4 types remove SIZEOF_* constants (2026-02-05)
+- [x] v4 test new + literal init shorthand (2026-02-06)
 - [x] v4 compiler generic helpers pointerized (bindings/typeinfo/clone) + casts cleanup + build_and_test pass (2026-02-04)
 - [x] v4 compiler forces HashMap instantiations for exports/aliases (build fix) (2026-02-04)
 - [x] v4 impl methods inherit generic struct params (fix HashMap get/put instantiation) (2026-02-04)
