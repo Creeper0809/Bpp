@@ -10,6 +10,7 @@
 - [x] v5 literal init cleanup for small structs (NameInfo/ConstInfo/ConstResult/ExportEntry/StringEntry/PtrLen) (2026-02-06)
 - [x] v5 const_find returns ConstResult (no u64 handle) (2026-02-06)
 - [x] v5 emitter gen_expr method-name buffer uses slices (2026-02-06)
+- [x] v5 codegen new ctor name buffer uses slices (2026-02-06)
 - [x] v5 typeinfo get_field_desc returns *FieldDesc (2026-02-06)
 - [x] v5 TypeInfo.struct_def uses *AstStructDef end-to-end (2026-02-06)
 - [x] v5 ast.bpp constructors return literal directly (2026-02-06)
@@ -17,4 +18,5 @@
 - [x] v5 Vec generic impl method instantiation test (2026-02-06)
 - [x] v5 parser Vec<*AstFunc> bootstrap push helper (2026-02-06)
 - [x] v5 impl template alias with resolved names (2026-02-06)
+- [ ] v5 compiler globals inline initialization (blocked: global init expr unsupported) (2026-02-06)
 
