@@ -13,4 +13,7 @@
 - [x] v5 typeinfo get_field_desc returns *FieldDesc (2026-02-06)
 - [x] v5 TypeInfo.struct_def uses *AstStructDef end-to-end (2026-02-06)
 - [x] v5 ast.bpp constructors return literal directly (2026-02-06)
+- [x] v5 impl method generic template aliasing (remove Vec instantiation hack) (2026-02-06)
+- [x] v5 Vec generic impl method instantiation test (2026-02-06)
+- [x] v5 parser Vec<*AstFunc> bootstrap push helper (2026-02-06)
 
