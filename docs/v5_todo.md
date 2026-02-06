@@ -18,5 +18,5 @@
 - [x] v5 Vec generic impl method instantiation test (2026-02-06)
 - [x] v5 parser Vec<*AstFunc> bootstrap push helper (2026-02-06)
 - [x] v5 impl template alias with resolved names (2026-02-06)
-- [ ] v5 compiler globals inline initialization (blocked: global init expr unsupported) (2026-02-06)
+- [ ] v5 compiler globals inline initialization (not required; keep explicit init) (2026-02-07)
 
