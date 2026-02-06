@@ -12,4 +12,5 @@
 - [x] v5 emitter gen_expr method-name buffer uses slices (2026-02-06)
 - [x] v5 typeinfo get_field_desc returns *FieldDesc (2026-02-06)
 - [x] v5 TypeInfo.struct_def uses *AstStructDef end-to-end (2026-02-06)
+- [x] v5 ast.bpp constructors return literal directly (2026-02-06)
 
