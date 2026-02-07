@@ -13,3 +13,7 @@
 - [x] v6 new generic constructor instantiation uses base struct name (2026-02-07)
 - [x] v6 HashMap.new removed; use new HashMap (2026-02-07)
 - [x] v6 HashMap zero-capacity guards for bootstrap (2026-02-07)
+- [x] v6 emitter uses symtab_new in init (2026-02-07)
+- [x] v6 replace u8 ptr casts with slices (2026-02-07)
+- [x] v6 emitter imports symtab module for symtab_new (2026-02-07)
+- [x] v6 TypeInfo constructor refactor (2026-02-07)
