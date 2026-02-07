@@ -1996,6 +1996,15 @@ func builder_binop_to_ssa_op(op: u64) -> u64 {
     return SSA_OP_NOP;
 }
 
+func builder_is_f64_expr(ctx: *BuilderCtx, node: u64) -> u64 {
+    if (node == 0) { return false; }
+    var ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)node, ctx.symtab);
+    if (ti == 0) { return false; }
+    if (ti.ptr_depth != 0) { return false; }
+    if (ti.type_kind == TYPE_F64) { return true; }
+    return false;
+}
+
 func build_const(ctx: *BuilderCtx, val: u64) -> u64 {
     var reg_id: u64 = builder_new_reg(ctx);
     var inst_ptr: *SSAInstruction = ssa_new_inst(ctx.ssa_ctx, SSA_OP_CONST, reg_id, ssa_operand_const(val), 0);
@@ -2074,6 +2083,15 @@ func build_expr(ctx: *BuilderCtx, node: u64) -> u64 {
         return build_const(ctx, lit.value);
     }
 
+    if (kind == AST_FLOAT) {
+        var fl: *AstFloat = (*AstFloat)node;
+        var info: *PtrLen = new PtrLen{fl.str_ptr, fl.str_len};
+        var reg_id_f: u64 = builder_new_reg(ctx);
+        var inst_ptr_f: *SSAInstruction = ssa_new_inst(ctx.ssa_ctx, SSA_OP_FCONST, reg_id_f, ssa_operand_const((u64)info), 0);
+        ssa_inst_append(ctx.cur_block, inst_ptr_f);
+        return reg_id_f;
+    }
+
     if (kind == AST_STRING) {
         var s: *AstString = (*AstString)node;
         var info: *PtrLen = new PtrLen{s.str_ptr, s.str_len};
@@ -2139,8 +2157,35 @@ func build_expr(ctx: *BuilderCtx, node: u64) -> u64 {
         if (bin.op == TOKEN_ANDAND || bin.op == TOKEN_OROR) {
             return build_short_circuit(ctx, bin.op, bin.left, bin.right);
         }
+        var l_is_f: u64 = builder_is_f64_expr(ctx, bin.left);
+        var r_is_f: u64 = builder_is_f64_expr(ctx, bin.right);
+        if (l_is_f != r_is_f) {
+            emit_stderr("[ERROR] Mixed float/integer binary operation is not supported\n", 70);
+            panic("SSA builder error");
+        }
         var lhs_reg: u64 = build_expr(ctx, bin.left);
         var rhs_reg: u64 = build_expr(ctx, bin.right);
+        if (l_is_f != 0) {
+            var fop: u64 = SSA_OP_NOP;
+            if (bin.op == TOKEN_PLUS) { fop = SSA_OP_FADD; }
+            else if (bin.op == TOKEN_MINUS) { fop = SSA_OP_FSUB; }
+            else if (bin.op == TOKEN_STAR) { fop = SSA_OP_FMUL; }
+            else if (bin.op == TOKEN_SLASH) { fop = SSA_OP_FDIV; }
+            else if (bin.op == TOKEN_EQEQ) { fop = SSA_OP_FEQ; }
+            else if (bin.op == TOKEN_BANGEQ) { fop = SSA_OP_FNE; }
+            else if (bin.op == TOKEN_LT) { fop = SSA_OP_FLT; }
+            else if (bin.op == TOKEN_GT) { fop = SSA_OP_FGT; }
+            else if (bin.op == TOKEN_LTEQ) { fop = SSA_OP_FLE; }
+            else if (bin.op == TOKEN_GTEQ) { fop = SSA_OP_FGE; }
+            if (fop == SSA_OP_NOP) {
+                emit_stderr("[ERROR] Unsupported float binary operator in SSA builder\n", 68);
+                panic("SSA builder error");
+            }
+            var freg: u64 = builder_new_reg(ctx);
+            var finst: *SSAInstruction = ssa_new_inst(ctx.ssa_ctx, fop, freg, ssa_operand_reg(lhs_reg), ssa_operand_reg(rhs_reg));
+            ssa_inst_append(ctx.cur_block, finst);
+            return freg;
+        }
         rhs_reg = builder_scale_ptr_arith(ctx, bin.left, bin.op, rhs_reg);
         var op: u64 = builder_binop_to_ssa_op(bin.op);
         if (op == SSA_OP_NOP) {
@@ -2161,6 +2206,13 @@ func build_expr(ctx: *BuilderCtx, node: u64) -> u64 {
         }
         var val_reg: u64 = build_expr(ctx, un.operand);
 
+        if (op == TOKEN_MINUS && builder_is_f64_expr(ctx, un.operand) != 0) {
+            var dstf: u64 = builder_new_reg(ctx);
+            var instf: *SSAInstruction = ssa_new_inst(ctx.ssa_ctx, SSA_OP_FNEG, dstf, ssa_operand_reg(val_reg), 0);
+            ssa_inst_append(ctx.cur_block, instf);
+            return dstf;
+        }
+
         if (op == TOKEN_MINUS) {
             var zero_reg: u64 = build_const(ctx, 0);
             var dst: u64 = builder_new_reg(ctx);
@@ -2170,6 +2222,10 @@ func build_expr(ctx: *BuilderCtx, node: u64) -> u64 {
         }
 
         if (op == TOKEN_BANG) {
+            if (builder_is_f64_expr(ctx, un.operand) != 0) {
+                emit_stderr("[ERROR] '!' on float is not supported in SSA builder\n", 66);
+                panic("SSA builder error");
+            }
             var zero_reg2: u64 = build_const(ctx, 0);
             var dst2: u64 = builder_new_reg(ctx);
             var inst_ptr4: *SSAInstruction = ssa_new_inst(ctx.ssa_ctx, SSA_OP_EQ, dst2, ssa_operand_reg(val_reg), ssa_operand_reg(zero_reg2));
@@ -2178,6 +2234,10 @@ func build_expr(ctx: *BuilderCtx, node: u64) -> u64 {
         }
 
         if (op == TOKEN_TILDE) {
+            if (builder_is_f64_expr(ctx, un.operand) != 0) {
+                emit_stderr("[ERROR] '~' on float is not supported in SSA builder\n", 66);
+                panic("SSA builder error");
+            }
             var all_ones_reg: u64 = build_const(ctx, -1);
             var dst3: u64 = builder_new_reg(ctx);
             var inst_ptr5: *SSAInstruction = ssa_new_inst(ctx.ssa_ctx, SSA_OP_XOR, dst3, ssa_operand_reg(val_reg), ssa_operand_reg(all_ones_reg));

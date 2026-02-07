@@ -100,6 +100,7 @@ func get_type_size(base_type: u64, ptr_depth: u64) -> u64 {
     if (base_type == TYPE_U32) { return 4; }
     if (base_type == TYPE_U64) { return 8; }
     if (base_type == TYPE_I64) { return 8; }
+    if (base_type == TYPE_F64) { return 8; }
     if (base_type == TYPE_SLICE) { return 16; }
     return 8;
 }
@@ -112,6 +113,7 @@ func get_pointee_size(base_type: u64, ptr_depth: u64) -> u64 {
         if (base_type == TYPE_U32) { return 4; }
         if (base_type == TYPE_U64) { return 8; }
         if (base_type == TYPE_I64) { return 8; }
+        if (base_type == TYPE_F64) { return 8; }
         if (base_type == TYPE_SLICE) { return 16; }
     }
     return 8;
@@ -189,6 +191,7 @@ func sizeof_type(type_kind: u64, ptr_depth: u64, struct_name_ptr: u64, struct_na
         case TYPE_U32: return 4;
         case TYPE_U64: return 8;
         case TYPE_I64: return 8;
+        case TYPE_F64: return 8;
         case TYPE_SLICE: return 16;
         case TYPE_STRUCT:
             var struct_def: *AstStructDef = _typeinfo_find_struct_def(struct_name_ptr, struct_name_len);
@@ -641,6 +644,66 @@ func get_expr_type_with_symtab(node: *AstNode, symtab: *Symtab) -> *TypeInfo {
         rb.tag_layout_len = cast_node.tag_layout_len;
         return rb;
     }
+
+    if (kind == AST_TRY) {
+        var tr: *AstTry = (*AstTry)node;
+        var opt_ti: *TypeInfo = get_expr_type_with_symtab(tr.operand, symtab);
+        if (opt_ti == 0) { return 0; }
+        if (opt_ti.type_kind != TYPE_STRUCT || opt_ti.ptr_depth != 0) { return 0; }
+
+        var base_len: u64 = compiler_find_generic_suffix_index(opt_ti.struct_name_ptr, opt_ti.struct_name_len);
+        var value_ptr: u64 = 0;
+        var value_len: u64 = 0;
+        if (str_eq(opt_ti.struct_name_ptr, base_len, "Option", 6)) {
+            value_ptr = (u64)"value";
+            value_len = 5;
+        } else if (str_eq(opt_ti.struct_name_ptr, base_len, "Result", 6)) {
+            value_ptr = (u64)"ok";
+            value_len = 2;
+        } else {
+            return 0;
+        }
+
+        var struct_def: *AstStructDef = opt_ti.struct_def;
+        if (struct_def == 0) {
+            struct_def = get_struct_def(opt_ti.struct_name_ptr, opt_ti.struct_name_len);
+        }
+        if (struct_def == 0) { return 0; }
+
+        var field: *FieldDesc = get_field_desc(struct_def, value_ptr, value_len);
+        if (field == 0) { return 0; }
+
+        if (field.type_kind == TYPE_STRUCT) {
+            var field_struct_def: *AstStructDef = 0;
+            if (field.struct_name_ptr != 0) {
+                field_struct_def = get_struct_def(field.struct_name_ptr, field.struct_name_len);
+            }
+            var rs2: *TypeInfo = typeinfo_make_struct(field.ptr_depth, field.struct_name_ptr, field.struct_name_len, field_struct_def);
+            rs2.is_tagged = field.is_tagged;
+            rs2.tag_layout_ptr = field.tag_layout_ptr;
+            rs2.tag_layout_len = field.tag_layout_len;
+            return rs2;
+        }
+        if (field.type_kind == TYPE_ARRAY) {
+            var elem_struct_def: *AstStructDef = 0;
+            if (field.elem_type_kind == TYPE_STRUCT && field.struct_name_ptr != 0) {
+                elem_struct_def = get_struct_def(field.struct_name_ptr, field.struct_name_len);
+            }
+            return typeinfo_make_array(field.ptr_depth, field.elem_type_kind, field.elem_ptr_depth, field.struct_name_ptr, field.struct_name_len, elem_struct_def, field.array_len);
+        }
+        if (field.type_kind == TYPE_SLICE) {
+            var elem_struct_def2: *AstStructDef = 0;
+            if (field.elem_type_kind == TYPE_STRUCT && field.struct_name_ptr != 0) {
+                elem_struct_def2 = get_struct_def(field.struct_name_ptr, field.struct_name_len);
+            }
+            return typeinfo_make_slice(field.ptr_depth, field.elem_type_kind, field.elem_ptr_depth, field.struct_name_ptr, field.struct_name_len, elem_struct_def2);
+        }
+        var rf2: *TypeInfo = typeinfo_make(field.type_kind, field.ptr_depth);
+        rf2.is_tagged = field.is_tagged;
+        rf2.tag_layout_ptr = field.tag_layout_ptr;
+        rf2.tag_layout_len = field.tag_layout_len;
+        return rf2;
+    }
     
     if (kind == AST_ADDR_OF) {
         var addr_of: *AstAddrOf = (*AstAddrOf)node;
@@ -881,6 +944,16 @@ func get_expr_type_with_symtab(node: *AstNode, symtab: *Symtab) -> *TypeInfo {
         var binary: *AstBinary = (*AstBinary)node;
         var op: u64 = binary.op;
 
+        var left_ti_f: *TypeInfo = get_expr_type_with_symtab(binary.left, symtab);
+        var right_ti_f: *TypeInfo = get_expr_type_with_symtab(binary.right, symtab);
+        if (left_ti_f != 0 && right_ti_f != 0) {
+            if (left_ti_f.ptr_depth == 0 && right_ti_f.ptr_depth == 0 && left_ti_f.type_kind == TYPE_F64 && right_ti_f.type_kind == TYPE_F64) {
+                if (op == TOKEN_PLUS || op == TOKEN_MINUS || op == TOKEN_STAR || op == TOKEN_SLASH) {
+                    return typeinfo_make(TYPE_F64, 0);
+                }
+            }
+        }
+
         // Logical/comparison operators return i64
         if (op == TOKEN_ANDAND || op == TOKEN_OROR ||
             op == TOKEN_LT || op == TOKEN_GT ||
@@ -925,6 +998,10 @@ func get_expr_type_with_symtab(node: *AstNode, symtab: *Symtab) -> *TypeInfo {
     
     if (kind == AST_LITERAL) {
         return typeinfo_make(TYPE_I64, 0);
+    }
+
+    if (kind == AST_FLOAT) {
+        return typeinfo_make(TYPE_F64, 0);
     }
     
     // Default

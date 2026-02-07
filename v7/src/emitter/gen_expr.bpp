@@ -493,6 +493,15 @@ func cg_expr(node: u64) -> u64 {
         emit_nl();
         return;
     }
+
+    if (kind == AST_FLOAT) {
+        var fl: *AstFloat = (*AstFloat)node;
+        var label_id: u64 = float_get_label(fl.str_ptr, fl.str_len);
+        emit("    mov rax, [rel _flt", 25);
+        emit_u64(label_id);
+        emit("]\n", 2);
+        return;
+    }
     
     if (kind == AST_STRING) {
         var str: *AstString = (*AstString)node;
@@ -640,13 +649,308 @@ func cg_expr(node: u64) -> u64 {
         var operand: u64 = unary.operand;
         
         cg_expr(operand);
-        if (op == TOKEN_MINUS) { emit("    neg rax\n", 12); }
+        if (op == TOKEN_MINUS) {
+            var ot: *TypeInfo = get_expr_type_with_symtab((*AstNode)operand, symtab);
+            if (ot != 0 && ot.ptr_depth == 0 && ot.type_kind == TYPE_F64) {
+                emit("    mov rbx, 1\n", 17);
+                emit("    mov rcx, 63\n", 18);
+                emit("    shl rbx, cl\n", 17);
+                emit("    movq xmm1, rbx\n", 22);
+                emit("    movq xmm0, rax\n", 22);
+                emit("    xorpd xmm0, xmm1\n", 23);
+                emit("    movq rax, xmm0\n", 22);
+                return;
+            }
+            emit("    neg rax\n", 12);
+        }
         else if (op == TOKEN_BANG) {
             emit("    test rax, rax\n", 18);
             emit("    setz al\n", 12);
             emit("    movzx rax, al\n", 18);
         } else if (op == TOKEN_TILDE) {
             emit("    not rax\n", 12);
+        }
+        return;
+    }
+
+    if (kind == AST_TRY) {
+        var tr: *AstTry = (*AstTry)node;
+        var operand: u64 = tr.operand;
+
+        var opt_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)operand, symtab);
+        if (opt_ti == 0) {
+            emit_stderr("[ERROR] try operand type not found\n", 41);
+            panic("Codegen error");
+        }
+        if (opt_ti.type_kind != TYPE_STRUCT || opt_ti.ptr_depth != 0) {
+            emit_stderr("[ERROR] try operator requires Option/Result value\n", 60);
+            panic("Codegen error");
+        }
+
+        var base_len: u64 = compiler_find_generic_suffix_index(opt_ti.struct_name_ptr, opt_ti.struct_name_len);
+        var is_option: u64 = 0;
+        var is_result: u64 = 0;
+        if (str_eq(opt_ti.struct_name_ptr, base_len, "Option", 6)) { is_option = 1; }
+        else if (str_eq(opt_ti.struct_name_ptr, base_len, "Result", 6)) { is_result = 1; }
+        else {
+            emit_stderr("[ERROR] try operator requires Option or Result\n", 56);
+            panic("Codegen error");
+        }
+
+        var ret_type: u64 = emitter_get_ret_type();
+        var ret_ptr_depth: u64 = emitter_get_ret_ptr_depth();
+        var ret_struct_name_ptr: u64 = emitter_get_ret_struct_name_ptr();
+        var ret_struct_name_len: u64 = emitter_get_ret_struct_name_len();
+        if (ret_type != TYPE_STRUCT || ret_ptr_depth != 0) {
+            emit_stderr("[ERROR] try operator requires Option/Result return type\n", 66);
+            panic("Codegen error");
+        }
+        if (str_eq(ret_struct_name_ptr, ret_struct_name_len, opt_ti.struct_name_ptr, opt_ti.struct_name_len) == 0) {
+            emit_stderr("[ERROR] try operand type must match function return type\n", 70);
+            panic("Codegen error");
+        }
+
+        var struct_def: *AstStructDef = opt_ti.struct_def;
+        if (struct_def == 0) {
+            struct_def = get_struct_def(opt_ti.struct_name_ptr, opt_ti.struct_name_len);
+        }
+        if (struct_def == 0) {
+            emit_stderr("[ERROR] try operand struct definition not found\n", 59);
+            panic("Codegen error");
+        }
+
+        var check_ptr: u64 = (u64)"is_some";
+        var check_len: u64 = 7;
+        var value_ptr: u64 = (u64)"value";
+        var value_len: u64 = 5;
+        if (is_result != 0) {
+            check_ptr = (u64)"is_ok";
+            check_len = 5;
+            value_ptr = (u64)"ok";
+            value_len = 2;
+        }
+
+        var value_desc: *FieldDesc = get_field_desc(struct_def, value_ptr, value_len);
+        if (value_desc == 0) {
+            emit_stderr("[ERROR] try value field not found\n", 38);
+            panic("Codegen error");
+        }
+
+        var check_off: u64 = get_field_offset(struct_def, check_ptr, check_len);
+        var value_off: u64 = get_field_offset(struct_def, value_ptr, value_len);
+
+        var struct_size: u64 = sizeof_type(TYPE_STRUCT, 0, opt_ti.struct_name_ptr, opt_ti.struct_name_len);
+        var tmp_offset: u64 = cg_alloc_tmp_struct(symtab, struct_size);
+        var op_kind: u64 = ast_kind(operand);
+
+        if (struct_size > 16) {
+            if (op_kind == AST_CALL) {
+                cg_call_sret_to_offset(operand, tmp_offset, symtab);
+            } else if (op_kind == AST_METHOD_CALL) {
+                cg_method_call_sret_to_offset((*AstMethodCall)operand, tmp_offset, symtab);
+            } else {
+                cg_lvalue(operand);
+                emit("    mov rbx, rax\n", 19);
+                emit("    lea r8, [rbp", 17);
+                if (tmp_offset < 0) { emit_i64(tmp_offset); }
+                else { emit("+", 1); emit_u64(tmp_offset); }
+                emit("]\n", 2);
+
+                var off: u64 = 0;
+                while (off + 8 <= struct_size) {
+                    emit("    mov rcx, [rbx", 18);
+                    if (off != 0) { emit("+", 1); emit_u64(off); }
+                    emit("]\n", 2);
+                    emit("    mov [r8", 11);
+                    if (off != 0) { emit("+", 1); emit_u64(off); }
+                    emit("], rcx\n", 7);
+                    off = off + 8;
+                }
+                var rem: u64 = struct_size - off;
+                if (rem >= 4) {
+                    emit("    mov ecx, [rbx", 18);
+                    if (off != 0) { emit("+", 1); emit_u64(off); }
+                    emit("]\n", 2);
+                    emit("    mov [r8", 11);
+                    if (off != 0) { emit("+", 1); emit_u64(off); }
+                    emit("], ecx\n", 7);
+                    off = off + 4;
+                    rem = rem - 4;
+                }
+                if (rem >= 2) {
+                    emit("    mov cx, [rbx", 16);
+                    if (off != 0) { emit("+", 1); emit_u64(off); }
+                    emit("]\n", 2);
+                    emit("    mov [r8", 11);
+                    if (off != 0) { emit("+", 1); emit_u64(off); }
+                    emit("], cx\n", 6);
+                    off = off + 2;
+                    rem = rem - 2;
+                }
+                if (rem >= 1) {
+                    emit("    mov cl, [rbx", 16);
+                    if (off != 0) { emit("+", 1); emit_u64(off); }
+                    emit("]\n", 2);
+                    emit("    mov [r8", 11);
+                    if (off != 0) { emit("+", 1); emit_u64(off); }
+                    emit("], cl\n", 6);
+                }
+            }
+        } else {
+            if (op_kind == AST_CALL || op_kind == AST_METHOD_CALL || op_kind == AST_CALL_PTR) {
+                cg_expr(operand);
+                emit("    lea rbx, [rbp", 17);
+                if (tmp_offset < 0) { emit_i64(tmp_offset); }
+                else { emit("+", 1); emit_u64(tmp_offset); }
+                emit("]\n", 2);
+                emit("    mov [rbx], rax\n", 21);
+                if (struct_size > 8) {
+                    emit("    mov [rbx+8], rdx\n", 24);
+                }
+            } else {
+                cg_lvalue(operand);
+                emit("    mov rbx, rax\n", 19);
+                emit("    lea r8, [rbp", 17);
+                if (tmp_offset < 0) { emit_i64(tmp_offset); }
+                else { emit("+", 1); emit_u64(tmp_offset); }
+                emit("]\n", 2);
+
+                var off2: u64 = 0;
+                while (off2 + 8 <= struct_size) {
+                    emit("    mov rcx, [rbx", 18);
+                    if (off2 != 0) { emit("+", 1); emit_u64(off2); }
+                    emit("]\n", 2);
+                    emit("    mov [r8", 11);
+                    if (off2 != 0) { emit("+", 1); emit_u64(off2); }
+                    emit("], rcx\n", 7);
+                    off2 = off2 + 8;
+                }
+                var rem2: u64 = struct_size - off2;
+                if (rem2 >= 4) {
+                    emit("    mov ecx, [rbx", 18);
+                    if (off2 != 0) { emit("+", 1); emit_u64(off2); }
+                    emit("]\n", 2);
+                    emit("    mov [r8", 11);
+                    if (off2 != 0) { emit("+", 1); emit_u64(off2); }
+                    emit("], ecx\n", 7);
+                    off2 = off2 + 4;
+                    rem2 = rem2 - 4;
+                }
+                if (rem2 >= 2) {
+                    emit("    mov cx, [rbx", 16);
+                    if (off2 != 0) { emit("+", 1); emit_u64(off2); }
+                    emit("]\n", 2);
+                    emit("    mov [r8", 11);
+                    if (off2 != 0) { emit("+", 1); emit_u64(off2); }
+                    emit("], cx\n", 6);
+                    off2 = off2 + 2;
+                    rem2 = rem2 - 2;
+                }
+                if (rem2 >= 1) {
+                    emit("    mov cl, [rbx", 16);
+                    if (off2 != 0) { emit("+", 1); emit_u64(off2); }
+                    emit("]\n", 2);
+                    emit("    mov [r8", 11);
+                    if (off2 != 0) { emit("+", 1); emit_u64(off2); }
+                    emit("], cl\n", 6);
+                }
+            }
+        }
+
+        var label_ok: u64 = new_label();
+        emit("    lea rbx, [rbp", 17);
+        if (tmp_offset < 0) { emit_i64(tmp_offset); }
+        else { emit("+", 1); emit_u64(tmp_offset); }
+        emit("]\n", 2);
+        emit("    mov rax, [rbx", 18);
+        if (check_off != 0) { emit("+", 1); emit_u64(check_off); }
+        emit("]\n", 2);
+        emit("    test rax, rax\n", 20);
+        emit("    jne ", 8);
+        emit_label(label_ok);
+        emit_nl();
+
+        var ret_struct_size: u64 = sizeof_type(TYPE_STRUCT, 0, ret_struct_name_ptr, ret_struct_name_len);
+        if (ret_struct_size > 16) {
+            var roff: u64 = 0;
+            while (roff + 8 <= ret_struct_size) {
+                emit("    mov rcx, [rbx", 18);
+                if (roff != 0) { emit("+", 1); emit_u64(roff); }
+                emit("]\n", 2);
+                emit("    mov [rdi", 12);
+                if (roff != 0) { emit("+", 1); emit_u64(roff); }
+                emit("], rcx\n", 7);
+                roff = roff + 8;
+            }
+            var rrem: u64 = ret_struct_size - roff;
+            if (rrem >= 4) {
+                emit("    mov ecx, [rbx", 18);
+                if (roff != 0) { emit("+", 1); emit_u64(roff); }
+                emit("]\n", 2);
+                emit("    mov [rdi", 12);
+                if (roff != 0) { emit("+", 1); emit_u64(roff); }
+                emit("], ecx\n", 7);
+                roff = roff + 4;
+                rrem = rrem - 4;
+            }
+            if (rrem >= 2) {
+                emit("    mov cx, [rbx", 16);
+                if (roff != 0) { emit("+", 1); emit_u64(roff); }
+                emit("]\n", 2);
+                emit("    mov [rdi", 12);
+                if (roff != 0) { emit("+", 1); emit_u64(roff); }
+                emit("], cx\n", 6);
+                roff = roff + 2;
+                rrem = rrem - 2;
+            }
+            if (rrem >= 1) {
+                emit("    mov cl, [rbx", 16);
+                if (roff != 0) { emit("+", 1); emit_u64(roff); }
+                emit("]\n", 2);
+                emit("    mov [rdi", 12);
+                if (roff != 0) { emit("+", 1); emit_u64(roff); }
+                emit("], cl\n", 6);
+            }
+        } else if (ret_struct_size <= 8) {
+            emit("    mov rax, [rbx]\n", 19);
+        } else {
+            emit("    mov rax, [rbx]\n", 19);
+            emit("    mov rdx, [rbx+8]\n", 23);
+        }
+        emit("    mov rsp, rbp\n", 17);
+        emit("    pop rbp\n", 12);
+        emit("    ret\n", 8);
+
+        emit_label_def(label_ok);
+        var value_size: u64 = sizeof_field_desc(value_desc);
+        if (value_size <= 8) {
+            if (value_desc.ptr_depth == 0 && value_desc.type_kind == TYPE_U8) {
+                emit("    movzx rax, byte [rbx", 29);
+                if (value_off != 0) { emit("+", 1); emit_u64(value_off); }
+                emit("]\n", 2);
+            } else if (value_desc.ptr_depth == 0 && value_desc.type_kind == TYPE_U16) {
+                emit("    movzx rax, word [rbx", 29);
+                if (value_off != 0) { emit("+", 1); emit_u64(value_off); }
+                emit("]\n", 2);
+            } else if (value_desc.ptr_depth == 0 && value_desc.type_kind == TYPE_U32) {
+                emit("    mov eax, [rbx", 18);
+                if (value_off != 0) { emit("+", 1); emit_u64(value_off); }
+                emit("]\n", 2);
+            } else {
+                emit("    mov rax, [rbx", 18);
+                if (value_off != 0) { emit("+", 1); emit_u64(value_off); }
+                emit("]\n", 2);
+            }
+        } else if (value_size <= 16) {
+            emit("    mov rax, [rbx", 18);
+            if (value_off != 0) { emit("+", 1); emit_u64(value_off); }
+            emit("]\n", 2);
+            emit("    mov rdx, [rbx", 18);
+            if (value_off + 8 != 0) { emit("+", 1); emit_u64(value_off + 8); }
+            emit("]\n", 2);
+        } else {
+            emit_stderr("[ERROR] try value size too large for expression result\n", 66);
+            panic("Codegen error");
         }
         return;
     }
@@ -1684,19 +1988,60 @@ func cg_binary_expr(node: u64, symtab: *Symtab) -> u64 {
     cg_expr(right);
     emit("    mov rbx, rax\n", 17);
     emit("    pop rax\n", 12);
+
+    var left_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)left, symtab);
+    var right_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)right, symtab);
+    var is_float: u64 = 0;
+    if (left_ti != 0 && right_ti != 0) {
+        if (left_ti.ptr_depth == 0 && right_ti.ptr_depth == 0 && left_ti.type_kind == TYPE_F64 && right_ti.type_kind == TYPE_F64) {
+            is_float = 1;
+        }
+    }
+    if (left_ti != 0 && right_ti != 0) {
+        var l_is_f: u64 = (left_ti.ptr_depth == 0 && left_ti.type_kind == TYPE_F64);
+        var r_is_f: u64 = (right_ti.ptr_depth == 0 && right_ti.type_kind == TYPE_F64);
+        if (l_is_f != r_is_f) {
+            emit_stderr("[ERROR] Mixed float/integer binary operation is not supported\n", 70);
+            panic("Codegen error");
+        }
+    }
+    if (is_float != 0) {
+        emit("    movq xmm0, rax\n", 22);
+        emit("    movq xmm1, rbx\n", 22);
+        if (op == TOKEN_PLUS) { emit("    addsd xmm0, xmm1\n", 24); }
+        else if (op == TOKEN_MINUS) { emit("    subsd xmm0, xmm1\n", 24); }
+        else if (op == TOKEN_STAR) { emit("    mulsd xmm0, xmm1\n", 24); }
+        else if (op == TOKEN_SLASH) { emit("    divsd xmm0, xmm1\n", 24); }
+        else if (op == TOKEN_LT || op == TOKEN_GT || op == TOKEN_LTEQ || op == TOKEN_GTEQ || op == TOKEN_EQEQ || op == TOKEN_BANGEQ) {
+            emit("    ucomisd xmm0, xmm1\n", 26);
+            if (op == TOKEN_LT) { emit("    setb al\n", 12); }
+            else if (op == TOKEN_GT) { emit("    seta al\n", 12); }
+            else if (op == TOKEN_LTEQ) { emit("    setbe al\n", 13); }
+            else if (op == TOKEN_GTEQ) { emit("    setae al\n", 13); }
+            else if (op == TOKEN_EQEQ) { emit("    sete al\n", 12); }
+            else if (op == TOKEN_BANGEQ) { emit("    setne al\n", 13); }
+            emit("    movzx rax, al\n", 18);
+            return;
+        } else {
+            emit_stderr("[ERROR] Unsupported float operator\n", 36);
+            panic("Codegen error");
+        }
+        emit("    movq rax, xmm0\n", 22);
+        return;
+    }
     
     // Pointer arithmetic scaling
-    var left_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)left, symtab);
-    if (left_ti == 0) { left_ti = typeinfo_make(TYPE_I64, 0); }
-    var ptr_depth: u64 = left_ti.ptr_depth;
+    var left_ti2: *TypeInfo = left_ti;
+    if (left_ti2 == 0) { left_ti2 = typeinfo_make(TYPE_I64, 0); }
+    var ptr_depth: u64 = left_ti2.ptr_depth;
     var use_signed: u64 = 0;
-    if (left_ti.type_kind == TYPE_I64 && left_ti.ptr_depth == 0) {
+    if (left_ti2.type_kind == TYPE_I64 && left_ti2.ptr_depth == 0) {
         use_signed = 1;
     }
     
     if (ptr_depth > 0) {
         if (op == TOKEN_PLUS || op == TOKEN_MINUS) {
-            var psize: u64 = get_pointee_size(left_ti.type_kind, ptr_depth);
+            var psize: u64 = get_pointee_size(left_ti2.type_kind, ptr_depth);
             if (psize > 1) {
                 emit("    imul rbx, ", 14);
                 emit_u64(psize);

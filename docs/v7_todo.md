@@ -40,3 +40,8 @@
 - [x] v7 remove arrow member-access parsing (TOKEN_ARROW in expr) + build_and_test.sh pass (2026-02-07)
 - [x] v7 .? refactor for null-check member access (core subsystems) + build_and_test.sh pass (2026-02-07)
 - [x] v7 std Option/Result types + tests + build_and_test.sh pass (2026-02-07)
+- [x] v7 standard ? operator (AST_TRY) for Option/Result propagation + tests + build_and_test.sh pass (2026-02-07)
+- [ ] v7 try operator early-return should emit defer stack (needs shared defer emitter)
+- [x] v7 f64 float literals/arith/compare + tests + build_and_test.sh pass (2026-02-08)
+- [ ] v7 float: implicit/explicit casts and mixed int/float operations
+- [x] v7 float: SSA codegen support (2026-02-08)
