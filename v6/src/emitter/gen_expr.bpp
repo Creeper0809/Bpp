@@ -29,7 +29,6 @@ func _cg_find_global_info(name_ptr: u64, name_len: u64) -> *GlobalInfo {
     }
     return 0;
 }
-
 var g_tmp_struct_arg_id;
 
 func emit_tagged_mask() -> u64 {
@@ -1120,6 +1119,37 @@ func cg_member_access_expr(node: u64, symtab: *Symtab) -> u64 {
             }
             return;
         }
+        if (ot->ptr_depth > 0 && ot->type_kind == TYPE_STRUCT) {
+            cg_expr(object);
+            if (ot->is_tagged == 1) {
+                emit_tagged_mask();
+            }
+
+            var struct_def_ptr: *AstStructDef = ot->struct_def;
+            if (struct_def_ptr == 0) {
+                emit("    ; ERROR: Struct definition not found for pointer type\n", 64);
+                return;
+            }
+
+            var field_offset_ptr: u64 = get_field_offset(struct_def_ptr, member_ptr, member_len);
+            var field_desc_ptr: *FieldDesc = get_field_desc(struct_def_ptr, member_ptr, member_len);
+            if (field_offset_ptr > 0) {
+                emit("    add rax, ", 13);
+                emit_u64(field_offset_ptr);
+                emit("\n", 1);
+            }
+            if (field_desc_ptr == 0) { return; }
+            var fd_ptr: *FieldDesc = field_desc_ptr;
+            if (fd_ptr->type_kind == TYPE_ARRAY) { return; }
+            if (fd_ptr->type_kind == TYPE_SLICE) { emit("    mov rax, [rax]\n", 19); return; }
+            if (fd_ptr->ptr_depth == 0) {
+                if (fd_ptr->type_kind == TYPE_U8) { emit("    movzx rax, byte [rax]\n", 26); return; }
+                if (fd_ptr->type_kind == TYPE_U16) { emit("    movzx rax, word [rax]\n", 26); return; }
+                if (fd_ptr->type_kind == TYPE_U32) { emit("    mov eax, [rax]\n", 19); return; }
+            }
+            emit("    mov rax, [rax]\n", 19);
+            return;
+        }
         if (ot->ptr_depth == 0 && ot->type_kind == TYPE_STRUCT && ot->struct_def != 0) {
             var struct_info: *AstStructDef = ot->struct_def;
             var packed_flag2: u64 = struct_info->is_packed;
@@ -1664,6 +1694,26 @@ func cg_member_access_lvalue(node: u64, symtab: *Symtab) -> u64 {
     var object: u64 = member_access->object;
     var member_ptr: u64 = member_access->member_ptr;
     var member_len: u64 = member_access->member_len;
+
+    var obj_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)object, symtab);
+    if (obj_ti != 0 && obj_ti->ptr_depth > 0 && obj_ti->type_kind == TYPE_STRUCT) {
+        cg_expr(object);
+        if (obj_ti->is_tagged == 1) {
+            emit_tagged_mask();
+        }
+        var struct_def_ptr: *AstStructDef = obj_ti->struct_def;
+        if (struct_def_ptr == 0) {
+            emit("    ; ERROR: Struct definition not found for pointer type\n", 64);
+            return;
+        }
+        var field_offset_ptr: u64 = get_field_offset(struct_def_ptr, member_ptr, member_len);
+        if (field_offset_ptr > 0) {
+            emit("    add rax, ", 13);
+            emit_u64(field_offset_ptr);
+            emit("\n", 1);
+        }
+        return;
+    }
     
     var obj_kind: u64 = ast_kind(object);
     
@@ -1863,6 +1913,12 @@ func cg_method_call(node: u64, symtab: *Symtab) -> u64 {
     var nargs: u64 = 0;
     if (args != 0) { nargs = args->len(); }
     var total_arg_words: u64 = 0;
+
+    var recv_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)receiver, symtab);
+    var recv_is_ptr: u64 = 0;
+    if (recv_ti != 0 && recv_ti->ptr_depth > 0) {
+        recv_is_ptr = 1;
+    }
     
     // Push user args (in reverse order)
     if (nargs != 0) {
@@ -1875,12 +1931,19 @@ func cg_method_call(node: u64, symtab: *Symtab) -> u64 {
     }
     
     // Push receiver address (first arg = self)
-    cg_lvalue(receiver);
+    if (recv_is_ptr != 0) {
+        cg_expr(receiver);
+        if (recv_ti->is_tagged == 1) {
+            emit_tagged_mask();
+        }
+    } else {
+        cg_lvalue(receiver);
+    }
     emit("    push rax\n", 13);
     total_arg_words = total_arg_words + 1;
     
     // Get receiver type to determine struct name
-    var type_info: *TypeInfo = get_expr_type_with_symtab((*AstNode)receiver, symtab);
+    var type_info: *TypeInfo = recv_ti;
     if (type_info == 0 || type_info->struct_name_ptr == 0 || type_info->struct_name_len == 0) {
         if (ast_kind(receiver) == AST_IDENT) {
             var rid: *AstIdent = (*AstIdent)receiver;

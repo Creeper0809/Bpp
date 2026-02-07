@@ -31,3 +31,5 @@
 - [x] v6 main defer pop_trace + error messages (2026-02-07)
 - [x] v6 defer pop_trace sweep across parser/lexer/ssa/codegen (2026-02-07)
 - [x] v6 build_and_test.sh pass after defer sweep (2026-02-07)
+- [x] v6 dot operator auto-deref for pointer member access/method calls (2026-02-07)
+- [x] v6 dot auto-deref test + build_and_test.sh pass (2026-02-07)
