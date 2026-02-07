@@ -37,3 +37,4 @@
 - [x] v7 created from v6 baseline (2026-02-07)
 - [x] v7 replace pointer member access `->` with `.` across codebase (2026-02-07)
 - [x] v7 fix sret method-call receiver for pointer `.` (Vec.pop crash) + build_and_test.sh pass (2026-02-07)
+- [x] v7 remove arrow member-access parsing (TOKEN_ARROW in expr) + build_and_test.sh pass (2026-02-07)
