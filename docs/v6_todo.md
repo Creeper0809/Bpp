@@ -17,3 +17,5 @@
 - [x] v6 replace u8 ptr casts with slices (2026-02-07)
 - [x] v6 emitter imports symtab module for symtab_new (2026-02-07)
 - [x] v6 TypeInfo constructor refactor (2026-02-07)
+- [x] v6 migrate new X{} to constructors (2026-02-07)
+- [x] v6 remove redundant zero-inits after constructors (2026-02-07)
