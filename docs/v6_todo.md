@@ -11,3 +11,5 @@
 - [x] v6 Vec.new removed; use new Vec (2026-02-07)
 - [x] v6 constructor generic template registration in impl parser (2026-02-07)
 - [x] v6 new generic constructor instantiation uses base struct name (2026-02-07)
+- [x] v6 HashMap.new removed; use new HashMap (2026-02-07)
+- [x] v6 HashMap zero-capacity guards for bootstrap (2026-02-07)
