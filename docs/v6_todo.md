@@ -27,3 +27,7 @@
 - [x] v6 parser token name SRP refactor (2026-02-07)
 - [x] v6 ssa codegen support-check SRP refactor (2026-02-07)
 - [x] v6 build_and_test.sh pass after SRP refactors (2026-02-07)
+- [x] v6 typeinfo sizeof_type SRP refactor (2026-02-07)
+- [x] v6 main defer pop_trace + error messages (2026-02-07)
+- [x] v6 defer pop_trace sweep across parser/lexer/ssa/codegen (2026-02-07)
+- [x] v6 build_and_test.sh pass after defer sweep (2026-02-07)
