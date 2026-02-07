@@ -20,3 +20,4 @@
 - [x] v6 migrate new X{} to constructors (2026-02-07)
 - [x] v6 remove redundant zero-inits after constructors (2026-02-07)
 - [x] v6 centralize method name building (2026-02-07)
+- [x] v6 parser name concat refactor (2026-02-07)
