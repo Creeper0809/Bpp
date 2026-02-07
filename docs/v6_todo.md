@@ -33,3 +33,4 @@
 - [x] v6 build_and_test.sh pass after defer sweep (2026-02-07)
 - [x] v6 dot operator auto-deref for pointer member access/method calls (2026-02-07)
 - [x] v6 dot auto-deref test + build_and_test.sh pass (2026-02-07)
+- [x] v6 safe navigation .? operator (lexer/parser/AST/typeinfo/codegen) + tests + build_and_test.sh pass (2026-02-07)

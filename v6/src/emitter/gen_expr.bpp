@@ -608,6 +608,11 @@ func cg_expr(node: u64) -> u64 {
         cg_member_access_expr(node, symtab);
         return;
     }
+
+    if (kind == AST_SAFE_MEMBER_ACCESS) {
+        cg_safe_member_access_expr(node, symtab);
+        return;
+    }
     
     if (kind == AST_BINARY) {
         cg_binary_expr(node, symtab);
@@ -1044,6 +1049,11 @@ func cg_expr(node: u64) -> u64 {
         cg_method_call(node, symtab);
         return;
     }
+
+    if (kind == AST_SAFE_METHOD_CALL) {
+        cg_safe_method_call(node, symtab);
+        return;
+    }
     
     if (kind == AST_STRUCT_LITERAL) {
         // Struct literals should only appear in var initializers (handled in cg_stmt)
@@ -1080,6 +1090,150 @@ func cg_struct_literal_init_ptr(init: u64) -> u64 {
 // ============================================
 // Member Access Expression
 // ============================================
+
+func cg_safe_member_access_expr(node: u64, symtab: *Symtab) -> u64 {
+    var member_access: *AstMemberAccess = (*AstMemberAccess)node;
+    var object: u64 = member_access->object;
+    var member_ptr: u64 = member_access->member_ptr;
+    var member_len: u64 = member_access->member_len;
+
+    var ot: *TypeInfo = get_expr_type_with_symtab((*AstNode)object, symtab);
+    if (ot == 0) {
+        emit_stderr("[ERROR] Safe member access type not found\n", 44);
+        return 0;
+    }
+    if (ot->ptr_depth == 0) {
+        emit_stderr("[ERROR] Safe member access requires pointer receiver\n", 59);
+        return 0;
+    }
+    if (ot->type_kind != TYPE_STRUCT) {
+        emit_stderr("[ERROR] Safe member access requires struct pointer\n", 56);
+        return 0;
+    }
+
+    var label_null: u64 = new_label();
+    var label_end: u64 = new_label();
+
+    cg_expr(object);
+    if (ot->is_tagged == 1) {
+        emit_tagged_mask();
+    }
+    emit("    test rax, rax\n", 20);
+    emit("    je ", 7);
+    emit_label(label_null);
+    emit_nl();
+
+    if (ot->is_tagged == 1 && ot->tag_layout_ptr != 0) {
+        var layout_info: *AstStructDef = get_struct_def(ot->tag_layout_ptr, ot->tag_layout_len);
+        if (layout_info == 0) {
+            emit("[ERROR] Tagged layout struct not found\n", 41);
+            panic("Codegen error");
+        }
+        var packed_flag: u64 = layout_info->is_packed;
+        if (packed_flag == 0) {
+            emit("[ERROR] Tagged layout must be packed struct\n", 49);
+            panic("Codegen error");
+        }
+        var total_bits: u64 = get_packed_layout_total_bits(layout_info);
+        var field_offset: u64 = get_packed_field_bit_offset(layout_info, member_ptr, member_len);
+        var field_width: u64 = get_packed_field_bit_width(layout_info, member_ptr, member_len);
+        var start_bit: u64 = 64 - total_bits;
+        var shift_bits: u64 = start_bit + field_offset;
+
+        if (shift_bits > 0) {
+            emit("    mov rcx, ", 13);
+            emit_u64(shift_bits);
+            emit_nl();
+            emit("    shr rax, cl\n", 16);
+        }
+        if (field_width < 64) {
+            emit_mask_to_rdx(field_width);
+            emit("    and rax, rdx\n", 17);
+        }
+        emit("    jmp ", 8);
+        emit_label(label_end);
+        emit_nl();
+        emit_label_def(label_null);
+        emit("    xor eax, eax\n", 17);
+        emit_label_def(label_end);
+        return 0;
+    }
+
+    var struct_def: *AstStructDef = ot->struct_def;
+    if (struct_def == 0) {
+        emit("    ; ERROR: Struct definition not found for pointer type\n", 64);
+        emit("    jmp ", 8);
+        emit_label(label_end);
+        emit_nl();
+        emit_label_def(label_null);
+        emit("    xor eax, eax\n", 17);
+        emit_label_def(label_end);
+        return 0;
+    }
+
+    var field_offset2: u64 = get_field_offset(struct_def, member_ptr, member_len);
+    var field_desc: *FieldDesc = get_field_desc(struct_def, member_ptr, member_len);
+    if (field_offset2 > 0) {
+        emit("    add rax, ", 13);
+        emit_u64(field_offset2);
+        emit("\n", 1);
+    }
+    if (field_desc == 0) {
+        emit("    jmp ", 8);
+        emit_label(label_end);
+        emit_nl();
+        emit_label_def(label_null);
+        emit("    xor eax, eax\n", 17);
+        emit_label_def(label_end);
+        return 0;
+    }
+    var fd: *FieldDesc = field_desc;
+    if (fd->type_kind == TYPE_STRUCT && fd->ptr_depth == 0) {
+        emit("    ; ERROR: Safe member access cannot return struct by value\n", 67);
+        emit("    jmp ", 8);
+        emit_label(label_end);
+        emit_nl();
+        emit_label_def(label_null);
+        emit("    xor eax, eax\n", 17);
+        emit_label_def(label_end);
+        return 0;
+    }
+    if (fd->type_kind == TYPE_ARRAY) {
+        emit("    jmp ", 8);
+        emit_label(label_end);
+        emit_nl();
+        emit_label_def(label_null);
+        emit("    xor eax, eax\n", 17);
+        emit_label_def(label_end);
+        return 0;
+    }
+    if (fd->type_kind == TYPE_SLICE) {
+        emit("    mov rax, [rax]\n", 19);
+        emit("    jmp ", 8);
+        emit_label(label_end);
+        emit_nl();
+        emit_label_def(label_null);
+        emit("    xor eax, eax\n", 17);
+        emit_label_def(label_end);
+        return 0;
+    }
+    if (fd->ptr_depth == 0) {
+        if (fd->type_kind == TYPE_U8) { emit("    movzx rax, byte [rax]\n", 26); }
+        else if (fd->type_kind == TYPE_U16) { emit("    movzx rax, word [rax]\n", 26); }
+        else if (fd->type_kind == TYPE_U32) { emit("    mov eax, [rax]\n", 19); }
+        else { emit("    mov rax, [rax]\n", 19); }
+    } else {
+        emit("    mov rax, [rax]\n", 19);
+    }
+
+    emit("    jmp ", 8);
+    emit_label(label_end);
+    emit_nl();
+    emit_label_def(label_null);
+    emit("    xor eax, eax\n", 17);
+    emit_label_def(label_end);
+    return 0;
+}
 
 func cg_member_access_expr(node: u64, symtab: *Symtab) -> u64 {
     var member_access: *AstMemberAccess = (*AstMemberAccess)node;
@@ -1683,6 +1837,11 @@ func cg_lvalue(node: u64) -> u64 {
         cg_member_access_lvalue(node, symtab);
         return;
     }
+
+    if (kind == AST_SAFE_MEMBER_ACCESS) {
+        emit_stderr("[ERROR] Safe member access cannot be used as lvalue\n", 61);
+        return;
+    }
 }
 
 // ============================================
@@ -1903,6 +2062,108 @@ func cg_member_access_lvalue(node: u64, symtab: *Symtab) -> u64 {
 // ============================================
 // Method Call Code Generation
 // ============================================
+
+func cg_safe_method_call(node: u64, symtab: *Symtab) -> u64 {
+    var method_call: *AstMethodCall = (*AstMethodCall)node;
+    var receiver: u64 = method_call->receiver;
+    var method_ptr: u64 = method_call->method_ptr;
+    var method_len: u64 = method_call->method_len;
+    var args: *Vec<*AstNode> = method_call->args_vec;
+    var nargs: u64 = 0;
+    if (args != 0) { nargs = args->len(); }
+
+    var recv_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)receiver, symtab);
+    if (recv_ti == 0) {
+        emit_stderr("[ERROR] Safe method call receiver type not found\n", 56);
+        return 0;
+    }
+    if (recv_ti->ptr_depth == 0) {
+        emit_stderr("[ERROR] Safe method call requires pointer receiver\n", 59);
+        return 0;
+    }
+    if (recv_ti->type_kind != TYPE_STRUCT) {
+        emit_stderr("[ERROR] Safe method call requires struct pointer\n", 56);
+        return 0;
+    }
+
+    var name_info: *NameInfo = compiler_build_method_name(recv_ti->struct_name_ptr, recv_ti->struct_name_len, method_ptr, method_len);
+    var resolved_ptr: u64 = name_info->ptr;
+    var resolved_len: u64 = name_info->len;
+    var resolved: *NameInfo = resolve_name(name_info->ptr, name_info->len);
+    if (resolved != 0) {
+        resolved_ptr = resolved->ptr;
+        resolved_len = resolved->len;
+    }
+
+    var fn: *AstFunc = typeinfo_find_func(resolved_ptr, resolved_len);
+    var ret_type: u64 = TYPE_I64;
+    var ret_ptr_depth: u64 = 0;
+    if (fn != 0) {
+        ret_type = fn->ret_type;
+        ret_ptr_depth = fn->ret_ptr_depth;
+        if (ret_type == TYPE_STRUCT && ret_ptr_depth == 0) {
+            emit_stderr("[ERROR] Safe method call cannot return struct by value\n", 69);
+            return 0;
+        }
+    }
+
+    var label_null: u64 = new_label();
+    var label_end: u64 = new_label();
+
+    cg_expr(receiver);
+    if (recv_ti->is_tagged == 1) {
+        emit_tagged_mask();
+    }
+    emit("    test rax, rax\n", 20);
+    emit("    je ", 7);
+    emit_label(label_null);
+    emit_nl();
+
+    var tmp_offset: u64 = cg_alloc_tmp_struct(symtab, 8);
+    emit("    mov [rbp", 12);
+    if (tmp_offset < 0) { emit_i64(tmp_offset); }
+    else { emit("+", 1); emit_u64(tmp_offset); }
+    emit("], rax\n", 7);
+
+    var total_arg_words: u64 = 0;
+    if (nargs != 0) {
+        var i: u64 = nargs;
+        while (i > 0) {
+            i = i - 1;
+            var arg: *AstNode = args->get(i);
+            total_arg_words = total_arg_words + _cg_sysv_push_call_arg(arg, symtab);
+        }
+    }
+
+    emit("    mov rax, [rbp", 17);
+    if (tmp_offset < 0) { emit_i64(tmp_offset); }
+    else { emit("+", 1); emit_u64(tmp_offset); }
+    emit("]\n", 2);
+    emit("    push rax\n", 13);
+    total_arg_words = total_arg_words + 1;
+
+    var stack_words: u64 = _cg_sysv_pop_arg_regs(total_arg_words);
+    emit("    call ", 9);
+    emit(resolved_ptr, resolved_len);
+    emit_nl();
+
+    if (stack_words > 0) {
+        emit("    add rsp, ", 13);
+        emit_u64(stack_words * 8);
+        emit_nl();
+    }
+
+    emit("    jmp ", 8);
+    emit_label(label_end);
+    emit_nl();
+
+    emit_label_def(label_null);
+    if (ret_type != TYPE_VOID) {
+        emit("    xor eax, eax\n", 17);
+    }
+    emit_label_def(label_end);
+    return 0;
+}
 
 func cg_method_call(node: u64, symtab: *Symtab) -> u64 {
     var method_call: *AstMethodCall = (*AstMethodCall)node;
