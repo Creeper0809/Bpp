@@ -45,3 +45,5 @@
 - [x] v7 f64 float literals/arith/compare + tests + build_and_test.sh pass (2026-02-08)
 - [ ] v7 float: implicit/explicit casts and mixed int/float operations
 - [x] v7 float: SSA codegen support (2026-02-08)
+- [x] v7 Type(...) stack constructor sugar + tests + build_and_test.sh pass (2026-02-09)
+- [x] v7 preserve sret pointer for large struct returns (2026-02-09)

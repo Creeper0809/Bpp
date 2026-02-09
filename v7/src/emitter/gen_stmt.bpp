@@ -298,6 +298,17 @@ func cg_return_stmt(node: u64, symtab: *Symtab) -> u64 {
             
             // Large structs: return via hidden sret pointer in rdi
             if (struct_size > 16) {
+                var sret_ptr_name: u64 = (u64)"__sret_ptr";
+                var sret_ptr_len: u64 = 10;
+                var sret_offset: u64 = symtab_find(symtab, sret_ptr_name, sret_ptr_len);
+                if (sret_offset == 0) {
+                    emit_stderr("[ERROR] sret pointer not saved for large struct return\n", 67);
+                    panic("Codegen error");
+                }
+                emit("    mov rdi, [rbp", 20);
+                if (sret_offset < 0) { emit_i64(sret_offset); }
+                else { emit("+", 1); emit_u64(sret_offset); }
+                emit("]\n", 2);
                 if (expr_kind == AST_STRUCT_LITERAL) {
                     var lit2: *AstStructLiteral = (*AstStructLiteral)expr;
                     var values2: *Vec<u64> = lit2.values_vec;
@@ -345,6 +356,9 @@ func cg_return_stmt(node: u64, symtab: *Symtab) -> u64 {
                         emit_u64(stack_words_call * 8);
                         emit_nl();
                     }
+                } else if (expr_kind == AST_STACK_CTOR) {
+                    emit("    mov r12, rdi\n", 19);
+                    cg_stack_ctor_call_at_r12((*AstStackCtor)expr, symtab);
                 } else {
                     emit("    push rdi\n", 13);
                     cg_lvalue(expr);
@@ -369,6 +383,9 @@ func cg_return_stmt(node: u64, symtab: *Symtab) -> u64 {
             if (expr_kind == AST_CALL) {
                 cg_expr(expr);
                 // rax and rdx already contain the struct value
+            } else if (expr_kind == AST_STACK_CTOR) {
+                emit_stderr("[ERROR] stack constructor return not supported for small structs\n", 70);
+                panic("Codegen error");
             } else if (expr_kind == AST_STRUCT_LITERAL) {
                 // For struct literals, evaluate fields and place in rax/rdx
                 var lit: *AstStructLiteral = (*AstStructLiteral)expr;
@@ -612,6 +629,11 @@ func cg_var_decl_stmt(node: u64, symtab: *Symtab, g_structs_vec: *Vec<*AstStruct
         }
         var init_kind: u64 = ast_kind(init);
 
+        if (init_kind == AST_STACK_CTOR) {
+            cg_stack_ctor_init_to_offset((*AstStackCtor)init, offset, symtab);
+            return;
+        }
+
         if (type_kind == TYPE_STRUCT && ptr_depth == 0) {
             var struct_size0: u64 = sizeof_type(type_kind, ptr_depth, struct_name_ptr, struct_name_len);
             if (struct_size0 > 16) {
@@ -832,6 +854,99 @@ func cg_struct_literal_init(init: u64, offset: u64) -> u64 {
     }
 }
 
+func cg_stack_ctor_call_at_r12(sc: *AstStackCtor, symtab: *Symtab) -> u64 {
+    if (sc.type_kind != TYPE_STRUCT) {
+        emit_stderr("[ERROR] stack constructor requires struct type\n", 50);
+        panic("Codegen error");
+    }
+
+    var size: u64 = sizeof_type(sc.type_kind, sc.ptr_depth, sc.struct_name_ptr, sc.struct_name_len);
+
+    var memset_ptr: u64 = (u64)"memset";
+    var memset_len: u64 = 6;
+    var memset_res: *NameInfo = resolve_name(memset_ptr, memset_len);
+    if (memset_res != 0) {
+        memset_ptr = memset_res.ptr;
+        memset_len = memset_res.len;
+    }
+
+    emit("    mov rdi, r12\n", 19);
+    emit("    xor esi, esi\n", 18);
+    emit("    mov rdx, ", 13);
+    emit_u64(size);
+    emit_nl();
+    emit("    call ", 9);
+    emit(memset_ptr, memset_len);
+    emit_nl();
+
+    var method_ptr: u64 = (u64)"constructor";
+    var method_len: u64 = 11;
+    var base_len: u64 = compiler_find_generic_suffix_index(sc.struct_name_ptr, sc.struct_name_len);
+    var suffix_len: u64 = sc.struct_name_len - base_len;
+    var name_info: *NameInfo = compiler_build_method_name_base(sc.struct_name_ptr, base_len, method_ptr, method_len, suffix_len);
+    var call_ptr: u64 = name_info.ptr;
+    var call_len: u64 = name_info.len;
+    var resolved: *NameInfo = resolve_name(name_info.ptr, name_info.len);
+    if (resolved != 0) {
+        call_ptr = resolved.ptr;
+        call_len = resolved.len;
+    }
+
+    if (compiler_func_exists(name_info.ptr, name_info.len) == 0) {
+        var alt_info: *NameInfo = compiler_build_method_name_base(sc.struct_name_ptr, base_len, method_ptr, method_len, 0);
+        var alt_call_ptr: u64 = alt_info.ptr;
+        var alt_call_len: u64 = alt_info.len;
+        var alt_res: *NameInfo = resolve_name(alt_info.ptr, alt_info.len);
+        if (alt_res != 0) {
+            alt_call_ptr = alt_res.ptr;
+            alt_call_len = alt_res.len;
+        }
+
+        if (compiler_func_exists(alt_info.ptr, alt_info.len) == 0) {
+            emit_stderr("[ERROR] constructor not found for stack ctor\n", 53);
+            emit_stderr(sc.struct_name_ptr, sc.struct_name_len);
+            emit_stderr("\n", 1);
+            panic("Codegen error");
+        }
+
+        call_ptr = alt_call_ptr;
+        call_len = alt_call_len;
+    }
+
+    var args: *Vec<*AstNode> = sc.ctor_args_vec;
+    var nargs: u64 = 0;
+    if (args != 0) { nargs = args.len(); }
+    var total_arg_words: u64 = 0;
+    if (nargs != 0) {
+        var ai: u64 = nargs;
+        while (ai > 0) {
+            ai = ai - 1;
+            var arg: *AstNode = args.get(ai);
+            total_arg_words = total_arg_words + _cg_sysv_push_call_arg(arg, symtab);
+        }
+    }
+    emit("    push r12\n", 14);
+    total_arg_words = total_arg_words + 1;
+    var stack_words: u64 = _cg_sysv_pop_arg_regs(total_arg_words);
+    emit("    call ", 9);
+    emit(call_ptr, call_len);
+    emit_nl();
+    if (stack_words > 0) {
+        emit("    add rsp, ", 13);
+        emit_u64(stack_words * 8);
+        emit_nl();
+    }
+    return 0;
+}
+
+func cg_stack_ctor_init_to_offset(sc: *AstStackCtor, dest_offset: u64, symtab: *Symtab) -> u64 {
+    emit("    lea r12, [rbp", 18);
+    if (dest_offset < 0) { emit_i64(dest_offset); }
+    else { emit("+", 1); emit_u64(dest_offset); }
+    emit("]\n", 2);
+    return cg_stack_ctor_call_at_r12(sc, symtab);
+}
+
 // ============================================
 // Assignment Statement
 // ============================================
@@ -846,6 +961,17 @@ func cg_assign_stmt(node: u64, symtab: *Symtab) -> u64 {
     if (target_kind == AST_SAFE_MEMBER_ACCESS) {
         emit_stderr("[ERROR] Safe member access cannot be used in assignment\n", 64);
         panic("Codegen error");
+    }
+    if (value_kind == AST_STACK_CTOR) {
+        var target_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)target, symtab);
+        if (target_ti == 0 || target_ti.type_kind != TYPE_STRUCT || target_ti.ptr_depth != 0) {
+            emit_stderr("[ERROR] stack constructor assignment requires struct lvalue\n", 64);
+            panic("Codegen error");
+        }
+        cg_lvalue(target);
+        emit("    mov r12, rax\n", 19);
+        cg_stack_ctor_call_at_r12((*AstStackCtor)value, symtab);
+        return;
     }
     if (target_kind == AST_MEMBER_ACCESS) {
         var m: *AstMemberAccess = (*AstMemberAccess)target;
