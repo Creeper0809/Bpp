@@ -54,4 +54,5 @@
 - [x] v7 trait runtime fixes: cast parsing guard, stack vptr init, thunk receiver adjust, build_and_test.sh pass (2026-02-11)
 - [x] v7 ssa: small-struct field span + struct literal size resolution (2026-02-11)
 - [x] v7 ssa: safe access/try/new/stack ctor support (2026-02-11)
-- [ ] v7 trait follow-ups: trait in struct inheritance list, Self return types, multi-trait layout rules
+- [ ] v7 trait follow-ups: Self return types, multi-trait layout rules
+- [x] v7 trait follow-ups: trait in struct inheritance list (2026-02-11)
