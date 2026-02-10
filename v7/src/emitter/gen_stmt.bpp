@@ -211,6 +211,7 @@ func cg_stmt(node: u64) -> u64 {
             cg_block(node);
             return;
     }
+
 }
 
 func emit_call_resolved(name_ptr: u64, name_len: u64) -> u64 {
@@ -611,6 +612,16 @@ func cg_var_decl_stmt(node: u64, symtab: *Symtab, g_structs_vec: *Vec<*AstStruct
         ti.array_len = 0;
     }
 
+    if (type_kind == TYPE_TRAIT) {
+        var ti_trait: *TypeInfo = symtab_get_type(symtab, name_ptr, name_len);
+        ti_trait.struct_name_ptr = struct_name_ptr;
+        ti_trait.struct_name_len = struct_name_len;
+        ti_trait.struct_def = 0;
+        ti_trait.elem_type_kind = 0;
+        ti_trait.elem_ptr_depth = 0;
+        ti_trait.array_len = 0;
+    }
+
     // If array/slice, store element type info in symtab
     if (type_kind == TYPE_ARRAY || type_kind == TYPE_SLICE) {
         var ti2: *TypeInfo = symtab_get_type(symtab, name_ptr, name_len);
@@ -834,6 +845,14 @@ func cg_var_decl_stmt(node: u64, symtab: *Symtab, g_structs_vec: *Vec<*AstStruct
             emit("], rax\n", 7);
         }
     }
+
+    if (type_kind == TYPE_STRUCT && ptr_depth == 0) {
+        emit("    lea r12, [rbp", 18);
+        if (offset < 0) { emit_i64(offset); }
+        else { emit("+", 1); emit_u64(offset); }
+        emit("]\n", 2);
+        cg_emit_trait_vptr_init_at_r12(struct_name_ptr, struct_name_len);
+    }
 }
 
 func cg_struct_literal_init(init: u64, offset: u64) -> u64 {
@@ -842,26 +861,73 @@ func cg_struct_literal_init(init: u64, offset: u64) -> u64 {
     var num_values: u64 = values.len();
     var fields: *Vec<*FieldDesc> = lit.struct_def.fields_vec;
     var num_fields: u64 = fields.len();
+
+    var parent_total: u64 = 0;
+    if (lit.struct_def.parents_vec != 0) {
+        var parents: *Vec<*ParentDesc> = lit.struct_def.parents_vec;
+        var pn: u64 = parents.len();
+        for (var pi: u64 = 0; pi < pn; pi++) {
+            var parent_desc: *ParentDesc = parents.get(pi);
+            var parent_def: *AstStructDef = parent_desc.struct_def;
+            if (parent_def == 0) {
+                parent_def = get_struct_def(parent_desc.name_ptr, parent_desc.name_len);
+                if (parent_def == 0) {
+                    emit("[ERROR] Parent struct not found\n", 34);
+                    panic("Codegen error");
+                }
+                parent_desc.struct_def = parent_def;
+            }
+            var parent_size: u64 = sizeof_type(TYPE_STRUCT, 0, parent_desc.name_ptr, parent_desc.name_len);
+            parent_total = parent_total + parent_size;
+        }
+    }
+
+    var impls: *Vec<*TraitImpl> = compiler_get_trait_impls();
+    if (impls != 0) {
+        var ni: u64 = impls.len();
+        for (var ti: u64 = 0; ti < ni; ti++) {
+            var impl_info: *TraitImpl = impls.get(ti);
+            if (!str_eq(impl_info.struct_ptr, impl_info.struct_len, lit.struct_def.name_ptr, lit.struct_def.name_len)) { continue; }
+            var vptr_name: *NameInfo = compiler_build_vptr_field_name(impl_info.trait_ptr, impl_info.trait_len);
+            var field_offset_v: u64 = 0;
+            var field_desc_v: *FieldDesc = 0;
+            var found_v: u64 = struct_find_field_desc_scoped(lit.struct_def, 0, 0, vptr_name.ptr, vptr_name.len, &field_offset_v, &field_desc_v);
+            if (found_v == 0) {
+                emit_stderr("[ERROR] vptr field not found for struct literal init\n", 58);
+                panic("Codegen error");
+            }
+            emit("    lea rax, [rel _gvar_", 28);
+            emit(impl_info.vtable_global_ptr, impl_info.vtable_global_len);
+            emit("]\n", 2);
+            emit("    mov [rbp", 12);
+            var total_off_v: u64 = offset + field_offset_v;
+            if (total_off_v < 0) { emit_i64(total_off_v); }
+            else { emit("+", 1); emit_u64(total_off_v); }
+            emit("], rax\n", 7);
+        }
+    }
     
     // Initialize each field
-    var field_offset: u64 = 0;
-    for (var i: u64 = 0; i < num_values; i++) {
-        if (i < num_fields) {
-            var field: *FieldDesc = fields.get(i);
-            var field_size: u64 = sizeof_field_desc(field);
-            
-            // Evaluate field value
-            cg_expr(values.get(i));
-            
-            // Store at variable offset + field offset
-            emit("    mov [rbp", 12);
-            var total_offset: u64 = offset + field_offset;
-            if (total_offset < 0) { emit_i64(total_offset); }
-            else { emit("+", 1); emit_u64(total_offset); }
-            emit("], rax\n", 7);
-            
+    var field_offset: u64 = parent_total;
+    var value_index: u64 = 0;
+    for (var fi: u64 = 0; fi < num_fields && value_index < num_values; fi++) {
+        var field: *FieldDesc = fields.get(fi);
+        var field_size: u64 = sizeof_field_desc(field);
+        if (compiler_is_vptr_field_name(field.name_ptr, field.name_len) != 0) {
             field_offset = field_offset + field_size;
+            continue;
         }
+
+        cg_expr(values.get(value_index));
+
+        emit("    mov [rbp", 12);
+        var total_offset: u64 = offset + field_offset;
+        if (total_offset < 0) { emit_i64(total_offset); }
+        else { emit("+", 1); emit_u64(total_offset); }
+        emit("], rax\n", 7);
+
+        field_offset = field_offset + field_size;
+        value_index = value_index + 1;
     }
 }
 

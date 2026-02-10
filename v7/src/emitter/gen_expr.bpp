@@ -76,6 +76,8 @@ func cg_stack_ctor_call_at_r12(sc: *AstStackCtor, symtab: *Symtab) -> u64 {
     emit_nl();
     emit_nl();
 
+    cg_emit_trait_vptr_init_at_r12(sc.struct_name_ptr, sc.struct_name_len);
+
     var method_ptr: u64 = (u64)"constructor";
     var method_len: u64 = 11;
     var base_len: u64 = compiler_find_generic_suffix_index(sc.struct_name_ptr, sc.struct_name_len);
@@ -142,6 +144,34 @@ func cg_stack_ctor_init_to_offset(sc: *AstStackCtor, dest_offset: u64, symtab: *
     else { emit("+", 1); emit_u64(dest_offset); }
     emit("]\n", 2);
     return cg_stack_ctor_call_at_r12(sc, symtab);
+}
+
+func cg_emit_trait_vptr_init_at_r12(struct_name_ptr: u64, struct_name_len: u64) -> u64 {
+    var impls: *Vec<*TraitImpl> = compiler_get_trait_impls();
+    if (impls == 0) { return 0; }
+    var struct_def: *AstStructDef = get_struct_def(struct_name_ptr, struct_name_len);
+    if (struct_def == 0) { return 0; }
+
+    var n: u64 = impls.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var impl_info: *TraitImpl = impls.get(i);
+        if (!str_eq(impl_info.struct_ptr, impl_info.struct_len, struct_name_ptr, struct_name_len)) { continue; }
+        var vptr_name: *NameInfo = compiler_build_vptr_field_name(impl_info.trait_ptr, impl_info.trait_len);
+        var field_offset: u64 = 0;
+        var field_desc: *FieldDesc = 0;
+        var found: u64 = struct_find_field_desc_scoped(struct_def, 0, 0, vptr_name.ptr, vptr_name.len, &field_offset, &field_desc);
+        if (found == 0) {
+            emit_stderr("[ERROR] vptr field not found for trait init\n", 51);
+            panic("Codegen error");
+        }
+        emit("    lea rax, [rel _gvar_", 28);
+        emit(impl_info.vtable_global_ptr, impl_info.vtable_global_len);
+        emit("]\n", 2);
+        emit("    mov [r12", 12);
+        if (field_offset != 0) { emit("+", 1); emit_u64(field_offset); }
+        emit("], rax\n", 7);
+    }
+    return 0;
 }
 
 func emit_call_resolved_expr(name_ptr: u64, name_len: u64) -> u64 {
@@ -1209,6 +1239,65 @@ func cg_expr(node: u64) -> u64 {
     if (kind == AST_CAST) {
         var cast: *AstCast = (*AstCast)node;
         var expr: u64 = cast.expr;
+        if (cast.target_type == TYPE_TRAIT) {
+            var src_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)expr, symtab);
+            if (src_ti == 0 || src_ti.type_kind != TYPE_STRUCT || src_ti.ptr_depth == 0) {
+                emit_stderr("[ERROR] Trait cast requires struct pointer source\n", 56);
+                panic("Codegen error");
+            }
+            var impl_info2: *TraitImpl = compiler_find_trait_impl(cast.struct_name_ptr, cast.struct_name_len, src_ti.struct_name_ptr, src_ti.struct_name_len);
+            if (impl_info2 == 0) {
+                emit_stderr("[ERROR] Struct does not implement trait for cast: ", 59);
+                emit_stderr(cast.struct_name_ptr, cast.struct_name_len);
+                emit_stderr("\n", 1);
+                panic("Codegen error");
+            }
+            var struct_def: *AstStructDef = get_struct_def(src_ti.struct_name_ptr, src_ti.struct_name_len);
+            var vptr_name: *NameInfo = compiler_build_vptr_field_name(cast.struct_name_ptr, cast.struct_name_len);
+            var field_offset: u64 = 0;
+            var field_desc: *FieldDesc = 0;
+            var found: u64 = struct_find_field_desc_scoped(struct_def, 0, 0, vptr_name.ptr, vptr_name.len, &field_offset, &field_desc);
+            if (found == 0) {
+                emit_stderr("[ERROR] vptr field not found for trait cast\n", 52);
+                panic("Codegen error");
+            }
+            cg_expr(expr);
+            if (src_ti.is_tagged == 1) { emit_tagged_mask(); }
+            if (field_offset != 0) {
+                emit("    add rax, ", 13);
+                emit_u64(field_offset);
+                emit_nl();
+            }
+            return;
+        }
+        if (cast.target_type == TYPE_STRUCT) {
+            var src_ti2: *TypeInfo = get_expr_type_with_symtab((*AstNode)expr, symtab);
+            if (src_ti2 != 0 && src_ti2.type_kind == TYPE_TRAIT && src_ti2.ptr_depth > 0) {
+                var impl2: *TraitImpl = compiler_find_trait_impl(src_ti2.struct_name_ptr, src_ti2.struct_name_len, cast.struct_name_ptr, cast.struct_name_len);
+                if (impl2 == 0) {
+                    emit_stderr("[ERROR] Trait cast target struct not implemented: ", 62);
+                    emit_stderr(cast.struct_name_ptr, cast.struct_name_len);
+                    emit_stderr("\n", 1);
+                    panic("Codegen error");
+                }
+                var struct_def2: *AstStructDef = get_struct_def(cast.struct_name_ptr, cast.struct_name_len);
+                var vptr_name2: *NameInfo = compiler_build_vptr_field_name(src_ti2.struct_name_ptr, src_ti2.struct_name_len);
+                var field_offset2: u64 = 0;
+                var field_desc2: *FieldDesc = 0;
+                var found2: u64 = struct_find_field_desc_scoped(struct_def2, 0, 0, vptr_name2.ptr, vptr_name2.len, &field_offset2, &field_desc2);
+                if (found2 == 0) {
+                    emit_stderr("[ERROR] vptr field not found for trait cast\n", 52);
+                    panic("Codegen error");
+                }
+                cg_expr(expr);
+                if (field_offset2 != 0) {
+                    emit("    sub rax, ", 13);
+                    emit_u64(field_offset2);
+                    emit_nl();
+                }
+                return;
+            }
+        }
         cg_expr(expr);
         return;
     }
@@ -1306,6 +1395,10 @@ func cg_expr(node: u64) -> u64 {
         emit("    call ", 9);
         emit(memset_ptr, memset_len);
         emit_nl();
+
+        if (nw.type_kind == TYPE_STRUCT) {
+            cg_emit_trait_vptr_init_at_r12(nw.struct_name_ptr, nw.struct_name_len);
+        }
 
         if (nw.literal_expr != 0) {
             if (ast_kind(nw.literal_expr) == AST_STRUCT_LITERAL) {
@@ -1549,20 +1642,47 @@ func cg_struct_literal_init_ptr(init: u64) -> u64 {
     var fields: *Vec<*FieldDesc> = lit.struct_def.fields_vec;
     var num_fields: u64 = fields.len();
 
-    var field_offset: u64 = 0;
-    for (var i: u64 = 0; i < num_values; i++) {
-        if (i < num_fields) {
-            var field: *FieldDesc = fields.get(i);
-            var field_size: u64 = sizeof_field_desc(field);
-
-            cg_expr(values.get(i));
-
+    var impls: *Vec<*TraitImpl> = compiler_get_trait_impls();
+    if (impls != 0) {
+        var ni: u64 = impls.len();
+        for (var ti: u64 = 0; ti < ni; ti++) {
+            var impl_info3: *TraitImpl = impls.get(ti);
+            if (!str_eq(impl_info3.struct_ptr, impl_info3.struct_len, lit.struct_def.name_ptr, lit.struct_def.name_len)) { continue; }
+            var vptr_name: *NameInfo = compiler_build_vptr_field_name(impl_info3.trait_ptr, impl_info3.trait_len);
+            var field_offset_v: u64 = 0;
+            var field_desc_v: *FieldDesc = 0;
+            var found_v: u64 = struct_find_field_desc_scoped(lit.struct_def, 0, 0, vptr_name.ptr, vptr_name.len, &field_offset_v, &field_desc_v);
+            if (found_v == 0) {
+                emit_stderr("[ERROR] vptr field not found for struct literal init\n", 58);
+                panic("Codegen error");
+            }
+            emit("    lea rax, [rel _gvar_", 28);
+            emit(impl_info3.vtable_global_ptr, impl_info3.vtable_global_len);
+            emit("]\n", 2);
             emit("    mov [r12", 12);
-            if (field_offset != 0) { emit("+", 1); emit_u64(field_offset); }
+            if (field_offset_v != 0) { emit("+", 1); emit_u64(field_offset_v); }
             emit("], rax\n", 7);
-
-            field_offset = field_offset + field_size;
         }
+    }
+
+    var field_offset: u64 = 0;
+    var value_index: u64 = 0;
+    for (var fi: u64 = 0; fi < num_fields && value_index < num_values; fi++) {
+        var field: *FieldDesc = fields.get(fi);
+        var field_size: u64 = sizeof_field_desc(field);
+        if (compiler_is_vptr_field_name(field.name_ptr, field.name_len) != 0) {
+            field_offset = field_offset + field_size;
+            continue;
+        }
+
+        cg_expr(values.get(value_index));
+
+        emit("    mov [r12", 12);
+        if (field_offset != 0) { emit("+", 1); emit_u64(field_offset); }
+        emit("], rax\n", 7);
+
+        field_offset = field_offset + field_size;
+        value_index = value_index + 1;
     }
     return 0;
 }
@@ -1576,6 +1696,8 @@ func cg_safe_member_access_expr(node: u64, symtab: *Symtab) -> u64 {
     var object: u64 = member_access.object;
     var member_ptr: u64 = member_access.member_ptr;
     var member_len: u64 = member_access.member_len;
+    var parent_ptr: u64 = member_access.parent_ptr;
+    var parent_len: u64 = member_access.parent_len;
 
     var ot: *TypeInfo = get_expr_type_with_symtab((*AstNode)object, symtab);
     if (ot == 0) {
@@ -1651,8 +1773,10 @@ func cg_safe_member_access_expr(node: u64, symtab: *Symtab) -> u64 {
         return 0;
     }
 
-    var field_offset2: u64 = get_field_offset(struct_def, member_ptr, member_len);
-    var field_desc: *FieldDesc = get_field_desc(struct_def, member_ptr, member_len);
+    var field_offset2: u64 = 0;
+    var field_desc: *FieldDesc = 0;
+    var found2: u64 = struct_find_field_desc_scoped(struct_def, parent_ptr, parent_len, member_ptr, member_len, &field_offset2, &field_desc);
+    if (found2 == 0) { return 0; }
     if (field_offset2 > 0) {
         emit("    add rax, ", 13);
         emit_u64(field_offset2);
@@ -1720,6 +1844,8 @@ func cg_member_access_expr(node: u64, symtab: *Symtab) -> u64 {
     var object: u64 = member_access.object;
     var member_ptr: u64 = member_access.member_ptr;
     var member_len: u64 = member_access.member_len;
+    var parent_ptr: u64 = member_access.parent_ptr;
+    var parent_len: u64 = member_access.parent_len;
     
     var ot: *TypeInfo = get_expr_type_with_symtab((*AstNode)object, symtab);
     if (ot != 0) {
@@ -1765,8 +1891,10 @@ func cg_member_access_expr(node: u64, symtab: *Symtab) -> u64 {
                 return;
             }
 
-            var field_offset_ptr: u64 = get_field_offset(struct_def_ptr, member_ptr, member_len);
-            var field_desc_ptr: *FieldDesc = get_field_desc(struct_def_ptr, member_ptr, member_len);
+            var field_offset_ptr: u64 = 0;
+            var field_desc_ptr: *FieldDesc = 0;
+            var found_ptr: u64 = struct_find_field_desc_scoped(struct_def_ptr, parent_ptr, parent_len, member_ptr, member_len, &field_offset_ptr, &field_desc_ptr);
+            if (found_ptr == 0) { return; }
             if (field_offset_ptr > 0) {
                 emit("    add rax, ", 13);
                 emit_u64(field_offset_ptr);
@@ -1890,8 +2018,10 @@ func cg_member_access_expr(node: u64, symtab: *Symtab) -> u64 {
             return;
         }
         
-        var field_offset: u64 = get_field_offset(struct_def, member_ptr, member_len);
-        var field_desc: *FieldDesc = get_field_desc(struct_def, member_ptr, member_len);
+        var field_offset: u64 = 0;
+        var field_desc: *FieldDesc = 0;
+        var found_field: u64 = struct_find_field_desc_scoped(struct_def, parent_ptr, parent_len, member_ptr, member_len, &field_offset, &field_desc);
+        if (found_field == 0) { return; }
         
         // Pop pointer value, add field offset
         emit("    pop rax\n", 12);
@@ -1925,8 +2055,10 @@ func cg_member_access_expr(node: u64, symtab: *Symtab) -> u64 {
             return;
         }
 
-        var field_offset_n: u64 = get_field_offset(nt.struct_def, member_ptr, member_len);
-        var field_desc_n: *FieldDesc = get_field_desc(nt.struct_def, member_ptr, member_len);
+        var field_offset_n: u64 = 0;
+        var field_desc_n: *FieldDesc = 0;
+        var found_n: u64 = struct_find_field_desc_scoped(nt.struct_def, parent_ptr, parent_len, member_ptr, member_len, &field_offset_n, &field_desc_n);
+        if (found_n == 0) { return; }
 
         cg_lvalue(object);
         if (field_offset_n > 0) {
@@ -1961,8 +2093,10 @@ func cg_member_access_expr(node: u64, symtab: *Symtab) -> u64 {
             return;
         }
 
-        var idx_field_offset: u64 = get_field_offset(it.struct_def, member_ptr, member_len);
-        var idx_field_desc: *FieldDesc = get_field_desc(it.struct_def, member_ptr, member_len);
+        var idx_field_offset: u64 = 0;
+        var idx_field_desc: *FieldDesc = 0;
+        var found_idx: u64 = struct_find_field_desc_scoped(it.struct_def, parent_ptr, parent_len, member_ptr, member_len, &idx_field_offset, &idx_field_desc);
+        if (found_idx == 0) { return; }
 
         cg_lvalue(object);
         if (idx_field_offset > 0) {
@@ -2019,8 +2153,10 @@ func cg_member_access_expr(node: u64, symtab: *Symtab) -> u64 {
             emit("    ; ERROR: Struct definition not found in global lvalue\n", 54);
             return;
         }
-        var field_offset_g: u64 = get_field_offset(struct_def_g, member_ptr, member_len);
-        var field_desc_g: *FieldDesc = get_field_desc(struct_def_g, member_ptr, member_len);
+        var field_offset_g: u64 = 0;
+        var field_desc_g: *FieldDesc = 0;
+        var found_g: u64 = struct_find_field_desc_scoped(struct_def_g, parent_ptr, parent_len, member_ptr, member_len, &field_offset_g, &field_desc_g);
+        if (found_g == 0) { return; }
         emit("    lea rax, [rel _gvar_", 24);
         emit(resolved_ptr, resolved_len);
         emit("]\n", 2);
@@ -2061,8 +2197,10 @@ func cg_member_access_expr(node: u64, symtab: *Symtab) -> u64 {
         return;
     }
     
-    var field_offset: u64 = get_field_offset(struct_def, member_ptr, member_len);
-    var field_desc: *FieldDesc = get_field_desc(struct_def, member_ptr, member_len);
+    var field_offset: u64 = 0;
+    var field_desc: *FieldDesc = 0;
+    var found_local: u64 = struct_find_field_desc_scoped(struct_def, parent_ptr, parent_len, member_ptr, member_len, &field_offset, &field_desc);
+    if (found_local == 0) { return; }
     
     // Calculate address: lea rax, [rbp + var_offset + field_offset]
     emit("    lea rax, [rbp", 17);
@@ -2374,6 +2512,8 @@ func cg_member_access_lvalue(node: u64, symtab: *Symtab) -> u64 {
     var object: u64 = member_access.object;
     var member_ptr: u64 = member_access.member_ptr;
     var member_len: u64 = member_access.member_len;
+    var parent_ptr: u64 = member_access.parent_ptr;
+    var parent_len: u64 = member_access.parent_len;
 
     var obj_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)object, symtab);
     if (obj_ti != 0 && obj_ti.ptr_depth > 0 && obj_ti.type_kind == TYPE_STRUCT) {
@@ -2386,7 +2526,10 @@ func cg_member_access_lvalue(node: u64, symtab: *Symtab) -> u64 {
             emit("    ; ERROR: Struct definition not found for pointer type\n", 64);
             return;
         }
-        var field_offset_ptr: u64 = get_field_offset(struct_def_ptr, member_ptr, member_len);
+        var field_offset_ptr: u64 = 0;
+        var field_desc_ptr: *FieldDesc = 0;
+        var found_ptr: u64 = struct_find_field_desc_scoped(struct_def_ptr, parent_ptr, parent_len, member_ptr, member_len, &field_offset_ptr, &field_desc_ptr);
+        if (found_ptr == 0) { return; }
         if (field_offset_ptr > 0) {
             emit("    add rax, ", 13);
             emit_u64(field_offset_ptr);
@@ -2431,7 +2574,10 @@ func cg_member_access_lvalue(node: u64, symtab: *Symtab) -> u64 {
             return;
         }
         
-        var field_offset: u64 = get_field_offset(struct_def, member_ptr, member_len);
+        var field_offset: u64 = 0;
+        var field_desc: *FieldDesc = 0;
+        var found_field: u64 = struct_find_field_desc_scoped(struct_def, parent_ptr, parent_len, member_ptr, member_len, &field_offset, &field_desc);
+        if (found_field == 0) { return; }
         
         // Pop pointer value and add field offset
         emit("    pop rax\n", 12);
@@ -2467,7 +2613,10 @@ func cg_member_access_lvalue(node: u64, symtab: *Symtab) -> u64 {
             return;
         }
         
-        var field_offset: u64 = get_field_offset(struct_def, member_ptr, member_len);
+        var field_offset: u64 = 0;
+        var field_desc: *FieldDesc = 0;
+        var found_field2: u64 = struct_find_field_desc_scoped(struct_def, parent_ptr, parent_len, member_ptr, member_len, &field_offset, &field_desc);
+        if (found_field2 == 0) { return; }
         
         // Pop base address and add field offset
         emit("    pop rax\n", 12);
@@ -2499,7 +2648,10 @@ func cg_member_access_lvalue(node: u64, symtab: *Symtab) -> u64 {
             return;
         }
 
-        var idx_field_offset: u64 = get_field_offset(idx_struct_def, member_ptr, member_len);
+        var idx_field_offset: u64 = 0;
+        var idx_field_desc: *FieldDesc = 0;
+        var found_idx: u64 = struct_find_field_desc_scoped(idx_struct_def, parent_ptr, parent_len, member_ptr, member_len, &idx_field_offset, &idx_field_desc);
+        if (found_idx == 0) { return; }
         emit("    pop rax\n", 12);
         if (idx_field_offset > 0) {
             emit("    add rax, ", 13);
@@ -2543,7 +2695,10 @@ func cg_member_access_lvalue(node: u64, symtab: *Symtab) -> u64 {
             emit("    ; ERROR: Struct definition not found in global lvalue\n", 54);
             return;
         }
-        var field_offset_g: u64 = get_field_offset(struct_def_g, member_ptr, member_len);
+        var field_offset_g: u64 = 0;
+        var field_desc_g: *FieldDesc = 0;
+        var found_g: u64 = struct_find_field_desc_scoped(struct_def_g, parent_ptr, parent_len, member_ptr, member_len, &field_offset_g, &field_desc_g);
+        if (found_g == 0) { return; }
         emit("    lea rax, [rel _gvar_", 24);
         emit(resolved_ptr, resolved_len);
         emit("]\n", 2);
@@ -2570,7 +2725,10 @@ func cg_member_access_lvalue(node: u64, symtab: *Symtab) -> u64 {
         return;
     }
     
-    var field_offset: u64 = get_field_offset(struct_def, member_ptr, member_len);
+    var field_offset: u64 = 0;
+    var field_desc_l: *FieldDesc = 0;
+    var found_l: u64 = struct_find_field_desc_scoped(struct_def, parent_ptr, parent_len, member_ptr, member_len, &field_offset, &field_desc_l);
+    if (found_l == 0) { return; }
     
     // Calculate address: lea rax, [rbp + var_offset + field_offset]
     emit("    lea rax, [rbp", 17);
@@ -2596,6 +2754,79 @@ func cg_safe_method_call(node: u64, symtab: *Symtab) -> u64 {
     var recv_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)receiver, symtab);
     if (recv_ti == 0) {
         emit_stderr("[ERROR] Safe method call receiver type not found\n", 56);
+        return 0;
+    }
+    if (recv_ti.type_kind == TYPE_TRAIT || compiler_is_trait_name(recv_ti.struct_name_ptr, recv_ti.struct_name_len) != 0) {
+        if (recv_ti.ptr_depth == 0) {
+            emit_stderr("[ERROR] Safe trait method call requires pointer receiver\n", 65);
+            return 0;
+        }
+        var method_index: u64 = compiler_find_trait_method_index(recv_ti.struct_name_ptr, recv_ti.struct_name_len, method_ptr, method_len);
+        if (method_index == 9223372036854775807) {
+            emit_stderr("[ERROR] Trait method not found: ", 38);
+            emit_stderr(method_ptr, method_len);
+            emit_stderr("\n", 1);
+            return 0;
+        }
+
+        var label_null_t: u64 = new_label();
+        var label_end_t: u64 = new_label();
+
+        cg_expr(receiver);
+        if (recv_ti.is_tagged == 1) {
+            emit_tagged_mask();
+        }
+        emit("    test rax, rax\n", 20);
+        emit("    je ", 7);
+        emit_label(label_null_t);
+        emit_nl();
+
+        var tmp_offset: u64 = cg_alloc_tmp_struct(symtab, 8);
+        emit("    mov [rbp", 12);
+        if (tmp_offset < 0) { emit_i64(tmp_offset); }
+        else { emit("+", 1); emit_u64(tmp_offset); }
+        emit("], rax\n", 7);
+
+        var total_arg_words_t: u64 = 0;
+        if (nargs != 0) {
+            var i_t: u64 = nargs;
+            while (i_t > 0) {
+                i_t = i_t - 1;
+                var arg_t: *AstNode = args.get(i_t);
+                total_arg_words_t = total_arg_words_t + _cg_sysv_push_call_arg(arg_t, symtab);
+            }
+        }
+
+        emit("    mov rax, [rbp", 17);
+        if (tmp_offset < 0) { emit_i64(tmp_offset); }
+        else { emit("+", 1); emit_u64(tmp_offset); }
+        emit("]\n", 2);
+        emit("    push rax\n", 13);
+        total_arg_words_t = total_arg_words_t + 1;
+
+        var stack_words_t: u64 = _cg_sysv_pop_arg_regs(total_arg_words_t);
+        emit("    mov rax, [rdi]\n", 20);
+        if (method_index != 0) {
+            emit("    add rax, ", 13);
+            emit_u64(method_index * 8);
+            emit_nl();
+        }
+        emit("    mov rax, [rax]\n", 20);
+        emit("    call rax\n", 14);
+
+        if (stack_words_t > 0) {
+            emit("    add rsp, ", 13);
+            emit_u64(stack_words_t * 8);
+            emit_nl();
+        }
+
+        emit("    jmp ", 8);
+        emit_label(label_end_t);
+        emit_nl();
+
+        emit_label_def(label_null_t);
+        emit("    xor eax, eax\n", 17);
+        emit_label_def(label_end_t);
         return 0;
     }
     if (recv_ti.ptr_depth == 0) {
@@ -2700,6 +2931,49 @@ func cg_method_call(node: u64, symtab: *Symtab) -> u64 {
     var recv_is_ptr: u64 = 0;
     if (recv_ti != 0 && recv_ti.ptr_depth > 0) {
         recv_is_ptr = 1;
+    }
+
+    if (recv_ti != 0 && (recv_ti.type_kind == TYPE_TRAIT || compiler_is_trait_name(recv_ti.struct_name_ptr, recv_ti.struct_name_len) != 0)) {
+        var method_index: u64 = compiler_find_trait_method_index(recv_ti.struct_name_ptr, recv_ti.struct_name_len, method_ptr, method_len);
+        if (method_index == 9223372036854775807) {
+            emit_stderr("[ERROR] Trait method not found: ", 38);
+            emit_stderr(method_ptr, method_len);
+            emit_stderr("\n", 1);
+            panic("Codegen error");
+        }
+
+        if (nargs != 0) {
+            var i_t2: u64 = nargs;
+            while (i_t2 > 0) {
+                i_t2 = i_t2 - 1;
+                var arg_t2: *AstNode = args.get(i_t2);
+                total_arg_words = total_arg_words + _cg_sysv_push_call_arg(arg_t2, symtab);
+            }
+        }
+
+        cg_expr(receiver);
+        if (recv_ti.is_tagged == 1) {
+            emit_tagged_mask();
+        }
+        emit("    push rax\n", 13);
+        total_arg_words = total_arg_words + 1;
+
+        var stack_words_t2: u64 = _cg_sysv_pop_arg_regs(total_arg_words);
+        emit("    mov rax, [rdi]\n", 20);
+        if (method_index != 0) {
+            emit("    add rax, ", 13);
+            emit_u64(method_index * 8);
+            emit_nl();
+        }
+        emit("    mov rax, [rax]\n", 20);
+        emit("    call rax\n", 14);
+
+        if (stack_words_t2 > 0) {
+            emit("    add rsp, ", 13);
+            emit_u64(stack_words_t2 * 8);
+            emit_nl();
+        }
+        return 0;
     }
     
     // Push user args (in reverse order)

@@ -322,6 +322,21 @@ func parse_is_generic_param_list_any(p: *Parser) -> u64 {
     }
 }
 
+func parse_is_impl_trait_block(p: *Parser) -> u64 {
+    if (parse_peek_kind(p) != TOKEN_IMPL) { return false; }
+    var saved: u64 = parser_pos(p);
+    parse_adv(p);
+    if (parse_peek_kind(p) != TOKEN_IDENTIFIER) {
+        parser_set_pos(p, saved);
+        return false;
+    }
+    parse_adv(p);
+    var k: u64 = parse_peek_kind(p);
+    parser_set_pos(p, saved);
+    if (k == TOKEN_FOR) { return true; }
+    return false;
+}
+
 // Parse generic parameter list for structs: <T, U, const N: u64>
 func parse_generic_params_any(p: *Parser) -> *Vec<*GenericParam> {
     push_trace("parse_generic_params_any", "parser/decl.b", __LINE__);
@@ -690,7 +705,38 @@ func parse_struct_def(p: *Parser) -> *AstStructDef {
     if (generic_params != 0) {
         type_parser_set_generic_params(generic_params);
     }
+
+    var parents: *Vec<*ParentDesc> = 0;
+    if (parse_match(p, TOKEN_COLON)) {
+        parents = new Vec<*ParentDesc>(4);
+        while (1) {
+            var parent_tok: *Token = parse_peek(p);
+            if (parse_peek_kind(p) != TOKEN_IDENTIFIER) {
+                emit_stderr("[ERROR] Expected parent struct name after ':'\n", 50);
+                panic("Parse error");
+            }
+            parse_adv(p);
+            if (str_eq(parent_tok.ptr, parent_tok.len, name_ptr, name_len)) {
+                emit_stderr("[ERROR] Struct cannot inherit from itself\n", 47);
+                panic("Parse error");
+            }
+            if (compiler_is_trait_name(parent_tok.ptr, parent_tok.len) != 0) {
+                emit_stderr("[ERROR] Trait inheritance is not supported in struct ':' list\n", 68);
+                panic("Parse error");
+            }
+            var parent_desc: *ParentDesc = new ParentDesc();
+            parent_desc.name_ptr = parent_tok.ptr;
+            parent_desc.name_len = parent_tok.len;
+            parents.push(parent_desc);
+            if (!parse_match(p, TOKEN_COMMA)) { break; }
+        }
+    }
     
+    if (is_packed == 1 && parents != 0 && parents.len() > 0) {
+        emit_stderr("[ERROR] packed struct cannot use inheritance\n", 50);
+        panic("Parse error");
+    }
+
     parse_consume(p, TOKEN_LBRACE);
     
     var fields: *Vec<*FieldDesc> = new Vec<*FieldDesc>(8);
@@ -792,7 +838,7 @@ func parse_struct_def(p: *Parser) -> *AstStructDef {
     
     parse_consume(p, TOKEN_RBRACE);
     
-    var struct_def: *AstStructDef = ast_struct_def(name_ptr, name_len, fields, is_packed);
+    var struct_def: *AstStructDef = ast_struct_def(name_ptr, name_len, parents, fields, is_packed);
     if (generic_params != 0) {
         type_parser_clear_generic_params();
         compiler_register_generic_struct_def(name_ptr, name_len, generic_params, struct_def);
@@ -853,6 +899,101 @@ func parse_enum_def(p: *Parser) -> *Vec<*AstConstDecl> {
 // ============================================
 // Impl Block Parsing
 // ============================================
+
+// ============================================
+// Trait Parsing
+// ============================================
+
+func parse_trait_method_signature(p: *Parser) -> *AstFunc {
+    parse_consume(p, TOKEN_FUNC);
+
+    var name_tok: *Token = parse_peek(p);
+    var name_kind: u64 = parse_peek_kind(p);
+    if (name_kind != TOKEN_IDENTIFIER) {
+        emit_stderr("[ERROR] Expected trait method name identifier\n", 52);
+        panic("Parse error");
+    }
+    parse_adv(p);
+
+    set_parsing_context(name_tok.ptr, name_tok.len, name_tok.line);
+
+    parse_consume(p, TOKEN_LPAREN);
+    var params: *Vec<*Param> = new Vec<*Param>(8);
+    if (parse_peek_kind(p) != TOKEN_RPAREN) {
+        params.push(parse_param(p));
+        while (parse_match(p, TOKEN_COMMA)) {
+            params.push(parse_param(p));
+        }
+    }
+    parse_consume(p, TOKEN_RPAREN);
+
+    var ret_type: u64 = TYPE_VOID;
+    var ret_ptr_depth: u64 = 0;
+    var ret_is_tagged: u64 = 0;
+    var ret_struct_name_ptr: u64 = 0;
+    var ret_struct_name_len: u64 = 0;
+    var ret_tag_layout_ptr: u64 = 0;
+    var ret_tag_layout_len: u64 = 0;
+
+    if (parse_match(p, TOKEN_ARROW)) {
+        var ty: *TypeInfo = parse_type_ex(p);
+        ret_type = ty.type_kind;
+        ret_ptr_depth = ty.ptr_depth;
+        ret_is_tagged = ty.is_tagged;
+        ret_struct_name_ptr = ty.struct_name_ptr;
+        ret_struct_name_len = ty.struct_name_len;
+        ret_tag_layout_ptr = ty.tag_layout_ptr;
+        ret_tag_layout_len = ty.tag_layout_len;
+        if (ret_type == TYPE_ARRAY) {
+            ret_type = ty.elem_type_kind;
+            ret_ptr_depth = ty.elem_ptr_depth + 1;
+            ret_is_tagged = 0;
+            ret_struct_name_ptr = ty.struct_name_ptr;
+            ret_struct_name_len = ty.struct_name_len;
+            ret_tag_layout_ptr = 0;
+            ret_tag_layout_len = 0;
+        }
+    }
+
+    parse_consume(p, TOKEN_SEMICOLON);
+    return ast_func_ex(name_tok.ptr, name_tok.len, params, ret_type, ret_ptr_depth, ret_is_tagged, ret_struct_name_ptr, ret_struct_name_len, ret_tag_layout_ptr, ret_tag_layout_len, 0);
+}
+
+func parse_trait_def(p: *Parser) -> *TraitDef {
+    parse_consume(p, TOKEN_TRAIT);
+
+    var name_tok: *Token = parse_peek(p);
+    var name_ptr: u64 = name_tok.ptr;
+    var name_len: u64 = name_tok.len;
+    parse_consume(p, TOKEN_IDENTIFIER);
+
+    parse_consume(p, TOKEN_LBRACE);
+
+    var methods: *Vec<*TraitMethod> = new Vec<*TraitMethod>(8);
+    while (parse_peek_kind(p) != TOKEN_RBRACE) {
+        if (parse_peek_kind(p) == TOKEN_EOF) { break; }
+        if (parse_peek_kind(p) != TOKEN_FUNC) {
+            emit_stderr("[ERROR] trait block can only contain method signatures\n", 62);
+            panic("Parse error");
+        }
+        var sig: *AstFunc = parse_trait_method_signature(p);
+        var tm: *TraitMethod = new TraitMethod();
+        tm.name_ptr = sig.name_ptr;
+        tm.name_len = sig.name_len;
+        tm.sig = sig;
+        tm.index = methods.len();
+        methods.push(tm);
+    }
+
+    parse_consume(p, TOKEN_RBRACE);
+
+    var td: *TraitDef = new TraitDef();
+    td.name_ptr = name_ptr;
+    td.name_len = name_len;
+    td.methods_vec = methods;
+    compiler_register_trait_def(td);
+    return td;
+}
 
 func _make_self_param(struct_name_ptr: u64, struct_name_len: u64) -> *Param {
     var p: *Param = new Param();
@@ -1039,6 +1180,82 @@ func parse_impl_block(p: *Parser) -> *Vec<*AstFunc> {
     return funcs;
 }
 
+func parse_impl_trait_block(p: *Parser) -> *Vec<*AstFunc> {
+    parse_consume(p, TOKEN_IMPL);
+
+    var trait_tok: *Token = parse_peek(p);
+    var trait_ptr: u64 = trait_tok.ptr;
+    var trait_len: u64 = trait_tok.len;
+    parse_consume(p, TOKEN_IDENTIFIER);
+
+    parse_consume(p, TOKEN_FOR);
+
+    var struct_tok: *Token = parse_peek(p);
+    var struct_name_ptr: u64 = struct_tok.ptr;
+    var struct_name_len: u64 = struct_tok.len;
+    parse_consume(p, TOKEN_IDENTIFIER);
+
+    parse_consume(p, TOKEN_LBRACE);
+
+    var funcs: *Vec<*AstFunc> = new Vec<*AstFunc>(8);
+    var impl_methods: *Vec<*TraitImplMethod> = new Vec<*TraitImplMethod>(8);
+    compiler_set_impl_prefix(struct_name_ptr, struct_name_len);
+
+    while (parse_peek_kind(p) != TOKEN_RBRACE) {
+        if (parse_peek_kind(p) == TOKEN_EOF) { break; }
+
+        if (parse_peek_kind(p) == TOKEN_STATIC) {
+            emit_stderr("[ERROR] trait impl methods cannot be static\n", 52);
+            panic("Parse error");
+        }
+
+        if (parse_peek_kind(p) == TOKEN_FUNC) {
+            var func_node: *AstFunc = parse_func_decl(p);
+
+            var original_name_ptr: u64 = func_node.name_ptr;
+            var original_name_len: u64 = func_node.name_len;
+            var name_info: *NameInfo = compiler_build_method_name(struct_name_ptr, struct_name_len, original_name_ptr, original_name_len);
+
+            func_node.name_ptr = name_info.ptr;
+            func_node.name_len = name_info.len;
+
+            compiler_register_impl_method(name_info.ptr, name_info.len);
+            compiler_alias_generic_template_by_func_ptr(func_node, name_info.ptr, name_info.len);
+            var resolved_method: *NameInfo = resolve_name(name_info.ptr, name_info.len);
+            if (resolved_method != 0) {
+                compiler_alias_generic_template_by_func_ptr(func_node, resolved_method.ptr, resolved_method.len);
+            }
+
+            var impl_method: *TraitImplMethod = new TraitImplMethod();
+            impl_method.name_ptr = original_name_ptr;
+            impl_method.name_len = original_name_len;
+            impl_method.func_def = func_node;
+            impl_methods.push(impl_method);
+
+            parser_vec_astfunc_push(funcs, func_node);
+        } else {
+            emit_stderr("[ERROR] impl Trait for Type block can only contain functions\n", 69);
+            panic("Parse error");
+        }
+    }
+
+    parse_consume(p, TOKEN_RBRACE);
+    compiler_clear_impl_prefix();
+
+    var impl_info: *TraitImpl = new TraitImpl();
+    impl_info.trait_ptr = trait_ptr;
+    impl_info.trait_len = trait_len;
+    impl_info.struct_ptr = struct_name_ptr;
+    impl_info.struct_len = struct_name_len;
+    impl_info.methods_vec = impl_methods;
+    impl_info.vtable_struct_def = 0;
+    impl_info.vtable_global_ptr = 0;
+    impl_info.vtable_global_len = 0;
+    compiler_register_trait_impl(impl_info);
+
+    return funcs;
+}
+
 // Impl block parsing for signature-only pass
 func parse_impl_block_signature(p: *Parser) -> *Vec<*AstFunc> {
     parse_consume(p, TOKEN_IMPL);
@@ -1136,6 +1353,62 @@ func parse_impl_block_signature(p: *Parser) -> *Vec<*AstFunc> {
     return funcs;
 }
 
+func parse_impl_trait_block_signature(p: *Parser) -> *Vec<*AstFunc> {
+    parse_consume(p, TOKEN_IMPL);
+
+    var trait_tok: *Token = parse_peek(p);
+    var trait_ptr: u64 = trait_tok.ptr;
+    var trait_len: u64 = trait_tok.len;
+    parse_consume(p, TOKEN_IDENTIFIER);
+
+    parse_consume(p, TOKEN_FOR);
+
+    var struct_tok: *Token = parse_peek(p);
+    var struct_name_ptr: u64 = struct_tok.ptr;
+    var struct_name_len: u64 = struct_tok.len;
+    parse_consume(p, TOKEN_IDENTIFIER);
+
+    parse_consume(p, TOKEN_LBRACE);
+
+    var funcs: *Vec<*AstFunc> = new Vec<*AstFunc>(8);
+    compiler_set_impl_prefix(struct_name_ptr, struct_name_len);
+
+    while (parse_peek_kind(p) != TOKEN_RBRACE) {
+        if (parse_peek_kind(p) == TOKEN_EOF) { break; }
+
+        if (parse_peek_kind(p) == TOKEN_STATIC) {
+            emit_stderr("[ERROR] trait impl methods cannot be static\n", 52);
+            panic("Parse error");
+        }
+
+        if (parse_peek_kind(p) == TOKEN_FUNC) {
+            var func_sig: *AstFunc = parse_func_decl_signature(p);
+
+            var original_name_ptr: u64 = func_sig.name_ptr;
+            var original_name_len: u64 = func_sig.name_len;
+            var name_info: *NameInfo = compiler_build_method_name(struct_name_ptr, struct_name_len, original_name_ptr, original_name_len);
+
+            func_sig.name_ptr = name_info.ptr;
+            func_sig.name_len = name_info.len;
+            compiler_register_impl_method(name_info.ptr, name_info.len);
+            compiler_alias_generic_template_by_func_ptr(func_sig, name_info.ptr, name_info.len);
+            var resolved_method: *NameInfo = resolve_name(name_info.ptr, name_info.len);
+            if (resolved_method != 0) {
+                compiler_alias_generic_template_by_func_ptr(func_sig, resolved_method.ptr, resolved_method.len);
+            }
+
+            parser_vec_astfunc_push(funcs, func_sig);
+        } else {
+            emit_stderr("[ERROR] impl Trait for Type block can only contain functions\n", 69);
+            panic("Parse error");
+        }
+    }
+
+    parse_consume(p, TOKEN_RBRACE);
+    compiler_clear_impl_prefix();
+    return funcs;
+}
+
 // ============================================
 // Program Parsing (Entry Point)
 // ============================================
@@ -1178,9 +1451,17 @@ func parse_program(p: *Parser) -> *AstProgram {
                 }
                 register_struct_type(struct_def);  // Register immediately for type checking/sizeof
                 break;
+            case TOKEN_TRAIT:
+                parse_trait_def(p);
+                break;
             case TOKEN_IMPL:
                 // impl 블록: 내부 함수들을 StructName_methodName으로 변환
-                var impl_funcs: *Vec<*AstFunc> = parse_impl_block(p);
+                var impl_funcs: *Vec<*AstFunc> = 0;
+                if (parse_is_impl_trait_block(p) != 0) {
+                    impl_funcs = parse_impl_trait_block(p);
+                } else {
+                    impl_funcs = parse_impl_block(p);
+                }
                 var num_impl_funcs: u64 = impl_funcs.len();
                 for (var i: u64 = 0; i < num_impl_funcs; i++) {
                     parser_vec_astfunc_push(funcs, impl_funcs.get(i));
@@ -1313,7 +1594,12 @@ func parse_program_pass1(p: *Parser) -> *AstProgram {
                 }
                 break;
             case TOKEN_IMPL:
-                var impl_funcs: *Vec<*AstFunc> = parse_impl_block_signature(p);
+                var impl_funcs: *Vec<*AstFunc> = 0;
+                if (parse_is_impl_trait_block(p) != 0) {
+                    impl_funcs = parse_impl_trait_block_signature(p);
+                } else {
+                    impl_funcs = parse_impl_block_signature(p);
+                }
                 var num_impl_funcs: u64 = impl_funcs.len();
                 for (var i: u64 = 0; i < num_impl_funcs; i++) {
                     var impl_fn_ptr: *AstFunc = impl_funcs.get(i);
@@ -1321,6 +1607,9 @@ func parse_program_pass1(p: *Parser) -> *AstProgram {
                         parser_vec_astfunc_push(funcs, impl_fn_ptr);
                     }
                 }
+                break;
+            case TOKEN_TRAIT:
+                parse_trait_def(p);
                 break;
             case TOKEN_STRUCT:
             case TOKEN_PACKED:

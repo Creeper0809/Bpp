@@ -48,6 +48,13 @@ func typeinfo_make_slice(ptr_depth: u64, elem_type_kind: u64, elem_ptr_depth: u6
     return ti;
 }
 
+func typeinfo_make_trait(ptr_depth: u64, trait_ptr: u64, trait_len: u64) -> *TypeInfo {
+    var ti: *TypeInfo = new TypeInfo(TYPE_TRAIT, ptr_depth);
+    ti.struct_name_ptr = trait_ptr;
+    ti.struct_name_len = trait_len;
+    return ti;
+}
+
 // Global struct definitions (set by codegen before use)
 var g_structs_vec: *Vec<*AstStructDef>;
 // Global function definitions (set by codegen before use)
@@ -102,6 +109,7 @@ func get_type_size(base_type: u64, ptr_depth: u64) -> u64 {
     if (base_type == TYPE_I64) { return 8; }
     if (base_type == TYPE_F64) { return 8; }
     if (base_type == TYPE_SLICE) { return 16; }
+    if (base_type == TYPE_TRAIT) { return 8; }
     return 8;
 }
 
@@ -115,6 +123,7 @@ func get_pointee_size(base_type: u64, ptr_depth: u64) -> u64 {
         if (base_type == TYPE_I64) { return 8; }
         if (base_type == TYPE_F64) { return 8; }
         if (base_type == TYPE_SLICE) { return 16; }
+        if (base_type == TYPE_TRAIT) { return 8; }
     }
     return 8;
 }
@@ -132,16 +141,8 @@ func sizeof_field_desc(field: *FieldDesc) -> u64 {
 }
 
 func get_field_desc(struct_def: *AstStructDef, field_name_ptr: u64, field_name_len: u64) -> *FieldDesc {
-    var struct_info: *AstStructDef = struct_def;
-    var fields: *Vec<*FieldDesc> = struct_info.fields_vec;
-    var num_fields: u64 = fields.len();
-    for (var i: u64 = 0; i < num_fields; i++) {
-        var field: *FieldDesc = fields.get(i);
-        if (str_eq(field.name_ptr, field.name_len, field_name_ptr, field_name_len)) {
-            return field;
-        }
-    }
-    return 0;
+    var field_desc: *FieldDesc = typeinfo_find_field_desc_scoped(struct_def, 0, 0, field_name_ptr, field_name_len);
+    return field_desc;
 }
 
 func check_type_compat(from_base: u64, from_depth: u64, from_tagged: u64, from_layout_ptr: u64, from_layout_len: u64, to_base: u64, to_depth: u64, to_tagged: u64, to_layout_ptr: u64, to_layout_len: u64) -> u64 {
@@ -193,6 +194,7 @@ func sizeof_type(type_kind: u64, ptr_depth: u64, struct_name_ptr: u64, struct_na
         case TYPE_I64: return 8;
         case TYPE_F64: return 8;
         case TYPE_SLICE: return 16;
+        case TYPE_TRAIT: return 8;
         case TYPE_STRUCT:
             var struct_def: *AstStructDef = _typeinfo_find_struct_def(struct_name_ptr, struct_name_len);
             if (struct_def == 0) { return 8; }
@@ -231,18 +233,7 @@ func _typeinfo_packed_struct_size(struct_info: *AstStructDef) -> u64 {
 }
 
 func _typeinfo_struct_size(struct_info: *AstStructDef) -> u64 {
-    if (struct_info.is_packed == 1) {
-        return _typeinfo_packed_struct_size(struct_info);
-    }
-    var fields: *Vec<*FieldDesc> = struct_info.fields_vec;
-    var num_fields: u64 = fields.len();
-    var total_size: u64 = 0;
-    for (var i: u64 = 0; i < num_fields; i++) {
-        var field: *FieldDesc = fields.get(i);
-        var field_size: u64 = sizeof_field_desc(field);
-        total_size = total_size + field_size;
-    }
-    return total_size;
+    return _typeinfo_struct_size_internal(struct_info, 0);
 }
 
 // Sizeof helper for extended types (array/slice)
@@ -251,32 +242,7 @@ func sizeof_type_ex(info: *TypeInfo) -> u64 {
     if (info.type_kind == TYPE_STRUCT && info.ptr_depth == 0) {
         if (info.struct_name_ptr == 0 && info.struct_def != 0) {
             var struct_def: *AstStructDef = info.struct_def;
-            var struct_info: *AstStructDef = struct_def;
-            var packed_flag: u64 = struct_info.is_packed;
-            if (packed_flag == 1) {
-                var fields_p: *Vec<*FieldDesc> = struct_info.fields_vec;
-                var num_fields_p: u64 = fields_p.len();
-                var total_bits: u64 = 0;
-                for (var pi: u64 = 0; pi < num_fields_p; pi++) {
-                    var field_p: *FieldDesc = fields_p.get(pi);
-                    if (field_p.bit_width > 0) {
-                        total_bits = total_bits + field_p.bit_width;
-                    } else {
-                        var fsize: u64 = sizeof_field_desc(field_p);
-                        total_bits = total_bits + fsize * 8;
-                    }
-                }
-                return (total_bits + 7) / 8;
-            }
-
-            var fields: *Vec<*FieldDesc> = struct_info.fields_vec;
-            var num_fields: u64 = fields.len();
-            var total_size: u64 = 0;
-            for (var i: u64 = 0; i < num_fields; i++) {
-                var field: *FieldDesc = fields.get(i);
-                total_size = total_size + sizeof_field_desc(field);
-            }
-            return total_size;
+            return _typeinfo_struct_size_internal(struct_def, 0);
         }
     }
     if (info.type_kind == TYPE_ARRAY) {
@@ -284,6 +250,7 @@ func sizeof_type_ex(info: *TypeInfo) -> u64 {
         return elem_size * info.array_len;
     }
     if (info.type_kind == TYPE_SLICE) { return 16; }
+    if (info.type_kind == TYPE_TRAIT) { return 8; }
     return sizeof_type(info.type_kind, info.ptr_depth, info.struct_name_ptr, info.struct_name_len);
 }
 
@@ -291,32 +258,218 @@ func sizeof_type_ex(info: *TypeInfo) -> u64 {
 // Struct Helper Functions
 // ============================================
 
-// Get field offset in bytes from struct definition
-// Returns 0 if field not found (caller must handle)
-func get_field_offset(struct_def: *AstStructDef, field_name_ptr: u64, field_name_len: u64) -> u64 {
-    var struct_info: *AstStructDef = struct_def;
-    var packed_flag2: u64 = struct_info.is_packed;
-    if (packed_flag2 == 1) {
-        emit_stderr("[ERROR] Packed struct field address is not supported\n", 56);
-        panic("Codegen error");
+func _typeinfo_resolve_parent_def(parent: *ParentDesc) -> *AstStructDef {
+    if (parent.struct_def != 0) { return parent.struct_def; }
+    var sd: *AstStructDef = get_struct_def(parent.name_ptr, parent.name_len);
+    if (sd == 0) {
+        emit_stderr("[ERROR] Parent struct not found: ", 34);
+        emit_stderr(parent.name_ptr, parent.name_len);
+        emit_stderr("\n", 1);
+        panic("TypeInfo error");
+    }
+    parent.struct_def = sd;
+    return sd;
+}
+
+func _typeinfo_struct_size_internal(struct_info: *AstStructDef, depth: u64) -> u64 {
+    if (struct_info == 0) { return 0; }
+    if (depth > 64) {
+        emit_stderr("[ERROR] Inheritance depth exceeded\n", 40);
+        panic("TypeInfo error");
+    }
+    if (struct_info.is_packed == 1) {
+        if (struct_info.parents_vec != 0 && struct_info.parents_vec.len() > 0) {
+            emit_stderr("[ERROR] packed struct cannot use inheritance\n", 50);
+            panic("TypeInfo error");
+        }
+        return _typeinfo_packed_struct_size(struct_info);
+    }
+    var total_size: u64 = 0;
+    if (struct_info.parents_vec != 0) {
+        var parents: *Vec<*ParentDesc> = struct_info.parents_vec;
+        var pn: u64 = parents.len();
+        for (var pi: u64 = 0; pi < pn; pi++) {
+            var parent_desc: *ParentDesc = parents.get(pi);
+            var parent_def: *AstStructDef = _typeinfo_resolve_parent_def(parent_desc);
+            var parent_size: u64 = _typeinfo_struct_size_internal(parent_def, depth + 1);
+            total_size = total_size + parent_size;
+        }
     }
     var fields: *Vec<*FieldDesc> = struct_info.fields_vec;
     var num_fields: u64 = fields.len();
-    var offset: u64 = 0;
-    
     for (var i: u64 = 0; i < num_fields; i++) {
         var field: *FieldDesc = fields.get(i);
-        
-        if (str_eq(field.name_ptr, field.name_len, field_name_ptr, field_name_len)) {
-            return offset;
+        var field_size: u64 = sizeof_field_desc(field);
+        total_size = total_size + field_size;
+    }
+    return total_size;
+}
+
+func _typeinfo_find_parent_offset(struct_info: *AstStructDef, target_ptr: u64, target_len: u64, base_offset: u64, depth: u64, out_offset: *u64, out_def: **AstStructDef) -> u64 {
+    if (struct_info == 0) { return 0; }
+    if (depth > 64) {
+        emit_stderr("[ERROR] Inheritance depth exceeded\n", 40);
+        panic("TypeInfo error");
+    }
+    if (str_eq(struct_info.name_ptr, struct_info.name_len, target_ptr, target_len)) {
+        *out_offset = base_offset;
+        *out_def = struct_info;
+        return 1;
+    }
+    if (struct_info.parents_vec == 0) { return 0; }
+    var parents: *Vec<*ParentDesc> = struct_info.parents_vec;
+    var pn: u64 = parents.len();
+    var cumulative: u64 = 0;
+    for (var i: u64 = 0; i < pn; i++) {
+        var parent_desc: *ParentDesc = parents.get(i);
+        var parent_def: *AstStructDef = _typeinfo_resolve_parent_def(parent_desc);
+        var found: u64 = _typeinfo_find_parent_offset(parent_def, target_ptr, target_len, base_offset + cumulative, depth + 1, out_offset, out_def);
+        if (found != 0) { return 1; }
+        var parent_size: u64 = _typeinfo_struct_size_internal(parent_def, depth + 1);
+        cumulative = cumulative + parent_size;
+    }
+    return 0;
+}
+
+func _typeinfo_struct_find_field_internal(struct_info: *AstStructDef, field_ptr: u64, field_len: u64, depth: u64, out_offset: *u64, out_desc: **FieldDesc) -> u64 {
+    if (struct_info == 0) { return 0; }
+    if (depth > 64) {
+        emit_stderr("[ERROR] Inheritance depth exceeded\n", 40);
+        panic("TypeInfo error");
+    }
+    if (struct_info.is_packed == 1) {
+        emit_stderr("[ERROR] Packed struct field address is not supported\n", 56);
+        panic("TypeInfo error");
+    }
+
+    var parent_total: u64 = 0;
+    if (struct_info.parents_vec != 0) {
+        var parents: *Vec<*ParentDesc> = struct_info.parents_vec;
+        var pn: u64 = parents.len();
+        for (var pi: u64 = 0; pi < pn; pi++) {
+            var parent_desc: *ParentDesc = parents.get(pi);
+            var parent_def: *AstStructDef = _typeinfo_resolve_parent_def(parent_desc);
+            var parent_size: u64 = _typeinfo_struct_size_internal(parent_def, depth + 1);
+            parent_total = parent_total + parent_size;
         }
-        
-        // Calculate field size based on type
+    }
+
+    var fields: *Vec<*FieldDesc> = struct_info.fields_vec;
+    var num_fields: u64 = fields.len();
+    var offset: u64 = parent_total;
+    for (var i: u64 = 0; i < num_fields; i++) {
+        var field: *FieldDesc = fields.get(i);
+        if (str_eq(field.name_ptr, field.name_len, field_ptr, field_len)) {
+            *out_offset = offset;
+            *out_desc = field;
+            return 1;
+        }
         var field_size: u64 = sizeof_field_desc(field);
         offset = offset + field_size;
     }
-    
+
+    var match_count: u64 = 0;
+    var match_offset: u64 = 0;
+    var match_desc: *FieldDesc = 0;
+    if (struct_info.parents_vec != 0) {
+        var parents2: *Vec<*ParentDesc> = struct_info.parents_vec;
+        var pn2: u64 = parents2.len();
+        var cumulative: u64 = 0;
+        for (var j: u64 = 0; j < pn2; j++) {
+            var parent_desc2: *ParentDesc = parents2.get(j);
+            var parent_def2: *AstStructDef = _typeinfo_resolve_parent_def(parent_desc2);
+            var child_offset: u64 = 0;
+            var child_desc: *FieldDesc = 0;
+            var found: u64 = _typeinfo_struct_find_field_internal(parent_def2, field_ptr, field_len, depth + 1, &child_offset, &child_desc);
+            if (found != 0) {
+                match_count = match_count + 1;
+                if (match_count == 1) {
+                    match_offset = cumulative + child_offset;
+                    match_desc = child_desc;
+                }
+            }
+            var parent_size2: u64 = _typeinfo_struct_size_internal(parent_def2, depth + 1);
+            cumulative = cumulative + parent_size2;
+        }
+    }
+    if (match_count > 1) {
+        emit_stderr("[ERROR] Ambiguous field access: ", 36);
+        emit_stderr(struct_info.name_ptr, struct_info.name_len);
+        emit_stderr(".", 1);
+        emit_stderr(field_ptr, field_len);
+        emit_stderr("\n", 1);
+        panic("TypeInfo error");
+    }
+    if (match_count == 1) {
+        *out_offset = match_offset;
+        *out_desc = match_desc;
+        return 1;
+    }
     return 0;
+}
+
+    func struct_find_field_desc_scoped(struct_def: *AstStructDef, parent_ptr: u64, parent_len: u64, field_ptr: u64, field_len: u64, out_offset: *u64, out_desc: **FieldDesc) -> u64 {
+    if (struct_def == 0) { return 0; }
+    if (parent_ptr != 0) {
+        var parent_offset: u64 = 0;
+        var parent_def: *AstStructDef = 0;
+        var found_parent: u64 = _typeinfo_find_parent_offset(struct_def, parent_ptr, parent_len, 0, 0, &parent_offset, &parent_def);
+        if (found_parent == 0 || parent_def == 0) {
+            emit_stderr("[ERROR] Parent scope not found: ", 35);
+            emit_stderr(parent_ptr, parent_len);
+            emit_stderr("\n", 1);
+            panic("TypeInfo error");
+        }
+        var field_offset: u64 = 0;
+        var field_desc: *FieldDesc = 0;
+        var found_field: u64 = _typeinfo_struct_find_field_internal(parent_def, field_ptr, field_len, 0, &field_offset, &field_desc);
+        if (found_field == 0 || field_desc == 0) {
+            emit_stderr("[ERROR] Field not found in parent scope: ", 44);
+            emit_stderr(parent_ptr, parent_len);
+            emit_stderr(".", 1);
+            emit_stderr(field_ptr, field_len);
+            emit_stderr("\n", 1);
+            panic("TypeInfo error");
+        }
+        *out_offset = parent_offset + field_offset;
+        *out_desc = field_desc;
+        return 1;
+    }
+    return _typeinfo_struct_find_field_internal(struct_def, field_ptr, field_len, 0, out_offset, out_desc);
+}
+
+func typeinfo_find_field_desc_scoped(struct_def: *AstStructDef, parent_ptr: u64, parent_len: u64, field_ptr: u64, field_len: u64) -> *FieldDesc {
+    if (struct_def == 0) { return 0; }
+    if (struct_def.is_packed == 1) {
+        if (parent_ptr != 0) {
+            emit_stderr("[ERROR] Packed struct cannot use parent scope\n", 49);
+            panic("TypeInfo error");
+        }
+        var fields: *Vec<*FieldDesc> = struct_def.fields_vec;
+        var num_fields: u64 = fields.len();
+        for (var i: u64 = 0; i < num_fields; i++) {
+            var field: *FieldDesc = fields.get(i);
+            if (str_eq(field.name_ptr, field.name_len, field_ptr, field_len)) {
+                return field;
+            }
+        }
+        return 0;
+    }
+    var field_offset: u64 = 0;
+    var field_desc: *FieldDesc = 0;
+    var found: u64 = struct_find_field_desc_scoped(struct_def, parent_ptr, parent_len, field_ptr, field_len, &field_offset, &field_desc);
+    if (found == 0) { return 0; }
+    return field_desc;
+}
+
+// Get field offset in bytes from struct definition
+// Returns 0 if field not found (caller must handle)
+func get_field_offset(struct_def: *AstStructDef, field_name_ptr: u64, field_name_len: u64) -> u64 {
+    var field_offset: u64 = 0;
+    var field_desc: *FieldDesc = 0;
+    var found: u64 = struct_find_field_desc_scoped(struct_def, 0, 0, field_name_ptr, field_name_len, &field_offset, &field_desc);
+    if (found == 0) { return 0; }
+    return field_offset;
 }
 
 // ============================================
@@ -489,6 +642,32 @@ func get_expr_type_with_symtab(node: *AstNode, symtab: *Symtab) -> *TypeInfo {
             var receiver: u64 = mc.receiver;
             var recv_ti: *TypeInfo = get_expr_type_with_symtab(receiver, symtab);
             if (recv_ti == 0) { return typeinfo_make(TYPE_I64, 0); }
+            if (recv_ti.type_kind == TYPE_TRAIT || compiler_is_trait_name(recv_ti.struct_name_ptr, recv_ti.struct_name_len) != 0) {
+                var trait_def: *TraitDef = compiler_get_trait_def(recv_ti.struct_name_ptr, recv_ti.struct_name_len);
+                if (trait_def == 0) { return typeinfo_make(TYPE_I64, 0); }
+                var mcount: u64 = trait_def.methods_vec.len();
+                for (var mi: u64 = 0; mi < mcount; mi++) {
+                    var tm: *TraitMethod = trait_def.methods_vec.get(mi);
+                    if (str_eq(tm.name_ptr, tm.name_len, mc.method_ptr, mc.method_len)) {
+                        var sig: *AstFunc = tm.sig;
+                        if (sig.ret_type == TYPE_STRUCT && sig.ret_ptr_depth == 0) { return typeinfo_make(TYPE_I64, 0); }
+                        if (sig.ret_type == TYPE_STRUCT) {
+                            var struct_def_t: *AstStructDef = get_struct_def(sig.ret_struct_name_ptr, sig.ret_struct_name_len);
+                            var rs_t: *TypeInfo = typeinfo_make_struct(sig.ret_ptr_depth, sig.ret_struct_name_ptr, sig.ret_struct_name_len, struct_def_t);
+                            rs_t.is_tagged = sig.ret_is_tagged;
+                            return rs_t;
+                        }
+                        var rb_t: *TypeInfo = typeinfo_make(sig.ret_type, sig.ret_ptr_depth);
+                        rb_t.is_tagged = sig.ret_is_tagged;
+                        rb_t.struct_name_ptr = sig.ret_struct_name_ptr;
+                        rb_t.struct_name_len = sig.ret_struct_name_len;
+                        rb_t.tag_layout_ptr = sig.ret_tag_layout_ptr;
+                        rb_t.tag_layout_len = sig.ret_tag_layout_len;
+                        return rb_t;
+                    }
+                }
+                return typeinfo_make(TYPE_I64, 0);
+            }
             if (recv_ti.type_kind != TYPE_STRUCT) { return typeinfo_make(TYPE_I64, 0); }
 
             var name_info: *NameInfo = compiler_build_method_name(recv_ti.struct_name_ptr, recv_ti.struct_name_len, mc.method_ptr, mc.method_len);
@@ -536,6 +715,35 @@ func get_expr_type_with_symtab(node: *AstNode, symtab: *Symtab) -> *TypeInfo {
             if (srecv_ti == 0) { return typeinfo_make(TYPE_I64, 0); }
             if (srecv_ti.ptr_depth == 0) {
                 emit_stderr("[ERROR] Safe method call requires pointer receiver\n", 59);
+                return typeinfo_make(TYPE_I64, 0);
+            }
+            if (srecv_ti.type_kind == TYPE_TRAIT || compiler_is_trait_name(srecv_ti.struct_name_ptr, srecv_ti.struct_name_len) != 0) {
+                var trait_def2: *TraitDef = compiler_get_trait_def(srecv_ti.struct_name_ptr, srecv_ti.struct_name_len);
+                if (trait_def2 == 0) { return typeinfo_make(TYPE_I64, 0); }
+                var mcount2: u64 = trait_def2.methods_vec.len();
+                for (var mi2: u64 = 0; mi2 < mcount2; mi2++) {
+                    var tm2: *TraitMethod = trait_def2.methods_vec.get(mi2);
+                    if (str_eq(tm2.name_ptr, tm2.name_len, smc.method_ptr, smc.method_len)) {
+                        var sig2: *AstFunc = tm2.sig;
+                        if (sig2.ret_type == TYPE_STRUCT && sig2.ret_ptr_depth == 0) {
+                            emit_stderr("[ERROR] Safe method call cannot return struct by value\n", 69);
+                            return typeinfo_make(TYPE_I64, 0);
+                        }
+                        if (sig2.ret_type == TYPE_STRUCT) {
+                            var struct_def_t2: *AstStructDef = get_struct_def(sig2.ret_struct_name_ptr, sig2.ret_struct_name_len);
+                            var rs_t2: *TypeInfo = typeinfo_make_struct(sig2.ret_ptr_depth, sig2.ret_struct_name_ptr, sig2.ret_struct_name_len, struct_def_t2);
+                            rs_t2.is_tagged = sig2.ret_is_tagged;
+                            return rs_t2;
+                        }
+                        var rb_t2: *TypeInfo = typeinfo_make(sig2.ret_type, sig2.ret_ptr_depth);
+                        rb_t2.is_tagged = sig2.ret_is_tagged;
+                        rb_t2.struct_name_ptr = sig2.ret_struct_name_ptr;
+                        rb_t2.struct_name_len = sig2.ret_struct_name_len;
+                        rb_t2.tag_layout_ptr = sig2.ret_tag_layout_ptr;
+                        rb_t2.tag_layout_len = sig2.ret_tag_layout_len;
+                        return rb_t2;
+                    }
+                }
                 return typeinfo_make(TYPE_I64, 0);
             }
             if (srecv_ti.type_kind != TYPE_STRUCT) { return typeinfo_make(TYPE_I64, 0); }
@@ -646,6 +854,9 @@ func get_expr_type_with_symtab(node: *AstNode, symtab: *Symtab) -> *TypeInfo {
     
     if (kind == AST_CAST) {
         var cast_node: *AstCast = (*AstCast)node;
+        if (cast_node.target_type == TYPE_TRAIT) {
+            return typeinfo_make_trait(cast_node.target_ptr_depth, cast_node.struct_name_ptr, cast_node.struct_name_len);
+        }
         if (cast_node.target_type == TYPE_STRUCT) {
             var struct_def: *AstStructDef = get_struct_def(cast_node.struct_name_ptr, cast_node.struct_name_len);
             var rs: *TypeInfo = typeinfo_make_struct(cast_node.target_ptr_depth, cast_node.struct_name_ptr, cast_node.struct_name_len, struct_def);
@@ -802,6 +1013,8 @@ func get_expr_type_with_symtab(node: *AstNode, symtab: *Symtab) -> *TypeInfo {
         var object: u64 = member_access.object;
         var member_ptr: u64 = member_access.member_ptr;
         var member_len: u64 = member_access.member_len;
+        var parent_ptr: u64 = member_access.parent_ptr;
+        var parent_len: u64 = member_access.parent_len;
         
         // Get the type of the object
         var obj_ti: *TypeInfo = get_expr_type_with_symtab(object, symtab);
@@ -824,58 +1037,49 @@ func get_expr_type_with_symtab(node: *AstNode, symtab: *Symtab) -> *TypeInfo {
         var struct_def: *AstStructDef = obj_ti.struct_def;
         if (struct_def == 0) { return 0; }
         
-        // Find the field in the struct
-        var struct_info: *AstStructDef = struct_def;
-        var fields: *Vec<*FieldDesc> = struct_info.fields_vec;
-        var num_fields: u64 = fields.len();
-        
-        for (var i: u64 = 0; i < num_fields; i++) {
-            var field: *FieldDesc = fields.get(i);
-            if (str_eq(field.name_ptr, field.name_len, member_ptr, member_len)) {
-                var field_type: u64 = field.type_kind;
-                var field_ptr_depth: u64 = field.ptr_depth;
-                if (field_type == TYPE_STRUCT) {
-                    var field_struct_def: *AstStructDef = 0;
-                    if (g_structs_vec != 0) {
-                        var num_structs: u64 = g_structs_vec.len();
-                        for (var j: u64 = 0; j < num_structs; j++) {
-                            var sd: *AstStructDef = g_structs_vec.get(j);
-                            var sname_ptr: u64 = sd.name_ptr;
-                            var sname_len: u64 = sd.name_len;
-                            if (str_eq(sname_ptr, sname_len, field.struct_name_ptr, field.struct_name_len)) {
-                                field_struct_def = sd;
-                                break;
-                            }
-                        }
+        var field: *FieldDesc = typeinfo_find_field_desc_scoped(struct_def, parent_ptr, parent_len, member_ptr, member_len);
+        if (field == 0) { return 0; }
+        var field_type: u64 = field.type_kind;
+        var field_ptr_depth: u64 = field.ptr_depth;
+        if (field_type == TYPE_STRUCT) {
+            var field_struct_def: *AstStructDef = 0;
+            if (g_structs_vec != 0) {
+                var num_structs: u64 = g_structs_vec.len();
+                for (var j: u64 = 0; j < num_structs; j++) {
+                    var sd: *AstStructDef = g_structs_vec.get(j);
+                    var sname_ptr: u64 = sd.name_ptr;
+                    var sname_len: u64 = sd.name_len;
+                    if (str_eq(sname_ptr, sname_len, field.struct_name_ptr, field.struct_name_len)) {
+                        field_struct_def = sd;
+                        break;
                     }
-                    var rs: *TypeInfo = typeinfo_make_struct(field_ptr_depth, field.struct_name_ptr, field.struct_name_len, field_struct_def);
-                    rs.is_tagged = field.is_tagged;
-                    rs.tag_layout_ptr = field.tag_layout_ptr;
-                    rs.tag_layout_len = field.tag_layout_len;
-                    return rs;
                 }
-                if (field_type == TYPE_ARRAY) {
-                    var elem_struct_def: *AstStructDef = 0;
-                    if (field.elem_type_kind == TYPE_STRUCT && field.struct_name_ptr != 0) {
-                        elem_struct_def = get_struct_def(field.struct_name_ptr, field.struct_name_len);
-                    }
-                    return typeinfo_make_array(field_ptr_depth, field.elem_type_kind, field.elem_ptr_depth, field.struct_name_ptr, field.struct_name_len, elem_struct_def, field.array_len);
-                }
-                if (field_type == TYPE_SLICE) {
-                    var elem_struct_def2: *AstStructDef = 0;
-                    if (field.elem_type_kind == TYPE_STRUCT && field.struct_name_ptr != 0) {
-                        elem_struct_def2 = get_struct_def(field.struct_name_ptr, field.struct_name_len);
-                    }
-                    return typeinfo_make_slice(field_ptr_depth, field.elem_type_kind, field.elem_ptr_depth, field.struct_name_ptr, field.struct_name_len, elem_struct_def2);
-                }
-                var rf: *TypeInfo = typeinfo_make(field_type, field_ptr_depth);
-                rf.is_tagged = field.is_tagged;
-                rf.tag_layout_ptr = field.tag_layout_ptr;
-                rf.tag_layout_len = field.tag_layout_len;
-                return rf;
             }
+            var rs: *TypeInfo = typeinfo_make_struct(field_ptr_depth, field.struct_name_ptr, field.struct_name_len, field_struct_def);
+            rs.is_tagged = field.is_tagged;
+            rs.tag_layout_ptr = field.tag_layout_ptr;
+            rs.tag_layout_len = field.tag_layout_len;
+            return rs;
         }
-        
+        if (field_type == TYPE_ARRAY) {
+            var elem_struct_def: *AstStructDef = 0;
+            if (field.elem_type_kind == TYPE_STRUCT && field.struct_name_ptr != 0) {
+                elem_struct_def = get_struct_def(field.struct_name_ptr, field.struct_name_len);
+            }
+            return typeinfo_make_array(field_ptr_depth, field.elem_type_kind, field.elem_ptr_depth, field.struct_name_ptr, field.struct_name_len, elem_struct_def, field.array_len);
+        }
+        if (field_type == TYPE_SLICE) {
+            var elem_struct_def2: *AstStructDef = 0;
+            if (field.elem_type_kind == TYPE_STRUCT && field.struct_name_ptr != 0) {
+                elem_struct_def2 = get_struct_def(field.struct_name_ptr, field.struct_name_len);
+            }
+            return typeinfo_make_slice(field_ptr_depth, field.elem_type_kind, field.elem_ptr_depth, field.struct_name_ptr, field.struct_name_len, elem_struct_def2);
+        }
+        var rf: *TypeInfo = typeinfo_make(field_type, field_ptr_depth);
+        rf.is_tagged = field.is_tagged;
+        rf.tag_layout_ptr = field.tag_layout_ptr;
+        rf.tag_layout_len = field.tag_layout_len;
+        return rf;
         return 0;
     }
 
@@ -884,6 +1088,8 @@ func get_expr_type_with_symtab(node: *AstNode, symtab: *Symtab) -> *TypeInfo {
         var sobj: u64 = sm.object;
         var sm_ptr: u64 = sm.member_ptr;
         var sm_len: u64 = sm.member_len;
+        var sparent_ptr: u64 = sm.parent_ptr;
+        var sparent_len: u64 = sm.parent_len;
 
         var sobj_ti: *TypeInfo = get_expr_type_with_symtab(sobj, symtab);
         if (sobj_ti == 0) { return 0; }
@@ -896,58 +1102,53 @@ func get_expr_type_with_symtab(node: *AstNode, symtab: *Symtab) -> *TypeInfo {
         var sstruct_def: *AstStructDef = sobj_ti.struct_def;
         if (sstruct_def == 0) { return 0; }
 
-        var sfields: *Vec<*FieldDesc> = sstruct_def.fields_vec;
-        var snum_fields: u64 = sfields.len();
-        for (var si: u64 = 0; si < snum_fields; si++) {
-            var sfield: *FieldDesc = sfields.get(si);
-            if (str_eq(sfield.name_ptr, sfield.name_len, sm_ptr, sm_len)) {
-                var sfield_type: u64 = sfield.type_kind;
-                var sfield_ptr_depth: u64 = sfield.ptr_depth;
-                if (sfield_type == TYPE_STRUCT && sfield_ptr_depth == 0) {
-                    emit_stderr("[ERROR] Safe member access on struct value is not supported\n", 73);
-                    return 0;
-                }
-                if (sfield_type == TYPE_STRUCT) {
-                    var sfield_struct_def: *AstStructDef = 0;
-                    if (g_structs_vec != 0) {
-                        var sstructs_n: u64 = g_structs_vec.len();
-                        for (var sj: u64 = 0; sj < sstructs_n; sj++) {
-                            var sd: *AstStructDef = g_structs_vec.get(sj);
-                            var sname_ptr: u64 = sd.name_ptr;
-                            var sname_len: u64 = sd.name_len;
-                            if (str_eq(sname_ptr, sname_len, sfield.struct_name_ptr, sfield.struct_name_len)) {
-                                sfield_struct_def = sd;
-                                break;
-                            }
-                        }
-                    }
-                    var srs: *TypeInfo = typeinfo_make_struct(sfield_ptr_depth, sfield.struct_name_ptr, sfield.struct_name_len, sfield_struct_def);
-                    srs.is_tagged = sfield.is_tagged;
-                    srs.tag_layout_ptr = sfield.tag_layout_ptr;
-                    srs.tag_layout_len = sfield.tag_layout_len;
-                    return srs;
-                }
-                if (sfield_type == TYPE_ARRAY) {
-                    var selem_struct_def: *AstStructDef = 0;
-                    if (sfield.elem_type_kind == TYPE_STRUCT && sfield.struct_name_ptr != 0) {
-                        selem_struct_def = get_struct_def(sfield.struct_name_ptr, sfield.struct_name_len);
-                    }
-                    return typeinfo_make_array(sfield_ptr_depth, sfield.elem_type_kind, sfield.elem_ptr_depth, sfield.struct_name_ptr, sfield.struct_name_len, selem_struct_def, sfield.array_len);
-                }
-                if (sfield_type == TYPE_SLICE) {
-                    var selem_struct_def2: *AstStructDef = 0;
-                    if (sfield.elem_type_kind == TYPE_STRUCT && sfield.struct_name_ptr != 0) {
-                        selem_struct_def2 = get_struct_def(sfield.struct_name_ptr, sfield.struct_name_len);
-                    }
-                    return typeinfo_make_slice(sfield_ptr_depth, sfield.elem_type_kind, sfield.elem_ptr_depth, sfield.struct_name_ptr, sfield.struct_name_len, selem_struct_def2);
-                }
-                var srf: *TypeInfo = typeinfo_make(sfield_type, sfield_ptr_depth);
-                srf.is_tagged = sfield.is_tagged;
-                srf.tag_layout_ptr = sfield.tag_layout_ptr;
-                srf.tag_layout_len = sfield.tag_layout_len;
-                return srf;
-            }
+        var sfield: *FieldDesc = typeinfo_find_field_desc_scoped(sstruct_def, sparent_ptr, sparent_len, sm_ptr, sm_len);
+        if (sfield == 0) { return 0; }
+        var sfield_type: u64 = sfield.type_kind;
+        var sfield_ptr_depth: u64 = sfield.ptr_depth;
+        if (sfield_type == TYPE_STRUCT && sfield_ptr_depth == 0) {
+            emit_stderr("[ERROR] Safe member access on struct value is not supported\n", 73);
+            return 0;
         }
+        if (sfield_type == TYPE_STRUCT) {
+            var sfield_struct_def: *AstStructDef = 0;
+            if (g_structs_vec != 0) {
+                var sstructs_n: u64 = g_structs_vec.len();
+                for (var sj: u64 = 0; sj < sstructs_n; sj++) {
+                    var sd: *AstStructDef = g_structs_vec.get(sj);
+                    var sname_ptr: u64 = sd.name_ptr;
+                    var sname_len: u64 = sd.name_len;
+                    if (str_eq(sname_ptr, sname_len, sfield.struct_name_ptr, sfield.struct_name_len)) {
+                        sfield_struct_def = sd;
+                        break;
+                    }
+                }
+            }
+            var srs: *TypeInfo = typeinfo_make_struct(sfield_ptr_depth, sfield.struct_name_ptr, sfield.struct_name_len, sfield_struct_def);
+            srs.is_tagged = sfield.is_tagged;
+            srs.tag_layout_ptr = sfield.tag_layout_ptr;
+            srs.tag_layout_len = sfield.tag_layout_len;
+            return srs;
+        }
+        if (sfield_type == TYPE_ARRAY) {
+            var selem_struct_def: *AstStructDef = 0;
+            if (sfield.elem_type_kind == TYPE_STRUCT && sfield.struct_name_ptr != 0) {
+                selem_struct_def = get_struct_def(sfield.struct_name_ptr, sfield.struct_name_len);
+            }
+            return typeinfo_make_array(sfield_ptr_depth, sfield.elem_type_kind, sfield.elem_ptr_depth, sfield.struct_name_ptr, sfield.struct_name_len, selem_struct_def, sfield.array_len);
+        }
+        if (sfield_type == TYPE_SLICE) {
+            var selem_struct_def2: *AstStructDef = 0;
+            if (sfield.elem_type_kind == TYPE_STRUCT && sfield.struct_name_ptr != 0) {
+                selem_struct_def2 = get_struct_def(sfield.struct_name_ptr, sfield.struct_name_len);
+            }
+            return typeinfo_make_slice(sfield_ptr_depth, sfield.elem_type_kind, sfield.elem_ptr_depth, sfield.struct_name_ptr, sfield.struct_name_len, selem_struct_def2);
+        }
+        var srf: *TypeInfo = typeinfo_make(sfield_type, sfield_ptr_depth);
+        srf.is_tagged = sfield.is_tagged;
+        srf.tag_layout_ptr = sfield.tag_layout_ptr;
+        srf.tag_layout_len = sfield.tag_layout_len;
+        return srf;
         return 0;
     }
     
@@ -989,6 +1190,10 @@ func get_expr_type_with_symtab(node: *AstNode, symtab: *Symtab) -> *TypeInfo {
                 if (l_depth > 0) {
                     var res_ti: *TypeInfo = new TypeInfo(left_ti.type_kind, l_depth);
                     res_ti.is_tagged = left_ti.is_tagged;
+                    res_ti.struct_name_ptr = left_ti.struct_name_ptr;
+                    res_ti.struct_name_len = left_ti.struct_name_len;
+                    res_ti.tag_layout_ptr = left_ti.tag_layout_ptr;
+                    res_ti.tag_layout_len = left_ti.tag_layout_len;
                     res_ti.struct_def = left_ti.struct_def;
                     res_ti.elem_type_kind = left_ti.elem_type_kind;
                     res_ti.elem_ptr_depth = left_ti.elem_ptr_depth;
@@ -1003,6 +1208,10 @@ func get_expr_type_with_symtab(node: *AstNode, symtab: *Symtab) -> *TypeInfo {
                 if (r_depth > 0) {
                     var res_ti: *TypeInfo = new TypeInfo(right_ti.type_kind, r_depth);
                     res_ti.is_tagged = right_ti.is_tagged;
+                    res_ti.struct_name_ptr = right_ti.struct_name_ptr;
+                    res_ti.struct_name_len = right_ti.struct_name_len;
+                    res_ti.tag_layout_ptr = right_ti.tag_layout_ptr;
+                    res_ti.tag_layout_len = right_ti.tag_layout_len;
                     res_ti.struct_def = right_ti.struct_def;
                     res_ti.elem_type_kind = right_ti.elem_type_kind;
                     res_ti.elem_ptr_depth = right_ti.elem_ptr_depth;

@@ -48,3 +48,8 @@
 - [x] v7 Type(...) stack constructor sugar + tests + build_and_test.sh pass (2026-02-09)
 - [x] v7 preserve sret pointer for large struct returns (2026-02-09)
 - [x] v7 stack constructor expression/arg/return support + tests + build_and_test.sh pass (2026-02-10)
+- [x] v7 basic multiple inheritance (no vptr) + parent scope access + tests + build_and_test.sh pass (2026-02-10)
+- [x] v7 packed struct field lookup fix after inheritance changes + build_and_test.sh pass (2026-02-10)
+- [x] v7 trait/vtable MVP (trait/impl, vptr insertion, vtable globals, dynamic dispatch, tests) (2026-02-10)
+- [x] v7 trait runtime fixes: cast parsing guard, stack vptr init, thunk receiver adjust, build_and_test.sh pass (2026-02-11)
+- [ ] v7 trait follow-ups: trait in struct inheritance list, Self return types, multi-trait layout rules
