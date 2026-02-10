@@ -57,4 +57,5 @@
 - [ ] v7 trait follow-ups: Self return types, multi-trait layout rules
 - [x] v7 trait follow-ups: trait in struct inheritance list (2026-02-11)
 - [x] v7 debug keywords: assert/todo/unreachable + runtime fail helper + tests (2026-02-11)
+- [x] v7 refactor: parent struct resolve helper reuse in compiler (2026-02-11)
 - [x] v7 abst abstract methods in struct inheritance + tests (2026-02-12)
