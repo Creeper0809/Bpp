@@ -669,6 +669,78 @@ func parse_func_decl_signature(p: *Parser) -> *AstFunc {
     return func_sig;
 }
 
+// Parse abstract function signature (no body, ends with ';')
+func parse_func_decl_abst_signature(p: *Parser) -> *AstFunc {
+    push_trace("parse_func_decl_abst_signature", "parser/decl.b", __LINE__);
+    defer pop_trace();
+
+    parse_consume(p, TOKEN_FUNC);
+
+    var name_tok: *Token = parse_peek(p);
+    var name_kind: u64 = parse_peek_kind(p);
+    if (name_kind != TOKEN_IDENTIFIER && name_kind != TOKEN_NEW && name_kind != TOKEN_DELETE) {
+        emit_stderr("[ERROR] Expected function name identifier\n", 45);
+        panic("Parse error");
+    }
+    parse_adv(p);
+
+    var generic_params: *Vec<*GenericParam> = parse_generic_params_any(p);
+    if (generic_params != 0) {
+        type_parser_set_generic_params(generic_params);
+    }
+
+    set_parsing_context(name_tok.ptr, name_tok.len, name_tok.line);
+
+    parse_consume(p, TOKEN_LPAREN);
+
+    var params: *Vec<*Param> = new Vec<*Param>(8);
+    if (parse_peek_kind(p) != TOKEN_RPAREN) {
+        params.push(parse_param(p));
+        while (parse_match(p, TOKEN_COMMA)) {
+            params.push(parse_param(p));
+        }
+    }
+    parse_consume(p, TOKEN_RPAREN);
+
+    var ret_type: u64 = TYPE_VOID;
+    var ret_ptr_depth: u64 = 0;
+    var ret_is_tagged: u64 = 0;
+    var ret_struct_name_ptr: u64 = 0;
+    var ret_struct_name_len: u64 = 0;
+    var ret_tag_layout_ptr: u64 = 0;
+    var ret_tag_layout_len: u64 = 0;
+
+    if (parse_match(p, TOKEN_ARROW)) {
+        var ty: *TypeInfo = parse_type_ex(p);
+        ret_type = ty.type_kind;
+        ret_ptr_depth = ty.ptr_depth;
+        ret_is_tagged = ty.is_tagged;
+        ret_struct_name_ptr = ty.struct_name_ptr;
+        ret_struct_name_len = ty.struct_name_len;
+        ret_tag_layout_ptr = ty.tag_layout_ptr;
+        ret_tag_layout_len = ty.tag_layout_len;
+        if (ret_type == TYPE_ARRAY) {
+            ret_type = ty.elem_type_kind;
+            ret_ptr_depth = ty.elem_ptr_depth + 1;
+            ret_is_tagged = 0;
+            ret_struct_name_ptr = ty.struct_name_ptr;
+            ret_struct_name_len = ty.struct_name_len;
+            ret_tag_layout_ptr = 0;
+            ret_tag_layout_len = 0;
+        }
+    }
+
+    parse_consume(p, TOKEN_SEMICOLON);
+
+    var func_sig: *AstFunc = ast_func_ex(name_tok.ptr, name_tok.len, params, ret_type, ret_ptr_depth, ret_is_tagged, ret_struct_name_ptr, ret_struct_name_len, ret_tag_layout_ptr, ret_tag_layout_len, 0);
+
+    if (generic_params != 0) {
+        type_parser_clear_generic_params();
+        compiler_register_generic_func_sig(name_tok.ptr, name_tok.len, generic_params, func_sig);
+    }
+    return func_sig;
+}
+
 // ============================================
 // Struct Parsing
 // ============================================
@@ -1111,16 +1183,29 @@ func parse_impl_block(p: *Parser) -> *Vec<*AstFunc> {
     while (parse_peek_kind(p) != TOKEN_RBRACE) {
         if (parse_peek_kind(p) == TOKEN_EOF) { break; }
         
-        // Check for static keyword
+        // Check for static/abst keyword
         var is_static: u64 = 0;
+        var is_abst: u64 = 0;
         if (parse_peek_kind(p) == TOKEN_STATIC) {
             is_static = 1;
             parse_adv(p);  // consume 'static'
+        }
+        if (parse_peek_kind(p) == TOKEN_ABST) {
+            is_abst = 1;
+            parse_adv(p);  // consume 'abst'
+        }
+        if (is_static != 0 && is_abst != 0) {
+            emit_stderr("[ERROR] abstract method cannot be static\n", 43);
+            panic("Parse error");
         }
         
         if (parse_peek_kind(p) == TOKEN_CONSTRUCTOR) {
             if (is_static != 0) {
                 emit_stderr("[ERROR] constructor cannot be static\n", 41);
+                panic("Parse error");
+            }
+            if (is_abst != 0) {
+                emit_stderr("[ERROR] constructor cannot be abstract\n", 45);
                 panic("Parse error");
             }
             var ctor_node: *AstFunc = parse_constructor_decl(p, struct_name_ptr, struct_name_len, 0);
@@ -1144,6 +1229,10 @@ func parse_impl_block(p: *Parser) -> *Vec<*AstFunc> {
                 emit_stderr("[ERROR] destructor cannot be static\n", 40);
                 panic("Parse error");
             }
+            if (is_abst != 0) {
+                emit_stderr("[ERROR] destructor cannot be abstract\n", 44);
+                panic("Parse error");
+            }
             var dtor_node: *AstFunc = parse_destructor_decl(p, struct_name_ptr, struct_name_len, 0);
 
             var original_name_ptr3: u64 = dtor_node.name_ptr;
@@ -1160,6 +1249,11 @@ func parse_impl_block(p: *Parser) -> *Vec<*AstFunc> {
             }
             parser_vec_astfunc_push(funcs, dtor_node);
         } else if (parse_peek_kind(p) == TOKEN_FUNC) {
+            if (is_abst != 0) {
+                var abst_sig: *AstFunc = parse_func_decl_abst_signature(p);
+                compiler_register_abst_method(struct_name_ptr, struct_name_len, abst_sig.name_ptr, abst_sig.name_len);
+                continue;
+            }
             var func_node: *AstFunc = parse_func_decl(p);
             
             // Rename function: methodName -> StructName_methodName
@@ -1217,6 +1311,11 @@ func parse_impl_trait_block(p: *Parser) -> *Vec<*AstFunc> {
 
         if (parse_peek_kind(p) == TOKEN_STATIC) {
             emit_stderr("[ERROR] trait impl methods cannot be static\n", 52);
+            panic("Parse error");
+        }
+
+        if (parse_peek_kind(p) == TOKEN_ABST) {
+            emit_stderr("[ERROR] trait impl methods cannot be abstract\n", 56);
             panic("Parse error");
         }
 
@@ -1285,14 +1384,27 @@ func parse_impl_block_signature(p: *Parser) -> *Vec<*AstFunc> {
         if (parse_peek_kind(p) == TOKEN_EOF) { break; }
 
         var is_static: u64 = 0;
+        var is_abst: u64 = 0;
         if (parse_peek_kind(p) == TOKEN_STATIC) {
             is_static = 1;
             parse_adv(p);
+        }
+        if (parse_peek_kind(p) == TOKEN_ABST) {
+            is_abst = 1;
+            parse_adv(p);
+        }
+        if (is_static != 0 && is_abst != 0) {
+            emit_stderr("[ERROR] abstract method cannot be static\n", 43);
+            panic("Parse error");
         }
 
         if (parse_peek_kind(p) == TOKEN_CONSTRUCTOR) {
             if (is_static != 0) {
                 emit_stderr("[ERROR] constructor cannot be static\n", 41);
+                panic("Parse error");
+            }
+            if (is_abst != 0) {
+                emit_stderr("[ERROR] constructor cannot be abstract\n", 45);
                 panic("Parse error");
             }
             var ctor_sig: *AstFunc = parse_constructor_decl(p, struct_name_ptr, struct_name_len, 1);
@@ -1315,6 +1427,10 @@ func parse_impl_block_signature(p: *Parser) -> *Vec<*AstFunc> {
                 emit_stderr("[ERROR] destructor cannot be static\n", 40);
                 panic("Parse error");
             }
+            if (is_abst != 0) {
+                emit_stderr("[ERROR] destructor cannot be abstract\n", 44);
+                panic("Parse error");
+            }
             var dtor_sig: *AstFunc = parse_destructor_decl(p, struct_name_ptr, struct_name_len, 1);
 
             var original_name_ptr3: u64 = dtor_sig.name_ptr;
@@ -1331,6 +1447,11 @@ func parse_impl_block_signature(p: *Parser) -> *Vec<*AstFunc> {
             }
             parser_vec_astfunc_push(funcs, dtor_sig);
         } else if (parse_peek_kind(p) == TOKEN_FUNC) {
+            if (is_abst != 0) {
+                var abst_sig: *AstFunc = parse_func_decl_abst_signature(p);
+                compiler_register_abst_method(struct_name_ptr, struct_name_len, abst_sig.name_ptr, abst_sig.name_len);
+                continue;
+            }
             var func_ptr: *AstFunc = parse_func_decl_signature(p);
             if (func_ptr == 0) {
                 continue;
@@ -1389,6 +1510,11 @@ func parse_impl_trait_block_signature(p: *Parser) -> *Vec<*AstFunc> {
 
         if (parse_peek_kind(p) == TOKEN_STATIC) {
             emit_stderr("[ERROR] trait impl methods cannot be static\n", 52);
+            panic("Parse error");
+        }
+
+        if (parse_peek_kind(p) == TOKEN_ABST) {
+            emit_stderr("[ERROR] trait impl methods cannot be abstract\n", 56);
             panic("Parse error");
         }
 

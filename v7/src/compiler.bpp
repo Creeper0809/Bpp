@@ -31,6 +31,7 @@ var g_all_structs_vec: *Vec<*AstStructDef> = new Vec<*AstStructDef>(16);   // Ve
 var g_all_traits: *HashMap<u64, *TraitDef> = new HashMap<u64, *TraitDef>(64);       // HashMap: trait_name -> trait_def
 var g_all_traits_vec: *Vec<*TraitDef> = new Vec<*TraitDef>(16);   // Vec of all trait_defs
 var g_all_trait_impls_vec: *Vec<*TraitImpl> = new Vec<*TraitImpl>(32);   // Vec of all trait impls
+var g_abst_methods: *HashMap<u64, *Vec<*NameInfo>> = 0;                 // HashMap: struct name -> abstract methods
 var g_base_dir = 0;          // Base directory for imports
 var g_base_dir_len = 0;
 var g_lib_dir = 0;           // Library root directory for compiler/runtime modules
@@ -1633,6 +1634,40 @@ func compiler_register_impl_method(name_ptr: u64, name_len: u64) -> u64 {
     if (g_impl_methods.has(name_ptr, name_len) != 0) { return 0; }
     g_impl_methods.put(name_ptr, name_len, 1);
     return 0;
+}
+
+func compiler_register_abst_method(struct_ptr: u64, struct_len: u64, method_ptr: u64, method_len: u64) -> u64 {
+    if (struct_ptr == 0 || struct_len == 0 || method_ptr == 0 || method_len == 0) { return 0; }
+    if (g_abst_methods == 0) { g_abst_methods = new HashMap<u64, *Vec<*NameInfo>>(32); }
+    var list: *Vec<*NameInfo> = g_abst_methods.get(struct_ptr, struct_len);
+    if (list == 0) {
+        list = new Vec<*NameInfo>(4);
+        g_abst_methods.put(struct_ptr, struct_len, list);
+    }
+    var n: u64 = list.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var ni: *NameInfo = list.get(i);
+        if (str_eq(ni.ptr, ni.len, method_ptr, method_len)) { return 0; }
+    }
+    var name_info: *NameInfo = new NameInfo{method_ptr, method_len};
+    list.push(name_info);
+    return 0;
+}
+
+func compiler_get_abst_methods(struct_ptr: u64, struct_len: u64) -> *Vec<*NameInfo> {
+    if (g_abst_methods == 0) { return 0; }
+    return g_abst_methods.get(struct_ptr, struct_len);
+}
+
+func compiler_is_abst_method(struct_ptr: u64, struct_len: u64, method_ptr: u64, method_len: u64) -> u64 {
+    var list: *Vec<*NameInfo> = compiler_get_abst_methods(struct_ptr, struct_len);
+    if (list == 0) { return false; }
+    var n: u64 = list.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var ni: *NameInfo = list.get(i);
+        if (str_eq(ni.ptr, ni.len, method_ptr, method_len)) { return true; }
+    }
+    return false;
 }
 
 func compiler_is_impl_method(name_ptr: u64, name_len: u64) -> u64 {
@@ -3983,6 +4018,71 @@ func compiler_finalize_traits() -> u64 {
         ginfo.init_kind = GLOBAL_INIT_EXPR;
         ginfo.init_expr = (u64)vtable_lit;
         g_all_globals.push(ginfo);
+    }
+    return 0;
+}
+
+func compiler_collect_abst_methods_recursive(struct_def: *AstStructDef, out: *Vec<*NameInfo>) -> u64 {
+    if (struct_def == 0 || out == 0) { return 0; }
+    if (struct_def.parents_vec != 0) {
+        var pn: u64 = struct_def.parents_vec.len();
+        for (var pi: u64 = 0; pi < pn; pi++) {
+            var parent_desc: *ParentDesc = struct_def.parents_vec.get(pi);
+            var parent_def: *AstStructDef = parent_desc.struct_def;
+            if (parent_def == 0) {
+                parent_def = get_struct_def(parent_desc.name_ptr, parent_desc.name_len);
+            }
+            if (parent_def != 0) {
+                compiler_collect_abst_methods_recursive(parent_def, out);
+                var list: *Vec<*NameInfo> = compiler_get_abst_methods(parent_def.name_ptr, parent_def.name_len);
+                if (list != 0) {
+                    var n: u64 = list.len();
+                    for (var i: u64 = 0; i < n; i++) {
+                        var mi: *NameInfo = list.get(i);
+                        var exists: u64 = 0;
+                        var on: u64 = out.len();
+                        for (var oi: u64 = 0; oi < on; oi++) {
+                            var om: *NameInfo = out.get(oi);
+                            if (str_eq(om.ptr, om.len, mi.ptr, mi.len)) { exists = 1; break; }
+                        }
+                        if (exists == 0) { out.push(mi); }
+                    }
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+func compiler_finalize_abst_methods() -> u64 {
+    if (g_all_structs_vec == 0) { return 0; }
+    var sn: u64 = g_all_structs_vec.len();
+    for (var si: u64 = 0; si < sn; si++) {
+        var sd: *AstStructDef = g_all_structs_vec.get(si);
+        if (sd == 0 || sd.parents_vec == 0) { continue; }
+        var required: *Vec<*NameInfo> = new Vec<*NameInfo>(8);
+        compiler_collect_abst_methods_recursive(sd, required);
+        var rn: u64 = required.len();
+        for (var ri: u64 = 0; ri < rn; ri++) {
+            var mi: *NameInfo = required.get(ri);
+            if (compiler_is_abst_method(sd.name_ptr, sd.name_len, mi.ptr, mi.len) != 0) {
+                emit_stderr("[ERROR] Abstract method must be implemented in child: ", 58);
+                emit_stderr(sd.name_ptr, sd.name_len);
+                emit_stderr(".", 1);
+                emit_stderr(mi.ptr, mi.len);
+                emit_stderr("\n", 1);
+                panic("Parse error");
+            }
+            var method_name: *NameInfo = compiler_build_method_name(sd.name_ptr, sd.name_len, mi.ptr, mi.len);
+            if (compiler_is_impl_method(method_name.ptr, method_name.len) == 0) {
+                emit_stderr("[ERROR] Missing abstract method implementation in child: ", 63);
+                emit_stderr(sd.name_ptr, sd.name_len);
+                emit_stderr(".", 1);
+                emit_stderr(mi.ptr, mi.len);
+                emit_stderr("\n", 1);
+                panic("Parse error");
+            }
+        }
     }
     return 0;
 }
