@@ -53,4 +53,5 @@
 - [x] v7 trait/vtable MVP (trait/impl, vptr insertion, vtable globals, dynamic dispatch, tests) (2026-02-10)
 - [x] v7 trait runtime fixes: cast parsing guard, stack vptr init, thunk receiver adjust, build_and_test.sh pass (2026-02-11)
 - [x] v7 ssa: small-struct field span + struct literal size resolution (2026-02-11)
+- [x] v7 ssa: safe access/try/new/stack ctor support (2026-02-11)
 - [ ] v7 trait follow-ups: trait in struct inheritance list, Self return types, multi-trait layout rules
