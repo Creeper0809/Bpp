@@ -47,3 +47,4 @@
 - [x] v7 float: SSA codegen support (2026-02-08)
 - [x] v7 Type(...) stack constructor sugar + tests + build_and_test.sh pass (2026-02-09)
 - [x] v7 preserve sret pointer for large struct returns (2026-02-09)
+- [x] v7 stack constructor expression/arg/return support + tests + build_and_test.sh pass (2026-02-10)
