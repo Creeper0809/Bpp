@@ -75,6 +75,72 @@ func builder_shift_right(ctx: *BuilderCtx, value_reg: u64, shift_bits: u64) -> u
     return out_reg;
 }
 
+func builder_resolve_struct_literal_size(ctx: *BuilderCtx, lit: *AstStructLiteral, fallback_name_ptr: u64, fallback_name_len: u64) -> u64 {
+    if (lit == 0) { return 0; }
+    var size: u64 = builder_struct_size_from_def(lit.struct_def);
+    if (size != 0) { return size; }
+    if (fallback_name_ptr != 0 && fallback_name_len != 0) {
+        size = sizeof_type(TYPE_STRUCT, 0, fallback_name_ptr, fallback_name_len);
+        if (size != 0) { return size; }
+        var fb_def: *AstStructDef = get_struct_def(fallback_name_ptr, fallback_name_len);
+        if (fb_def != 0) {
+            size = builder_struct_size_from_def(fb_def);
+            if (size != 0) { return size; }
+        }
+    }
+    var ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)lit, ctx.symtab);
+    if (ti == 0) { return 0; }
+    if (ti.type_kind != TYPE_STRUCT || ti.ptr_depth != 0) { return 0; }
+    if (ti.struct_def != 0) {
+        size = builder_struct_size_from_def(ti.struct_def);
+        if (size != 0) { return size; }
+    }
+    if (ti.struct_name_ptr != 0 && ti.struct_name_len != 0) {
+        size = sizeof_type(TYPE_STRUCT, 0, ti.struct_name_ptr, ti.struct_name_len);
+        if (size != 0) { return size; }
+        var name_def: *AstStructDef = get_struct_def(ti.struct_name_ptr, ti.struct_name_len);
+        if (name_def != 0) {
+            size = builder_struct_size_from_def(name_def);
+            if (size != 0) { return size; }
+        }
+    }
+    return 0;
+}
+
+func builder_extract_field_from_small_struct_regs(ctx: *BuilderCtx, lo_reg: u64, hi_reg: u64, struct_size: u64, field_offset: u64, field_size: u64) -> u64 {
+    if (struct_size == 0 || field_size == 0) { return 0; }
+    var temp_offset: u64 = symtab_add(ctx.symtab, 0, 0, TYPE_STRUCT, 0, struct_size);
+    var temp_addr: u64 = builder_new_lea_local(ctx, temp_offset);
+    builder_store_by_size(ctx, temp_addr, lo_reg, 8);
+    if (struct_size > 8) {
+        var off8: u64 = build_const(ctx, 8);
+        var addr2: u64 = builder_new_reg(ctx);
+        var add_ptr: *SSAInstruction = ssa_new_inst(ctx.ssa_ctx, SSA_OP_ADD, addr2, ssa_operand_reg(temp_addr), ssa_operand_reg(off8));
+        ssa_inst_append(ctx.cur_block, add_ptr);
+        var tail_size: u64 = struct_size - 8;
+        if (tail_size > 8) { tail_size = 8; }
+        builder_store_by_size(ctx, addr2, hi_reg, tail_size);
+    }
+    var field_addr: u64 = temp_addr;
+    if (field_offset != 0) {
+        var off_reg: u64 = build_const(ctx, field_offset);
+        var addr3: u64 = builder_new_reg(ctx);
+        var add_ptr2: *SSAInstruction = ssa_new_inst(ctx.ssa_ctx, SSA_OP_ADD, addr3, ssa_operand_reg(temp_addr), ssa_operand_reg(off_reg));
+        ssa_inst_append(ctx.cur_block, add_ptr2);
+        field_addr = addr3;
+    }
+    if (ctx.debug_mode != 0) {
+        emit("[DEBUG] ssa member access span field via temp, size=", 55);
+        print_u64(struct_size);
+        emit(" offset=", 8);
+        print_u64(field_offset);
+        emit(" field=", 7);
+        print_u64(field_size);
+        emit("\n", 1);
+    }
+    return builder_load_by_size(ctx, field_addr, field_size);
+}
+
 func builder_mask_tagged_ptr(ctx: *BuilderCtx, value_reg: u64) -> u64 {
     var mask_reg: u64 = build_const(ctx, TAGGED_PTR_MASK);
     var out_reg: u64 = builder_new_reg(ctx);
@@ -971,11 +1037,11 @@ func builder_append_call_arg(ctx: *BuilderCtx, arg_regs: *Vec<u64>, arg: u64) ->
     // Fast-path: struct literal arguments (handle byval lowering directly)
     if (arg_kind == AST_STRUCT_LITERAL) {
         var lit: *AstStructLiteral = (*AstStructLiteral)arg;
-        var struct_size_lit: u64 = builder_struct_size_from_def(lit.struct_def);
-        if (struct_size_lit == 0 && lit.values_vec != 0) {
-            struct_size_lit = lit.values_vec.len() * 8;
+        var struct_size_lit: u64 = builder_resolve_struct_literal_size(ctx, lit, 0, 0);
+        if (struct_size_lit == 0) {
+            emit_stderr("[ERROR] SSA arg struct literal size unresolved\n", 51);
+            return 0;
         }
-        if (struct_size_lit == 0) { return 0; }
 
         if (lit.struct_def != 0 && struct_size_lit <= 16) {
             var struct_info: *AstStructDef = lit.struct_def;
@@ -1091,12 +1157,13 @@ func builder_append_call_arg(ctx: *BuilderCtx, arg_regs: *Vec<u64>, arg: u64) ->
                 if (def_size > 0) { struct_size = def_size; }
             }
             if (struct_size == 0 && arg_kind == AST_STRUCT_LITERAL) {
-                var lit_fallback: *AstStructLiteral = (*AstStructLiteral)arg;
-                if (lit_fallback.values_vec != 0) {
-                    struct_size = ((*Vec<u64>)lit_fallback.values_vec).len() * 8;
-                }
+                var lit_fallback2: *AstStructLiteral = (*AstStructLiteral)arg;
+                struct_size = builder_resolve_struct_literal_size(ctx, lit_fallback2, 0, 0);
             }
-            if (struct_size == 0) { return 0; }
+            if (struct_size == 0) {
+                emit_stderr("[ERROR] SSA arg struct size unresolved\n", 42);
+                return 0;
+            }
             if (struct_size <= 8) {
                 if (arg_kind == AST_CALL) {
                     var reg0: u64 = builder_new_reg(ctx);
@@ -2416,6 +2483,10 @@ func build_expr(ctx: *BuilderCtx, node: u64) -> u64 {
                                 var shift_amt_fp4: u64 = (field_offset_fp4 - 8) * 8;
                                 return builder_shift_right(ctx, hi_reg_fp2, shift_amt_fp4);
                             }
+                            var lo_reg_fp_span: u64 = builder_new_reg(ctx);
+                            var hi_reg_fp_span: u64 = builder_new_reg(ctx);
+                            builder_emit_call_ptr(ctx, (*AstCallPtr)cp_tmp, lo_reg_fp_span, hi_reg_fp_span);
+                            return builder_extract_field_from_small_struct_regs(ctx, lo_reg_fp_span, hi_reg_fp_span, struct_size_fp2, field_offset_fp4, field_size_fp4);
                         }
                     }
                 }
@@ -2447,6 +2518,10 @@ func build_expr(ctx: *BuilderCtx, node: u64) -> u64 {
                                 var shift_amt2: u64 = (field_offset - 8) * 8;
                                 return builder_shift_right(ctx, hi_reg, shift_amt2);
                             }
+                            var lo_reg_span: u64 = builder_new_reg(ctx);
+                            var hi_reg_span: u64 = builder_new_reg(ctx);
+                            builder_emit_call(ctx, call, lo_reg_span, hi_reg_span);
+                            return builder_extract_field_from_small_struct_regs(ctx, lo_reg_span, hi_reg_span, struct_size, field_offset, field_size);
                         }
                     } else if (struct_size > 16) {
                         var struct_def_big: *AstStructDef = get_struct_def(fn.ret_struct_name_ptr, fn.ret_struct_name_len);
@@ -2581,7 +2656,7 @@ func build_expr(ctx: *BuilderCtx, node: u64) -> u64 {
                         var field_size: u64 = builder_type_size_from_expr(ctx, node);
 
                         // Only handle simple cases: field fully within lo or hi register
-                        // Field spans both registers → fallback to memory
+                        // Field spans both registers → use temp memory extraction
                         if (field_offset + field_size <= 8) {
                             // Field in lo register (rax)
                             var lo_reg: u64 = builder_new_reg(ctx);
@@ -2614,7 +2689,16 @@ func build_expr(ctx: *BuilderCtx, node: u64) -> u64 {
                             var shifted2: u64 = builder_shift_right(ctx, hi_reg, shift_amt2);
                             return shifted2;
                         }
-                        // Field spans both registers - fallback to memory-based access
+                        var lo_reg_span: u64 = builder_new_reg(ctx);
+                        var hi_reg_span: u64 = builder_new_reg(ctx);
+                        if (obj_kind == AST_CALL) {
+                            builder_emit_call(ctx, (*AstCall)obj, lo_reg_span, hi_reg_span);
+                        } else if (obj_kind == AST_METHOD_CALL) {
+                            builder_emit_method_call(ctx, (*AstMethodCall)obj, lo_reg_span, hi_reg_span);
+                        } else {
+                            builder_emit_call_ptr(ctx, (*AstCallPtr)obj, lo_reg_span, hi_reg_span);
+                        }
+                        return builder_extract_field_from_small_struct_regs(ctx, lo_reg_span, hi_reg_span, struct_size, field_offset, field_size);
                     }
                 }
             }
@@ -2709,6 +2793,10 @@ func build_expr(ctx: *BuilderCtx, node: u64) -> u64 {
                     var shift_amt_fp2: u64 = (field_offset_fp2 - 8) * 8;
                     return builder_shift_right(ctx, hi_reg_fp, shift_amt_fp2);
                 }
+                var lo_reg_fp_span: u64 = builder_new_reg(ctx);
+                var hi_reg_fp_span: u64 = builder_new_reg(ctx);
+                builder_emit_call_ptr(ctx, (*AstCallPtr)obj, lo_reg_fp_span, hi_reg_fp_span);
+                return builder_extract_field_from_small_struct_regs(ctx, lo_reg_fp_span, hi_reg_fp_span, struct_size_fp, field_offset_fp2, field_size_fp2);
             }
         }
 
@@ -3804,18 +3892,13 @@ func build_stmt(ctx: *BuilderCtx, node: u64) -> u64 {
 
         if (ast_kind(ret.expr) == AST_STRUCT_LITERAL) {
             var lit0: *AstStructLiteral = (*AstStructLiteral)ret.expr;
-            var struct_size0: u64 = builder_struct_size_from_def(lit0.struct_def);
+            var fallback_name_ptr: u64 = emitter_get_ret_struct_name_ptr();
+            var fallback_name_len: u64 = emitter_get_ret_struct_name_len();
+            var struct_size0: u64 = builder_resolve_struct_literal_size(ctx, lit0, fallback_name_ptr, fallback_name_len);
             if (struct_size0 == 0) {
-                var fallback_name_ptr: u64 = emitter_get_ret_struct_name_ptr();
-                var fallback_name_len: u64 = emitter_get_ret_struct_name_len();
-                if (fallback_name_ptr != 0 && fallback_name_len != 0) {
-                    struct_size0 = sizeof_type(TYPE_STRUCT, 0, fallback_name_ptr, fallback_name_len);
-                }
+                emit_stderr("[ERROR] SSA return struct literal size unresolved\n", 54);
+                return 0;
             }
-            if (struct_size0 == 0 && lit0.values_vec != 0) {
-                struct_size0 = ((*Vec<u64>)lit0.values_vec).len() * 8;
-            }
-            if (struct_size0 == 0) { return 0; }
             if (struct_size0 > 16) {
                 if (ctx.sret_addr_reg == 0) { return 0; }
                 builder_struct_literal_init(ctx, lit0.struct_def, lit0.values_vec, ctx.sret_addr_reg);
@@ -3906,9 +3989,7 @@ func build_stmt(ctx: *BuilderCtx, node: u64) -> u64 {
             }
             if (struct_size == 0 && expr_kind == AST_STRUCT_LITERAL) {
                 var lit_fallback: *AstStructLiteral = (*AstStructLiteral)ret.expr;
-                if (lit_fallback.values_vec != 0) {
-                    struct_size = lit_fallback.values_vec.len() * 8;
-                }
+                struct_size = builder_resolve_struct_literal_size(ctx, lit_fallback, struct_name_ptr, struct_name_len);
             }
             if (expr_kind == AST_CALL) {
                 var call_node: *AstCall = (*AstCall)ret.expr;
@@ -3930,7 +4011,10 @@ func build_stmt(ctx: *BuilderCtx, node: u64) -> u64 {
                     }
                 }
             }
-            if (struct_size == 0) { return 0; }
+            if (struct_size == 0) {
+                emit_stderr("[ERROR] SSA return struct size unresolved\n", 46);
+                return 0;
+            }
             if (struct_size > 16) {
                 if (ctx.sret_addr_reg == 0) { return 0; }
                 if (expr_kind == AST_STRUCT_LITERAL) {
