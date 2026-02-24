@@ -2,6 +2,7 @@
 # B 컴파일러 빌드 → 셀프 호스팅 → 테스트 자동화 스크립트
 
 set -e  # 에러 발생 시 즉시 중단
+set -o pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -22,6 +23,19 @@ BIN_DIR="$ROOT_DIR/bin"
 SRC_FILE="$SCRIPT_DIR/src/main.bpp"
 TEST_SCRIPT="$SCRIPT_DIR/test/run_tests.sh"
 BASE_COMPILER="${VERSION}_base"
+NASM_FLAGS="-felf64 -O0"
+
+# Use RAM disk for large self-host ASM I/O when available (no build step skipped).
+ASM_WORK_DIR="$BUILD_DIR"
+if [ -d "/dev/shm" ] && [ -w "/dev/shm" ]; then
+    ASM_WORK_DIR="/dev/shm/bpp_${VERSION}_selfhost_$$"
+    mkdir -p "$ASM_WORK_DIR"
+fi
+trap 'if [ "$ASM_WORK_DIR" != "$BUILD_DIR" ]; then rm -rf "$ASM_WORK_DIR"; fi' EXIT
+
+STAGE0_ASM="$ASM_WORK_DIR/${VERSION}_stage0.asm"
+STAGE1_ASM="$ASM_WORK_DIR/${VERSION}_stage1.asm"
+STAGE2_ASM="$ASM_WORK_DIR/${VERSION}_stage2.asm"
 
 echo "========================================="
 echo "${VERSION} Build & Test Automation"
@@ -33,51 +47,62 @@ echo "[1/6] Compiling ${VERSION}..."
 cd "$ROOT_DIR"
 
 # {VERSION}_base가 있으면 사용, 없으면 이전 버전 사용
+BASE_BIN=""
 if [ -f "./bin/${BASE_COMPILER}" ]; then
     echo "   (${BASE_COMPILER} used)"
-    ./bin/${BASE_COMPILER} -asm ${SRC_FILE} > build/${VERSION}_stage0.asm
+    BASE_BIN="./bin/${BASE_COMPILER}"
 elif [ -f "./bin/${PREV_VERSION}_stage1" ]; then
     echo "   (${PREV_VERSION}_stage1 used)"
-    ./bin/${PREV_VERSION}_stage1 -asm ${SRC_FILE} > build/${VERSION}_stage0.asm
+    BASE_BIN="./bin/${PREV_VERSION}_stage1"
 elif [ -f "./bin/${PREV_VERSION}" ]; then
     echo "   (${PREV_VERSION} used)"
-    ./bin/${PREV_VERSION} -asm ${SRC_FILE} > build/${VERSION}_stage0.asm
+    BASE_BIN="./bin/${PREV_VERSION}"
 else
     echo "Error: Base compiler not found."
     echo "   ${BASE_COMPILER}, ${PREV_VERSION}_stage1 or ${PREV_VERSION} is required."
     exit 1
 fi
-nasm -felf64 build/${VERSION}_stage0.asm -o build/${VERSION}_stage0.o
+
+echo "   (ASM work dir: ${ASM_WORK_DIR})"
+
+"${BASE_BIN}" -asm "${SRC_FILE}" > "${STAGE0_ASM}"
+nasm ${NASM_FLAGS} "${STAGE0_ASM}" -o "build/${VERSION}_stage0.o"
 ld build/${VERSION}_stage0.o -o bin/${VERSION}_stage0
 echo "Stage 0 Build Completed"
 echo ""
 
 # Step 2: 셀프 호스팅 (1단계)
 echo "[2/6] Self-Hosting Stage 1..."
-./bin/${VERSION}_stage0 -asm ${SRC_FILE} > build/${VERSION}_stage1.asm
-nasm -felf64 build/${VERSION}_stage1.asm -o build/${VERSION}_stage1.o
+./bin/${VERSION}_stage0 -asm "${SRC_FILE}" > "${STAGE1_ASM}"
+nasm ${NASM_FLAGS} "${STAGE1_ASM}" -o "build/${VERSION}_stage1.o"
 ld build/${VERSION}_stage1.o -o bin/${VERSION}_stage1
 echo "Stage 1 Build Completed"
 echo ""
 
 # Step 3: 셀프 호스팅 (2단계)
 echo "[3/6] Self-Hosting Stage 2..."
-./bin/${VERSION}_stage1 -asm ${SRC_FILE} > build/${VERSION}_stage2.asm
+./bin/${VERSION}_stage1 -asm "${SRC_FILE}" > "${STAGE2_ASM}"
 echo "Stage 2 Build Completed"
 echo ""
 
 # Step 4: ASM 비교 (1단계 vs 2단계)
 echo "[4/6] Self-Hosting Verification..."
-if diff -q build/${VERSION}_stage1.asm build/${VERSION}_stage2.asm > /dev/null; then
+# We only need equality check; cmp is faster than textual diff for this.
+if cmp -s "${STAGE1_ASM}" "${STAGE2_ASM}"; then
     echo "Self-Hosting Success! (Stage 1 == Stage 2)"
-    echo "   ASM: $(wc -l < build/${VERSION}_stage1.asm) lines"
+    echo "   ASM: $(wc -l < "${STAGE1_ASM}") lines"
 else
     echo "Self-Hosting Failed! ASM is different."
-    echo "   Stage 1: $(wc -l < build/${VERSION}_stage1.asm) lines"
-    echo "   Stage 2: $(wc -l < build/${VERSION}_stage2.asm) lines"
+    echo "   Stage 1: $(wc -l < "${STAGE1_ASM}") lines"
+    echo "   Stage 2: $(wc -l < "${STAGE2_ASM}") lines"
     exit 1
 fi
 echo ""
+
+# Persist ASM artifacts under build/ as before.
+cp "${STAGE0_ASM}" "build/${VERSION}_stage0.asm"
+cp "${STAGE1_ASM}" "build/${VERSION}_stage1.asm"
+cp "${STAGE2_ASM}" "build/${VERSION}_stage2.asm"
 
 # Step 5: 테스트 실행
 echo "[5/6] Running Tests..."
