@@ -64,6 +64,8 @@ var g_impl_prefix_len = 0;
 var g_impl_methods: *HashMap<u64, u64> = new HashMap<u64, u64>(64);       // HashMap: impl-lowered name -> 1
 var g_reg_aliases: *HashMap<u64, *NameInfo> = new HashMap<u64, *NameInfo>(64);   // HashMap: alias name -> register name
 
+const PRELUDE_MODULE_COUNT = 7;
+
 // Generic function template (48 bytes)
 struct GenericFuncTemplate {
     name_ptr: u64;
@@ -265,6 +267,96 @@ func compiler_get_source_len() -> u64 {
     return g_file_len;
 }
 
+func clone_cstr(src_ptr: u64, src_len: u64) -> u64 {
+    if (src_ptr == 0) { return 0; }
+    var dst_ptr: u64 = heap_alloc((src_len + 1) * sizeof(u8));
+    str_copy(dst_ptr, src_ptr, src_len);
+    var dst_u8: []u8 = slice(dst_ptr, src_len + 1);
+    dst_u8[src_len] = 0;
+    return dst_ptr;
+}
+
+func clone_name_info(src_ptr: u64, src_len: u64) -> *NameInfo {
+    var copied_ptr: u64 = clone_cstr(src_ptr, src_len);
+    return new NameInfo{copied_ptr, src_len};
+}
+
+func clone_ast_import(src: *AstImport, with_symbol_alias: u64) -> *AstImport {
+    if (src == 0) { return 0; }
+    var path_copy: u64 = clone_cstr(src.path_ptr, src.path_len);
+    var sym_copy: u64 = 0;
+    var alias_copy: u64 = 0;
+    var sym_len: u64 = 0;
+    var alias_len: u64 = 0;
+    if (with_symbol_alias != 0 && src.symbol_ptr != 0) {
+        sym_copy = clone_cstr(src.symbol_ptr, src.symbol_len);
+        alias_copy = clone_cstr(src.alias_ptr, src.alias_len);
+        sym_len = src.symbol_len;
+        alias_len = src.alias_len;
+    }
+    return ast_import(path_copy, src.path_len, sym_copy, sym_len, alias_copy, alias_len);
+}
+
+func prelude_module_info(index: u64, out_ptr: *u64, out_len: *u64) -> u64 {
+    switch (index) {
+        case 0:
+            *out_ptr = (u64)"std/io";
+            *out_len = 6;
+            return true;
+        case 1:
+            *out_ptr = (u64)"std/mem";
+            *out_len = 7;
+            return true;
+        case 2:
+            *out_ptr = (u64)"std/str";
+            *out_len = 7;
+            return true;
+        case 3:
+            *out_ptr = (u64)"std/char";
+            *out_len = 8;
+            return true;
+        case 4:
+            *out_ptr = (u64)"std/util";
+            *out_len = 8;
+            return true;
+        case 5:
+            *out_ptr = (u64)"std/vec";
+            *out_len = 7;
+            return true;
+        case 6:
+            *out_ptr = (u64)"std/hashmap";
+            *out_len = 11;
+            return true;
+        default:
+            *out_ptr = 0;
+            *out_len = 0;
+            return false;
+    }
+}
+
+func build_joined_name(lhs_ptr: u64, lhs_len: u64, rhs_ptr: u64, rhs_len: u64) -> *NameInfo {
+    var full_len: u64 = lhs_len + 1 + rhs_len;
+    var full_ptr: u64 = heap_alloc((full_len + 1) * sizeof(u8));
+    str_copy(full_ptr, lhs_ptr, lhs_len);
+    var full_u8: []u8 = slice(full_ptr, full_len + 1);
+    full_u8[lhs_len] = 95;
+    str_copy(full_ptr + lhs_len + 1, rhs_ptr, rhs_len);
+    full_u8[full_len] = 0;
+    return new NameInfo{full_ptr, full_len};
+}
+
+func build_joined_name_with_suffix(lhs_ptr: u64, lhs_len: u64, rhs_ptr: u64, rhs_len: u64, suffix_ptr: u64, suffix_len: u64) -> *NameInfo {
+    var full_len: u64 = lhs_len + 1 + rhs_len + suffix_len;
+    var full_ptr: u64 = heap_alloc((full_len + 1) * sizeof(u8));
+    str_copy(full_ptr, lhs_ptr, lhs_len);
+    var full_u8: []u8 = slice(full_ptr, full_len + 1);
+    full_u8[lhs_len] = 95;
+    str_copy(full_ptr + lhs_len + 1, rhs_ptr, rhs_len);
+    str_copy(full_ptr + lhs_len + 1 + rhs_len, suffix_ptr, suffix_len);
+    full_u8[full_len] = 0;
+    return new NameInfo{full_ptr, full_len};
+}
+
 // ============================================
 // Config File Parsing
 // ============================================
@@ -376,15 +468,7 @@ func module_id_from_path(path: u64, path_len: u64) -> *NameInfo {
 
 // Import path already normalized to "a/b" without extension
 func module_id_from_import(path: u64, path_len: u64) -> *NameInfo {
-    var id_ptr: u64 = heap_alloc((path_len + 1) * sizeof(u8));
-    var id_u8: []u8 = slice(id_ptr, path_len + 1);
-    var path_u8: []u8 = slice(path, path_len);
-    for (var i: u64 = 0; i < path_len; i++) {
-        id_u8[i] = path_u8[i];
-    }
-    id_u8[path_len] = 0;
-    var out: *NameInfo = new NameInfo{id_ptr, path_len};
-    return out;
+    return clone_name_info(path, path_len);
 }
 
 func module_prefix_from_id(id_ptr: u64, id_len: u64) -> *NameInfo {
@@ -759,13 +843,12 @@ func prelude_try_symbol(module_path: u64, module_len: u64, name_ptr: u64, name_l
 }
 
 func load_std_prelude_modules() -> u64 {
-    if (!load_module_by_name("std/io", 6)) { return false; }
-    if (!load_module_by_name("std/mem", 7)) { return false; }
-    if (!load_module_by_name("std/str", 7)) { return false; }
-    if (!load_module_by_name("std/char", 8)) { return false; }
-    if (!load_module_by_name("std/util", 8)) { return false; }
-    if (!load_module_by_name("std/vec", 7)) { return false; }
-    if (!load_module_by_name("std/hashmap", 11)) { return false; }
+    for (var i: u64 = 0; i < PRELUDE_MODULE_COUNT; i++) {
+        var module_ptr: u64 = 0;
+        var module_len: u64 = 0;
+        if (prelude_module_info(i, &module_ptr, &module_len) == 0) { continue; }
+        if (!load_module_by_name(module_ptr, module_len)) { return false; }
+    }
     return true;
 }
 
@@ -789,20 +872,13 @@ func resolve_prelude_alias_lazy(name_ptr: u64, name_len: u64) -> *NameInfo {
         return 0;
     }
 
-    var info: *NameInfo = prelude_try_symbol("std/io", 6, name_ptr, name_len);
-    if (info != 0) { return info; }
-    info = prelude_try_symbol("std/mem", 7, name_ptr, name_len);
-    if (info != 0) { return info; }
-    info = prelude_try_symbol("std/str", 7, name_ptr, name_len);
-    if (info != 0) { return info; }
-    info = prelude_try_symbol("std/char", 8, name_ptr, name_len);
-    if (info != 0) { return info; }
-    info = prelude_try_symbol("std/util", 8, name_ptr, name_len);
-    if (info != 0) { return info; }
-    info = prelude_try_symbol("std/vec", 7, name_ptr, name_len);
-    if (info != 0) { return info; }
-    info = prelude_try_symbol("std/hashmap", 11, name_ptr, name_len);
-    if (info != 0) { return info; }
+    for (var i: u64 = 0; i < PRELUDE_MODULE_COUNT; i++) {
+        var module_ptr: u64 = 0;
+        var module_len: u64 = 0;
+        if (prelude_module_info(i, &module_ptr, &module_len) == 0) { continue; }
+        var info: *NameInfo = prelude_try_symbol(module_ptr, module_len, name_ptr, name_len);
+        if (info != 0) { return info; }
+    }
     if (g_prelude_miss_cache == 0) {
         g_prelude_miss_cache = new HashMap<u64, u64>(256);
     }
@@ -820,18 +896,11 @@ func resolve_name(name_ptr: u64, name_len: u64) -> *NameInfo {
             var suffix_len: u64 = name_len - suffix_idx;
             var combined_len: u64 = resolved_base.len + suffix_len;
             var combined_ptr: u64 = heap_alloc((combined_len + 1) * sizeof(u8));
+            str_copy(combined_ptr, resolved_base.ptr, resolved_base.len);
+            str_copy(combined_ptr + resolved_base.len, name_ptr + suffix_idx, suffix_len);
             var combined_u8: []u8 = slice(combined_ptr, combined_len + 1);
-            var resolved_base_u8: []u8 = slice(resolved_base.ptr, resolved_base.len);
-            var name_u8: []u8 = slice(name_ptr, name_len);
-            for (var i: u64 = 0; i < resolved_base.len; i++) {
-                combined_u8[i] = resolved_base_u8[i];
-            }
-            for (var j: u64 = 0; j < suffix_len; j++) {
-                combined_u8[resolved_base.len + j] = name_u8[suffix_idx + j];
-            }
             combined_u8[combined_len] = 0;
-            var info_out: *NameInfo = new NameInfo{combined_ptr, combined_len};
-            return info_out;
+            return new NameInfo{combined_ptr, combined_len};
         }
     }
     if (g_current_module_ptr != 0 && g_current_module_len != 0) {
@@ -1152,17 +1221,7 @@ func load_module_pass1(file_path: u64, file_path_len: u64) -> u64 {
     var num_imports: u64 = imports_only.len();
     for (var ii: u64 = 0; ii < num_imports; ii++) {
         var imp: *AstImport = imports_only.get(ii);
-        var imp_path: u64 = imp.path_ptr;
-        var imp_len: u64 = imp.path_len;
-        var path_copy: u64 = heap_alloc((imp_len + 1) * sizeof(u8));
-        var path_copy_u8: []u8 = slice(path_copy, imp_len + 1);
-        var imp_path_u8: []u8 = slice(imp_path, imp_len);
-        for (var ci: u64 = 0; ci < imp_len; ci++) {
-            path_copy_u8[ci] = imp_path_u8[ci];
-        }
-        path_copy_u8[imp_len] = 0;
-        var imp_copy: *AstImport = ast_import(path_copy, imp_len, 0, 0, 0, 0);
-        imports_copy.push(imp_copy);
+        imports_copy.push(clone_ast_import(imp, 0));
     }
     if (g_module_imports_pass1 == 0) { g_module_imports_pass1 = new HashMap<u64, *Vec<*AstImport>>(64); }
     g_module_imports_pass1.put(file_path, file_path_len, imports_copy);
@@ -1194,33 +1253,14 @@ func load_std_prelude() -> u64 {
     g_prelude_loaded = 0;
     g_prelude_miss_cache = new HashMap<u64, u64>(256);
 
-    if (!load_module_by_name("std/io", 6)) { return false; }
-    var id_io: *NameInfo = module_id_from_import("std/io", 6);
-    prelude_import_all_from_module(id_io.ptr, id_io.len);
-
-    if (!load_module_by_name("std/mem", 7)) { return false; }
-    var id_mem: *NameInfo = module_id_from_import("std/mem", 7);
-    prelude_import_all_from_module(id_mem.ptr, id_mem.len);
-
-    if (!load_module_by_name("std/str", 7)) { return false; }
-    var id_str: *NameInfo = module_id_from_import("std/str", 7);
-    prelude_import_all_from_module(id_str.ptr, id_str.len);
-
-    if (!load_module_by_name("std/char", 8)) { return false; }
-    var id_char: *NameInfo = module_id_from_import("std/char", 8);
-    prelude_import_all_from_module(id_char.ptr, id_char.len);
-
-    if (!load_module_by_name("std/util", 8)) { return false; }
-    var id_util: *NameInfo = module_id_from_import("std/util", 8);
-    prelude_import_all_from_module(id_util.ptr, id_util.len);
-
-    if (!load_module_by_name("std/vec", 7)) { return false; }
-    var id_vec: *NameInfo = module_id_from_import("std/vec", 7);
-    prelude_import_all_from_module(id_vec.ptr, id_vec.len);
-
-    if (!load_module_by_name("std/hashmap", 11)) { return false; }
-    var id_hm: *NameInfo = module_id_from_import("std/hashmap", 11);
-    prelude_import_all_from_module(id_hm.ptr, id_hm.len);
+    for (var i: u64 = 0; i < PRELUDE_MODULE_COUNT; i++) {
+        var module_ptr: u64 = 0;
+        var module_len: u64 = 0;
+        if (prelude_module_info(i, &module_ptr, &module_len) == 0) { continue; }
+        if (!load_module_by_name(module_ptr, module_len)) { return false; }
+        var module_id: *NameInfo = module_id_from_import(module_ptr, module_len);
+        prelude_import_all_from_module(module_id.ptr, module_id.len);
+    }
     g_prelude_loaded = 1;
     return true;
 }
@@ -1236,14 +1276,7 @@ func load_module(file_path: u64, file_path_len: u64) -> u64 {
 
     g_loaded_modules.put(file_path, file_path_len, 1);
 
-    var path_copy2: u64 = heap_alloc((file_path_len + 1) * sizeof(u8));
-    var path_copy2_u8: []u8 = slice(path_copy2, file_path_len + 1);
-    var file_path_u8: []u8 = slice(file_path, file_path_len);
-    for (var pc: u64 = 0; pc < file_path_len; pc++) {
-        path_copy2_u8[pc] = file_path_u8[pc];
-    }
-    path_copy2_u8[file_path_len] = 0;
-    var path_info: *NameInfo = new NameInfo{path_copy2, file_path_len};
+    var path_info: *NameInfo = clone_name_info(file_path, file_path_len);
     g_loaded_modules_vec.push(path_info);
 
     // Ensure imports are fully parsed before this module (type resolution).
@@ -1303,43 +1336,7 @@ func load_module(file_path: u64, file_path_len: u64) -> u64 {
     var num_imports: u64 = imports.len();
     for (var ii: u64 = 0; ii < num_imports; ii++) {
         var imp: *AstImport = imports.get(ii);
-        var imp_path: u64 = imp.path_ptr;
-        var imp_len: u64 = imp.path_len;
-        var imp_sym_ptr: u64 = imp.symbol_ptr;
-        var imp_sym_len: u64 = imp.symbol_len;
-        var imp_alias_ptr: u64 = imp.alias_ptr;
-        var imp_alias_len: u64 = imp.alias_len;
-
-        var path_copy: u64 = heap_alloc((imp_len + 1) * sizeof(u8));
-        var path_copy_u8: []u8 = slice(path_copy, imp_len + 1);
-        var imp_path_u8: []u8 = slice(imp_path, imp_len);
-        for (var ci: u64 = 0; ci < imp_len; ci++) {
-            path_copy_u8[ci] = imp_path_u8[ci];
-        }
-        path_copy_u8[imp_len] = 0;
-
-        var sym_copy: u64 = 0;
-        var alias_copy: u64 = 0;
-        if (imp_sym_ptr != 0) {
-            sym_copy = heap_alloc((imp_sym_len + 1) * sizeof(u8));
-            var sym_copy_u8: []u8 = slice(sym_copy, imp_sym_len + 1);
-            var imp_sym_u8: []u8 = slice(imp_sym_ptr, imp_sym_len);
-            for (var si: u64 = 0; si < imp_sym_len; si++) {
-                sym_copy_u8[si] = imp_sym_u8[si];
-            }
-            sym_copy_u8[imp_sym_len] = 0;
-
-            alias_copy = heap_alloc((imp_alias_len + 1) * sizeof(u8));
-            var alias_copy_u8: []u8 = slice(alias_copy, imp_alias_len + 1);
-            var imp_alias_u8: []u8 = slice(imp_alias_ptr, imp_alias_len);
-            for (var ai: u64 = 0; ai < imp_alias_len; ai++) {
-                alias_copy_u8[ai] = imp_alias_u8[ai];
-            }
-            alias_copy_u8[imp_alias_len] = 0;
-        }
-
-        var imp_copy: *AstImport = ast_import(path_copy, imp_len, sym_copy, imp_sym_len, alias_copy, imp_alias_len);
-        imports_copy.push(imp_copy);
+        imports_copy.push(clone_ast_import(imp, 1));
     }
     g_module_imports_pass2.put(file_path, file_path_len, imports_copy);
 
@@ -3488,40 +3485,11 @@ func compiler_build_method_name(struct_name_ptr: u64, struct_name_len: u64, meth
 }
 
 func compiler_build_method_name_base(struct_name_ptr: u64, base_len: u64, method_ptr: u64, method_len: u64, suffix_len: u64) -> *NameInfo {
-    var full_len: u64 = base_len + 1 + method_len + suffix_len;
-    var full_ptr: u64 = heap_alloc((full_len + 1) * sizeof(u8));
-    var full_u8: []u8 = slice(full_ptr, full_len + 1);
-    var struct_u8: []u8 = slice(struct_name_ptr, base_len + suffix_len);
-    var method_u8: []u8 = slice(method_ptr, method_len);
-    for (var i: u64 = 0; i < base_len; i++) {
-        full_u8[i] = struct_u8[i];
-    }
-    full_u8[base_len] = 95;
-    for (var j: u64 = 0; j < method_len; j++) {
-        full_u8[base_len + 1 + j] = method_u8[j];
-    }
-    for (var k: u64 = 0; k < suffix_len; k++) {
-        full_u8[base_len + 1 + method_len + k] = struct_u8[base_len + k];
-    }
-    full_u8[full_len] = 0;
-    return new NameInfo{full_ptr, full_len};
+    return build_joined_name_with_suffix(struct_name_ptr, base_len, method_ptr, method_len, struct_name_ptr + base_len, suffix_len);
 }
 
 func compiler_build_scoped_name(base_ptr: u64, base_len: u64, member_ptr: u64, member_len: u64) -> *NameInfo {
-    var full_len: u64 = base_len + 1 + member_len;
-    var full_ptr: u64 = heap_alloc((full_len + 1) * sizeof(u8));
-    var full_u8: []u8 = slice(full_ptr, full_len + 1);
-    var base_u8: []u8 = slice(base_ptr, base_len);
-    var member_u8: []u8 = slice(member_ptr, member_len);
-    for (var i: u64 = 0; i < base_len; i++) {
-        full_u8[i] = base_u8[i];
-    }
-    full_u8[base_len] = 95;
-    for (var j: u64 = 0; j < member_len; j++) {
-        full_u8[base_len + 1 + j] = member_u8[j];
-    }
-    full_u8[full_len] = 0;
-    return new NameInfo{full_ptr, full_len};
+    return build_joined_name(base_ptr, base_len, member_ptr, member_len);
 }
 
 // ============================================
