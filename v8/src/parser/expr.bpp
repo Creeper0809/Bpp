@@ -1,0 +1,964 @@
+// parse_expr.b - Expression parsing
+//
+// Pratt parser style with precedence climbing:
+// - Primary expressions (literals, identifiers, calls)
+// - Postfix expressions (array access, member access)
+// - Unary expressions (*, -, !)
+// - Binary expressions (arithmetic, comparison, logical)
+
+import std.io;
+import std.vec;
+import std.util;
+import std.str;
+import types;
+import lexer;
+import ast;
+import compiler;
+import parser.util;
+import parser.type;
+
+// ============================================
+// Primary Expression
+// ============================================
+
+func parse_primary(p: *Parser) -> *AstNode {
+    push_trace("parse_primary", "parser/expr.b", __LINE__);
+    defer pop_trace();
+    var k: u64 = parse_peek_kind(p);
+    
+    switch (k) {
+        case TOKEN_NUMBER:
+            var tok: *Token = parse_peek(p);
+            parse_adv(p);
+                return ast_literal(parse_num_val(tok));
+        case TOKEN_FLOAT:
+            var ftok: *Token = parse_peek(p);
+            parse_adv(p);
+                return ast_float(ftok.ptr, ftok.len);
+        case TOKEN_LINE_MACRO:
+            var tok2: *Token = parse_peek(p);
+            parse_adv(p);
+            var line: u64 = tok2.line;
+                return ast_literal(line);
+        case TOKEN_TRUE:
+            parse_adv(p);
+                return ast_literal(1);
+        case TOKEN_FALSE:
+            parse_adv(p);
+                return ast_literal(0);
+        case TOKEN_NULL:
+            parse_adv(p);
+                return ast_literal(0);
+        case TOKEN_STRING:
+            var tok3: *Token = parse_peek(p);
+            parse_adv(p);
+                return ast_string(tok3.ptr, tok3.len);
+        case TOKEN_SIZEOF:
+            parse_adv(p);
+            parse_consume(p, TOKEN_LPAREN);
+
+            var nk: u64 = parse_peek_kind(p);
+            var is_type: u64 = 0;
+            if (nk == TOKEN_STAR || nk == TOKEN_U8 || nk == TOKEN_U16 || nk == TOKEN_U32 || nk == TOKEN_U64 || nk == TOKEN_I64 || nk == TOKEN_F64 || nk == TOKEN_LBRACKET) {
+                is_type = 1;
+            } else if (nk == TOKEN_IDENTIFIER) {
+                var t: *Token = parse_peek(p);
+                var n_ptr: u64 = t.ptr;
+                var n_len: u64 = t.len;
+                if (is_struct_type(n_ptr, n_len) != 0) { is_type = 1; }
+                else if (n_ptr != 0 && n_len > 0) {
+                    var n_u8: []u8 = slice(n_ptr, n_len);
+                    var first_ch: u64 = n_u8[0];
+                    if (first_ch >= 65 && first_ch <= 90) { is_type = 1; }
+                }
+            }
+
+            if (is_type != 0) {
+                // Parse type: sizeof(u64), sizeof(*u8), sizeof(StructName), sizeof(*StructName)
+                var ty: *TypeInfo = parse_type_ex(p);
+                var type_kind: u64 = ty.type_kind;
+                var ptr_depth: u64 = ty.ptr_depth;
+                var struct_name_ptr: u64 = ty.struct_name_ptr;
+                var struct_name_len: u64 = ty.struct_name_len;
+                var elem_type_kind: u64 = ty.elem_type_kind;
+                var elem_ptr_depth: u64 = ty.elem_ptr_depth;
+                var array_len: u64 = ty.array_len;
+                var array_len_is_param: u64 = ty.array_len_is_param;
+                var array_len_param_ptr: u64 = ty.array_len_param_ptr;
+                var array_len_param_len: u64 = ty.array_len_param_len;
+
+                parse_consume(p, TOKEN_RPAREN);
+                    return ast_sizeof(type_kind, ptr_depth, struct_name_ptr, struct_name_len, elem_type_kind, elem_ptr_depth, array_len, array_len_is_param, array_len_param_ptr, array_len_param_len);
+            }
+
+            var expr: *AstNode = parse_expr(p);
+            parse_consume(p, TOKEN_RPAREN);
+                return ast_sizeof_expr(expr);
+        case TOKEN_NEW:
+            parse_adv(p);
+            var ty_new: *TypeInfo = parse_type_ex(p);
+            var literal_expr: *AstNode = 0;
+            var ctor_args_vec: *Vec<*AstNode> = 0;
+
+            if (parse_peek_kind(p) == TOKEN_LBRACE) {
+                if (ty_new.type_kind != TYPE_STRUCT) {
+                    emit_stderr("[ERROR] new { ... } is only supported for struct types\n", 62);
+                    panic("Parse error");
+                }
+                var struct_def_new: *AstStructDef = get_struct_def(ty_new.struct_name_ptr, ty_new.struct_name_len);
+                if (struct_def_new == 0) {
+                    var resolved_new: *NameInfo = resolve_name(ty_new.struct_name_ptr, ty_new.struct_name_len);
+                    if (resolved_new != 0) {
+                        struct_def_new = get_struct_def(resolved_new.ptr, resolved_new.len);
+                    }
+                }
+                if (struct_def_new == 0) {
+                    emit_stderr("[ERROR] Struct definition not found for new literal\n", 60);
+                    panic("Parse error");
+                }
+                parse_adv(p);
+                var values_new: *Vec<*AstNode> = new Vec<*AstNode>(8);
+                if (parse_peek_kind(p) != TOKEN_RBRACE) {
+                    values_new.push(parse_expr(p));
+                    while (parse_match(p, TOKEN_COMMA)) {
+                        values_new.push(parse_expr(p));
+                    }
+                }
+                parse_consume(p, TOKEN_RBRACE);
+                literal_expr = (*AstNode)ast_struct_literal(struct_def_new, values_new);
+            }
+
+            if (parse_peek_kind(p) == TOKEN_LPAREN) {
+                if (ty_new.type_kind != TYPE_STRUCT) {
+                    emit_stderr("[ERROR] new(...) constructor call requires struct type\n", 61);
+                    panic("Parse error");
+                }
+                parse_adv(p);
+                ctor_args_vec = new Vec<*AstNode>(4);
+                if (parse_peek_kind(p) != TOKEN_RPAREN) {
+                    ctor_args_vec.push(parse_expr(p));
+                    while (parse_match(p, TOKEN_COMMA)) {
+                        ctor_args_vec.push(parse_expr(p));
+                    }
+                }
+                parse_consume(p, TOKEN_RPAREN);
+            }
+
+            return (*AstNode)ast_new(ty_new.type_kind, ty_new.ptr_depth, ty_new.is_tagged, ty_new.struct_name_ptr, ty_new.struct_name_len,
+                                     ty_new.tag_layout_ptr, ty_new.tag_layout_len, ty_new.elem_type_kind, ty_new.elem_ptr_depth,
+                                     ty_new.array_len, ty_new.array_len_is_param, ty_new.array_len_param_ptr, ty_new.array_len_param_len,
+                                     literal_expr, ctor_args_vec);
+        case TOKEN_AMPERSAND:
+            parse_adv(p);
+            var operand: *AstNode = parse_unary(p);
+            if (operand == 0) {
+                emit_stderr("[ERROR] Expected expression after &\n", 37);
+                return 0;
+            }
+                return ast_addr_of(operand);
+        case TOKEN_STAR:
+            parse_adv(p);
+            var operand2: *AstNode = parse_unary(p);
+                return ast_deref(operand2);
+        case TOKEN_LPAREN:
+            parse_adv(p);
+            
+            var next_k: u64 = parse_peek_kind(p);
+            if (next_k == TOKEN_STAR || next_k == TOKEN_U8 || next_k == TOKEN_U16 || 
+                next_k == TOKEN_U32 || next_k == TOKEN_U64 || next_k == TOKEN_I64) {
+                // Use parse_type_ex to get struct name directly
+                // TypeInfo layout: [type_kind:8][ptr_depth:8][is_tagged:8][struct_name_ptr:8][struct_name_len:8][tag_layout_ptr:8][tag_layout_len:8]
+                var ty2: *TypeInfo = parse_type_ex(p);
+                var type_kind2: u64 = ty2.type_kind;
+                var ptr_depth2: u64 = ty2.ptr_depth;
+                var is_tagged2: u64 = ty2.is_tagged;
+                var struct_name_ptr2: u64 = ty2.struct_name_ptr;
+                var struct_name_len2: u64 = ty2.struct_name_len;
+                var tag_layout_ptr2: u64 = ty2.tag_layout_ptr;
+                var tag_layout_len2: u64 = ty2.tag_layout_len;
+                
+                parse_consume(p, TOKEN_RPAREN);
+                var operand3: *AstNode = parse_unary(p);
+                    return ast_cast_ex(operand3, type_kind2, ptr_depth2, is_tagged2, struct_name_ptr2, struct_name_len2, tag_layout_ptr2, tag_layout_len2);
+            }
+
+            if (next_k == TOKEN_IDENTIFIER) {
+                var name_tok: *Token = parse_peek(p);
+                var name_ptr: u64 = name_tok.ptr;
+                var name_len: u64 = name_tok.len;
+                var is_known_type: u64 = 0;
+                if (compiler_is_trait_name(name_ptr, name_len) != 0) { is_known_type = 1; }
+                if (is_struct_type(name_ptr, name_len) != 0) { is_known_type = 1; }
+                if (type_parser_find_generic_param(name_ptr, name_len) != 0) { is_known_type = 1; }
+
+                var peek_saved: u64 = parser_pos(p);
+                parse_adv(p);
+                if (parse_peek_kind(p) == TOKEN_LT) {
+                    var tpl_check: *GenericStructTemplate = compiler_find_generic_struct_template_by_name(name_ptr, name_len);
+                    if (tpl_check != 0) { is_known_type = 1; }
+                }
+                parser_set_pos(p, peek_saved);
+
+                if (is_known_type != 0) {
+                    var saved_pos: u64 = parser_pos(p);
+                    var ty_id: *TypeInfo = parse_type_ex(p);
+                    if (parse_peek_kind(p) == TOKEN_RPAREN) {
+                        var type_kind3: u64 = ty_id.type_kind;
+                        var ptr_depth3: u64 = ty_id.ptr_depth;
+                        var is_tagged3: u64 = ty_id.is_tagged;
+                        var struct_name_ptr3: u64 = ty_id.struct_name_ptr;
+                        var struct_name_len3: u64 = ty_id.struct_name_len;
+                        var tag_layout_ptr3: u64 = ty_id.tag_layout_ptr;
+                        var tag_layout_len3: u64 = ty_id.tag_layout_len;
+
+                        parse_consume(p, TOKEN_RPAREN);
+                        var operand4: *AstNode = parse_unary(p);
+                        return ast_cast_ex(operand4, type_kind3, ptr_depth3, is_tagged3, struct_name_ptr3, struct_name_len3, tag_layout_ptr3, tag_layout_len3);
+                    }
+                    parser_set_pos(p, saved_pos);
+                }
+            }
+            
+            var expr2: *AstNode = parse_expr(p);
+            parse_consume(p, TOKEN_RPAREN);
+            // Handle postfix operators after parenthesized expression: (expr).field, (expr).field, (expr)[idx]
+            return parse_postfix_from(p, expr2);
+        case TOKEN_IDENTIFIER:
+            var tok4: *Token = parse_peek(p);
+            parse_adv(p);
+
+            // Generic call: ident<...>(...)
+            if (parse_is_generic_call(p)) {
+                var generic_args: *Vec<*GenericArg> = parse_generic_args(p);
+                parse_consume(p, TOKEN_LPAREN);
+                var args_g: *Vec<*AstNode> = new Vec<*AstNode>(8);
+                if (parse_peek_kind(p) != TOKEN_RPAREN) {
+                    args_g.push(parse_expr(p));
+                    while (parse_match(p, TOKEN_COMMA)) {
+                        args_g.push(parse_expr(p));
+                    }
+                }
+                parse_consume(p, TOKEN_RPAREN);
+                var struct_tpl: *GenericStructTemplate = compiler_find_generic_struct_template_by_name(tok4.ptr, tok4.len);
+                if (struct_tpl != 0) {
+                    var bindings_struct: *Vec<*GenericBinding> = generic_build_bindings_for_struct(struct_tpl, generic_args);
+                    var name_info_struct: *NameInfo = generic_struct_get_or_create_instance(struct_tpl, bindings_struct);
+                    return (*AstNode)ast_stack_ctor(TYPE_STRUCT, 0, 0, name_info_struct.ptr, name_info_struct.len, 0, 0, 0, 0, 0, 0, 0, 0, args_g);
+                }
+                if (compiler_is_impl_context() == 0 && compiler_is_impl_method(tok4.ptr, tok4.len) != 0) {
+                    emit_stderr("[ERROR] Direct call to impl-lowered method is not allowed: ", 66);
+                    emit_stderr(tok4.ptr, tok4.len);
+                    emit_stderr("\n", 1);
+                    return 0;
+                }
+                return ast_generic_call(tok4.ptr, tok4.len, generic_args, args_g);
+            }
+
+            // Generic struct literal: Name<T> { ... }
+            if (parse_is_generic_struct_literal(p)) {
+                var generic_args2: *Vec<*GenericArg> = parse_generic_args_type(p);
+                if (parse_peek_kind(p) == TOKEN_LBRACE) {
+                    var tpl0: *GenericStructTemplate = compiler_find_generic_struct_template_by_name(tok4.ptr, tok4.len);
+                    if (tpl0 == 0) {
+                        emit_stderr("[ERROR] Generic struct template not found: ", 47);
+                        emit_stderr(tok4.ptr, tok4.len);
+                        emit_stderr("\n", 1);
+                        panic("Parse error");
+                    }
+                    var bindings0: *Vec<*GenericBinding> = generic_build_bindings_for_struct(tpl0, generic_args2);
+                    var name_info0: *NameInfo = generic_struct_get_or_create_instance(tpl0, bindings0);
+                    var struct_def0: *AstStructDef = get_struct_def(name_info0.ptr, name_info0.len);
+                    if (struct_def0 == 0) {
+                        emit_stderr("[ERROR] Generic struct def missing\n", 43);
+                        panic("Parse error");
+                    }
+
+                    parse_adv(p);  // consume '{'
+                    var values0: *Vec<*AstNode> = new Vec<*AstNode>(8);
+                    if (parse_peek_kind(p) != TOKEN_RBRACE) {
+                        values0.push(parse_expr(p));
+                        while (parse_match(p, TOKEN_COMMA)) {
+                            values0.push(parse_expr(p));
+                        }
+                    }
+                    parse_consume(p, TOKEN_RBRACE);
+                    return ast_struct_literal(struct_def0, values0);
+                }
+            }
+
+            // Slice literal: slice(ptr, len)
+            if (tok4.len == 5) {
+                if (str_eq(tok4.ptr, tok4.len, "slice", 5)) {
+                    if (parse_peek_kind(p) == TOKEN_LPAREN) {
+                        parse_adv(p);
+                        var ptr_expr: *AstNode = parse_expr(p);
+                        parse_consume(p, TOKEN_COMMA);
+                        var len_expr: *AstNode = parse_expr(p);
+                        parse_consume(p, TOKEN_RPAREN);
+                        return ast_slice(ptr_expr, len_expr);
+                    }
+                }
+            }
+            
+            // Check for struct literal: StructName { expr, expr, ... }
+            if (parse_peek_kind(p) == TOKEN_LBRACE) {
+                var name_ptr: u64 = tok4.ptr;
+                var name_len: u64 = tok4.len;
+                var struct_def: *AstStructDef = get_struct_def(name_ptr, name_len);
+                if (struct_def == 0) {
+                    var resolved: *NameInfo = resolve_name(name_ptr, name_len);
+                    if (resolved != 0) {
+                        var resolved_ptr: u64 = resolved.ptr;
+                        var resolved_len: u64 = resolved.len;
+                        struct_def = get_struct_def(resolved_ptr, resolved_len);
+                    }
+                }
+
+                parse_adv(p);  // consume '{'
+
+                var values: *Vec<*AstNode> = new Vec<*AstNode>(8);
+                if (parse_peek_kind(p) != TOKEN_RBRACE) {
+                    values.push(parse_expr(p));
+                    while (parse_match(p, TOKEN_COMMA)) {
+                        values.push(parse_expr(p));
+                    }
+                }
+                parse_consume(p, TOKEN_RBRACE);
+                return ast_struct_literal(struct_def, values);
+            }
+            
+            // Check for static method call: StructName.method(...)
+            // Only process if IDENTIFIER is a known struct type, DOT is followed by IDENTIFIER and LPAREN
+            if (parse_peek_kind(p) == TOKEN_DOT) {
+                var struct_name_ptr: u64 = tok4.ptr;
+                var struct_name_len: u64 = tok4.len;
+                
+                // Only treat as static method call if this is a struct type name
+                if (is_struct_type(struct_name_ptr, struct_name_len) != 0) {
+                    // Look ahead to check if this is a static method call
+                    var saved_pos: u64 = parser_pos(p);
+                    parse_adv(p);  // consume '.'
+                    
+                    var method_kind: u64 = parse_peek_kind(p);
+                    if (method_kind == TOKEN_IDENTIFIER || method_kind == TOKEN_NEW || method_kind == TOKEN_DELETE || method_kind == TOKEN_CONSTRUCTOR || method_kind == TOKEN_DESTRUCTOR) {
+                        var method_tok: *Token = parse_peek(p);
+                        parse_adv(p);  // consume method name
+
+                        var method_name_ptr: u64 = method_tok.ptr;
+                        var method_name_len: u64 = method_tok.len;
+
+                        var has_generic: u64 = 0;
+                        var generic_args2: *Vec<*GenericArg> = 0;
+                        if (parse_is_generic_call(p)) {
+                            generic_args2 = parse_generic_args(p);
+                            has_generic = 1;
+                        }
+
+                        if (parse_peek_kind(p) == TOKEN_LPAREN) {
+                            // This is a static method call: StructName.method(...)
+                            // Create combined name: StructName_methodName
+                            var name_info: *NameInfo = compiler_build_method_name(struct_name_ptr, struct_name_len, method_name_ptr, method_name_len);
+
+                            parse_adv(p);  // consume '('
+                            var args: *Vec<*AstNode> = new Vec<*AstNode>(8);
+                            if (parse_peek_kind(p) != TOKEN_RPAREN) {
+                                args.push(parse_expr(p));
+                                while (parse_match(p, TOKEN_COMMA)) {
+                                    args.push(parse_expr(p));
+                                }
+                            }
+                            parse_consume(p, TOKEN_RPAREN);
+                            if (has_generic != 0) {
+                                return ast_generic_call(name_info.ptr, name_info.len, generic_args2, args);
+                            }
+                            return ast_call(name_info.ptr, name_info.len, args);
+                        }
+                    }
+                    
+                    // Not a static method call, restore position and let postfix handle it
+                    parser_set_pos(p, saved_pos);
+                }
+            }
+            
+            if (parse_peek_kind(p) == TOKEN_LPAREN) {
+                parse_adv(p);
+                var args: *Vec<*AstNode> = new Vec<*AstNode>(8);
+                if (parse_peek_kind(p) != TOKEN_RPAREN) {
+                    args.push(parse_expr(p));
+                    while (parse_match(p, TOKEN_COMMA)) {
+                        args.push(parse_expr(p));
+                    }
+                }
+                parse_consume(p, TOKEN_RPAREN);
+                var ctor_ptr: u64 = tok4.ptr;
+                var ctor_len: u64 = tok4.len;
+                var ctor_def: *AstStructDef = get_struct_def(ctor_ptr, ctor_len);
+                if (ctor_def == 0) {
+                    var resolved_ctor: *NameInfo = resolve_name(ctor_ptr, ctor_len);
+                    if (resolved_ctor != 0) {
+                        ctor_ptr = resolved_ctor.ptr;
+                        ctor_len = resolved_ctor.len;
+                        ctor_def = get_struct_def(ctor_ptr, ctor_len);
+                    }
+                }
+                if (ctor_def != 0) {
+                    return (*AstNode)ast_stack_ctor(TYPE_STRUCT, 0, 0, ctor_ptr, ctor_len, 0, 0, 0, 0, 0, 0, 0, 0, args);
+                }
+                if (compiler_is_impl_context() == 0 && compiler_is_impl_method(tok4.ptr, tok4.len) != 0) {
+                    emit_stderr("[ERROR] Direct call to impl-lowered method is not allowed: ", 66);
+                    emit_stderr(tok4.ptr, tok4.len);
+                    emit_stderr("\n", 1);
+                    return 0;
+                }
+                return ast_call(tok4.ptr, tok4.len, args);
+            }
+
+            return ast_ident(tok4.ptr, tok4.len);
+        default:
+            return 0;
+    }
+}
+
+// Lookahead for generic call: <...>(...)
+func parse_is_generic_call(p: *Parser) -> u64 {
+    if (parse_peek_kind(p) != TOKEN_LT) { return false; }
+    var saved: u64 = parser_pos(p);
+    var depth: u64 = 0;
+    while (1) {
+        var k: u64 = parse_peek_kind(p);
+        if (k == TOKEN_EOF) {
+            parser_set_pos(p, saved);
+            return false;
+        }
+        if (k != TOKEN_LT && k != TOKEN_GT && k != TOKEN_RSHIFT && k != TOKEN_IDENTIFIER && k != TOKEN_NUMBER && k != TOKEN_COMMA &&
+            k != TOKEN_COLON && k != TOKEN_CONST && k != TOKEN_U8 && k != TOKEN_U16 && k != TOKEN_U32 &&
+            k != TOKEN_U64 && k != TOKEN_I64 && k != TOKEN_CHAR && k != TOKEN_STAR) {
+            parser_set_pos(p, saved);
+            return false;
+        }
+        if (k == TOKEN_LT) { depth = depth + 1; }
+        if (k == TOKEN_GT) {
+            if (depth == 0) {
+                parser_set_pos(p, saved);
+                return false;
+            }
+            depth = depth - 1;
+            if (depth == 0) {
+                parse_adv(p);
+                var next_k: u64 = parse_peek_kind(p);
+                parser_set_pos(p, saved);
+                if (next_k == TOKEN_LPAREN) { return true; }
+                return false;
+            }
+        }
+        if (k == TOKEN_RSHIFT) {
+            if (depth < 2) {
+                parser_set_pos(p, saved);
+                return false;
+            }
+            depth = depth - 2;
+            if (depth == 0) {
+                parse_adv(p);
+                var next_k2: u64 = parse_peek_kind(p);
+                parser_set_pos(p, saved);
+                if (next_k2 == TOKEN_LPAREN) { return true; }
+                return false;
+            }
+        }
+        parse_adv(p);
+    }
+}
+
+// Lookahead for generic struct literal: <...>{...}
+func parse_is_generic_struct_literal(p: *Parser) -> u64 {
+    if (parse_peek_kind(p) != TOKEN_LT) { return false; }
+    var saved: u64 = parser_pos(p);
+    var depth: u64 = 0;
+    while (1) {
+        var k: u64 = parse_peek_kind(p);
+        if (k == TOKEN_EOF) {
+            parser_set_pos(p, saved);
+            return false;
+        }
+        if (k != TOKEN_LT && k != TOKEN_GT && k != TOKEN_RSHIFT && k != TOKEN_IDENTIFIER && k != TOKEN_NUMBER && k != TOKEN_COMMA &&
+            k != TOKEN_COLON && k != TOKEN_CONST && k != TOKEN_U8 && k != TOKEN_U16 && k != TOKEN_U32 &&
+            k != TOKEN_U64 && k != TOKEN_I64 && k != TOKEN_CHAR && k != TOKEN_STAR) {
+            parser_set_pos(p, saved);
+            return false;
+        }
+        if (k == TOKEN_LT) { depth = depth + 1; }
+        if (k == TOKEN_GT) {
+            if (depth == 0) {
+                parser_set_pos(p, saved);
+                return false;
+            }
+            depth = depth - 1;
+            if (depth == 0) {
+                parse_adv(p);
+                var next_k: u64 = parse_peek_kind(p);
+                parser_set_pos(p, saved);
+                if (next_k == TOKEN_LBRACE) { return true; }
+                return false;
+            }
+        }
+        if (k == TOKEN_RSHIFT) {
+            if (depth < 2) {
+                parser_set_pos(p, saved);
+                return false;
+            }
+            depth = depth - 2;
+            if (depth == 0) {
+                parse_adv(p);
+                var next_k2: u64 = parse_peek_kind(p);
+                parser_set_pos(p, saved);
+                if (next_k2 == TOKEN_LBRACE) { return true; }
+                return false;
+            }
+        }
+        parse_adv(p);
+    }
+}
+
+// Parse generic argument list: <T, U, 8>
+func parse_generic_args(p: *Parser) -> *Vec<*GenericArg> {
+    parse_consume(p, TOKEN_LT);
+    var args: *Vec<*GenericArg> = new Vec<*GenericArg>(4);
+    var pk: u64 = parse_peek_kind(p);
+    if (pk == TOKEN_RSHIFT) {
+        var t0: *Token = parse_peek(p);
+        var pending0: *Token = tok_new(TOKEN_GT, t0.ptr + 1, 1, t0.line, t0.col + 1);
+        g_pending_gt_active = 1;
+        g_pending_gt_tok = pending0;
+        parse_adv(p);
+        return args;
+    }
+    if (pk != TOKEN_GT && pk != TOKEN_RSHIFT) {
+        while (1) {
+            if (parse_peek_kind(p) == TOKEN_RSHIFT) {
+                var t1: *Token = parse_peek(p);
+                var pending1: *Token = tok_new(TOKEN_GT, t1.ptr + 1, 1, t1.line, t1.col + 1);
+                g_pending_gt_active = 1;
+                g_pending_gt_tok = pending1;
+                parse_adv(p);
+                return args;
+            }
+            var k: u64 = parse_peek_kind(p);
+            if (k == TOKEN_NUMBER) {
+                var tok: *Token = parse_peek(p);
+                parse_adv(p);
+                var ga: *GenericArg = new GenericArg();
+                ga.kind = GENERIC_KIND_VALUE;
+                ga.type_ptr = 0;
+                ga.value = parse_num_val(tok);
+                args.push(ga);
+            } else {
+                var ty: *TypeInfo = parse_type_ex(p);
+                var ga2: *GenericArg = new GenericArg();
+                ga2.kind = GENERIC_KIND_TYPE;
+                ga2.type_ptr = ty;
+                ga2.value = 0;
+                args.push(ga2);
+            }
+
+            if (parse_match(p, TOKEN_COMMA)) { continue; }
+            break;
+        }
+    }
+    parse_consume_generic_gt(p);
+    return args;
+}
+
+// ============================================
+// Postfix Expression
+// ============================================
+
+func parse_postfix_from(p: *Parser, left: *AstNode) -> *AstNode {
+    while (1) {
+        var k: u64 = parse_peek_kind(p);
+
+        switch (k) {
+            case TOKEN_LBRACKET:
+                parse_adv(p);
+                var idx: *AstNode = parse_expr(p);
+                parse_consume(p, TOKEN_RBRACKET);
+                left = ast_index(left, idx);
+                break;
+            case TOKEN_LPAREN:
+                parse_adv(p);
+                var args: *Vec<*AstNode> = new Vec<*AstNode>(4);
+
+                if (parse_peek_kind(p) != TOKEN_RPAREN) {
+                    args.push(parse_expr(p));
+                    while (parse_peek_kind(p) == TOKEN_COMMA) {
+                        parse_adv(p);
+                        args.push(parse_expr(p));
+                    }
+                }
+
+                parse_consume(p, TOKEN_RPAREN);
+                left = ast_call_ptr(left, args);
+                break;
+            case TOKEN_DOT:
+                parse_adv(p);
+                if (parse_peek_kind(p) == TOKEN_LT) {
+                    parse_adv(p);
+                    var parent_tok: *Token = parse_peek(p);
+                    if (parse_peek_kind(p) != TOKEN_IDENTIFIER) {
+                        emit_stderr("[ERROR] Expected parent struct name after '.<'\n", 53);
+                        panic("Parse error");
+                    }
+                    parse_adv(p);
+                    parse_consume_generic_gt(p);
+                    var scoped_field_tok: *Token = parse_peek(p);
+                    if (parse_peek_kind(p) != TOKEN_IDENTIFIER) {
+                        emit_stderr("[ERROR] Expected field name after parent scope\n", 54);
+                        panic("Parse error");
+                    }
+                    parse_adv(p);
+                    left = ast_member_access_scoped(left, parent_tok.ptr, parent_tok.len, scoped_field_tok.ptr, scoped_field_tok.len);
+                } else {
+                    var field_tok: *Token = parse_peek(p);
+                    var field_kind: u64 = parse_peek_kind(p);
+                    if (field_kind != TOKEN_IDENTIFIER && field_kind != TOKEN_NEW && field_kind != TOKEN_DELETE && field_kind != TOKEN_CONSTRUCTOR && field_kind != TOKEN_DESTRUCTOR) {
+                        emit_stderr("[ERROR] Expected identifier after '.'\n", 41);
+                        panic("Parse error");
+                    }
+                    parse_adv(p);
+
+                    if (parse_peek_kind(p) == TOKEN_LPAREN) {
+                        parse_adv(p);
+                        var args2: *Vec<*AstNode> = new Vec<*AstNode>(4);
+
+                        if (parse_peek_kind(p) != TOKEN_RPAREN) {
+                            args2.push(parse_expr(p));
+                            while (parse_peek_kind(p) == TOKEN_COMMA) {
+                                parse_adv(p);
+                                args2.push(parse_expr(p));
+                            }
+                        }
+
+                        parse_consume(p, TOKEN_RPAREN);
+                        left = ast_method_call(left, field_tok.ptr, field_tok.len, args2);
+                    } else {
+                        left = ast_member_access(left, field_tok.ptr, field_tok.len);
+                    }
+                }
+                break;
+            case TOKEN_DOT_Q:
+                parse_adv(p);
+                if (parse_peek_kind(p) == TOKEN_LT) {
+                    parse_adv(p);
+                    var safe_parent_tok: *Token = parse_peek(p);
+                    if (parse_peek_kind(p) != TOKEN_IDENTIFIER) {
+                        emit_stderr("[ERROR] Expected parent struct name after '.?<'\n", 54);
+                        panic("Parse error");
+                    }
+                    parse_adv(p);
+                    parse_consume_generic_gt(p);
+                    var safe_scoped_field_tok: *Token = parse_peek(p);
+                    if (parse_peek_kind(p) != TOKEN_IDENTIFIER) {
+                        emit_stderr("[ERROR] Expected field name after parent scope\n", 54);
+                        panic("Parse error");
+                    }
+                    parse_adv(p);
+                    left = ast_safe_member_access_scoped(left, safe_parent_tok.ptr, safe_parent_tok.len, safe_scoped_field_tok.ptr, safe_scoped_field_tok.len);
+                } else {
+                    var safe_field_tok: *Token = parse_peek(p);
+                    var safe_field_kind: u64 = parse_peek_kind(p);
+                    if (safe_field_kind != TOKEN_IDENTIFIER && safe_field_kind != TOKEN_NEW && safe_field_kind != TOKEN_DELETE && safe_field_kind != TOKEN_CONSTRUCTOR && safe_field_kind != TOKEN_DESTRUCTOR) {
+                        emit_stderr("[ERROR] Expected identifier after '.?'\n", 42);
+                        panic("Parse error");
+                    }
+                    parse_adv(p);
+
+                    if (parse_peek_kind(p) == TOKEN_LPAREN) {
+                        parse_adv(p);
+                        var safe_args: *Vec<*AstNode> = new Vec<*AstNode>(4);
+
+                        if (parse_peek_kind(p) != TOKEN_RPAREN) {
+                            safe_args.push(parse_expr(p));
+                            while (parse_peek_kind(p) == TOKEN_COMMA) {
+                                parse_adv(p);
+                                safe_args.push(parse_expr(p));
+                            }
+                        }
+
+                        parse_consume(p, TOKEN_RPAREN);
+                        left = ast_safe_method_call(left, safe_field_tok.ptr, safe_field_tok.len, safe_args);
+                    } else {
+                        left = ast_safe_member_access(left, safe_field_tok.ptr, safe_field_tok.len);
+                    }
+                }
+                break;
+            case TOKEN_QUESTION:
+                parse_adv(p);
+                left = ast_try(left);
+                break;
+            default:
+                return left;
+        }
+    }
+}
+
+func parse_postfix(p: *Parser) -> *AstNode {
+    var left: *AstNode = parse_primary(p);
+    return parse_postfix_from(p, left);
+}
+
+// ============================================
+// Unary Expression
+// ============================================
+
+func parse_unary(p: *Parser) -> *AstNode {
+    var k: u64 = parse_peek_kind(p);
+    
+    switch (k) {
+        case TOKEN_STAR:
+            parse_adv(p);
+            var operand: *AstNode = parse_unary(p);
+            return ast_deref(operand);
+        case TOKEN_MINUS:
+            parse_adv(p);
+            var next_k: u64 = parse_peek_kind(p);
+            if (next_k == TOKEN_NUMBER) {
+                var tok: *Token = parse_peek(p);
+                parse_adv(p);
+                var val: u64 = parse_num_val(tok);
+                var lit: *AstNode = ast_literal(val);
+                return ast_unary(TOKEN_MINUS, lit);
+            }
+            var operand2: *AstNode = parse_unary(p);
+            return ast_unary(TOKEN_MINUS, operand2);
+        case TOKEN_BANG:
+            parse_adv(p);
+            var operand3: *AstNode = parse_unary(p);
+            return ast_unary(TOKEN_BANG, operand3);
+        case TOKEN_TILDE:
+            parse_adv(p);
+            var operand4: *AstNode = parse_unary(p);
+            return ast_unary(TOKEN_TILDE, operand4);
+        default:
+            return parse_postfix(p);
+    }
+}
+
+// ============================================
+// Binary Expressions (Precedence Climbing)
+// ============================================
+
+func parse_mul(p: *Parser) -> *AstNode {
+    var left: *AstNode = parse_unary(p);
+    
+    while (1) {
+        var k: u64 = parse_peek_kind(p);
+        switch (k) {
+            case TOKEN_STAR:
+                parse_adv(p);
+                var right: *AstNode = parse_unary(p);
+                left = ast_binary(TOKEN_STAR, left, right);
+                break;
+            case TOKEN_SLASH:
+                parse_adv(p);
+                var right2: *AstNode = parse_unary(p);
+                left = ast_binary(TOKEN_SLASH, left, right2);
+                break;
+            case TOKEN_PERCENT:
+                parse_adv(p);
+                var right3: *AstNode = parse_unary(p);
+                left = ast_binary(TOKEN_PERCENT, left, right3);
+                break;
+            default:
+                return left;
+        }
+    }
+}
+
+func parse_add(p: *Parser) -> *AstNode {
+    var left: *AstNode = parse_mul(p);
+    
+    while (1) {
+        var k: u64 = parse_peek_kind(p);
+        switch (k) {
+            case TOKEN_PLUS:
+                parse_adv(p);
+                var right: *AstNode = parse_mul(p);
+                left = ast_binary(TOKEN_PLUS, left, right);
+                break;
+            case TOKEN_MINUS:
+                parse_adv(p);
+                var right2: *AstNode = parse_mul(p);
+                left = ast_binary(TOKEN_MINUS, left, right2);
+                break;
+            default:
+                return left;
+        }
+    }
+}
+
+func parse_shift(p: *Parser) -> *AstNode {
+    var left: *AstNode = parse_add(p);
+    
+    while (1) {
+        var k: u64 = parse_peek_kind(p);
+        switch (k) {
+            case TOKEN_LSHIFT:
+                parse_adv(p);
+                var right: *AstNode = parse_add(p);
+                left = ast_binary(TOKEN_LSHIFT, left, right);
+                break;
+            case TOKEN_RSHIFT:
+                parse_adv(p);
+                var right2: *AstNode = parse_add(p);
+                left = ast_binary(TOKEN_RSHIFT, left, right2);
+                break;
+            default:
+                return left;
+        }
+    }
+}
+
+func parse_rel(p: *Parser) -> *AstNode {
+    var left: *AstNode = parse_shift(p);
+    
+    while (1) {
+        var k: u64 = parse_peek_kind(p);
+        switch (k) {
+            case TOKEN_LT:
+                parse_adv(p);
+                var right: *AstNode = parse_shift(p);
+                left = ast_binary(TOKEN_LT, left, right);
+                break;
+            case TOKEN_GT:
+                parse_adv(p);
+                var right2: *AstNode = parse_shift(p);
+                left = ast_binary(TOKEN_GT, left, right2);
+                break;
+            case TOKEN_LTEQ:
+                parse_adv(p);
+                var right3: *AstNode = parse_shift(p);
+                left = ast_binary(TOKEN_LTEQ, left, right3);
+                break;
+            case TOKEN_GTEQ:
+                parse_adv(p);
+                var right4: *AstNode = parse_shift(p);
+                left = ast_binary(TOKEN_GTEQ, left, right4);
+                break;
+            default:
+                return left;
+        }
+    }
+}
+
+func parse_eq(p: *Parser) -> *AstNode {
+    var left: *AstNode = parse_rel(p);
+    
+    while (1) {
+        var k: u64 = parse_peek_kind(p);
+        switch (k) {
+            case TOKEN_EQEQ:
+                parse_adv(p);
+                var right: *AstNode = parse_rel(p);
+                left = ast_binary(TOKEN_EQEQ, left, right);
+                break;
+            case TOKEN_BANGEQ:
+                parse_adv(p);
+                var right2: *AstNode = parse_rel(p);
+                left = ast_binary(TOKEN_BANGEQ, left, right2);
+                break;
+            default:
+                return left;
+        }
+    }
+}
+
+func parse_bitand(p: *Parser) -> *AstNode {
+    var left: *AstNode = parse_eq(p);
+    
+    while (1) {
+        var k: u64 = parse_peek_kind(p);
+        switch (k) {
+            case TOKEN_AMPERSAND:
+                parse_adv(p);
+                var right: *AstNode = parse_eq(p);
+                left = ast_binary(TOKEN_AMPERSAND, left, right);
+                break;
+            default:
+                return left;
+        }
+    }
+}
+
+func parse_bitxor(p: *Parser) -> *AstNode {
+    var left: *AstNode = parse_bitand(p);
+    
+    while (1) {
+        var k: u64 = parse_peek_kind(p);
+        switch (k) {
+            case TOKEN_CARET:
+                parse_adv(p);
+                var right: *AstNode = parse_bitand(p);
+                left = ast_binary(TOKEN_CARET, left, right);
+                break;
+            default:
+                return left;
+        }
+    }
+}
+
+func parse_bitor(p: *Parser) -> *AstNode {
+    var left: *AstNode = parse_bitxor(p);
+    
+    while (1) {
+        var k: u64 = parse_peek_kind(p);
+        switch (k) {
+            case TOKEN_PIPE:
+                parse_adv(p);
+                var right: *AstNode = parse_bitxor(p);
+                left = ast_binary(TOKEN_PIPE, left, right);
+                break;
+            default:
+                return left;
+        }
+    }
+}
+
+func parse_logand(p: *Parser) -> *AstNode {
+    var left: *AstNode = parse_bitor(p);
+
+    while (1) {
+        var k: u64 = parse_peek_kind(p);
+        switch (k) {
+            case TOKEN_ANDAND:
+                parse_adv(p);
+                var right: *AstNode = parse_bitor(p);
+                left = ast_binary(TOKEN_ANDAND, left, right);
+                break;
+            default:
+                return left;
+        }
+    }
+}
+
+func parse_logor(p: *Parser) -> *AstNode {
+    var left: *AstNode = parse_logand(p);
+
+    while (1) {
+        var k: u64 = parse_peek_kind(p);
+        switch (k) {
+            case TOKEN_OROR:
+                parse_adv(p);
+                var right: *AstNode = parse_logand(p);
+                left = ast_binary(TOKEN_OROR, left, right);
+                break;
+            default:
+                return left;
+        }
+    }
+}
+
+func parse_expr(p: *Parser) -> *AstNode {
+    push_trace("parse_expr", "parser/expr.b", __LINE__);
+    defer pop_trace();
+    var result: *AstNode = parse_logor(p);
+    return result;
+}
