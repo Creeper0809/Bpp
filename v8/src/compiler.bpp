@@ -13,6 +13,7 @@ import parser.util;
 import parser.decl;
 
 const GENERIC_DEBUG = 0;
+const COMPILER_NOT_FOUND_U64 = 9223372036854775807;
 
 // ============================================
 // Global Module State
@@ -628,6 +629,15 @@ func compiler_resolve_parent_def(parent_desc: *ParentDesc, panic_context: u64) -
     }
     parent_desc.struct_def = parent_def;
     return parent_def;
+}
+
+func compiler_not_found_u64() -> u64 {
+    return COMPILER_NOT_FOUND_U64;
+}
+
+func compiler_is_not_found_u64(value: u64) -> u64 {
+    if (value == COMPILER_NOT_FOUND_U64) { return 1; }
+    return 0;
 }
 
 func std_alias_to_module_path(module_path: u64, module_len: u64) -> u64 {
@@ -1572,6 +1582,47 @@ func load_module_by_name(module_path: u64, module_len: u64) -> u64 {
     return load_module(resolved, resolved_len);
 }
 
+func compiler_import_panic_missing_module() -> u64 {
+    emit_stderr("[ERROR] Expected module identifier in import\n");
+    panic("Parse error");
+    return 0;
+}
+
+func compiler_import_expect_module_tok(tokens: *Vec<*Token>, idx: *u64, n: u64) -> *Token {
+    if (*idx >= n) {
+        compiler_import_panic_missing_module();
+    }
+    var tok: *Token = tokens.get(*idx);
+    var kind: u64 = tok.kind;
+    if (kind != TOKEN_IDENTIFIER && kind != TOKEN_CHAR) {
+        compiler_import_panic_missing_module();
+    }
+    *idx = *idx + 1;
+    return tok;
+}
+
+func compiler_import_parse_path_suffix(tokens: *Vec<*Token>, idx: *u64, n: u64, start_tok: *Token) -> *NameInfo {
+    var path_ptr: u64 = start_tok.ptr;
+    var path_len: u64 = start_tok.len;
+    while (*idx < n && tokens.get(*idx).kind == TOKEN_DOT) {
+        *idx = *idx + 1;
+        var next_tok: *Token = compiler_import_expect_module_tok(tokens, idx, n);
+        var joined_path: u64 = str_concat(path_ptr, path_len, "/", 1);
+        path_ptr = str_concat(joined_path, path_len + 1, next_tok.ptr, next_tok.len);
+        path_len = path_len + 1 + next_tok.len;
+    }
+    return new NameInfo{path_ptr, path_len};
+}
+
+func compiler_import_expect_semicolon(tokens: *Vec<*Token>, idx: *u64, n: u64) -> u64 {
+    if (*idx >= n || tokens.get(*idx).kind != TOKEN_SEMICOLON) {
+        emit_stderr("[ERROR] Expected ';' after import\n");
+        panic("Parse error");
+    }
+    *idx = *idx + 1;
+    return 0;
+}
+
 func compiler_scan_imports_from_tokens(tokens: *Vec<*Token>) -> *Vec<*AstImport> {
     var imports: *Vec<*AstImport> = new Vec<*AstImport>(4);
     if (tokens == 0) { return imports; }
@@ -1587,13 +1638,7 @@ func compiler_scan_imports_from_tokens(tokens: *Vec<*Token>) -> *Vec<*AstImport>
         i = i + 1;
         if (i >= n) { break; }
 
-        var first_tok: *Token = tokens.get(i);
-        var first_kind: u64 = first_tok.kind;
-        if (first_kind != TOKEN_IDENTIFIER && first_kind != TOKEN_CHAR) {
-            emit_stderr("[ERROR] Expected module identifier in import\n");
-            panic("Parse error");
-        }
-        i = i + 1;
+        var first_tok: *Token = compiler_import_expect_module_tok(tokens, &i, n);
 
         if (i < n && (tokens.get(i).kind == TOKEN_AS || tokens.get(i).kind == TOKEN_FROM)) {
             var symbol_ptr: u64 = first_tok.ptr;
@@ -1619,76 +1664,17 @@ func compiler_scan_imports_from_tokens(tokens: *Vec<*Token>) -> *Vec<*AstImport>
             }
             i = i + 1;
 
-            if (i >= n) {
-                emit_stderr("[ERROR] Expected module identifier in import\n");
-                panic("Parse error");
-            }
-            var mod_tok: *Token = tokens.get(i);
-            var mod_kind: u64 = mod_tok.kind;
-            if (mod_kind != TOKEN_IDENTIFIER && mod_kind != TOKEN_CHAR) {
-                emit_stderr("[ERROR] Expected module identifier in import\n");
-                panic("Parse error");
-            }
-            i = i + 1;
+            var mod_tok: *Token = compiler_import_expect_module_tok(tokens, &i, n);
+            var path_info: *NameInfo = compiler_import_parse_path_suffix(tokens, &i, n, mod_tok);
+            compiler_import_expect_semicolon(tokens, &i, n);
 
-            var path_ptr: u64 = mod_tok.ptr;
-            var path_len: u64 = mod_tok.len;
-            while (i < n && tokens.get(i).kind == TOKEN_DOT) {
-                i = i + 1;
-                if (i >= n) {
-                    emit_stderr("[ERROR] Expected module identifier in import\n");
-                    panic("Parse error");
-                }
-                var next_tok: *Token = tokens.get(i);
-                var next_kind: u64 = next_tok.kind;
-                if (next_kind != TOKEN_IDENTIFIER && next_kind != TOKEN_CHAR) {
-                    emit_stderr("[ERROR] Expected module identifier in import\n");
-                    panic("Parse error");
-                }
-                i = i + 1;
-
-                var joined_path: u64 = str_concat(path_ptr, path_len, "/", 1);
-                path_ptr = str_concat(joined_path, path_len + 1, next_tok.ptr, next_tok.len);
-                path_len = path_len + 1 + next_tok.len;
-            }
-
-            if (i >= n || tokens.get(i).kind != TOKEN_SEMICOLON) {
-                emit_stderr("[ERROR] Expected ';' after import\n");
-                panic("Parse error");
-            }
-            i = i + 1;
-
-            imports.push(ast_import(path_ptr, path_len, symbol_ptr, symbol_len, alias_ptr, alias_len));
+            imports.push(ast_import(path_info.ptr, path_info.len, symbol_ptr, symbol_len, alias_ptr, alias_len));
             continue;
         }
 
-        var path_ptr2: u64 = first_tok.ptr;
-        var path_len2: u64 = first_tok.len;
-        while (i < n && tokens.get(i).kind == TOKEN_DOT) {
-            i = i + 1;
-            if (i >= n) {
-                emit_stderr("[ERROR] Expected module identifier in import\n");
-                panic("Parse error");
-            }
-            var next_tok2: *Token = tokens.get(i);
-            var next_kind2: u64 = next_tok2.kind;
-            if (next_kind2 != TOKEN_IDENTIFIER && next_kind2 != TOKEN_CHAR) {
-                emit_stderr("[ERROR] Expected module identifier in import\n");
-                panic("Parse error");
-            }
-            i = i + 1;
-
-            var joined_path2: u64 = str_concat(path_ptr2, path_len2, "/", 1);
-            path_ptr2 = str_concat(joined_path2, path_len2 + 1, next_tok2.ptr, next_tok2.len);
-            path_len2 = path_len2 + 1 + next_tok2.len;
-        }
-
-        if (i >= n || tokens.get(i).kind != TOKEN_SEMICOLON) {
-            emit_stderr("[ERROR] Expected ';' after import\n");
-            panic("Parse error");
-        }
-        i = i + 1;
-        imports.push(ast_import(path_ptr2, path_len2, 0, 0, 0, 0));
+        var path_info2: *NameInfo = compiler_import_parse_path_suffix(tokens, &i, n, first_tok);
+        compiler_import_expect_semicolon(tokens, &i, n);
+        imports.push(ast_import(path_info2.ptr, path_info2.len, 0, 0, 0, 0));
     }
 
     return imports;
@@ -3486,6 +3472,110 @@ func generic_resolve_template(name_ptr: u64, name_len: u64) -> *GenericFuncTempl
     return tpl;
 }
 
+func generic_build_method_template_name(struct_ptr: u64, base_len: u64, method_ptr: u64, method_len: u64) -> *NameInfo {
+    var full_len: u64 = base_len + 1 + method_len;
+    var full_ptr: u64 = heap_alloc((full_len + 1) * sizeof(u8));
+    var full_u8: []u8 = slice(full_ptr, full_len + 1);
+    var struct_u8: []u8 = slice(struct_ptr, base_len);
+    var method_u8: []u8 = slice(method_ptr, method_len);
+    for (var i: u64 = 0; i < base_len; i++) {
+        full_u8[i] = struct_u8[i];
+    }
+    full_u8[base_len] = 95;
+    for (var j: u64 = 0; j < method_len; j++) {
+        full_u8[base_len + 1 + j] = method_u8[j];
+    }
+    full_u8[full_len] = 0;
+    return new NameInfo{full_ptr, full_len};
+}
+
+func generic_find_method_template_for_struct(struct_ptr: u64, struct_len: u64, method_ptr: u64, method_len: u64) -> *GenericFuncTemplate {
+    var base_len: u64 = compiler_find_generic_suffix_index(struct_ptr, struct_len);
+    var full_name: *NameInfo = generic_build_method_template_name(struct_ptr, base_len, method_ptr, method_len);
+    var tpl: *GenericFuncTemplate = compiler_find_generic_template_by_name(full_name.ptr, full_name.len);
+    if (tpl != 0) { return tpl; }
+
+    var base_u8: []u8 = slice(struct_ptr, base_len);
+    var last_sep: u64 = base_len;
+    for (var si: u64 = 0; si + 1 < base_len; si++) {
+        if (base_u8[si] == 95 && base_u8[si + 1] == 95) { last_sep = si + 2; }
+    }
+    if (last_sep >= base_len) { return 0; }
+
+    var short_base_len: u64 = base_len - last_sep;
+    var short_base_ptr: u64 = struct_ptr + last_sep;
+    var alt_name: *NameInfo = generic_build_method_template_name(short_base_ptr, short_base_len, method_ptr, method_len);
+    return compiler_find_generic_template_by_name(alt_name.ptr, alt_name.len);
+}
+
+func generic_try_instantiate_method_template(mc: *AstMethodCall, args: *Vec<*AstNode>, recv_ti: *TypeInfo, symtab: *HashMap<u64, *TypeInfo>) -> u64 {
+    if (recv_ti == 0 || recv_ti.type_kind != TYPE_STRUCT) { return 0; }
+
+    var struct_ptr: u64 = recv_ti.struct_name_ptr;
+    var struct_len: u64 = recv_ti.struct_name_len;
+    var tpl_ptr: *GenericFuncTemplate = generic_find_method_template_for_struct(struct_ptr, struct_len, mc.method_ptr, mc.method_len);
+    if (tpl_ptr == 0) { return 0; }
+
+    var base_len: u64 = compiler_find_generic_suffix_index(struct_ptr, struct_len);
+    var bindings: *Vec<*GenericBinding> = 0;
+    if (base_len != struct_len) {
+        bindings = compiler_get_generic_struct_bindings(struct_ptr, struct_len);
+    }
+    if (bindings == 0) {
+        var an: u64 = args.len();
+        var infer_args: *Vec<*AstNode> = new Vec<*AstNode>(an + 1);
+        if (recv_ti.ptr_depth > 0) { infer_args.push(mc.receiver); }
+        else { infer_args.push(ast_addr_of(mc.receiver)); }
+        for (var ai: u64 = 0; ai < an; ai++) {
+            infer_args.push(args.get(ai));
+        }
+        bindings = generic_build_bindings_by_infer(tpl_ptr, infer_args, symtab);
+    }
+    if (bindings != 0) {
+        generic_get_or_create_instance(tpl_ptr, bindings);
+    }
+    return 0;
+}
+
+func generic_process_method_call_expr(mc: *AstMethodCall, symtab: *HashMap<u64, *TypeInfo>) -> u64 {
+    mc.receiver = generic_process_expr(mc.receiver, symtab);
+    var args: *Vec<*AstNode> = new Vec<*AstNode>(4);
+    var an: u64 = mc.args_vec.?len();
+    for (var i: u64 = 0; i < an; i++) {
+        args.push(generic_process_expr(mc.args_vec.get(i), symtab));
+    }
+    mc.args_vec = args;
+    var recv_ti: *TypeInfo = generic_infer_expr_type(mc.receiver, symtab);
+    generic_try_instantiate_method_template(mc, args, recv_ti, symtab);
+    return 0;
+}
+
+func generic_process_args_vec(args_in: *Vec<*AstNode>, symtab: *HashMap<u64, *TypeInfo>) -> *Vec<*AstNode> {
+    if (args_in == 0) { return 0; }
+    var args_out: *Vec<*AstNode> = new Vec<*AstNode>(4);
+    var n: u64 = args_in.len();
+    for (var i: u64 = 0; i < n; i++) {
+        args_out.push(generic_process_expr(args_in.get(i), symtab));
+    }
+    return args_out;
+}
+
+func generic_try_instantiate_ctor_template(type_kind: u64, struct_name_ptr: u64, struct_name_len: u64, ctor_args_vec: *Vec<*AstNode>) -> u64 {
+    if (ctor_args_vec == 0) { return 0; }
+    if (type_kind != TYPE_STRUCT) { return 0; }
+
+    var struct_base_len: u64 = compiler_find_generic_suffix_index(struct_name_ptr, struct_name_len);
+    var ctor_name: *NameInfo = _compiler_build_constructor_name(struct_name_ptr, struct_base_len);
+    var tpl_ptr: *GenericFuncTemplate = compiler_find_generic_template_by_name(ctor_name.ptr, ctor_name.len);
+    if (tpl_ptr == 0 || tpl_ptr.params_vec == 0 || tpl_ptr.params_vec.len() == 0) { return 0; }
+
+    var ctor_bindings: *Vec<*GenericBinding> = compiler_get_generic_struct_bindings(struct_name_ptr, struct_name_len);
+    if (ctor_bindings != 0) {
+        generic_get_or_create_instance(tpl_ptr, ctor_bindings);
+    }
+    return 0;
+}
+
 func generic_process_expr(expr: *AstNode, symtab: *HashMap<u64, *TypeInfo>) -> *AstNode {
     if (expr == 0) { return 0; }
     var kind: u64 = ast_kind(expr);
@@ -3499,38 +3589,22 @@ func generic_process_expr(expr: *AstNode, symtab: *HashMap<u64, *TypeInfo>) -> *
             }
             var bindings: *Vec<*GenericBinding> = generic_build_bindings_for_explicit(tpl_ptr, gc.generic_args_vec);
             var name_info: *NameInfo = generic_get_or_create_instance(tpl_ptr, bindings);
-            var args_new: *Vec<*AstNode> = new Vec<*AstNode>(4);
-            var an: u64 = gc.args_vec.len();
-            for (var i: u64 = 0; i < an; i++) {
-                args_new.push(generic_process_expr(gc.args_vec.get(i), symtab));
-            }
+            var args_new: *Vec<*AstNode> = generic_process_args_vec(gc.args_vec, symtab);
             return ast_call(name_info.ptr, name_info.len, args_new);
         case AST_CALL:
             var call: *AstCall = (*AstCall)expr;
             var tpl_ptr2: *GenericFuncTemplate = generic_resolve_template(call.name_ptr, call.name_len);
             if (tpl_ptr2 == 0) {
-                var args_new2: *Vec<*AstNode> = new Vec<*AstNode>(4);
-                var an2: u64 = call.args_vec.len();
-                for (var i2: u64 = 0; i2 < an2; i2++) {
-                    args_new2.push(generic_process_expr(call.args_vec.get(i2), symtab));
-                }
+                var args_new2: *Vec<*AstNode> = generic_process_args_vec(call.args_vec, symtab);
                 return ast_call(call.name_ptr, call.name_len, args_new2);
             }
             var bindings2: *Vec<*GenericBinding> = generic_build_bindings_by_infer(tpl_ptr2, call.args_vec, symtab);
             if (bindings2 == 0) {
-                var args_fallback: *Vec<*AstNode> = new Vec<*AstNode>(4);
-                var an_fallback: u64 = call.args_vec.len();
-                for (var ifb: u64 = 0; ifb < an_fallback; ifb++) {
-                    args_fallback.push(generic_process_expr(call.args_vec.get(ifb), symtab));
-                }
+                var args_fallback: *Vec<*AstNode> = generic_process_args_vec(call.args_vec, symtab);
                 return ast_call(call.name_ptr, call.name_len, args_fallback);
             }
             var name_info2: *NameInfo = generic_get_or_create_instance(tpl_ptr2, bindings2);
-            var args_new3: *Vec<*AstNode> = new Vec<*AstNode>(4);
-            var an3: u64 = call.args_vec.len();
-            for (var i3: u64 = 0; i3 < an3; i3++) {
-                args_new3.push(generic_process_expr(call.args_vec.get(i3), symtab));
-            }
+            var args_new3: *Vec<*AstNode> = generic_process_args_vec(call.args_vec, symtab);
             return ast_call(name_info2.ptr, name_info2.len, args_new3);
         case AST_BINARY:
             var bin: *AstBinary = (*AstBinary)expr;
@@ -3572,201 +3646,23 @@ func generic_process_expr(expr: *AstNode, symtab: *HashMap<u64, *TypeInfo>) -> *
         case AST_FLOAT:
             return expr;
         case AST_METHOD_CALL:
-            var mc: *AstMethodCall = (*AstMethodCall)expr;
-            mc.receiver = generic_process_expr(mc.receiver, symtab);
-            var args: *Vec<*AstNode> = new Vec<*AstNode>(4);
-            var an4: u64 = mc.args_vec.len();
-            for (var i4: u64 = 0; i4 < an4; i4++) {
-                args.push(generic_process_expr(mc.args_vec.get(i4), symtab));
-            }
-            mc.args_vec = args;
-            var recv_ti: *TypeInfo = generic_infer_expr_type(mc.receiver, symtab);
-            if (recv_ti != 0) {
-                if (recv_ti.type_kind == TYPE_STRUCT) {
-                    var struct_ptr: u64 = recv_ti.struct_name_ptr;
-                    var struct_len: u64 = recv_ti.struct_name_len;
-                    var base_len: u64 = compiler_find_generic_suffix_index(struct_ptr, struct_len);
-                    var full_len2: u64 = base_len + 1 + mc.method_len;
-                    var full_ptr2: u64 = heap_alloc((full_len2 + 1) * sizeof(u8));
-                    var full_u8: []u8 = slice(full_ptr2, full_len2 + 1);
-                    var struct_u8: []u8 = slice(struct_ptr, struct_len);
-                    var method_u8: []u8 = slice(mc.method_ptr, mc.method_len);
-                    for (var bi: u64 = 0; bi < base_len; bi++) {
-                        full_u8[bi] = struct_u8[bi];
-                    }
-                    full_u8[base_len] = 95;
-                    for (var mj: u64 = 0; mj < mc.method_len; mj++) {
-                        full_u8[base_len + 1 + mj] = method_u8[mj];
-                    }
-                    full_u8[full_len2] = 0;
-
-                    var tpl_ptr3: *GenericFuncTemplate = compiler_find_generic_template_by_name(full_ptr2, full_len2);
-                    if (tpl_ptr3 == 0) {
-                        var base_u8: []u8 = slice(struct_ptr, base_len);
-                        var last_sep: u64 = base_len;
-                        for (var si: u64 = 0; si + 1 < base_len; si++) {
-                            if (base_u8[si] == 95 && base_u8[si + 1] == 95) { last_sep = si + 2; }
-                        }
-                        if (last_sep < base_len) {
-                            var short_base_len: u64 = base_len - last_sep;
-                            var short_base_ptr: u64 = struct_ptr + last_sep;
-                            var alt_len: u64 = short_base_len + 1 + mc.method_len;
-                            var alt_ptr: u64 = heap_alloc((alt_len + 1) * sizeof(u8));
-                            var alt_u8: []u8 = slice(alt_ptr, alt_len + 1);
-                            var short_u8: []u8 = slice(short_base_ptr, short_base_len);
-                            for (var ai0: u64 = 0; ai0 < short_base_len; ai0++) {
-                                alt_u8[ai0] = short_u8[ai0];
-                            }
-                            alt_u8[short_base_len] = 95;
-                            for (var ai1: u64 = 0; ai1 < mc.method_len; ai1++) {
-                                alt_u8[short_base_len + 1 + ai1] = method_u8[ai1];
-                            }
-                            alt_u8[alt_len] = 0;
-                            tpl_ptr3 = compiler_find_generic_template_by_name(alt_ptr, alt_len);
-                        }
-                    }
-                    if (tpl_ptr3 != 0) {
-                        var bindings3: *Vec<*GenericBinding> = 0;
-                        if (base_len != struct_len) {
-                            bindings3 = compiler_get_generic_struct_bindings(struct_ptr, struct_len);
-                        }
-                        if (bindings3 == 0) {
-                            var infer_args: *Vec<*AstNode> = new Vec<*AstNode>(an4 + 1);
-                            if (recv_ti.ptr_depth > 0) { infer_args.push(mc.receiver); }
-                            else { infer_args.push(ast_addr_of(mc.receiver)); }
-                            for (var ai: u64 = 0; ai < an4; ai++) {
-                                infer_args.push(args.get(ai));
-                            }
-                            bindings3 = generic_build_bindings_by_infer(tpl_ptr3, infer_args, symtab);
-                        }
-                        if (bindings3 != 0) {
-                            generic_get_or_create_instance(tpl_ptr3, bindings3);
-                        }
-                    }
-                }
-            }
+            generic_process_method_call_expr((*AstMethodCall)expr, symtab);
             return expr;
         case AST_SAFE_METHOD_CALL:
-            var smc: *AstMethodCall = (*AstMethodCall)expr;
-            smc.receiver = generic_process_expr(smc.receiver, symtab);
-            var sargs: *Vec<*AstNode> = new Vec<*AstNode>(4);
-            var san: u64 = smc.args_vec.?len();
-            for (var si: u64 = 0; si < san; si++) {
-                sargs.push(generic_process_expr(smc.args_vec.get(si), symtab));
-            }
-            smc.args_vec = sargs;
-            var srecv_ti: *TypeInfo = generic_infer_expr_type(smc.receiver, symtab);
-            if (srecv_ti != 0) {
-                if (srecv_ti.type_kind == TYPE_STRUCT) {
-                    var sstruct_ptr: u64 = srecv_ti.struct_name_ptr;
-                    var sstruct_len: u64 = srecv_ti.struct_name_len;
-                    var sbase_len: u64 = compiler_find_generic_suffix_index(sstruct_ptr, sstruct_len);
-                    var sfull_len: u64 = sbase_len + 1 + smc.method_len;
-                    var sfull_ptr: u64 = heap_alloc((sfull_len + 1) * sizeof(u8));
-                    var sfull_u8: []u8 = slice(sfull_ptr, sfull_len + 1);
-                    var sstruct_u8: []u8 = slice(sstruct_ptr, sstruct_len);
-                    var smethod_u8: []u8 = slice(smc.method_ptr, smc.method_len);
-                    for (var sbi: u64 = 0; sbi < sbase_len; sbi++) {
-                        sfull_u8[sbi] = sstruct_u8[sbi];
-                    }
-                    sfull_u8[sbase_len] = 95;
-                    for (var smj: u64 = 0; smj < smc.method_len; smj++) {
-                        sfull_u8[sbase_len + 1 + smj] = smethod_u8[smj];
-                    }
-                    sfull_u8[sfull_len] = 0;
-
-                    var tpl_ptr4: *GenericFuncTemplate = compiler_find_generic_template_by_name(sfull_ptr, sfull_len);
-                    if (tpl_ptr4 == 0) {
-                        var sbase_u8: []u8 = slice(sstruct_ptr, sbase_len);
-                        var slast_sep: u64 = sbase_len;
-                        for (var ssi: u64 = 0; ssi + 1 < sbase_len; ssi++) {
-                            if (sbase_u8[ssi] == 95 && sbase_u8[ssi + 1] == 95) { slast_sep = ssi + 2; }
-                        }
-                        if (slast_sep < sbase_len) {
-                            var sshort_base_len: u64 = sbase_len - slast_sep;
-                            var sshort_base_ptr: u64 = sstruct_ptr + slast_sep;
-                            var salt_len: u64 = sshort_base_len + 1 + smc.method_len;
-                            var salt_ptr: u64 = heap_alloc((salt_len + 1) * sizeof(u8));
-                            var salt_u8: []u8 = slice(salt_ptr, salt_len + 1);
-                            var sshort_u8: []u8 = slice(sshort_base_ptr, sshort_base_len);
-                            for (var sai0: u64 = 0; sai0 < sshort_base_len; sai0++) {
-                                salt_u8[sai0] = sshort_u8[sai0];
-                            }
-                            salt_u8[sshort_base_len] = 95;
-                            for (var sai1: u64 = 0; sai1 < smc.method_len; sai1++) {
-                                salt_u8[sshort_base_len + 1 + sai1] = smethod_u8[sai1];
-                            }
-                            salt_u8[salt_len] = 0;
-                            tpl_ptr4 = compiler_find_generic_template_by_name(salt_ptr, salt_len);
-                        }
-                    }
-                    if (tpl_ptr4 != 0) {
-                        var bindings4: *Vec<*GenericBinding> = 0;
-                        if (sbase_len != sstruct_len) {
-                            bindings4 = compiler_get_generic_struct_bindings(sstruct_ptr, sstruct_len);
-                        }
-                        if (bindings4 == 0) {
-                            var infer_args4: *Vec<*AstNode> = new Vec<*AstNode>(san + 1);
-                            if (srecv_ti.ptr_depth > 0) { infer_args4.push(smc.receiver); }
-                            else { infer_args4.push(ast_addr_of(smc.receiver)); }
-                            for (var sai2: u64 = 0; sai2 < san; sai2++) {
-                                infer_args4.push(sargs.get(sai2));
-                            }
-                            bindings4 = generic_build_bindings_by_infer(tpl_ptr4, infer_args4, symtab);
-                        }
-                        if (bindings4 != 0) {
-                            generic_get_or_create_instance(tpl_ptr4, bindings4);
-                        }
-                    }
-                }
-            }
+            generic_process_method_call_expr((*AstMethodCall)expr, symtab);
             return expr;
         case AST_NEW:
             var nw: *AstNew = (*AstNew)expr;
             if (nw.literal_expr != 0) {
                 nw.literal_expr = generic_process_expr(nw.literal_expr, symtab);
             }
-            if (nw.ctor_args_vec != 0) {
-                var ctor_args: *Vec<*AstNode> = new Vec<*AstNode>(4);
-                var cn: u64 = nw.ctor_args_vec.len();
-                for (var ci: u64 = 0; ci < cn; ci++) {
-                    ctor_args.push(generic_process_expr(nw.ctor_args_vec.get(ci), symtab));
-                }
-                nw.ctor_args_vec = ctor_args;
-            }
-            if (nw.ctor_args_vec != 0 && nw.type_kind == TYPE_STRUCT) {
-                var struct_base_len: u64 = compiler_find_generic_suffix_index(nw.struct_name_ptr, nw.struct_name_len);
-                var ctor_name: *NameInfo = _compiler_build_constructor_name(nw.struct_name_ptr, struct_base_len);
-                var tpl_ptr4: *GenericFuncTemplate = compiler_find_generic_template_by_name(ctor_name.ptr, ctor_name.len);
-                if (tpl_ptr4 != 0 && tpl_ptr4.params_vec != 0 && tpl_ptr4.params_vec.len() > 0) {
-                    var ctor_bindings2: *Vec<*GenericBinding> = compiler_get_generic_struct_bindings(nw.struct_name_ptr, nw.struct_name_len);
-                    if (ctor_bindings2 != 0) {
-                        generic_get_or_create_instance(tpl_ptr4, ctor_bindings2);
-                    }
-                }
-            }
+            nw.ctor_args_vec = generic_process_args_vec(nw.ctor_args_vec, symtab);
+            generic_try_instantiate_ctor_template(nw.type_kind, nw.struct_name_ptr, nw.struct_name_len, nw.ctor_args_vec);
             return expr;
         case AST_STACK_CTOR:
             var sc2: *AstStackCtor = (*AstStackCtor)expr;
-            if (sc2.ctor_args_vec != 0) {
-                var ctor_args_sc: *Vec<*AstNode> = new Vec<*AstNode>(4);
-                var scn: u64 = sc2.ctor_args_vec.len();
-                for (var sci: u64 = 0; sci < scn; sci++) {
-                    ctor_args_sc.push(generic_process_expr(sc2.ctor_args_vec.get(sci), symtab));
-                }
-                sc2.ctor_args_vec = ctor_args_sc;
-            }
-            if (sc2.ctor_args_vec != 0 && sc2.type_kind == TYPE_STRUCT) {
-                var struct_base_len_sc2: u64 = compiler_find_generic_suffix_index(sc2.struct_name_ptr, sc2.struct_name_len);
-                var ctor_name_sc2: *NameInfo = _compiler_build_constructor_name(sc2.struct_name_ptr, struct_base_len_sc2);
-                var tpl_ptr_sc2: *GenericFuncTemplate = compiler_find_generic_template_by_name(ctor_name_sc2.ptr, ctor_name_sc2.len);
-                if (tpl_ptr_sc2 != 0 && tpl_ptr_sc2.params_vec != 0 && tpl_ptr_sc2.params_vec.len() > 0) {
-                    var ctor_bindings_sc2: *Vec<*GenericBinding> = compiler_get_generic_struct_bindings(sc2.struct_name_ptr, sc2.struct_name_len);
-                    if (ctor_bindings_sc2 != 0) {
-                        generic_get_or_create_instance(tpl_ptr_sc2, ctor_bindings_sc2);
-                    }
-                }
-            }
+            sc2.ctor_args_vec = generic_process_args_vec(sc2.ctor_args_vec, symtab);
+            generic_try_instantiate_ctor_template(sc2.type_kind, sc2.struct_name_ptr, sc2.struct_name_len, sc2.ctor_args_vec);
             return expr;
         case AST_INDEX:
             var ix: *AstIndex = (*AstIndex)expr;
@@ -3781,12 +3677,7 @@ func generic_process_expr(expr: *AstNode, symtab: *HashMap<u64, *TypeInfo>) -> *
         case AST_CALL_PTR:
             var cp: *AstCallPtr = (*AstCallPtr)expr;
             cp.callee = generic_process_expr(cp.callee, symtab);
-            var args5: *Vec<*AstNode> = new Vec<*AstNode>(4);
-            var an5: u64 = cp.args_vec.len();
-            for (var i5: u64 = 0; i5 < an5; i5++) {
-                args5.push(generic_process_expr(cp.args_vec.get(i5), symtab));
-            }
-            cp.args_vec = args5;
+            cp.args_vec = generic_process_args_vec(cp.args_vec, symtab);
             return expr;
         case AST_SIZEOF_EXPR:
             var se: *AstSizeofExpr = (*AstSizeofExpr)expr;
@@ -4082,7 +3973,7 @@ func compiler_find_trait_method_index(trait_ptr: u64, trait_len: u64, name_ptr: 
         emit_stderr("[DEBUG] Trait def missing for: ");
         emit_stderr_len(trait_ptr, trait_len);
         emit_stderr("\n");
-        return 9223372036854775807;
+        return COMPILER_NOT_FOUND_U64;
     }
     var n: u64 = td.methods_vec.len();
     for (var i: u64 = 0; i < n; i++) {
@@ -4111,7 +4002,7 @@ func compiler_find_trait_method_index(trait_ptr: u64, trait_len: u64, name_ptr: 
         emit_stderr_len(tm3.name_ptr, tm3.name_len);
         emit_stderr("\n");
     }
-    return 9223372036854775807;
+    return COMPILER_NOT_FOUND_U64;
 }
 
 func compiler_sizeof_type(type_kind: u64, ptr_depth: u64, struct_name_ptr: u64, struct_name_len: u64) -> u64 {
@@ -4194,7 +4085,7 @@ func compiler_struct_find_field_offset(struct_def: *AstStructDef, field_ptr: u64
         if (str_eq(field.name_ptr, field.name_len, field_ptr, field_len)) { return offset; }
         offset = offset + compiler_sizeof_field_desc(field);
     }
-    return 9223372036854775807;
+    return COMPILER_NOT_FOUND_U64;
 }
 
 func compiler_insert_vptr_field(struct_def: *AstStructDef, trait_ptr: u64, trait_len: u64, vtable_struct_ptr: u64, vtable_struct_len: u64) -> u64 {
@@ -4390,7 +4281,7 @@ func compiler_finalize_traits() -> u64 {
 
         var vptr_name: *NameInfo = compiler_build_vptr_field_name(impl_info.trait_ptr, impl_info.trait_len);
         var vptr_offset: u64 = compiler_struct_find_field_offset(struct_def, vptr_name.ptr, vptr_name.len);
-        if (vptr_offset == 9223372036854775807) {
+        if (vptr_offset == COMPILER_NOT_FOUND_U64) {
             emit_stderr("[ERROR] vptr field not found for trait impl: ");
             emit_stderr_len(impl_info.struct_ptr, impl_info.struct_len);
             emit_stderr("\n");

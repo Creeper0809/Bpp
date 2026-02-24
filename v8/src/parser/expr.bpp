@@ -21,6 +21,183 @@ import parser.type;
 // Primary Expression
 // ============================================
 
+func parse_expr_list_paren(p: *Parser) -> *Vec<*AstNode> {
+    parse_consume(p, TOKEN_LPAREN);
+    var args: *Vec<*AstNode> = new Vec<*AstNode>(8);
+    if (parse_peek_kind(p) != TOKEN_RPAREN) {
+        args.push(parse_expr(p));
+        while (parse_match(p, TOKEN_COMMA)) {
+            args.push(parse_expr(p));
+        }
+    }
+    parse_consume(p, TOKEN_RPAREN);
+    return args;
+}
+
+func parse_expr_list_brace(p: *Parser) -> *Vec<*AstNode> {
+    parse_consume(p, TOKEN_LBRACE);
+    var values: *Vec<*AstNode> = new Vec<*AstNode>(8);
+    if (parse_peek_kind(p) != TOKEN_RBRACE) {
+        values.push(parse_expr(p));
+        while (parse_match(p, TOKEN_COMMA)) {
+            values.push(parse_expr(p));
+        }
+    }
+    parse_consume(p, TOKEN_RBRACE);
+    return values;
+}
+
+func parse_resolve_struct_def(name_ptr: u64, name_len: u64) -> *AstStructDef {
+    var struct_def: *AstStructDef = get_struct_def(name_ptr, name_len);
+    if (struct_def != 0) { return struct_def; }
+    var resolved: *NameInfo = resolve_name(name_ptr, name_len);
+    if (resolved == 0) { return 0; }
+    return get_struct_def(resolved.ptr, resolved.len);
+}
+
+func parse_primary_identifier(p: *Parser, tok4: *Token) -> *AstNode {
+    // Generic call: ident<...>(...)
+    if (parse_is_generic_call(p)) {
+        var generic_args: *Vec<*GenericArg> = parse_generic_args(p);
+        var args_g: *Vec<*AstNode> = parse_expr_list_paren(p);
+        var struct_tpl: *GenericStructTemplate = compiler_find_generic_struct_template_by_name(tok4.ptr, tok4.len);
+        if (struct_tpl != 0) {
+            var bindings_struct: *Vec<*GenericBinding> = generic_build_bindings_for_struct(struct_tpl, generic_args);
+            var name_info_struct: *NameInfo = generic_struct_get_or_create_instance(struct_tpl, bindings_struct);
+            return (*AstNode)ast_stack_ctor(TYPE_STRUCT, 0, 0, name_info_struct.ptr, name_info_struct.len, 0, 0, 0, 0, 0, 0, 0, 0, args_g);
+        }
+        if (compiler_is_impl_context() == 0 && compiler_is_impl_method(tok4.ptr, tok4.len) != 0) {
+            emit_stderr("[ERROR] Direct call to impl-lowered method is not allowed: ");
+            emit_stderr_len(tok4.ptr, tok4.len);
+            emit_stderr("\n");
+            return 0;
+        }
+        return ast_generic_call(tok4.ptr, tok4.len, generic_args, args_g);
+    }
+
+    // Generic struct literal: Name<T> { ... }
+    if (parse_is_generic_struct_literal(p)) {
+        var generic_args2: *Vec<*GenericArg> = parse_generic_args_type(p);
+        if (parse_peek_kind(p) == TOKEN_LBRACE) {
+            var tpl0: *GenericStructTemplate = compiler_find_generic_struct_template_by_name(tok4.ptr, tok4.len);
+            if (tpl0 == 0) {
+                emit_stderr("[ERROR] Generic struct template not found: ");
+                emit_stderr_len(tok4.ptr, tok4.len);
+                emit_stderr("\n");
+                parse_panic_here(p, "Parse error");
+            }
+            var bindings0: *Vec<*GenericBinding> = generic_build_bindings_for_struct(tpl0, generic_args2);
+            var name_info0: *NameInfo = generic_struct_get_or_create_instance(tpl0, bindings0);
+            var struct_def0: *AstStructDef = get_struct_def(name_info0.ptr, name_info0.len);
+            if (struct_def0 == 0) {
+                emit_stderr("[ERROR] Generic struct def missing\n");
+                parse_panic_here(p, "Parse error");
+            }
+
+            var values0: *Vec<*AstNode> = parse_expr_list_brace(p);
+            return ast_struct_literal(struct_def0, values0);
+        }
+    }
+
+    // Slice literal: slice(ptr, len)
+    if (tok4.len == 5) {
+        if (str_eq(tok4.ptr, tok4.len, "slice", 5)) {
+            if (parse_peek_kind(p) == TOKEN_LPAREN) {
+                parse_adv(p);
+                var ptr_expr: *AstNode = parse_expr(p);
+                parse_consume(p, TOKEN_COMMA);
+                var len_expr: *AstNode = parse_expr(p);
+                parse_consume(p, TOKEN_RPAREN);
+                return ast_slice(ptr_expr, len_expr);
+            }
+        }
+    }
+
+    // Check for struct literal: StructName { expr, expr, ... }
+    if (parse_peek_kind(p) == TOKEN_LBRACE) {
+        var name_ptr: u64 = tok4.ptr;
+        var name_len: u64 = tok4.len;
+        var struct_def: *AstStructDef = parse_resolve_struct_def(name_ptr, name_len);
+        var values: *Vec<*AstNode> = parse_expr_list_brace(p);
+        return ast_struct_literal(struct_def, values);
+    }
+
+    // Check for static method call: StructName.method(...)
+    // Only process if IDENTIFIER is a known struct type, DOT is followed by IDENTIFIER and LPAREN
+    if (parse_peek_kind(p) == TOKEN_DOT) {
+        var struct_name_ptr: u64 = tok4.ptr;
+        var struct_name_len: u64 = tok4.len;
+
+        // Only treat as static method call if this is a struct type name
+        if (is_struct_type(struct_name_ptr, struct_name_len) != 0) {
+            // Look ahead to check if this is a static method call
+            var saved_pos: u64 = parser_pos(p);
+            parse_adv(p);  // consume '.'
+
+            var method_kind: u64 = parse_peek_kind(p);
+            if (method_kind == TOKEN_IDENTIFIER || method_kind == TOKEN_NEW || method_kind == TOKEN_DELETE || method_kind == TOKEN_CONSTRUCTOR || method_kind == TOKEN_DESTRUCTOR) {
+                var method_tok: *Token = parse_peek(p);
+                parse_adv(p);  // consume method name
+
+                var method_name_ptr: u64 = method_tok.ptr;
+                var method_name_len: u64 = method_tok.len;
+
+                var has_generic: u64 = 0;
+                var generic_args2: *Vec<*GenericArg> = 0;
+                if (parse_is_generic_call(p)) {
+                    generic_args2 = parse_generic_args(p);
+                    has_generic = 1;
+                }
+
+                if (parse_peek_kind(p) == TOKEN_LPAREN) {
+                    // This is a static method call: StructName.method(...)
+                    // Create combined name: StructName_methodName
+                    var name_info: *NameInfo = compiler_build_method_name(struct_name_ptr, struct_name_len, method_name_ptr, method_name_len);
+
+                    var args: *Vec<*AstNode> = parse_expr_list_paren(p);
+                    if (has_generic != 0) {
+                        return ast_generic_call(name_info.ptr, name_info.len, generic_args2, args);
+                    }
+                    return ast_call(name_info.ptr, name_info.len, args);
+                }
+            }
+
+            // Not a static method call, restore position and let postfix handle it
+            parser_set_pos(p, saved_pos);
+        }
+    }
+
+    if (parse_peek_kind(p) == TOKEN_LPAREN) {
+        var args: *Vec<*AstNode> = parse_expr_list_paren(p);
+        var ctor_ptr: u64 = tok4.ptr;
+        var ctor_len: u64 = tok4.len;
+        var ctor_def: *AstStructDef = get_struct_def(ctor_ptr, ctor_len);
+        if (ctor_def == 0) {
+            var resolved_ctor: *NameInfo = resolve_name(ctor_ptr, ctor_len);
+            if (resolved_ctor != 0) {
+                var resolved_def: *AstStructDef = get_struct_def(resolved_ctor.ptr, resolved_ctor.len);
+                if (resolved_def != 0) {
+                    ctor_ptr = resolved_ctor.ptr;
+                    ctor_len = resolved_ctor.len;
+                    ctor_def = resolved_def;
+                }
+            }
+        }
+        if (ctor_def != 0) {
+            return (*AstNode)ast_stack_ctor(TYPE_STRUCT, 0, 0, ctor_ptr, ctor_len, 0, 0, 0, 0, 0, 0, 0, 0, args);
+        }
+        if (compiler_is_impl_context() == 0 && compiler_is_impl_method(tok4.ptr, tok4.len) != 0) {
+            emit_stderr("[ERROR] Direct call to impl-lowered method is not allowed: ");
+            emit_stderr_len(tok4.ptr, tok4.len);
+            emit_stderr("\n");
+            return 0;
+        }
+        return ast_call(tok4.ptr, tok4.len, args);
+    }
+
+    return ast_ident(tok4.ptr, tok4.len);
+}
+
 func parse_primary(p: *Parser) -> *AstNode {
     push_trace("parse_primary", "parser/expr.b", __LINE__);
     defer pop_trace();
@@ -105,26 +282,12 @@ func parse_primary(p: *Parser) -> *AstNode {
                     emit_stderr("[ERROR] new { ... } is only supported for struct types\n");
                     parse_panic_here(p, "Parse error");
                 }
-                var struct_def_new: *AstStructDef = get_struct_def(ty_new.struct_name_ptr, ty_new.struct_name_len);
-                if (struct_def_new == 0) {
-                    var resolved_new: *NameInfo = resolve_name(ty_new.struct_name_ptr, ty_new.struct_name_len);
-                    if (resolved_new != 0) {
-                        struct_def_new = get_struct_def(resolved_new.ptr, resolved_new.len);
-                    }
-                }
+                var struct_def_new: *AstStructDef = parse_resolve_struct_def(ty_new.struct_name_ptr, ty_new.struct_name_len);
                 if (struct_def_new == 0) {
                     emit_stderr("[ERROR] Struct definition not found for new literal\n");
                     parse_panic_here(p, "Parse error");
                 }
-                parse_adv(p);
-                var values_new: *Vec<*AstNode> = new Vec<*AstNode>(8);
-                if (parse_peek_kind(p) != TOKEN_RBRACE) {
-                    values_new.push(parse_expr(p));
-                    while (parse_match(p, TOKEN_COMMA)) {
-                        values_new.push(parse_expr(p));
-                    }
-                }
-                parse_consume(p, TOKEN_RBRACE);
+                var values_new: *Vec<*AstNode> = parse_expr_list_brace(p);
                 literal_expr = (*AstNode)ast_struct_literal(struct_def_new, values_new);
             }
 
@@ -133,15 +296,7 @@ func parse_primary(p: *Parser) -> *AstNode {
                     emit_stderr("[ERROR] new(...) constructor call requires struct type\n");
                     parse_panic_here(p, "Parse error");
                 }
-                parse_adv(p);
-                ctor_args_vec = new Vec<*AstNode>(4);
-                if (parse_peek_kind(p) != TOKEN_RPAREN) {
-                    ctor_args_vec.push(parse_expr(p));
-                    while (parse_match(p, TOKEN_COMMA)) {
-                        ctor_args_vec.push(parse_expr(p));
-                    }
-                }
-                parse_consume(p, TOKEN_RPAREN);
+                ctor_args_vec = parse_expr_list_paren(p);
             }
 
             return (*AstNode)ast_new(ty_new.type_kind, ty_new.ptr_depth, ty_new.is_tagged, ty_new.struct_name_ptr, ty_new.struct_name_len,
@@ -226,194 +381,7 @@ func parse_primary(p: *Parser) -> *AstNode {
         case TOKEN_IDENTIFIER:
             var tok4: *Token = parse_peek(p);
             parse_adv(p);
-
-            // Generic call: ident<...>(...)
-            if (parse_is_generic_call(p)) {
-                var generic_args: *Vec<*GenericArg> = parse_generic_args(p);
-                parse_consume(p, TOKEN_LPAREN);
-                var args_g: *Vec<*AstNode> = new Vec<*AstNode>(8);
-                if (parse_peek_kind(p) != TOKEN_RPAREN) {
-                    args_g.push(parse_expr(p));
-                    while (parse_match(p, TOKEN_COMMA)) {
-                        args_g.push(parse_expr(p));
-                    }
-                }
-                parse_consume(p, TOKEN_RPAREN);
-                var struct_tpl: *GenericStructTemplate = compiler_find_generic_struct_template_by_name(tok4.ptr, tok4.len);
-                if (struct_tpl != 0) {
-                    var bindings_struct: *Vec<*GenericBinding> = generic_build_bindings_for_struct(struct_tpl, generic_args);
-                    var name_info_struct: *NameInfo = generic_struct_get_or_create_instance(struct_tpl, bindings_struct);
-                    return (*AstNode)ast_stack_ctor(TYPE_STRUCT, 0, 0, name_info_struct.ptr, name_info_struct.len, 0, 0, 0, 0, 0, 0, 0, 0, args_g);
-                }
-                if (compiler_is_impl_context() == 0 && compiler_is_impl_method(tok4.ptr, tok4.len) != 0) {
-                    emit_stderr("[ERROR] Direct call to impl-lowered method is not allowed: ");
-                    emit_stderr_len(tok4.ptr, tok4.len);
-                    emit_stderr("\n");
-                    return 0;
-                }
-                return ast_generic_call(tok4.ptr, tok4.len, generic_args, args_g);
-            }
-
-            // Generic struct literal: Name<T> { ... }
-            if (parse_is_generic_struct_literal(p)) {
-                var generic_args2: *Vec<*GenericArg> = parse_generic_args_type(p);
-                if (parse_peek_kind(p) == TOKEN_LBRACE) {
-                    var tpl0: *GenericStructTemplate = compiler_find_generic_struct_template_by_name(tok4.ptr, tok4.len);
-                    if (tpl0 == 0) {
-                        emit_stderr("[ERROR] Generic struct template not found: ");
-                        emit_stderr_len(tok4.ptr, tok4.len);
-                        emit_stderr("\n");
-                        parse_panic_here(p, "Parse error");
-                    }
-                    var bindings0: *Vec<*GenericBinding> = generic_build_bindings_for_struct(tpl0, generic_args2);
-                    var name_info0: *NameInfo = generic_struct_get_or_create_instance(tpl0, bindings0);
-                    var struct_def0: *AstStructDef = get_struct_def(name_info0.ptr, name_info0.len);
-                    if (struct_def0 == 0) {
-                        emit_stderr("[ERROR] Generic struct def missing\n");
-                        parse_panic_here(p, "Parse error");
-                    }
-
-                    parse_adv(p);  // consume '{'
-                    var values0: *Vec<*AstNode> = new Vec<*AstNode>(8);
-                    if (parse_peek_kind(p) != TOKEN_RBRACE) {
-                        values0.push(parse_expr(p));
-                        while (parse_match(p, TOKEN_COMMA)) {
-                            values0.push(parse_expr(p));
-                        }
-                    }
-                    parse_consume(p, TOKEN_RBRACE);
-                    return ast_struct_literal(struct_def0, values0);
-                }
-            }
-
-            // Slice literal: slice(ptr, len)
-            if (tok4.len == 5) {
-                if (str_eq(tok4.ptr, tok4.len, "slice", 5)) {
-                    if (parse_peek_kind(p) == TOKEN_LPAREN) {
-                        parse_adv(p);
-                        var ptr_expr: *AstNode = parse_expr(p);
-                        parse_consume(p, TOKEN_COMMA);
-                        var len_expr: *AstNode = parse_expr(p);
-                        parse_consume(p, TOKEN_RPAREN);
-                        return ast_slice(ptr_expr, len_expr);
-                    }
-                }
-            }
-            
-            // Check for struct literal: StructName { expr, expr, ... }
-            if (parse_peek_kind(p) == TOKEN_LBRACE) {
-                var name_ptr: u64 = tok4.ptr;
-                var name_len: u64 = tok4.len;
-                var struct_def: *AstStructDef = get_struct_def(name_ptr, name_len);
-                if (struct_def == 0) {
-                    var resolved: *NameInfo = resolve_name(name_ptr, name_len);
-                    if (resolved != 0) {
-                        var resolved_ptr: u64 = resolved.ptr;
-                        var resolved_len: u64 = resolved.len;
-                        struct_def = get_struct_def(resolved_ptr, resolved_len);
-                    }
-                }
-
-                parse_adv(p);  // consume '{'
-
-                var values: *Vec<*AstNode> = new Vec<*AstNode>(8);
-                if (parse_peek_kind(p) != TOKEN_RBRACE) {
-                    values.push(parse_expr(p));
-                    while (parse_match(p, TOKEN_COMMA)) {
-                        values.push(parse_expr(p));
-                    }
-                }
-                parse_consume(p, TOKEN_RBRACE);
-                return ast_struct_literal(struct_def, values);
-            }
-            
-            // Check for static method call: StructName.method(...)
-            // Only process if IDENTIFIER is a known struct type, DOT is followed by IDENTIFIER and LPAREN
-            if (parse_peek_kind(p) == TOKEN_DOT) {
-                var struct_name_ptr: u64 = tok4.ptr;
-                var struct_name_len: u64 = tok4.len;
-                
-                // Only treat as static method call if this is a struct type name
-                if (is_struct_type(struct_name_ptr, struct_name_len) != 0) {
-                    // Look ahead to check if this is a static method call
-                    var saved_pos: u64 = parser_pos(p);
-                    parse_adv(p);  // consume '.'
-                    
-                    var method_kind: u64 = parse_peek_kind(p);
-                    if (method_kind == TOKEN_IDENTIFIER || method_kind == TOKEN_NEW || method_kind == TOKEN_DELETE || method_kind == TOKEN_CONSTRUCTOR || method_kind == TOKEN_DESTRUCTOR) {
-                        var method_tok: *Token = parse_peek(p);
-                        parse_adv(p);  // consume method name
-
-                        var method_name_ptr: u64 = method_tok.ptr;
-                        var method_name_len: u64 = method_tok.len;
-
-                        var has_generic: u64 = 0;
-                        var generic_args2: *Vec<*GenericArg> = 0;
-                        if (parse_is_generic_call(p)) {
-                            generic_args2 = parse_generic_args(p);
-                            has_generic = 1;
-                        }
-
-                        if (parse_peek_kind(p) == TOKEN_LPAREN) {
-                            // This is a static method call: StructName.method(...)
-                            // Create combined name: StructName_methodName
-                            var name_info: *NameInfo = compiler_build_method_name(struct_name_ptr, struct_name_len, method_name_ptr, method_name_len);
-
-                            parse_adv(p);  // consume '('
-                            var args: *Vec<*AstNode> = new Vec<*AstNode>(8);
-                            if (parse_peek_kind(p) != TOKEN_RPAREN) {
-                                args.push(parse_expr(p));
-                                while (parse_match(p, TOKEN_COMMA)) {
-                                    args.push(parse_expr(p));
-                                }
-                            }
-                            parse_consume(p, TOKEN_RPAREN);
-                            if (has_generic != 0) {
-                                return ast_generic_call(name_info.ptr, name_info.len, generic_args2, args);
-                            }
-                            return ast_call(name_info.ptr, name_info.len, args);
-                        }
-                    }
-                    
-                    // Not a static method call, restore position and let postfix handle it
-                    parser_set_pos(p, saved_pos);
-                }
-            }
-            
-            if (parse_peek_kind(p) == TOKEN_LPAREN) {
-                parse_adv(p);
-                var args: *Vec<*AstNode> = new Vec<*AstNode>(8);
-                if (parse_peek_kind(p) != TOKEN_RPAREN) {
-                    args.push(parse_expr(p));
-                    while (parse_match(p, TOKEN_COMMA)) {
-                        args.push(parse_expr(p));
-                    }
-                }
-                parse_consume(p, TOKEN_RPAREN);
-                var ctor_ptr: u64 = tok4.ptr;
-                var ctor_len: u64 = tok4.len;
-                var ctor_def: *AstStructDef = get_struct_def(ctor_ptr, ctor_len);
-                if (ctor_def == 0) {
-                    var resolved_ctor: *NameInfo = resolve_name(ctor_ptr, ctor_len);
-                    if (resolved_ctor != 0) {
-                        ctor_ptr = resolved_ctor.ptr;
-                        ctor_len = resolved_ctor.len;
-                        ctor_def = get_struct_def(ctor_ptr, ctor_len);
-                    }
-                }
-                if (ctor_def != 0) {
-                    return (*AstNode)ast_stack_ctor(TYPE_STRUCT, 0, 0, ctor_ptr, ctor_len, 0, 0, 0, 0, 0, 0, 0, 0, args);
-                }
-                if (compiler_is_impl_context() == 0 && compiler_is_impl_method(tok4.ptr, tok4.len) != 0) {
-                    emit_stderr("[ERROR] Direct call to impl-lowered method is not allowed: ");
-                    emit_stderr_len(tok4.ptr, tok4.len);
-                    emit_stderr("\n");
-                    return 0;
-                }
-                return ast_call(tok4.ptr, tok4.len, args);
-            }
-
-            return ast_ident(tok4.ptr, tok4.len);
+            return parse_primary_identifier(p, tok4);
         default:
             return 0;
     }
@@ -876,6 +844,5 @@ func parse_logor(p: *Parser) -> *AstNode {
 func parse_expr(p: *Parser) -> *AstNode {
     push_trace("parse_expr", "parser/expr.b", __LINE__);
     defer pop_trace();
-    var result: *AstNode = parse_logor(p);
-    return result;
+    return parse_logor(p);
 }

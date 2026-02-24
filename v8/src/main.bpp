@@ -44,29 +44,17 @@ impl Argv2 {
     }
 }
 
+func main_print_usage() -> u64 {
+    emit("Usage: v3_19 [-O0|-O1] [-dump-ir|-dump-ssa|-asm] <source.bpp>\n");
+    return 0;
+}
 
-func main(argc: u64, argv: u64) -> u64 {
-    init_stack_trace();
-
+func main_parse_cli(argc: u64, argv_ptr: *u64, filename_out: *u64) -> u64 {
     // Default flags (avoid uninitialized globals affecting codegen)
-    opt_set_level(0);
-    opt_set_ir_mode(IR_NONE);
-    opt_set_output_mode(OUT_EXEC);
+    opt_init_defaults();
 
-    if (argc < 2) {
-        emit("Usage: v3_19 [-O0|-O1] [-dump-ir|-dump-ssa|-asm] <source.bpp>\n");
-        return 1;
-    }
+    if (argc < 2) { return 0; }
 
-    var argv_ptr: *u64 = (*u64)argv;
-    // Compute sizes at runtime to keep sizeof in use without const-restrictions.
-    // This keeps allocations correct while avoiding manual byte multipliers.
-    var argv6_size: u64 = sizeof(Argv6);
-    var argv5_size: u64 = sizeof(Argv5);
-    var argv2_size: u64 = sizeof(Argv2);
-    var compiler_path: u64 = *argv_ptr;
-    var compiler_len: u64 = 0;
-    if (compiler_path != 0) { compiler_len = str_len(compiler_path); }
     var filename: u64 = 0;
     for (var i: u64 = 1; i < argc; i++) {
         var arg: u64 = argv_ptr[i];
@@ -98,8 +86,125 @@ func main(argc: u64, argv: u64) -> u64 {
         filename = arg;
     }
 
-    if (filename == 0) {
-        emit("Usage: v3_19 [-O0|-O1] [-dump-ir|-dump-ssa|-asm] <source.bpp>\n");
+    if (filename == 0) { return 0; }
+    *filename_out = filename;
+    return 1;
+}
+
+func main_run_compile_pipeline(filename: u64, filename_len: u64) -> *AstProgram {
+    if (!load_std_prelude()) {
+        emit_stderr("[ERROR] failed to load std prelude\n");
+        return 0;
+    }
+
+    if (!load_module(filename, filename_len)) {
+        emit_stderr("[ERROR] failed to load module: ");
+        emit_stderr_len(filename, filename_len);
+        emit_stderr("\n");
+        return 0;
+    }
+
+    finalize_import_aliases();
+    compiler_insert_default_constructors();
+    compiler_insert_global_init_func();
+    compiler_monomorphize_generics();
+    compiler_finalize_abst_methods();
+    compiler_finalize_traits();
+
+    return build_merged_program();
+}
+
+func main_emit_and_run(base_name: u64, base_len: u64, merged_prog: *AstProgram) -> u64 {
+    var s_ext: u64 = ".s";
+    var o_ext: u64 = ".o";
+    var out_ext: u64 = ".out";
+    var asm_path: u64 = str_concat(base_name, base_len, s_ext, 2);
+    var obj_path: u64 = str_concat(base_name, base_len, o_ext, 2);
+    var exe_path: u64 = str_concat(base_name, base_len, out_ext, 4);
+
+    var flags: u64 = OS_O_WRONLY + OS_O_CREAT + OS_O_TRUNC;
+    var fd_i: i64 = (i64)sys_open(asm_path, flags, 420);
+    if (fd_i < 0) {
+        emit_stderr("[ERROR] failed to open asm output: ");
+        emit_stderr(asm_path);
+        emit_stderr("\n");
+        return 1;
+    }
+    var fd: u64 = (u64)fd_i;
+
+    var saved_fd: u64 = 100;
+    var dup_res: i64 = (i64)os_sys_dup2(1, saved_fd);
+    if (dup_res < 0) {
+        sys_close(fd);
+        emit_stderr("[ERROR] failed to dup stdout\n");
+        return 1;
+    }
+
+    var dup_res2: i64 = (i64)os_sys_dup2(fd, 1);
+    if (dup_res2 < 0) {
+        sys_close(fd);
+        os_sys_dup2(saved_fd, 1);
+        sys_close(saved_fd);
+        emit_stderr("[ERROR] failed to redirect stdout to asm file\n");
+        return 1;
+    }
+    cg_program_with_sigs(merged_prog, get_func_sigs());
+    sys_close(fd);
+
+    os_sys_dup2(saved_fd, 1);
+    sys_close(saved_fd);
+
+    var nasm_argv: *Argv6 = new Argv6();
+    nasm_argv.a0 = (u64)"nasm";
+    nasm_argv.a1 = (u64)"-felf64";
+    nasm_argv.a2 = asm_path;
+    nasm_argv.a3 = (u64)"-o";
+    nasm_argv.a4 = obj_path;
+    nasm_argv.a5 = 0;
+    var nasm_status: i64 = os_execute((u64)"/usr/bin/nasm", (u64)nasm_argv);
+    if (nasm_status != 0) {
+        emit_stderr("[ERROR] nasm failed\n");
+        return 1;
+    }
+
+    var ld_argv: *Argv5 = new Argv5();
+    ld_argv.a0 = (u64)"ld";
+    ld_argv.a1 = obj_path;
+    ld_argv.a2 = (u64)"-o";
+    ld_argv.a3 = exe_path;
+    ld_argv.a4 = 0;
+    var ld_status: i64 = os_execute((u64)"/usr/bin/ld", (u64)ld_argv);
+    if (ld_status != 0) {
+        emit_stderr("[ERROR] ld failed\n");
+        return 1;
+    }
+
+    emit("[OK] output: ");
+    emit(exe_path);
+    emit("\n");
+
+    var exe_argv: *Argv2 = new Argv2();
+    exe_argv.a0 = exe_path;
+    exe_argv.a1 = 0;
+    var status: i64 = os_execute(exe_path, (u64)exe_argv);
+    emit("[RUN] exit=");
+    print_i64(status);
+    emit("\n");
+    return 0;
+}
+
+
+func main(argc: u64, argv: u64) -> u64 {
+    init_stack_trace();
+
+    var argv_ptr: *u64 = (*u64)argv;
+    var compiler_path: u64 = *argv_ptr;
+    var compiler_len: u64 = 0;
+    if (compiler_path != 0) { compiler_len = str_len(compiler_path); }
+
+    var filename: u64 = 0;
+    if (main_parse_cli(argc, argv_ptr, &filename) == 0) {
+        main_print_usage();
         return 1;
     }
 
@@ -110,36 +215,14 @@ func main(argc: u64, argv: u64) -> u64 {
     push_trace("main", "main.bpp", __LINE__);
     defer pop_trace();
 
-    if (!load_std_prelude()) {
-        emit_stderr("[ERROR] failed to load std prelude\n");
+    var merged_prog: *AstProgram = main_run_compile_pipeline(filename, filename_len);
+    if (merged_prog == 0) {
         return 1;
     }
 
-    if (!load_module(filename, filename_len)) {
-        emit_stderr("[ERROR] failed to load module: ");
-        emit_stderr_len(filename, filename_len);
-        emit_stderr("\n");
-        return 1;
-    }
-
-    finalize_import_aliases();
-
-    compiler_insert_default_constructors();
-
-    compiler_insert_global_init_func();
-
-    compiler_monomorphize_generics();
-
-    compiler_finalize_abst_methods();
-    compiler_finalize_traits();
-    
-    var merged_prog: *AstProgram = build_merged_program();
     var out_mode: u64 = opt_get_output_mode();
     var base_name: u64 = path_basename_noext(filename, filename_len);
     var base_len: u64 = str_len(base_name);
-    var s_ext: u64 = ".s";
-    var o_ext: u64 = ".o";
-    var out_ext: u64 = ".out";
 
     switch (out_mode) {
         case OUT_IR:
@@ -149,78 +232,9 @@ func main(argc: u64, argv: u64) -> u64 {
             cg_program_with_sigs(merged_prog, get_func_sigs());
             break;
         default:
-            var asm_path: u64 = str_concat(base_name, base_len, s_ext, 2);
-            var obj_path: u64 = str_concat(base_name, base_len, o_ext, 2);
-            var exe_path: u64 = str_concat(base_name, base_len, out_ext, 4);
-
-            var flags: u64 = OS_O_WRONLY + OS_O_CREAT + OS_O_TRUNC;
-            var fd_i: i64 = (i64)sys_open(asm_path, flags, 420);
-            if (fd_i < 0) {
-                emit_stderr("[ERROR] failed to open asm output: ");
-                emit_stderr(asm_path);
-                emit_stderr("\n");
+            if (main_emit_and_run(base_name, base_len, merged_prog) != 0) {
                 return 1;
             }
-            var fd: u64 = (u64)fd_i;
-
-            var saved_fd: u64 = 100;
-            var dup_res: i64 = (i64)os_sys_dup2(1, saved_fd);
-            if (dup_res < 0) {
-                sys_close(fd);
-                emit_stderr("[ERROR] failed to dup stdout\n");
-                return 1;
-            }
-
-            var dup_res2: i64 = (i64)os_sys_dup2(fd, 1);
-            if (dup_res2 < 0) {
-                sys_close(fd);
-                os_sys_dup2(saved_fd, 1);
-                sys_close(saved_fd);
-                emit_stderr("[ERROR] failed to redirect stdout to asm file\n");
-                return 1;
-            }
-            cg_program_with_sigs(merged_prog, get_func_sigs());
-            sys_close(fd);
-
-            os_sys_dup2(saved_fd, 1);
-            sys_close(saved_fd);
-
-            var nasm_argv: *Argv6 = new Argv6();
-            nasm_argv.a0 = (u64)"nasm";
-            nasm_argv.a1 = (u64)"-felf64";
-            nasm_argv.a2 = asm_path;
-            nasm_argv.a3 = (u64)"-o";
-            nasm_argv.a4 = obj_path;
-            nasm_argv.a5 = 0;
-            var nasm_status: i64 = os_execute((u64)"/usr/bin/nasm", (u64)nasm_argv);
-            if (nasm_status != 0) {
-                emit_stderr("[ERROR] nasm failed\n");
-                return 1;
-            }
-
-            var ld_argv: *Argv5 = new Argv5();
-            ld_argv.a0 = (u64)"ld";
-            ld_argv.a1 = obj_path;
-            ld_argv.a2 = (u64)"-o";
-            ld_argv.a3 = exe_path;
-            ld_argv.a4 = 0;
-            var ld_status: i64 = os_execute((u64)"/usr/bin/ld", (u64)ld_argv);
-            if (ld_status != 0) {
-                emit_stderr("[ERROR] ld failed\n");
-                return 1;
-            }
-
-            emit("[OK] output: ");
-            emit(exe_path);
-            emit("\n");
-
-            var exe_argv: *Argv2 = new Argv2();
-            exe_argv.a0 = exe_path;
-            exe_argv.a1 = 0;
-            var status: i64 = os_execute(exe_path, (u64)exe_argv);
-            emit("[RUN] exit=");
-            print_i64(status);
-            emit("\n");
             break;
     }
     

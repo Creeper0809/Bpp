@@ -30,6 +30,27 @@ func _cg_find_global_info(name_ptr: u64, name_len: u64) -> *GlobalInfo {
 }
 var g_tmp_struct_arg_id;
 
+func cg_codegen_error(msg: u64) -> u64 {
+    emit_stderr(msg);
+    panic("Codegen error");
+    return 0;
+}
+
+func cg_emit_jump(label_id: u64) -> u64 {
+    emit("    jmp ");
+    emit_label(label_id);
+    emit_nl();
+    return 0;
+}
+
+func cg_emit_safe_null_epilogue(label_null: u64, label_end: u64) -> u64 {
+    cg_emit_jump(label_end);
+    emit_label_def(label_null);
+    emit("    xor eax, eax\n");
+    emit_label_def(label_end);
+    return 0;
+}
+
 func emit_tagged_mask() -> u64 {
     emit("    mov rbx, ");
     emit_u64(281474976710655);
@@ -49,6 +70,39 @@ func emit_mask_to_rdx(bit_width: u64) -> u64 {
 func cg_emit_field_load_from_rax(fd: *FieldDesc) -> u64 {
     if (fd == 0) { return 0; }
     emit_load_rax_from_addr(fd.type_kind, fd.ptr_depth);
+    return 0;
+}
+
+func cg_require_tagged_layout_struct(tag_layout_ptr: u64, tag_layout_len: u64) -> *AstStructDef {
+    var layout_info: *AstStructDef = get_struct_def(tag_layout_ptr, tag_layout_len);
+    if (layout_info == 0) {
+        cg_codegen_error("[ERROR] Tagged layout struct not found\n");
+        return 0;
+    }
+    if (layout_info.is_packed == 0) {
+        cg_codegen_error("[ERROR] Tagged layout must be packed struct\n");
+        return 0;
+    }
+    return layout_info;
+}
+
+func cg_emit_tagged_layout_extract_from_rax(layout_info: *AstStructDef, member_ptr: u64, member_len: u64) -> u64 {
+    var total_bits: u64 = get_packed_layout_total_bits(layout_info);
+    var field_offset: u64 = get_packed_field_bit_offset(layout_info, member_ptr, member_len);
+    var field_width: u64 = get_packed_field_bit_width(layout_info, member_ptr, member_len);
+    var start_bit: u64 = 64 - total_bits;
+    var shift_bits: u64 = start_bit + field_offset;
+
+    if (shift_bits > 0) {
+        emit("    mov rcx, ");
+        emit_u64(shift_bits);
+        emit_nl();
+        emit("    shr rax, cl\n");
+    }
+    if (field_width < 64) {
+        emit_mask_to_rdx(field_width);
+        emit("    and rax, rdx\n");
+    }
     return 0;
 }
 
@@ -357,9 +411,7 @@ func get_packed_field_bit_offset(struct_def: *AstStructDef, field_name_ptr: u64,
             bit_cursor = bit_cursor + fsize2 * 8;
         }
     }
-    emit("[ERROR] Packed field not found\n");
-    panic("Codegen error");
-    return 0;
+    return cg_codegen_error("[ERROR] Packed field not found\n");
 }
 
 func get_packed_field_bit_width(struct_def: *AstStructDef, field_name_ptr: u64, field_name_len: u64) -> u64 {
@@ -373,42 +425,45 @@ func get_packed_field_bit_width(struct_def: *AstStructDef, field_name_ptr: u64, 
             return sizeof_field_desc(field) * 8;
         }
     }
-    emit("[ERROR] Packed field not found\n");
-    panic("Codegen error");
-    return 0;
+    return cg_codegen_error("[ERROR] Packed field not found\n");
 }
 
-func _cg_sysv_pop_arg_regs(total_words: u64) -> u64 {
-    var reg_count: u64 = total_words;
-    if (reg_count > 6) { reg_count = 6; }
-    for (var i: u64 = 0; i < reg_count; i++) {
-        emit("    pop ");
+func _cg_sysv_emit_pop_arg_reg(i: u64, sret: u64) -> u64 {
+    emit("    pop ");
+    if (sret == 0) {
         if (i == 0) { emit("rdi"); }
         else if (i == 1) { emit("rsi"); }
         else if (i == 2) { emit("rdx"); }
         else if (i == 3) { emit("rcx"); }
         else if (i == 4) { emit("r8"); }
         else if (i == 5) { emit("r9"); }
-        emit_nl();
-    }
-    if (total_words > 6) { return total_words - 6; }
-    return 0;
-}
-
-func _cg_sysv_pop_arg_regs_sret(total_words: u64) -> u64 {
-    var reg_count: u64 = total_words;
-    if (reg_count > 5) { reg_count = 5; }
-    for (var i: u64 = 0; i < reg_count; i++) {
-        emit("    pop ");
+    } else {
         if (i == 0) { emit("rsi"); }
         else if (i == 1) { emit("rdx"); }
         else if (i == 2) { emit("rcx"); }
         else if (i == 3) { emit("r8"); }
         else if (i == 4) { emit("r9"); }
-        emit_nl();
     }
-    if (total_words > 5) { return total_words - 5; }
+    emit_nl();
     return 0;
+}
+
+func _cg_sysv_pop_arg_regs_common(total_words: u64, reg_limit: u64, sret: u64) -> u64 {
+    var reg_count: u64 = total_words;
+    if (reg_count > reg_limit) { reg_count = reg_limit; }
+    for (var i: u64 = 0; i < reg_count; i++) {
+        _cg_sysv_emit_pop_arg_reg(i, sret);
+    }
+    if (total_words > reg_limit) { return total_words - reg_limit; }
+    return 0;
+}
+
+func _cg_sysv_pop_arg_regs(total_words: u64) -> u64 {
+    return _cg_sysv_pop_arg_regs_common(total_words, 6, 0);
+}
+
+func _cg_sysv_pop_arg_regs_sret(total_words: u64) -> u64 {
+    return _cg_sysv_pop_arg_regs_common(total_words, 5, 1);
 }
 
 func _cg_sysv_push_call_arg(arg: *AstNode, symtab: *Symtab) -> u64 {
@@ -1555,50 +1610,16 @@ func cg_safe_member_access_expr(node: u64, symtab: *Symtab) -> u64 {
     emit_nl();
 
     if (ot.is_tagged == 1 && ot.tag_layout_ptr != 0) {
-        var layout_info: *AstStructDef = get_struct_def(ot.tag_layout_ptr, ot.tag_layout_len);
-        if (layout_info == 0) {
-            emit("[ERROR] Tagged layout struct not found\n");
-            panic("Codegen error");
-        }
-        var packed_flag: u64 = layout_info.is_packed;
-        if (packed_flag == 0) {
-            emit("[ERROR] Tagged layout must be packed struct\n");
-            panic("Codegen error");
-        }
-        var total_bits: u64 = get_packed_layout_total_bits(layout_info);
-        var field_offset: u64 = get_packed_field_bit_offset(layout_info, member_ptr, member_len);
-        var field_width: u64 = get_packed_field_bit_width(layout_info, member_ptr, member_len);
-        var start_bit: u64 = 64 - total_bits;
-        var shift_bits: u64 = start_bit + field_offset;
-
-        if (shift_bits > 0) {
-            emit("    mov rcx, ");
-            emit_u64(shift_bits);
-            emit_nl();
-            emit("    shr rax, cl\n");
-        }
-        if (field_width < 64) {
-            emit_mask_to_rdx(field_width);
-            emit("    and rax, rdx\n");
-        }
-        emit("    jmp ");
-        emit_label(label_end);
-        emit_nl();
-        emit_label_def(label_null);
-        emit("    xor eax, eax\n");
-        emit_label_def(label_end);
+        var layout_info: *AstStructDef = cg_require_tagged_layout_struct(ot.tag_layout_ptr, ot.tag_layout_len);
+        cg_emit_tagged_layout_extract_from_rax(layout_info, member_ptr, member_len);
+        cg_emit_safe_null_epilogue(label_null, label_end);
         return 0;
     }
 
     var struct_def: *AstStructDef = ot.struct_def;
     if (struct_def == 0) {
         emit("    ; ERROR: Struct definition not found for pointer type\n");
-        emit("    jmp ");
-        emit_label(label_end);
-        emit_nl();
-        emit_label_def(label_null);
-        emit("    xor eax, eax\n");
-        emit_label_def(label_end);
+        cg_emit_safe_null_epilogue(label_null, label_end);
         return 0;
     }
 
@@ -1612,42 +1633,22 @@ func cg_safe_member_access_expr(node: u64, symtab: *Symtab) -> u64 {
         emit("\n");
     }
     if (field_desc == 0) {
-        emit("    jmp ");
-        emit_label(label_end);
-        emit_nl();
-        emit_label_def(label_null);
-        emit("    xor eax, eax\n");
-        emit_label_def(label_end);
+        cg_emit_safe_null_epilogue(label_null, label_end);
         return 0;
     }
     var fd: *FieldDesc = field_desc;
     if (fd.type_kind == TYPE_STRUCT && fd.ptr_depth == 0) {
         emit("    ; ERROR: Safe member access cannot return struct by value\n");
-        emit("    jmp ");
-        emit_label(label_end);
-        emit_nl();
-        emit_label_def(label_null);
-        emit("    xor eax, eax\n");
-        emit_label_def(label_end);
+        cg_emit_safe_null_epilogue(label_null, label_end);
         return 0;
     }
     if (fd.type_kind == TYPE_ARRAY) {
-        emit("    jmp ");
-        emit_label(label_end);
-        emit_nl();
-        emit_label_def(label_null);
-        emit("    xor eax, eax\n");
-        emit_label_def(label_end);
+        cg_emit_safe_null_epilogue(label_null, label_end);
         return 0;
     }
     cg_emit_field_load_from_rax(fd);
 
-    emit("    jmp ");
-    emit_label(label_end);
-    emit_nl();
-    emit_label_def(label_null);
-    emit("    xor eax, eax\n");
-    emit_label_def(label_end);
+    cg_emit_safe_null_epilogue(label_null, label_end);
     return 0;
 }
 
@@ -1662,33 +1663,9 @@ func cg_member_access_expr(node: u64, symtab: *Symtab) -> u64 {
     var ot: *TypeInfo = get_expr_type_with_symtab((*AstNode)object, symtab);
     if (ot != 0) {
         if (ot.ptr_depth > 0 && ot.is_tagged == 1 && ot.tag_layout_ptr != 0) {
-            var layout_info: *AstStructDef = get_struct_def(ot.tag_layout_ptr, ot.tag_layout_len);
-            if (layout_info == 0) {
-                emit("[ERROR] Tagged layout struct not found\n");
-                panic("Codegen error");
-            }
-            var packed_flag: u64 = layout_info.is_packed;
-            if (packed_flag == 0) {
-                emit("[ERROR] Tagged layout must be packed struct\n");
-                panic("Codegen error");
-            }
-            var total_bits: u64 = get_packed_layout_total_bits(layout_info);
-            var field_offset: u64 = get_packed_field_bit_offset(layout_info, member_ptr, member_len);
-            var field_width: u64 = get_packed_field_bit_width(layout_info, member_ptr, member_len);
-            var start_bit: u64 = 64 - total_bits;
-            var shift_bits: u64 = start_bit + field_offset;
-
+            var layout_info: *AstStructDef = cg_require_tagged_layout_struct(ot.tag_layout_ptr, ot.tag_layout_len);
             cg_expr(object);
-            if (shift_bits > 0) {
-                emit("    mov rcx, ");
-                emit_u64(shift_bits);
-                emit_nl();
-                emit("    shr rax, cl\n");
-            }
-            if (field_width < 64) {
-                emit_mask_to_rdx(field_width);
-                emit("    and rax, rdx\n");
-            }
+            cg_emit_tagged_layout_extract_from_rax(layout_info, member_ptr, member_len);
             return;
         }
         if (ot.ptr_depth > 0 && ot.type_kind == TYPE_STRUCT) {
@@ -2294,6 +2271,24 @@ func cg_lvalue(node: u64) -> u64 {
 // Member Access LValue
 // ============================================
 
+func cg_member_add_offset_to_rax(field_offset: u64) -> u64 {
+    if (field_offset == 0) { return 0; }
+    emit("    add rax, ");
+    emit_u64(field_offset);
+    emit("\n");
+    return 0;
+}
+
+func cg_member_resolve_field_offset(struct_def: *AstStructDef, parent_ptr: u64, parent_len: u64, member_ptr: u64, member_len: u64, offset_out: *u64) -> u64 {
+    if (struct_def == 0) { return 0; }
+    var field_offset: u64 = 0;
+    var field_desc: *FieldDesc = 0;
+    var found: u64 = struct_find_field_desc_scoped(struct_def, parent_ptr, parent_len, member_ptr, member_len, &field_offset, &field_desc);
+    if (found == 0) { return 0; }
+    *offset_out = field_offset;
+    return 1;
+}
+
 func cg_member_access_lvalue(node: u64, symtab: *Symtab) -> u64 {
     var member_access: *AstMemberAccess = (*AstMemberAccess)node;
     var object: u64 = member_access.object;
@@ -2314,14 +2309,8 @@ func cg_member_access_lvalue(node: u64, symtab: *Symtab) -> u64 {
             return;
         }
         var field_offset_ptr: u64 = 0;
-        var field_desc_ptr: *FieldDesc = 0;
-        var found_ptr: u64 = struct_find_field_desc_scoped(struct_def_ptr, parent_ptr, parent_len, member_ptr, member_len, &field_offset_ptr, &field_desc_ptr);
-        if (found_ptr == 0) { return; }
-        if (field_offset_ptr > 0) {
-            emit("    add rax, ");
-            emit_u64(field_offset_ptr);
-            emit("\n");
-        }
+        if (cg_member_resolve_field_offset(struct_def_ptr, parent_ptr, parent_len, member_ptr, member_len, &field_offset_ptr) == 0) { return; }
+        cg_member_add_offset_to_rax(field_offset_ptr);
         return;
     }
     
@@ -2362,17 +2351,11 @@ func cg_member_access_lvalue(node: u64, symtab: *Symtab) -> u64 {
         }
         
         var field_offset: u64 = 0;
-        var field_desc: *FieldDesc = 0;
-        var found_field: u64 = struct_find_field_desc_scoped(struct_def, parent_ptr, parent_len, member_ptr, member_len, &field_offset, &field_desc);
-        if (found_field == 0) { return; }
+        if (cg_member_resolve_field_offset(struct_def, parent_ptr, parent_len, member_ptr, member_len, &field_offset) == 0) { return; }
         
         // Pop pointer value and add field offset
         emit("    pop rax\n");
-        if (field_offset > 0) {
-            emit("    add rax, ");
-            emit_u64(field_offset);
-            emit("\n");
-        }
+        cg_member_add_offset_to_rax(field_offset);
         return;
     }
     
@@ -2401,17 +2384,11 @@ func cg_member_access_lvalue(node: u64, symtab: *Symtab) -> u64 {
         }
         
         var field_offset: u64 = 0;
-        var field_desc: *FieldDesc = 0;
-        var found_field2: u64 = struct_find_field_desc_scoped(struct_def, parent_ptr, parent_len, member_ptr, member_len, &field_offset, &field_desc);
-        if (found_field2 == 0) { return; }
+        if (cg_member_resolve_field_offset(struct_def, parent_ptr, parent_len, member_ptr, member_len, &field_offset) == 0) { return; }
         
         // Pop base address and add field offset
         emit("    pop rax\n");
-        if (field_offset > 0) {
-            emit("    add rax, ");
-            emit_u64(field_offset);
-            emit("\n");
-        }
+        cg_member_add_offset_to_rax(field_offset);
         return;
     }
 
@@ -2436,15 +2413,9 @@ func cg_member_access_lvalue(node: u64, symtab: *Symtab) -> u64 {
         }
 
         var idx_field_offset: u64 = 0;
-        var idx_field_desc: *FieldDesc = 0;
-        var found_idx: u64 = struct_find_field_desc_scoped(idx_struct_def, parent_ptr, parent_len, member_ptr, member_len, &idx_field_offset, &idx_field_desc);
-        if (found_idx == 0) { return; }
+        if (cg_member_resolve_field_offset(idx_struct_def, parent_ptr, parent_len, member_ptr, member_len, &idx_field_offset) == 0) { return; }
         emit("    pop rax\n");
-        if (idx_field_offset > 0) {
-            emit("    add rax, ");
-            emit_u64(idx_field_offset);
-            emit("\n");
-        }
+        cg_member_add_offset_to_rax(idx_field_offset);
         return;
     }
     
@@ -2483,17 +2454,11 @@ func cg_member_access_lvalue(node: u64, symtab: *Symtab) -> u64 {
             return;
         }
         var field_offset_g: u64 = 0;
-        var field_desc_g: *FieldDesc = 0;
-        var found_g: u64 = struct_find_field_desc_scoped(struct_def_g, parent_ptr, parent_len, member_ptr, member_len, &field_offset_g, &field_desc_g);
-        if (found_g == 0) { return; }
+        if (cg_member_resolve_field_offset(struct_def_g, parent_ptr, parent_len, member_ptr, member_len, &field_offset_g) == 0) { return; }
         emit("    lea rax, [rel _gvar_");
         emit_len(resolved_ptr, resolved_len);
         emit("]\n");
-        if (field_offset_g > 0) {
-            emit("    add rax, ");
-            emit_u64(field_offset_g);
-            emit("\n");
-        }
+        cg_member_add_offset_to_rax(field_offset_g);
         return;
     }
     
@@ -2513,9 +2478,7 @@ func cg_member_access_lvalue(node: u64, symtab: *Symtab) -> u64 {
     }
     
     var field_offset: u64 = 0;
-    var field_desc_l: *FieldDesc = 0;
-    var found_l: u64 = struct_find_field_desc_scoped(struct_def, parent_ptr, parent_len, member_ptr, member_len, &field_offset, &field_desc_l);
-    if (found_l == 0) { return; }
+    if (cg_member_resolve_field_offset(struct_def, parent_ptr, parent_len, member_ptr, member_len, &field_offset) == 0) { return; }
     
     // Calculate address: lea rax, [rbp + var_offset + field_offset]
     emit("    lea rax, [rbp");
@@ -2548,7 +2511,7 @@ func cg_safe_method_call(node: u64, symtab: *Symtab) -> u64 {
             return 0;
         }
         var method_index: u64 = compiler_find_trait_method_index(recv_ti.struct_name_ptr, recv_ti.struct_name_len, method_ptr, method_len);
-        if (method_index == 9223372036854775807) {
+        if (compiler_is_not_found_u64(method_index) != 0) {
             emit_stderr("[ERROR] Trait method not found: ");
             emit_stderr_len(method_ptr, method_len);
             emit_stderr("\n");
@@ -2717,7 +2680,7 @@ func cg_method_call(node: u64, symtab: *Symtab) -> u64 {
 
     if (recv_ti != 0 && (recv_ti.type_kind == TYPE_TRAIT || compiler_is_trait_name(recv_ti.struct_name_ptr, recv_ti.struct_name_len) != 0)) {
         var method_index: u64 = compiler_find_trait_method_index(recv_ti.struct_name_ptr, recv_ti.struct_name_len, method_ptr, method_len);
-        if (method_index == 9223372036854775807) {
+        if (compiler_is_not_found_u64(method_index) != 0) {
             emit_stderr("[ERROR] Trait method not found: ");
             emit_stderr_len(method_ptr, method_len);
             emit_stderr("\n");

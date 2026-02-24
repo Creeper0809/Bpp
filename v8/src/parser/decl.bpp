@@ -80,20 +80,37 @@ func parse_const_decl(p: *Parser) -> *AstConstDecl {
     return ast_const_decl(name_ptr, name_len, value);
 }
 
+func parse_import_expect_module_token(p: *Parser) -> *Token {
+    var tok: *Token = parse_peek(p);
+    var kind: u64 = parse_peek_kind(p);
+    if (kind != TOKEN_IDENTIFIER && kind != TOKEN_CHAR) {
+        emit_stderr("[ERROR] Expected module identifier in import\n");
+        parse_panic_here(p, "Parse error");
+    }
+    parse_adv(p);
+    return tok;
+}
+
+func parse_import_parse_path_suffix(p: *Parser, path_ptr_in: u64, path_len_in: u64) -> *NameInfo {
+    var path_ptr: u64 = path_ptr_in;
+    var path_len: u64 = path_len_in;
+    while (parse_match(p, TOKEN_DOT)) {
+        var next_tok: *Token = parse_import_expect_module_token(p);
+        var joined_path: u64 = str_concat(path_ptr, path_len, "/", 1);
+        path_ptr = str_concat(joined_path, path_len + 1, next_tok.ptr, next_tok.len);
+        path_len = path_len + 1 + next_tok.len;
+    }
+    return new NameInfo{path_ptr, path_len};
+}
+
 // ============================================
 // Import Declaration
 // ============================================
 
 func parse_import_decl(p: *Parser) -> *AstImport {
     parse_consume(p, TOKEN_IMPORT);
-    
-    var first_tok: *Token = parse_peek(p);
-    var first_kind: u64 = parse_peek_kind(p);
-    if (first_kind != TOKEN_IDENTIFIER && first_kind != TOKEN_CHAR) {
-        emit_stderr("[ERROR] Expected module identifier in import\n");
-        parse_panic_here(p, "Parse error");
-    }
-    parse_adv(p);
+
+    var first_tok: *Token = parse_import_expect_module_token(p);
 
     // Selective import: import <symbol> [as <alias>] from <module>
     if (parse_peek_kind(p) == TOKEN_AS || parse_peek_kind(p) == TOKEN_FROM) {
@@ -115,57 +132,20 @@ func parse_import_decl(p: *Parser) -> *AstImport {
 
         parse_consume(p, TOKEN_FROM);
 
-        var mod_tok: *Token = parse_peek(p);
-        var mod_kind: u64 = parse_peek_kind(p);
-        if (mod_kind != TOKEN_IDENTIFIER && mod_kind != TOKEN_CHAR) {
-            emit_stderr("[ERROR] Expected module identifier in import\n");
-            parse_panic_here(p, "Parse error");
-        }
-        parse_adv(p);
-
-        var path_ptr: u64 = mod_tok.ptr;
-        var path_len: u64 = mod_tok.len;
-
-        while (parse_match(p, TOKEN_DOT)) {
-            var next_tok: *Token = parse_peek(p);
-            var next_kind: u64 = parse_peek_kind(p);
-            if (next_kind != TOKEN_IDENTIFIER && next_kind != TOKEN_CHAR) {
-                emit_stderr("[ERROR] Expected module identifier in import\n");
-                parse_panic_here(p, "Parse error");
-            }
-            parse_adv(p);
-
-            var joined_path: u64 = str_concat(path_ptr, path_len, "/", 1);
-            path_ptr = str_concat(joined_path, path_len + 1, next_tok.ptr, next_tok.len);
-            path_len = path_len + 1 + next_tok.len;
-        }
+        var mod_tok: *Token = parse_import_expect_module_token(p);
+        var path_info: *NameInfo = parse_import_parse_path_suffix(p, mod_tok.ptr, mod_tok.len);
 
         parse_consume(p, TOKEN_SEMICOLON);
 
-        return ast_import(path_ptr, path_len, symbol_ptr, symbol_len, alias_ptr, alias_len);
+        return ast_import(path_info.ptr, path_info.len, symbol_ptr, symbol_len, alias_ptr, alias_len);
     }
 
     // Import module: import <module>;
-    var path_ptr: u64  = first_tok.ptr;
-    var path_len: u64 = first_tok.len;
-    
-    while (parse_match(p, TOKEN_DOT)) {
-        var next_tok: *Token = parse_peek(p);
-        var next_kind: u64 = parse_peek_kind(p);
-        if (next_kind != TOKEN_IDENTIFIER && next_kind != TOKEN_CHAR) {
-            emit_stderr("[ERROR] Expected module identifier in import\n");
-            parse_panic_here(p, "Parse error");
-        }
-        parse_adv(p);
-        
-        var joined_path2: u64 = str_concat(path_ptr, path_len, "/", 1);
-        path_ptr = str_concat(joined_path2, path_len + 1, next_tok.ptr, next_tok.len);
-        path_len = path_len + 1 + next_tok.len;
-    }
+    var path_info2: *NameInfo = parse_import_parse_path_suffix(p, first_tok.ptr, first_tok.len);
     
     parse_consume(p, TOKEN_SEMICOLON);
     
-    return ast_import(path_ptr, path_len, 0, 0, 0, 0);
+    return ast_import(path_info2.ptr, path_info2.len, 0, 0, 0, 0);
 }
 
 // ============================================
@@ -518,6 +498,25 @@ func parse_func_header(p: *Parser) -> *ParsedFuncHeader {
     return parsed;
 }
 
+func parse_func_from_header(parsed: *ParsedFuncHeader, body: *AstNode) -> *AstFunc {
+    var name_tok: *Token = parsed.name_tok;
+    return ast_func_ex(name_tok.ptr, name_tok.len, parsed.params,
+                       parsed.ret_type, parsed.ret_ptr_depth, parsed.ret_is_tagged,
+                       parsed.ret_struct_name_ptr, parsed.ret_struct_name_len,
+                       parsed.ret_tag_layout_ptr, parsed.ret_tag_layout_len, body);
+}
+
+func parse_register_generic_func(name_tok: *Token, generic_params: *Vec<*GenericParam>, func_node: *AstFunc, is_definition: u64) -> u64 {
+    if (generic_params == 0) { return 0; }
+    type_parser_clear_generic_params();
+    if (is_definition != 0) {
+        compiler_register_generic_func_def(name_tok.ptr, name_tok.len, generic_params, func_node);
+        return 0;
+    }
+    compiler_register_generic_func_sig(name_tok.ptr, name_tok.len, generic_params, func_node);
+    return 0;
+}
+
 func parse_func_decl(p: *Parser) -> *AstFunc {
     push_trace("parse_func_decl", "parser/decl.b", __LINE__);
     defer pop_trace();
@@ -528,15 +527,8 @@ func parse_func_decl(p: *Parser) -> *AstFunc {
 
     var body: *AstNode = parse_block(p);
 
-    var func_node: *AstFunc = ast_func_ex(name_tok.ptr, name_tok.len, parsed.params,
-                                          parsed.ret_type, parsed.ret_ptr_depth, parsed.ret_is_tagged,
-                                          parsed.ret_struct_name_ptr, parsed.ret_struct_name_len,
-                                          parsed.ret_tag_layout_ptr, parsed.ret_tag_layout_len, body);
-
-    if (generic_params != 0) {
-        type_parser_clear_generic_params();
-        compiler_register_generic_func_def(name_tok.ptr, name_tok.len, generic_params, func_node);
-    }
+    var func_node: *AstFunc = parse_func_from_header(parsed, body);
+    parse_register_generic_func(name_tok, generic_params, func_node, 1);
     return func_node;
 }
 
@@ -552,15 +544,8 @@ func parse_func_decl_signature(p: *Parser) -> *AstFunc {
     // Skip function body
     parse_skip_block(p);
 
-    var func_sig: *AstFunc = ast_func_ex(name_tok.ptr, name_tok.len, parsed.params,
-                                         parsed.ret_type, parsed.ret_ptr_depth, parsed.ret_is_tagged,
-                                         parsed.ret_struct_name_ptr, parsed.ret_struct_name_len,
-                                         parsed.ret_tag_layout_ptr, parsed.ret_tag_layout_len, 0);
-
-    if (generic_params != 0) {
-        type_parser_clear_generic_params();
-        compiler_register_generic_func_sig(name_tok.ptr, name_tok.len, generic_params, func_sig);
-    }
+    var func_sig: *AstFunc = parse_func_from_header(parsed, 0);
+    parse_register_generic_func(name_tok, generic_params, func_sig, 0);
     return func_sig;
 }
 
@@ -575,15 +560,8 @@ func parse_func_decl_abst_signature(p: *Parser) -> *AstFunc {
 
     parse_consume(p, TOKEN_SEMICOLON);
 
-    var func_sig: *AstFunc = ast_func_ex(name_tok.ptr, name_tok.len, parsed.params,
-                                         parsed.ret_type, parsed.ret_ptr_depth, parsed.ret_is_tagged,
-                                         parsed.ret_struct_name_ptr, parsed.ret_struct_name_len,
-                                         parsed.ret_tag_layout_ptr, parsed.ret_tag_layout_len, 0);
-
-    if (generic_params != 0) {
-        type_parser_clear_generic_params();
-        compiler_register_generic_func_sig(name_tok.ptr, name_tok.len, generic_params, func_sig);
-    }
+    var func_sig: *AstFunc = parse_func_from_header(parsed, 0);
+    parse_register_generic_func(name_tok, generic_params, func_sig, 0);
     return func_sig;
 }
 
