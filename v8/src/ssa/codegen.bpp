@@ -1084,15 +1084,20 @@ func _ssa_emit_restore_reg(dest: u64, phys: u64) -> u64 {
     return 0;
 }
 
-func _ssa_emit_call(dest: u64, extra_dest: u64, info_ptr: u64, live_mask: u64) -> u64 {
-    var info: *SSACallInfo = (*SSACallInfo)info_ptr;
-    var name_ptr: u64 = info.name_ptr;
-    var name_len: u64 = info.name_len;
-    var args_vec: *Vec<u64> = info.args_vec;
-    var nargs: u64 = info.nargs;
-    var ret_type: u64 = info.ret_type;
-    var ret_ptr_depth: u64 = info.ret_ptr_depth;
-    var ret_struct_size: u64 = info.ret_struct_size;
+func _ssa_emit_call_common(
+    is_ptr: u64,
+    dest: u64,
+    extra_dest: u64,
+    name_ptr: u64,
+    name_len: u64,
+    callee_reg: u64,
+    args_vec: *Vec<u64>,
+    nargs: u64,
+    ret_type: u64,
+    ret_ptr_depth: u64,
+    ret_struct_size: u64,
+    live_mask: u64
+) -> u64 {
     if (nargs == 0 && args_vec != 0) { nargs = args_vec.len(); }
     var is_sret: u64 = 0;
     if (ret_type == TYPE_STRUCT && ret_ptr_depth == 0 && ret_struct_size > 16) {
@@ -1101,12 +1106,8 @@ func _ssa_emit_call(dest: u64, extra_dest: u64, info_ptr: u64, live_mask: u64) -
 
     var keep_rax: u64 = 0;
     var keep_rdx: u64 = 0;
-    if (dest == SSA_PHYS_RAX) {
-        keep_rax = 1;
-    }
-    if (extra_dest == SSA_PHYS_RDX) {
-        keep_rdx = 1;
-    }
+    if (dest == SSA_PHYS_RAX) { keep_rax = 1; }
+    if (extra_dest == SSA_PHYS_RDX) { keep_rdx = 1; }
     if (ret_type == TYPE_SLICE && ret_ptr_depth == 0) {
         if (dest == SSA_PHYS_RAX) { keep_rax = 1; }
         if (extra_dest == SSA_PHYS_RDX) { keep_rdx = 1; }
@@ -1116,12 +1117,8 @@ func _ssa_emit_call(dest: u64, extra_dest: u64, info_ptr: u64, live_mask: u64) -
     var save_mask: u64 = live_mask & all_mask;
     if (keep_rax != 0) { save_mask = save_mask & (all_mask ^ SSA_LIVE_RAX); }
     if (keep_rdx != 0) { save_mask = save_mask & (all_mask ^ SSA_LIVE_RDX); }
-    if (dest != 0) {
-        save_mask = save_mask & (all_mask ^ _ssa_phys_mask(dest));
-    }
-    if (extra_dest != 0) {
-        save_mask = save_mask & (all_mask ^ _ssa_phys_mask(extra_dest));
-    }
+    if (dest != 0) { save_mask = save_mask & (all_mask ^ _ssa_phys_mask(dest)); }
+    if (extra_dest != 0) { save_mask = save_mask & (all_mask ^ _ssa_phys_mask(extra_dest)); }
     var save_words: u64 = _ssa_live_mask_word_count(save_mask);
 
     if ((save_mask & SSA_LIVE_RAX) != 0) { _ssa_emit_push_reg(SSA_PHYS_RAX); }
@@ -1133,9 +1130,9 @@ func _ssa_emit_call(dest: u64, extra_dest: u64, info_ptr: u64, live_mask: u64) -
     if ((save_mask & SSA_LIVE_R10) != 0) { _ssa_emit_push_reg(SSA_PHYS_R10); }
     if ((save_mask & SSA_LIVE_R11) != 0) { _ssa_emit_push_reg(SSA_PHYS_R11); }
 
-    var reg_count2: u64 = nargs;
-    if (reg_count2 > 6) { reg_count2 = 6; }
-    var stack_args: u64 = nargs - reg_count2;
+    var reg_count: u64 = nargs;
+    if (reg_count > 6) { reg_count = 6; }
+    var stack_args: u64 = nargs - reg_count;
     var align_pad: u64 = 0;
     var call_stack_words: u64 = save_words + stack_args;
     if ((call_stack_words % 2) != 0) {
@@ -1143,14 +1140,14 @@ func _ssa_emit_call(dest: u64, extra_dest: u64, info_ptr: u64, live_mask: u64) -
         align_pad = 1;
     }
 
-    for (var si2: i64 = (i64)nargs - 1; si2 >= 0; si2 = si2 - 1) {
-        var sreg2: u64 = args_vec.get((u64)si2);
+    for (var si: i64 = (i64)nargs - 1; si >= 0; si = si - 1) {
+        var sreg: u64 = args_vec.get((u64)si);
         emit("    push ");
-        _ssa_emit_reg_name(sreg2);
+        _ssa_emit_reg_name(sreg);
         emit_nl();
     }
 
-    for (var i: u64 = 0; i < reg_count2; i++) {
+    for (var i: u64 = 0; i < reg_count; i++) {
         emit("    pop ");
         if (i == 0) { emit("rdi"); }
         else if (i == 1) { emit("rsi"); }
@@ -1162,7 +1159,8 @@ func _ssa_emit_call(dest: u64, extra_dest: u64, info_ptr: u64, live_mask: u64) -
     }
 
     emit("    call ");
-    emit_len(name_ptr, name_len);
+    if (is_ptr != 0) { _ssa_emit_reg_name(callee_reg); }
+    else { emit_len(name_ptr, name_len); }
     emit_nl();
 
     if (is_sret == 0) {
@@ -1193,112 +1191,22 @@ func _ssa_emit_call(dest: u64, extra_dest: u64, info_ptr: u64, live_mask: u64) -
     return 0;
 }
 
+func _ssa_emit_call(dest: u64, extra_dest: u64, info_ptr: u64, live_mask: u64) -> u64 {
+    var info: *SSACallInfo = (*SSACallInfo)info_ptr;
+    return _ssa_emit_call_common(0, dest, extra_dest,
+                                 info.name_ptr, info.name_len, 0,
+                                 info.args_vec, info.nargs,
+                                 info.ret_type, info.ret_ptr_depth, info.ret_struct_size,
+                                 live_mask);
+}
+
 func _ssa_emit_call_ptr(dest: u64, extra_dest: u64, info_ptr: u64, live_mask: u64) -> u64 {
     var info: *SSACallPtrInfo = (*SSACallPtrInfo)info_ptr;
-    var callee_reg: u64 = info.callee_reg;
-    var args_vec: *Vec<u64> = info.args_vec;
-    var nargs: u64 = info.nargs;
-    var ret_type: u64 = info.ret_type;
-    var ret_ptr_depth: u64 = info.ret_ptr_depth;
-    var ret_struct_size: u64 = info.ret_struct_size;
-    if (nargs == 0 && args_vec != 0) { nargs = args_vec.len(); }
-    var is_sret: u64 = 0;
-    if (ret_type == TYPE_STRUCT && ret_ptr_depth == 0 && ret_struct_size > 16) {
-        is_sret = 1;
-    }
-
-    var keep_rax: u64 = 0;
-    var keep_rdx: u64 = 0;
-    if (dest == SSA_PHYS_RAX) {
-        keep_rax = 1;
-    }
-    if (extra_dest == SSA_PHYS_RDX) {
-        keep_rdx = 1;
-    }
-    if (ret_type == TYPE_SLICE && ret_ptr_depth == 0) {
-        if (dest == SSA_PHYS_RAX) { keep_rax = 1; }
-        if (extra_dest == SSA_PHYS_RDX) { keep_rdx = 1; }
-    }
-
-    var all_mask2: u64 = _ssa_live_all_mask();
-    var save_mask: u64 = live_mask & all_mask2;
-    if (keep_rax != 0) { save_mask = save_mask & (all_mask2 ^ SSA_LIVE_RAX); }
-    if (keep_rdx != 0) { save_mask = save_mask & (all_mask2 ^ SSA_LIVE_RDX); }
-    if (dest != 0) {
-        save_mask = save_mask & (all_mask2 ^ _ssa_phys_mask(dest));
-    }
-    if (extra_dest != 0) {
-        save_mask = save_mask & (all_mask2 ^ _ssa_phys_mask(extra_dest));
-    }
-    var save_words: u64 = _ssa_live_mask_word_count(save_mask);
-
-    if ((save_mask & SSA_LIVE_RAX) != 0) { _ssa_emit_push_reg(SSA_PHYS_RAX); }
-    if ((save_mask & SSA_LIVE_RBX) != 0) { _ssa_emit_push_reg(SSA_PHYS_RBX); }
-    if ((save_mask & SSA_LIVE_RCX) != 0) { _ssa_emit_push_reg(SSA_PHYS_RCX); }
-    if ((save_mask & SSA_LIVE_RDX) != 0) { _ssa_emit_push_reg(SSA_PHYS_RDX); }
-    if ((save_mask & SSA_LIVE_R8) != 0) { _ssa_emit_push_reg(SSA_PHYS_R8); }
-    if ((save_mask & SSA_LIVE_R9) != 0) { _ssa_emit_push_reg(SSA_PHYS_R9); }
-    if ((save_mask & SSA_LIVE_R10) != 0) { _ssa_emit_push_reg(SSA_PHYS_R10); }
-    if ((save_mask & SSA_LIVE_R11) != 0) { _ssa_emit_push_reg(SSA_PHYS_R11); }
-
-    var reg_count0: u64 = nargs;
-    if (reg_count0 > 6) { reg_count0 = 6; }
-    var stack_args: u64 = nargs - reg_count0;
-    var align_pad: u64 = 0;
-    var call_stack_words: u64 = save_words + stack_args;
-    if ((call_stack_words % 2) != 0) {
-        emit("    sub rsp, 8\n");
-        align_pad = 1;
-    }
-
-    for (var si3: i64 = (i64)nargs - 1; si3 >= 0; si3 = si3 - 1) {
-        var sreg3: u64 = args_vec.get((u64)si3);
-        emit("    push ");
-        _ssa_emit_reg_name(sreg3);
-        emit_nl();
-    }
-
-    for (var i: u64 = 0; i < reg_count0; i++) {
-        emit("    pop ");
-        if (i == 0) { emit("rdi"); }
-        else if (i == 1) { emit("rsi"); }
-        else if (i == 2) { emit("rdx"); }
-        else if (i == 3) { emit("rcx"); }
-        else if (i == 4) { emit("r8"); }
-        else if (i == 5) { emit("r9"); }
-        emit_nl();
-    }
-
-    emit("    call ");
-    _ssa_emit_reg_name(callee_reg);
-    emit_nl();
-
-    if (is_sret == 0) {
-        if (dest != 0 && dest != SSA_PHYS_RAX) {
-            _ssa_emit_mov_reg_opr(dest, ssa_operand_reg(SSA_PHYS_RAX));
-        }
-        if (extra_dest != 0 && extra_dest != SSA_PHYS_RDX) {
-            emit("    mov ");
-            _ssa_emit_reg_name(extra_dest);
-            emit(", rdx\n");
-        }
-    }
-
-    if (stack_args + align_pad > 0) {
-        emit("    add rsp, ");
-        emit_u64((stack_args + align_pad) * 8);
-        emit_nl();
-    }
-
-    if ((save_mask & SSA_LIVE_R11) != 0) { _ssa_emit_restore_reg(dest, SSA_PHYS_R11); }
-    if ((save_mask & SSA_LIVE_R10) != 0) { _ssa_emit_restore_reg(dest, SSA_PHYS_R10); }
-    if ((save_mask & SSA_LIVE_R9) != 0) { _ssa_emit_restore_reg(dest, SSA_PHYS_R9); }
-    if ((save_mask & SSA_LIVE_R8) != 0) { _ssa_emit_restore_reg(dest, SSA_PHYS_R8); }
-    if ((save_mask & SSA_LIVE_RDX) != 0) { _ssa_emit_restore_reg(dest, SSA_PHYS_RDX); }
-    if ((save_mask & SSA_LIVE_RCX) != 0) { _ssa_emit_restore_reg(dest, SSA_PHYS_RCX); }
-    if ((save_mask & SSA_LIVE_RBX) != 0) { _ssa_emit_restore_reg(dest, SSA_PHYS_RBX); }
-    if ((save_mask & SSA_LIVE_RAX) != 0) { _ssa_emit_restore_reg(dest, SSA_PHYS_RAX); }
-    return 0;
+    return _ssa_emit_call_common(1, dest, extra_dest,
+                                 0, 0, info.callee_reg,
+                                 info.args_vec, info.nargs,
+                                 info.ret_type, info.ret_ptr_depth, info.ret_struct_size,
+                                 live_mask);
 }
 
 func _ssa_emit_label_def(fn_id: u64, block_id: u64) -> u64 {

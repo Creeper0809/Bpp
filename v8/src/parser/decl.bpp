@@ -23,45 +23,6 @@ import parser.expr;
 import parser.stmt;
 
 // ============================================
-// Vec<*AstFunc> Helpers (bootstrap-safe)
-// ============================================
-
-func parser_vec_astfunc_push(vec: *Vec<*AstFunc>, item: *AstFunc) -> u64 {
-    var len: u64 = vec.length;
-    var cap: u64 = vec.capacity;
-    var elem_size: u64 = sizeof(*AstFunc);
-
-    if (len >= cap) {
-        var new_cap: u64 = cap * 2;
-        if (new_cap < 4) { new_cap = 4; }
-        var new_buf: u64 = heap_alloc(new_cap * elem_size);
-        var old_buf: u64 = vec.data_ptr;
-        for (var i: u64 = 0; i < len; i++) {
-            var src: u64 = old_buf + i * elem_size;
-            var dst: u64 = new_buf + i * elem_size;
-            var src_u8: *u8 = (*u8)src;
-            var dst_u8: *u8 = (*u8)dst;
-            for (var j: u64 = 0; j < elem_size; j++) {
-                dst_u8[j] = src_u8[j];
-            }
-        }
-        vec.data_ptr = new_buf;
-        vec.capacity = new_cap;
-    }
-
-    var buf: u64 = vec.data_ptr;
-    var dst2: u64 = buf + len * elem_size;
-    var src2: u64 = (u64)&item;
-    var dst2_u8: *u8 = (*u8)dst2;
-    var src2_u8: *u8 = (*u8)src2;
-    for (var k: u64 = 0; k < elem_size; k++) {
-        dst2_u8[k] = src2_u8[k];
-    }
-    vec.length = len + 1;
-    return 0;
-}
-
-// ============================================
 // Const Declaration
 // ============================================
 
@@ -234,7 +195,7 @@ func parse_skip_block(p: *Parser) -> u64 {
     return 0;
 }
 
-func parse_is_generic_param_list(p: *Parser) -> u64 {
+func parse_is_generic_param_list_impl(p: *Parser, require_follow_lparen: u64) -> u64 {
     if (parse_peek_kind(p) != TOKEN_LT) { return false; }
     var saved: u64 = parser_pos(p);
     parse_adv(p);
@@ -253,6 +214,10 @@ func parse_is_generic_param_list(p: *Parser) -> u64 {
         if (k == TOKEN_GT) {
             depth = depth - 1;
             if (depth == 0) {
+                if (require_follow_lparen == 0) {
+                    parser_set_pos(p, saved);
+                    return true;
+                }
                 var saved2: u64 = parser_pos(p);
                 parse_adv(p);
                 var next_kind: u64 = parse_peek_kind(p);
@@ -269,6 +234,10 @@ func parse_is_generic_param_list(p: *Parser) -> u64 {
             }
             depth = depth - 2;
             if (depth == 0) {
+                if (require_follow_lparen == 0) {
+                    parser_set_pos(p, saved);
+                    return true;
+                }
                 var saved3: u64 = parser_pos(p);
                 parse_adv(p);
                 var next_kind2: u64 = parse_peek_kind(p);
@@ -282,38 +251,12 @@ func parse_is_generic_param_list(p: *Parser) -> u64 {
     }
 }
 
+func parse_is_generic_param_list(p: *Parser) -> u64 {
+    return parse_is_generic_param_list_impl(p, 1);
+}
+
 func parse_is_generic_param_list_any(p: *Parser) -> u64 {
-    if (parse_peek_kind(p) != TOKEN_LT) { return false; }
-    var saved: u64 = parser_pos(p);
-    parse_adv(p);
-    var depth: u64 = 1;
-    while (1) {
-        var k: u64 = parse_peek_kind(p);
-        if (k == TOKEN_EOF) {
-            parser_set_pos(p, saved);
-            return false;
-        }
-        if (k == TOKEN_LT) { depth = depth + 1; }
-        if (k == TOKEN_GT) {
-            depth = depth - 1;
-            if (depth == 0) {
-                parser_set_pos(p, saved);
-                return true;
-            }
-        }
-        if (k == TOKEN_RSHIFT) {
-            if (depth < 2) {
-                parser_set_pos(p, saved);
-                return false;
-            }
-            depth = depth - 2;
-            if (depth == 0) {
-                parser_set_pos(p, saved);
-                return true;
-            }
-        }
-        parse_adv(p);
-    }
+    return parse_is_generic_param_list_impl(p, 0);
 }
 
 func parse_is_impl_trait_block(p: *Parser) -> u64 {
@@ -476,12 +419,37 @@ func parse_param(p: *Parser) -> *Param {
     return param;
 }
 
-func parse_func_decl(p: *Parser) -> *AstFunc {
-    push_trace("parse_func_decl", "parser/decl.b", __LINE__);
-    defer pop_trace();
-    
+struct ParsedFuncHeader {
+    name_tok: *Token;
+    generic_params: *Vec<*GenericParam>;
+    params: *Vec<*Param>;
+    ret_type: u64;
+    ret_ptr_depth: u64;
+    ret_is_tagged: u64;
+    ret_struct_name_ptr: u64;
+    ret_struct_name_len: u64;
+    ret_tag_layout_ptr: u64;
+    ret_tag_layout_len: u64;
+}
+
+impl ParsedFuncHeader {
+    constructor() {
+        self.name_tok = 0;
+        self.generic_params = 0;
+        self.params = 0;
+        self.ret_type = TYPE_VOID;
+        self.ret_ptr_depth = 0;
+        self.ret_is_tagged = 0;
+        self.ret_struct_name_ptr = 0;
+        self.ret_struct_name_len = 0;
+        self.ret_tag_layout_ptr = 0;
+        self.ret_tag_layout_len = 0;
+    }
+}
+
+func parse_func_header(p: *Parser) -> *ParsedFuncHeader {
     parse_consume(p, TOKEN_FUNC);
-    
+
     var name_tok: *Token = parse_peek(p);
     var name_kind: u64 = parse_peek_kind(p);
     if (name_kind != TOKEN_IDENTIFIER && name_kind != TOKEN_NEW && name_kind != TOKEN_DELETE) {
@@ -494,23 +462,19 @@ func parse_func_decl(p: *Parser) -> *AstFunc {
     if (generic_params != 0) {
         type_parser_set_generic_params(generic_params);
     }
-    
-    // Set parsing context for better error messages
+
     set_parsing_context(name_tok.ptr, name_tok.len, name_tok.line);
-    
+
     parse_consume(p, TOKEN_LPAREN);
-    
     var params: *Vec<*Param> = new Vec<*Param>(8);
-    
     if (parse_peek_kind(p) != TOKEN_RPAREN) {
         params.push(parse_param(p));
         while (parse_match(p, TOKEN_COMMA)) {
             params.push(parse_param(p));
         }
     }
-    
     parse_consume(p, TOKEN_RPAREN);
-    
+
     var ret_type: u64 = TYPE_VOID;
     var ret_ptr_depth: u64 = 0;
     var ret_is_tagged: u64 = 0;
@@ -518,7 +482,7 @@ func parse_func_decl(p: *Parser) -> *AstFunc {
     var ret_struct_name_len: u64 = 0;
     var ret_tag_layout_ptr: u64 = 0;
     var ret_tag_layout_len: u64 = 0;
-    
+
     if (parse_match(p, TOKEN_ARROW)) {
         var ty: *TypeInfo = parse_type_ex(p);
         ret_type = ty.type_kind;
@@ -529,7 +493,6 @@ func parse_func_decl(p: *Parser) -> *AstFunc {
         ret_tag_layout_ptr = ty.tag_layout_ptr;
         ret_tag_layout_len = ty.tag_layout_len;
         if (ret_type == TYPE_ARRAY) {
-            // Array return decays to pointer to first element
             ret_type = ty.elem_type_kind;
             ret_ptr_depth = ty.elem_ptr_depth + 1;
             ret_is_tagged = 0;
@@ -539,10 +502,35 @@ func parse_func_decl(p: *Parser) -> *AstFunc {
             ret_tag_layout_len = 0;
         }
     }
-    
+
+    var parsed: *ParsedFuncHeader = new ParsedFuncHeader();
+    parsed.name_tok = name_tok;
+    parsed.generic_params = generic_params;
+    parsed.params = params;
+    parsed.ret_type = ret_type;
+    parsed.ret_ptr_depth = ret_ptr_depth;
+    parsed.ret_is_tagged = ret_is_tagged;
+    parsed.ret_struct_name_ptr = ret_struct_name_ptr;
+    parsed.ret_struct_name_len = ret_struct_name_len;
+    parsed.ret_tag_layout_ptr = ret_tag_layout_ptr;
+    parsed.ret_tag_layout_len = ret_tag_layout_len;
+    return parsed;
+}
+
+func parse_func_decl(p: *Parser) -> *AstFunc {
+    push_trace("parse_func_decl", "parser/decl.b", __LINE__);
+    defer pop_trace();
+
+    var parsed: *ParsedFuncHeader = parse_func_header(p);
+    var name_tok: *Token = parsed.name_tok;
+    var generic_params: *Vec<*GenericParam> = parsed.generic_params;
+
     var body: *AstNode = parse_block(p);
 
-    var func_node: *AstFunc = ast_func_ex(name_tok.ptr, name_tok.len, params, ret_type, ret_ptr_depth, ret_is_tagged, ret_struct_name_ptr, ret_struct_name_len, ret_tag_layout_ptr, ret_tag_layout_len, body);
+    var func_node: *AstFunc = ast_func_ex(name_tok.ptr, name_tok.len, parsed.params,
+                                          parsed.ret_type, parsed.ret_ptr_depth, parsed.ret_is_tagged,
+                                          parsed.ret_struct_name_ptr, parsed.ret_struct_name_len,
+                                          parsed.ret_tag_layout_ptr, parsed.ret_tag_layout_len, body);
 
     if (generic_params != 0) {
         type_parser_clear_generic_params();
@@ -556,66 +544,17 @@ func parse_func_decl_signature(p: *Parser) -> *AstFunc {
     push_trace("parse_func_decl_signature", "parser/decl.b", __LINE__);
     defer pop_trace();
 
-    parse_consume(p, TOKEN_FUNC);
-
-    var name_tok: *Token = parse_peek(p);
-    var name_kind: u64 = parse_peek_kind(p);
-    if (name_kind != TOKEN_IDENTIFIER && name_kind != TOKEN_NEW && name_kind != TOKEN_DELETE) {
-        emit_stderr("[ERROR] Expected function name identifier\n");
-        parse_panic_here(p, "Parse error");
-    }
-    parse_adv(p);
-
-    var generic_params: *Vec<*GenericParam> = parse_generic_params_any(p);
-    if (generic_params != 0) {
-        type_parser_set_generic_params(generic_params);
-    }
-
-    set_parsing_context(name_tok.ptr, name_tok.len, name_tok.line);
-
-    parse_consume(p, TOKEN_LPAREN);
-
-    var params: *Vec<*Param> = new Vec<*Param>(8);
-    if (parse_peek_kind(p) != TOKEN_RPAREN) {
-        params.push(parse_param(p));
-        while (parse_match(p, TOKEN_COMMA)) {
-            params.push(parse_param(p));
-        }
-    }
-    parse_consume(p, TOKEN_RPAREN);
-
-    var ret_type: u64 = TYPE_VOID;
-    var ret_ptr_depth: u64 = 0;
-    var ret_is_tagged: u64 = 0;
-    var ret_struct_name_ptr: u64 = 0;
-    var ret_struct_name_len: u64 = 0;
-    var ret_tag_layout_ptr: u64 = 0;
-    var ret_tag_layout_len: u64 = 0;
-
-    if (parse_match(p, TOKEN_ARROW)) {
-        var ty: *TypeInfo = parse_type_ex(p);
-        ret_type = ty.type_kind;
-        ret_ptr_depth = ty.ptr_depth;
-        ret_is_tagged = ty.is_tagged;
-        ret_struct_name_ptr = ty.struct_name_ptr;
-        ret_struct_name_len = ty.struct_name_len;
-        ret_tag_layout_ptr = ty.tag_layout_ptr;
-        ret_tag_layout_len = ty.tag_layout_len;
-        if (ret_type == TYPE_ARRAY) {
-            ret_type = ty.elem_type_kind;
-            ret_ptr_depth = ty.elem_ptr_depth + 1;
-            ret_is_tagged = 0;
-            ret_struct_name_ptr = ty.struct_name_ptr;
-            ret_struct_name_len = ty.struct_name_len;
-            ret_tag_layout_ptr = 0;
-            ret_tag_layout_len = 0;
-        }
-    }
+    var parsed: *ParsedFuncHeader = parse_func_header(p);
+    var name_tok: *Token = parsed.name_tok;
+    var generic_params: *Vec<*GenericParam> = parsed.generic_params;
 
     // Skip function body
     parse_skip_block(p);
 
-    var func_sig: *AstFunc = ast_func_ex(name_tok.ptr, name_tok.len, params, ret_type, ret_ptr_depth, ret_is_tagged, ret_struct_name_ptr, ret_struct_name_len, ret_tag_layout_ptr, ret_tag_layout_len, 0);
+    var func_sig: *AstFunc = ast_func_ex(name_tok.ptr, name_tok.len, parsed.params,
+                                         parsed.ret_type, parsed.ret_ptr_depth, parsed.ret_is_tagged,
+                                         parsed.ret_struct_name_ptr, parsed.ret_struct_name_len,
+                                         parsed.ret_tag_layout_ptr, parsed.ret_tag_layout_len, 0);
 
     if (generic_params != 0) {
         type_parser_clear_generic_params();
@@ -629,65 +568,16 @@ func parse_func_decl_abst_signature(p: *Parser) -> *AstFunc {
     push_trace("parse_func_decl_abst_signature", "parser/decl.b", __LINE__);
     defer pop_trace();
 
-    parse_consume(p, TOKEN_FUNC);
-
-    var name_tok: *Token = parse_peek(p);
-    var name_kind: u64 = parse_peek_kind(p);
-    if (name_kind != TOKEN_IDENTIFIER && name_kind != TOKEN_NEW && name_kind != TOKEN_DELETE) {
-        emit_stderr("[ERROR] Expected function name identifier\n");
-        parse_panic_here(p, "Parse error");
-    }
-    parse_adv(p);
-
-    var generic_params: *Vec<*GenericParam> = parse_generic_params_any(p);
-    if (generic_params != 0) {
-        type_parser_set_generic_params(generic_params);
-    }
-
-    set_parsing_context(name_tok.ptr, name_tok.len, name_tok.line);
-
-    parse_consume(p, TOKEN_LPAREN);
-
-    var params: *Vec<*Param> = new Vec<*Param>(8);
-    if (parse_peek_kind(p) != TOKEN_RPAREN) {
-        params.push(parse_param(p));
-        while (parse_match(p, TOKEN_COMMA)) {
-            params.push(parse_param(p));
-        }
-    }
-    parse_consume(p, TOKEN_RPAREN);
-
-    var ret_type: u64 = TYPE_VOID;
-    var ret_ptr_depth: u64 = 0;
-    var ret_is_tagged: u64 = 0;
-    var ret_struct_name_ptr: u64 = 0;
-    var ret_struct_name_len: u64 = 0;
-    var ret_tag_layout_ptr: u64 = 0;
-    var ret_tag_layout_len: u64 = 0;
-
-    if (parse_match(p, TOKEN_ARROW)) {
-        var ty: *TypeInfo = parse_type_ex(p);
-        ret_type = ty.type_kind;
-        ret_ptr_depth = ty.ptr_depth;
-        ret_is_tagged = ty.is_tagged;
-        ret_struct_name_ptr = ty.struct_name_ptr;
-        ret_struct_name_len = ty.struct_name_len;
-        ret_tag_layout_ptr = ty.tag_layout_ptr;
-        ret_tag_layout_len = ty.tag_layout_len;
-        if (ret_type == TYPE_ARRAY) {
-            ret_type = ty.elem_type_kind;
-            ret_ptr_depth = ty.elem_ptr_depth + 1;
-            ret_is_tagged = 0;
-            ret_struct_name_ptr = ty.struct_name_ptr;
-            ret_struct_name_len = ty.struct_name_len;
-            ret_tag_layout_ptr = 0;
-            ret_tag_layout_len = 0;
-        }
-    }
+    var parsed: *ParsedFuncHeader = parse_func_header(p);
+    var name_tok: *Token = parsed.name_tok;
+    var generic_params: *Vec<*GenericParam> = parsed.generic_params;
 
     parse_consume(p, TOKEN_SEMICOLON);
 
-    var func_sig: *AstFunc = ast_func_ex(name_tok.ptr, name_tok.len, params, ret_type, ret_ptr_depth, ret_is_tagged, ret_struct_name_ptr, ret_struct_name_len, ret_tag_layout_ptr, ret_tag_layout_len, 0);
+    var func_sig: *AstFunc = ast_func_ex(name_tok.ptr, name_tok.len, parsed.params,
+                                         parsed.ret_type, parsed.ret_ptr_depth, parsed.ret_is_tagged,
+                                         parsed.ret_struct_name_ptr, parsed.ret_struct_name_len,
+                                         parsed.ret_tag_layout_ptr, parsed.ret_tag_layout_len, 0);
 
     if (generic_params != 0) {
         type_parser_clear_generic_params();
@@ -1120,40 +1010,54 @@ func parse_destructor_decl(p: *Parser, struct_name_ptr: u64, struct_name_len: u6
     return ast_func_ex(name_tok.ptr, name_tok.len, params_out, TYPE_VOID, 0, 0, 0, 0, 0, 0, body);
 }
 
-func parse_impl_block(p: *Parser) -> *Vec<*AstFunc> {
+func parser_finalize_impl_method_name(struct_name_ptr: u64, struct_name_len: u64, func_node: *AstFunc) -> u64 {
+    var original_name_ptr: u64 = func_node.name_ptr;
+    var original_name_len: u64 = func_node.name_len;
+    var name_info: *NameInfo = compiler_build_method_name(struct_name_ptr, struct_name_len, original_name_ptr, original_name_len);
+
+    func_node.name_ptr = name_info.ptr;
+    func_node.name_len = name_info.len;
+    compiler_register_impl_method(name_info.ptr, name_info.len);
+    compiler_alias_generic_template_by_func_ptr(func_node, name_info.ptr, name_info.len);
+
+    var resolved_method: *NameInfo = resolve_name(name_info.ptr, name_info.len);
+    if (resolved_method != 0) {
+        compiler_alias_generic_template_by_func_ptr(func_node, resolved_method.ptr, resolved_method.len);
+    }
+    return 0;
+}
+
+func parse_impl_block_impl(p: *Parser, sig_only: u64) -> *Vec<*AstFunc> {
     parse_consume(p, TOKEN_IMPL);
-    
-    // Get struct name
+
     var struct_name_tok: *Token = parse_peek(p);
     var struct_name_ptr: u64 = struct_name_tok.ptr;
     var struct_name_len: u64 = struct_name_tok.len;
     parse_consume(p, TOKEN_IDENTIFIER);
-    
+
     parse_consume(p, TOKEN_LBRACE);
-    
+
     var funcs: *Vec<*AstFunc> = new Vec<*AstFunc>(8);
     compiler_set_impl_prefix(struct_name_ptr, struct_name_len);
-    
-    // Parse all functions in impl block
+
     while (parse_peek_kind(p) != TOKEN_RBRACE) {
         if (parse_peek_kind(p) == TOKEN_EOF) { break; }
-        
-        // Check for static/abst keyword
+
         var is_static: u64 = 0;
         var is_abst: u64 = 0;
         if (parse_peek_kind(p) == TOKEN_STATIC) {
             is_static = 1;
-            parse_adv(p);  // consume 'static'
+            parse_adv(p);
         }
         if (parse_peek_kind(p) == TOKEN_ABST) {
             is_abst = 1;
-            parse_adv(p);  // consume 'abst'
+            parse_adv(p);
         }
         if (is_static != 0 && is_abst != 0) {
             emit_stderr("[ERROR] abstract method cannot be static\n");
             parse_panic_here(p, "Parse error");
         }
-        
+
         if (parse_peek_kind(p) == TOKEN_CONSTRUCTOR) {
             if (is_static != 0) {
                 emit_stderr("[ERROR] constructor cannot be static\n");
@@ -1163,23 +1067,13 @@ func parse_impl_block(p: *Parser) -> *Vec<*AstFunc> {
                 emit_stderr("[ERROR] constructor cannot be abstract\n");
                 parse_panic_here(p, "Parse error");
             }
-            var ctor_node: *AstFunc = parse_constructor_decl(p, struct_name_ptr, struct_name_len, 0);
+            var ctor_node: *AstFunc = parse_constructor_decl(p, struct_name_ptr, struct_name_len, sig_only);
+            parser_finalize_impl_method_name(struct_name_ptr, struct_name_len, ctor_node);
+            funcs.push(ctor_node);
+            continue;
+        }
 
-            // Rename function: constructor -> StructName_constructor
-            var original_name_ptr2: u64 = ctor_node.name_ptr;
-            var original_name_len2: u64 = ctor_node.name_len;
-            var name_info2: *NameInfo = compiler_build_method_name(struct_name_ptr, struct_name_len, original_name_ptr2, original_name_len2);
-
-            ctor_node.name_ptr = name_info2.ptr;
-            ctor_node.name_len = name_info2.len;
-            compiler_register_impl_method(name_info2.ptr, name_info2.len);
-            compiler_alias_generic_template_by_func_ptr(ctor_node, name_info2.ptr, name_info2.len);
-            var resolved_ctor: *NameInfo = resolve_name(name_info2.ptr, name_info2.len);
-            if (resolved_ctor != 0) {
-                compiler_alias_generic_template_by_func_ptr(ctor_node, resolved_ctor.ptr, resolved_ctor.len);
-            }
-            parser_vec_astfunc_push(funcs, ctor_node);
-        } else if (parse_peek_kind(p) == TOKEN_DESTRUCTOR) {
+        if (parse_peek_kind(p) == TOKEN_DESTRUCTOR) {
             if (is_static != 0) {
                 emit_stderr("[ERROR] destructor cannot be static\n");
                 parse_panic_here(p, "Parse error");
@@ -1188,59 +1082,51 @@ func parse_impl_block(p: *Parser) -> *Vec<*AstFunc> {
                 emit_stderr("[ERROR] destructor cannot be abstract\n");
                 parse_panic_here(p, "Parse error");
             }
-            var dtor_node: *AstFunc = parse_destructor_decl(p, struct_name_ptr, struct_name_len, 0);
+            var dtor_node: *AstFunc = parse_destructor_decl(p, struct_name_ptr, struct_name_len, sig_only);
+            parser_finalize_impl_method_name(struct_name_ptr, struct_name_len, dtor_node);
+            funcs.push(dtor_node);
+            continue;
+        }
 
-            var original_name_ptr3: u64 = dtor_node.name_ptr;
-            var original_name_len3: u64 = dtor_node.name_len;
-            var name_info3: *NameInfo = compiler_build_method_name(struct_name_ptr, struct_name_len, original_name_ptr3, original_name_len3);
-
-            dtor_node.name_ptr = name_info3.ptr;
-            dtor_node.name_len = name_info3.len;
-            compiler_register_impl_method(name_info3.ptr, name_info3.len);
-            compiler_alias_generic_template_by_func_ptr(dtor_node, name_info3.ptr, name_info3.len);
-            var resolved_dtor: *NameInfo = resolve_name(name_info3.ptr, name_info3.len);
-            if (resolved_dtor != 0) {
-                compiler_alias_generic_template_by_func_ptr(dtor_node, resolved_dtor.ptr, resolved_dtor.len);
-            }
-            parser_vec_astfunc_push(funcs, dtor_node);
-        } else if (parse_peek_kind(p) == TOKEN_FUNC) {
+        if (parse_peek_kind(p) == TOKEN_FUNC) {
             if (is_abst != 0) {
                 var abst_sig: *AstFunc = parse_func_decl_abst_signature(p);
                 compiler_register_abst_method(struct_name_ptr, struct_name_len, abst_sig.name_ptr, abst_sig.name_len);
                 continue;
             }
-            var func_node: *AstFunc = parse_func_decl(p);
-            
-            // Rename function: methodName -> StructName_methodName
-            var original_name_ptr: u64 = func_node.name_ptr;
-            var original_name_len: u64 = func_node.name_len;
-            var name_info: *NameInfo = compiler_build_method_name(struct_name_ptr, struct_name_len, original_name_ptr, original_name_len);
 
-            // Update function name
-            func_node.name_ptr = name_info.ptr;
-            func_node.name_len = name_info.len;
-
-            compiler_register_impl_method(name_info.ptr, name_info.len);
-            compiler_alias_generic_template_by_func_ptr(func_node, name_info.ptr, name_info.len);
-            var resolved_method: *NameInfo = resolve_name(name_info.ptr, name_info.len);
-            if (resolved_method != 0) {
-                compiler_alias_generic_template_by_func_ptr(func_node, resolved_method.ptr, resolved_method.len);
+            var func_node: *AstFunc = 0;
+            if (sig_only != 0) {
+                func_node = parse_func_decl_signature(p);
+            } else {
+                func_node = parse_func_decl(p);
             }
+            if (func_node == 0) { continue; }
 
-            parser_vec_astfunc_push(funcs, func_node);
-        } else {
-            emit_stderr("[ERROR] impl block can only contain functions\n");
-            break;
+            parser_finalize_impl_method_name(struct_name_ptr, struct_name_len, func_node);
+            funcs.push(func_node);
+            continue;
         }
+
+        emit_stderr("[ERROR] impl block can only contain functions\n");
+        break;
     }
-    
+
     parse_consume(p, TOKEN_RBRACE);
     compiler_clear_impl_prefix();
-    
     return funcs;
 }
 
-func parse_impl_trait_block(p: *Parser) -> *Vec<*AstFunc> {
+func parse_impl_block(p: *Parser) -> *Vec<*AstFunc> {
+    return parse_impl_block_impl(p, 0);
+}
+
+// Impl block parsing for signature-only pass
+func parse_impl_block_signature(p: *Parser) -> *Vec<*AstFunc> {
+    return parse_impl_block_impl(p, 1);
+}
+
+func parse_impl_trait_block_impl(p: *Parser, sig_only: u64, register_trait_impl: u64) -> *Vec<*AstFunc> {
     parse_consume(p, TOKEN_IMPL);
 
     var trait_tok: *Token = parse_peek(p);
@@ -1258,7 +1144,10 @@ func parse_impl_trait_block(p: *Parser) -> *Vec<*AstFunc> {
     parse_consume(p, TOKEN_LBRACE);
 
     var funcs: *Vec<*AstFunc> = new Vec<*AstFunc>(8);
-    var impl_methods: *Vec<*TraitImplMethod> = new Vec<*TraitImplMethod>(8);
+    var impl_methods: *Vec<*TraitImplMethod> = 0;
+    if (register_trait_impl != 0) {
+        impl_methods = new Vec<*TraitImplMethod>(8);
+    }
     compiler_set_impl_prefix(struct_name_ptr, struct_name_len);
 
     while (parse_peek_kind(p) != TOKEN_RBRACE) {
@@ -1274,394 +1163,313 @@ func parse_impl_trait_block(p: *Parser) -> *Vec<*AstFunc> {
             parse_panic_here(p, "Parse error");
         }
 
-        if (parse_peek_kind(p) == TOKEN_FUNC) {
-            var func_node: *AstFunc = parse_func_decl(p);
+        if (parse_peek_kind(p) != TOKEN_FUNC) {
+            emit_stderr("[ERROR] impl Trait for Type block can only contain functions\n");
+            parse_panic_here(p, "Parse error");
+        }
 
-            var original_name_ptr: u64 = func_node.name_ptr;
-            var original_name_len: u64 = func_node.name_len;
-            var name_info: *NameInfo = compiler_build_method_name(struct_name_ptr, struct_name_len, original_name_ptr, original_name_len);
+        var func_node: *AstFunc = 0;
+        if (sig_only != 0) {
+            func_node = parse_func_decl_signature(p);
+        } else {
+            func_node = parse_func_decl(p);
+        }
+        if (func_node == 0) { continue; }
 
-            func_node.name_ptr = name_info.ptr;
-            func_node.name_len = name_info.len;
+        var original_name_ptr: u64 = func_node.name_ptr;
+        var original_name_len: u64 = func_node.name_len;
+        parser_finalize_impl_method_name(struct_name_ptr, struct_name_len, func_node);
 
-            compiler_register_impl_method(name_info.ptr, name_info.len);
-            compiler_alias_generic_template_by_func_ptr(func_node, name_info.ptr, name_info.len);
-            var resolved_method: *NameInfo = resolve_name(name_info.ptr, name_info.len);
-            if (resolved_method != 0) {
-                compiler_alias_generic_template_by_func_ptr(func_node, resolved_method.ptr, resolved_method.len);
-            }
-
+        if (register_trait_impl != 0) {
             var impl_method: *TraitImplMethod = new TraitImplMethod();
             impl_method.name_ptr = original_name_ptr;
             impl_method.name_len = original_name_len;
             impl_method.func_def = func_node;
             impl_methods.push(impl_method);
-
-            parser_vec_astfunc_push(funcs, func_node);
-        } else {
-            emit_stderr("[ERROR] impl Trait for Type block can only contain functions\n");
-            parse_panic_here(p, "Parse error");
         }
+
+        funcs.push(func_node);
     }
 
     parse_consume(p, TOKEN_RBRACE);
     compiler_clear_impl_prefix();
 
-    var impl_info: *TraitImpl = new TraitImpl();
-    impl_info.trait_ptr = trait_ptr;
-    impl_info.trait_len = trait_len;
-    impl_info.struct_ptr = struct_name_ptr;
-    impl_info.struct_len = struct_name_len;
-    impl_info.methods_vec = impl_methods;
-    impl_info.vtable_struct_def = 0;
-    impl_info.vtable_global_ptr = 0;
-    impl_info.vtable_global_len = 0;
-    compiler_register_trait_impl(impl_info);
+    if (register_trait_impl != 0) {
+        var impl_info: *TraitImpl = new TraitImpl();
+        impl_info.trait_ptr = trait_ptr;
+        impl_info.trait_len = trait_len;
+        impl_info.struct_ptr = struct_name_ptr;
+        impl_info.struct_len = struct_name_len;
+        impl_info.methods_vec = impl_methods;
+        impl_info.vtable_struct_def = 0;
+        impl_info.vtable_global_ptr = 0;
+        impl_info.vtable_global_len = 0;
+        compiler_register_trait_impl(impl_info);
+    }
 
     return funcs;
 }
 
-// Impl block parsing for signature-only pass
-func parse_impl_block_signature(p: *Parser) -> *Vec<*AstFunc> {
-    parse_consume(p, TOKEN_IMPL);
-
-    var struct_name_tok: *Token = parse_peek(p);
-    var struct_name_ptr: u64 = struct_name_tok.ptr;
-    var struct_name_len: u64 = struct_name_tok.len;
-    parse_consume(p, TOKEN_IDENTIFIER);
-
-    parse_consume(p, TOKEN_LBRACE);
-
-    var funcs: *Vec<*AstFunc> = new Vec<*AstFunc>(8);
-    compiler_set_impl_prefix(struct_name_ptr, struct_name_len);
-
-    while (parse_peek_kind(p) != TOKEN_RBRACE) {
-        if (parse_peek_kind(p) == TOKEN_EOF) { break; }
-
-        var is_static: u64 = 0;
-        var is_abst: u64 = 0;
-        if (parse_peek_kind(p) == TOKEN_STATIC) {
-            is_static = 1;
-            parse_adv(p);
-        }
-        if (parse_peek_kind(p) == TOKEN_ABST) {
-            is_abst = 1;
-            parse_adv(p);
-        }
-        if (is_static != 0 && is_abst != 0) {
-            emit_stderr("[ERROR] abstract method cannot be static\n");
-            parse_panic_here(p, "Parse error");
-        }
-
-        if (parse_peek_kind(p) == TOKEN_CONSTRUCTOR) {
-            if (is_static != 0) {
-                emit_stderr("[ERROR] constructor cannot be static\n");
-                parse_panic_here(p, "Parse error");
-            }
-            if (is_abst != 0) {
-                emit_stderr("[ERROR] constructor cannot be abstract\n");
-                parse_panic_here(p, "Parse error");
-            }
-            var ctor_sig: *AstFunc = parse_constructor_decl(p, struct_name_ptr, struct_name_len, 1);
-
-            var original_name_ptr2: u64 = ctor_sig.name_ptr;
-            var original_name_len2: u64 = ctor_sig.name_len;
-            var name_info2: *NameInfo = compiler_build_method_name(struct_name_ptr, struct_name_len, original_name_ptr2, original_name_len2);
-
-            ctor_sig.name_ptr = name_info2.ptr;
-            ctor_sig.name_len = name_info2.len;
-            compiler_register_impl_method(name_info2.ptr, name_info2.len);
-            compiler_alias_generic_template_by_func_ptr(ctor_sig, name_info2.ptr, name_info2.len);
-            var resolved_ctor_sig: *NameInfo = resolve_name(name_info2.ptr, name_info2.len);
-            if (resolved_ctor_sig != 0) {
-                compiler_alias_generic_template_by_func_ptr(ctor_sig, resolved_ctor_sig.ptr, resolved_ctor_sig.len);
-            }
-            parser_vec_astfunc_push(funcs, ctor_sig);
-        } else if (parse_peek_kind(p) == TOKEN_DESTRUCTOR) {
-            if (is_static != 0) {
-                emit_stderr("[ERROR] destructor cannot be static\n");
-                parse_panic_here(p, "Parse error");
-            }
-            if (is_abst != 0) {
-                emit_stderr("[ERROR] destructor cannot be abstract\n");
-                parse_panic_here(p, "Parse error");
-            }
-            var dtor_sig: *AstFunc = parse_destructor_decl(p, struct_name_ptr, struct_name_len, 1);
-
-            var original_name_ptr3: u64 = dtor_sig.name_ptr;
-            var original_name_len3: u64 = dtor_sig.name_len;
-            var name_info3: *NameInfo = compiler_build_method_name(struct_name_ptr, struct_name_len, original_name_ptr3, original_name_len3);
-
-            dtor_sig.name_ptr = name_info3.ptr;
-            dtor_sig.name_len = name_info3.len;
-            compiler_register_impl_method(name_info3.ptr, name_info3.len);
-            compiler_alias_generic_template_by_func_ptr(dtor_sig, name_info3.ptr, name_info3.len);
-            var resolved_dtor_sig: *NameInfo = resolve_name(name_info3.ptr, name_info3.len);
-            if (resolved_dtor_sig != 0) {
-                compiler_alias_generic_template_by_func_ptr(dtor_sig, resolved_dtor_sig.ptr, resolved_dtor_sig.len);
-            }
-            parser_vec_astfunc_push(funcs, dtor_sig);
-        } else if (parse_peek_kind(p) == TOKEN_FUNC) {
-            if (is_abst != 0) {
-                var abst_sig: *AstFunc = parse_func_decl_abst_signature(p);
-                compiler_register_abst_method(struct_name_ptr, struct_name_len, abst_sig.name_ptr, abst_sig.name_len);
-                continue;
-            }
-            var func_ptr: *AstFunc = parse_func_decl_signature(p);
-            if (func_ptr == 0) {
-                continue;
-            }
-            var func_node: *AstFunc = func_ptr;
-
-            var original_name_ptr: u64 = func_node.name_ptr;
-            var original_name_len: u64 = func_node.name_len;
-            var name_info: *NameInfo = compiler_build_method_name(struct_name_ptr, struct_name_len, original_name_ptr, original_name_len);
-
-            func_node.name_ptr = name_info.ptr;
-            func_node.name_len = name_info.len;
-
-            compiler_register_impl_method(name_info.ptr, name_info.len);
-            compiler_alias_generic_template_by_func_ptr(func_node, name_info.ptr, name_info.len);
-            var resolved_method_sig: *NameInfo = resolve_name(name_info.ptr, name_info.len);
-            if (resolved_method_sig != 0) {
-                compiler_alias_generic_template_by_func_ptr(func_node, resolved_method_sig.ptr, resolved_method_sig.len);
-            }
-
-            parser_vec_astfunc_push(funcs, func_node);
-        } else {
-            emit_stderr("[ERROR] impl block can only contain functions\n");
-            break;
-        }
-    }
-
-    parse_consume(p, TOKEN_RBRACE);
-    compiler_clear_impl_prefix();
-
-    return funcs;
+func parse_impl_trait_block(p: *Parser) -> *Vec<*AstFunc> {
+    return parse_impl_trait_block_impl(p, 0, 1);
 }
 
 func parse_impl_trait_block_signature(p: *Parser) -> *Vec<*AstFunc> {
-    parse_consume(p, TOKEN_IMPL);
-
-    var trait_tok: *Token = parse_peek(p);
-    var trait_ptr: u64 = trait_tok.ptr;
-    var trait_len: u64 = trait_tok.len;
-    parse_consume(p, TOKEN_IDENTIFIER);
-
-    parse_consume(p, TOKEN_FOR);
-
-    var struct_tok: *Token = parse_peek(p);
-    var struct_name_ptr: u64 = struct_tok.ptr;
-    var struct_name_len: u64 = struct_tok.len;
-    parse_consume(p, TOKEN_IDENTIFIER);
-
-    parse_consume(p, TOKEN_LBRACE);
-
-    var funcs: *Vec<*AstFunc> = new Vec<*AstFunc>(8);
-    compiler_set_impl_prefix(struct_name_ptr, struct_name_len);
-
-    while (parse_peek_kind(p) != TOKEN_RBRACE) {
-        if (parse_peek_kind(p) == TOKEN_EOF) { break; }
-
-        if (parse_peek_kind(p) == TOKEN_STATIC) {
-            emit_stderr("[ERROR] trait impl methods cannot be static\n");
-            parse_panic_here(p, "Parse error");
-        }
-
-        if (parse_peek_kind(p) == TOKEN_ABST) {
-            emit_stderr("[ERROR] trait impl methods cannot be abstract\n");
-            parse_panic_here(p, "Parse error");
-        }
-
-        if (parse_peek_kind(p) == TOKEN_FUNC) {
-            var func_sig: *AstFunc = parse_func_decl_signature(p);
-
-            var original_name_ptr: u64 = func_sig.name_ptr;
-            var original_name_len: u64 = func_sig.name_len;
-            var name_info: *NameInfo = compiler_build_method_name(struct_name_ptr, struct_name_len, original_name_ptr, original_name_len);
-
-            func_sig.name_ptr = name_info.ptr;
-            func_sig.name_len = name_info.len;
-            compiler_register_impl_method(name_info.ptr, name_info.len);
-            compiler_alias_generic_template_by_func_ptr(func_sig, name_info.ptr, name_info.len);
-            var resolved_method: *NameInfo = resolve_name(name_info.ptr, name_info.len);
-            if (resolved_method != 0) {
-                compiler_alias_generic_template_by_func_ptr(func_sig, resolved_method.ptr, resolved_method.len);
-            }
-
-            parser_vec_astfunc_push(funcs, func_sig);
-        } else {
-            emit_stderr("[ERROR] impl Trait for Type block can only contain functions\n");
-            parse_panic_here(p, "Parse error");
-        }
-    }
-
-    parse_consume(p, TOKEN_RBRACE);
-    compiler_clear_impl_prefix();
-    return funcs;
+    return parse_impl_trait_block_impl(p, 1, 0);
 }
 
 // ============================================
 // Program Parsing (Entry Point)
 // ============================================
 
-func parse_program(p: *Parser) -> *AstProgram {
-    push_trace("parse_program", "parser/decl.b", __LINE__);
-    defer pop_trace();
-    
+const PARSE_PROGRAM_MODE_FULL = 0;
+const PARSE_PROGRAM_MODE_SIGNATURE = 1;
+
+func parse_report_unexpected_top_level(p: *Parser) -> u64 {
+    var err_tok: *Token = parse_peek(p);
+    var err_ptr: u64 = err_tok.ptr;
+    var err_len: u64 = err_tok.len;
+    emit_stderr("[ERROR] Expected function, const, or import. Got token kind=");
+    print_u64(parse_peek_kind(p));
+    emit_stderr(" text=");
+    emit_stderr_len(err_ptr, err_len);
+    emit_stderr("\n");
+    parse_adv(p);
+    return 0;
+}
+
+func parse_skip_until_semicolon(p: *Parser) -> u64 {
+    while (parse_peek_kind(p) != TOKEN_SEMICOLON && parse_peek_kind(p) != TOKEN_EOF) {
+        parse_adv(p);
+    }
+    parse_consume(p, TOKEN_SEMICOLON);
+    return 0;
+}
+
+func parse_skip_const_decl_signature(p: *Parser) -> u64 {
+    parse_consume(p, TOKEN_CONST);
+    parse_consume(p, TOKEN_IDENTIFIER);
+    if (parse_match(p, TOKEN_EQ)) {
+        parse_skip_until_semicolon(p);
+        return 0;
+    }
+    parse_consume(p, TOKEN_SEMICOLON);
+    return 0;
+}
+
+func parse_skip_global_var_decl_signature(p: *Parser) -> u64 {
+    parse_consume(p, TOKEN_VAR);
+    parse_consume(p, TOKEN_IDENTIFIER);
+    if (parse_match(p, TOKEN_COLON)) {
+        parse_type_ex(p);
+    }
+    if (parse_match(p, TOKEN_EQ)) {
+        parse_skip_until_semicolon(p);
+        return 0;
+    }
+    parse_consume(p, TOKEN_SEMICOLON);
+    return 0;
+}
+
+func parse_append_impl_funcs(dst: *Vec<*AstFunc>, src: *Vec<*AstFunc>, mode: u64) -> u64 {
+    var num_impl_funcs: u64 = src.len();
+    for (var i: u64 = 0; i < num_impl_funcs; i++) {
+        var impl_fn: *AstFunc = src.get(i);
+        if (mode == PARSE_PROGRAM_MODE_SIGNATURE && impl_fn == 0) { continue; }
+        dst.push(impl_fn);
+    }
+    return 0;
+}
+
+func parse_global_var_decl_full(p: *Parser, consts: *Vec<*AstConstDecl>, globals: *Vec<*GlobalInfo>) -> u64 {
+    parse_consume(p, TOKEN_VAR);
+    var tok: *Token = parse_peek(p);
+
+    parse_consume(p, TOKEN_IDENTIFIER);
+    var gtype: *TypeInfo = 0;
+    if (parse_match(p, TOKEN_COLON)) {
+        gtype = parse_type_ex(p);
+    } else {
+        gtype = parse_typeinfo_new(TYPE_U64, 0);
+    }
+
+    var init_kind: u64 = GLOBAL_INIT_NONE;
+    var init_value: u64 = 0;
+    var init_name_ptr: u64 = 0;
+    var init_name_len: u64 = 0;
+    var init_expr: *AstNode = 0;
+
+    if (parse_match(p, TOKEN_EQ)) {
+        init_expr = parse_expr(p);
+        if (init_expr == 0) {
+            emit_stderr("[ERROR] Global init expression missing\n");
+            parse_panic_here(p, "Parse error");
+        }
+        var init_expr_kind: u64 = ast_kind(init_expr);
+        if (init_expr_kind == AST_LITERAL) {
+            var lit: *AstLiteral = (*AstLiteral)init_expr;
+            init_kind = GLOBAL_INIT_VALUE;
+            init_value = lit.value;
+        } else if (init_expr_kind == AST_IDENT) {
+            var id: *AstIdent = (*AstIdent)init_expr;
+            init_name_ptr = id.name_ptr;
+            init_name_len = id.name_len;
+
+            var resolved_value: u64 = 0;
+            var found_const: u64 = 0;
+            if (consts != 0) {
+                var cn: u64 = consts.len();
+                for (var ci: u64 = 0; ci < cn; ci++) {
+                    var cdecl: *AstConstDecl = consts.get(ci);
+                    if (str_eq(cdecl.name_ptr, cdecl.name_len, init_name_ptr, init_name_len)) {
+                        resolved_value = cdecl.value;
+                        found_const = 1;
+                        break;
+                    }
+                }
+            }
+            if (found_const != 0) {
+                init_kind = GLOBAL_INIT_VALUE;
+                init_value = resolved_value;
+                init_name_ptr = 0;
+                init_name_len = 0;
+            } else {
+                init_kind = GLOBAL_INIT_CONST;
+            }
+        } else if (init_expr_kind == AST_STRUCT_LITERAL) {
+            if (gtype.type_kind != TYPE_STRUCT || gtype.ptr_depth != 0) {
+                emit_stderr("[ERROR] Global struct literal requires struct type\n");
+                parse_panic_here(p, "Parse error");
+            }
+            init_kind = GLOBAL_INIT_EXPR;
+        } else if (init_expr_kind == AST_CALL || init_expr_kind == AST_METHOD_CALL || init_expr_kind == AST_CALL_PTR || init_expr_kind == AST_GENERIC_CALL || init_expr_kind == AST_NEW || init_expr_kind == AST_STACK_CTOR) {
+            init_kind = GLOBAL_INIT_RUNTIME;
+        } else {
+            emit_stderr("[ERROR] Unsupported global init expression\n");
+            parse_panic_here(p, "Parse error");
+        }
+    }
+
+    parse_consume(p, TOKEN_SEMICOLON);
+
+    var ginfo: *GlobalInfo = new GlobalInfo();
+    ginfo.name_ptr = tok.ptr;
+    ginfo.name_len = tok.len;
+    ginfo.typeinfo_ptr = gtype;
+    ginfo.init_kind = init_kind;
+    ginfo.init_value = init_value;
+    ginfo.init_name_ptr = init_name_ptr;
+    ginfo.init_name_len = init_name_len;
+    ginfo.init_expr = (u64)init_expr;
+    globals.push(ginfo);
+    return 0;
+}
+
+func parse_program_impl(p: *Parser, mode: u64) -> *AstProgram {
     var funcs: *Vec<*AstFunc> = new Vec<*AstFunc>(16);
-    var consts: *Vec<*AstConstDecl> = new Vec<*AstConstDecl>(64);
+    var consts: *Vec<*AstConstDecl> = new Vec<*AstConstDecl>(1);
     var imports: *Vec<*AstImport> = new Vec<*AstImport>(16);
-    var globals: *Vec<*GlobalInfo> = new Vec<*GlobalInfo>(32);
-    var structs: *Vec<*AstStructDef> = new Vec<*AstStructDef>(16);
-    
+    var globals: *Vec<*GlobalInfo> = 0;
+    var structs: *Vec<*AstStructDef> = 0;
+
+    if (mode == PARSE_PROGRAM_MODE_FULL) {
+        consts = new Vec<*AstConstDecl>(64);
+        globals = new Vec<*GlobalInfo>(32);
+        structs = new Vec<*AstStructDef>(16);
+    }
+
     while (parse_peek_kind(p) != TOKEN_EOF) {
         var k: u64 = parse_peek_kind(p);
         switch (k) {
             case TOKEN_FUNC:
-                var fn_ptr: *AstFunc = parse_func_decl(p);
-                if (fn_ptr != 0) {
-                    parser_vec_astfunc_push(funcs, fn_ptr);
+                if (mode == PARSE_PROGRAM_MODE_FULL) {
+                    var fn_ptr: *AstFunc = parse_func_decl(p);
+                    if (fn_ptr != 0) { funcs.push(fn_ptr); }
+                } else {
+                    var sig_ptr: *AstFunc = parse_func_decl_signature(p);
+                    if (sig_ptr != 0 && compiler_is_generic_template(sig_ptr) == 0) {
+                        funcs.push(sig_ptr);
+                    }
                 }
                 break;
             case TOKEN_CONST:
-                consts.push(parse_const_decl(p));
+                if (mode == PARSE_PROGRAM_MODE_FULL) {
+                    consts.push(parse_const_decl(p));
+                } else {
+                    parse_skip_const_decl_signature(p);
+                }
                 break;
             case TOKEN_ENUM:
-                // Enum을 여러 const로 변환
-                var enum_consts: *Vec<*AstConstDecl> = parse_enum_def(p);
-                var num_enum_consts: u64 = enum_consts.len();
-                for (var i: u64 = 0; i < num_enum_consts; i++) {
-                    consts.push(enum_consts.get(i));
+                if (mode == PARSE_PROGRAM_MODE_FULL) {
+                    var enum_consts: *Vec<*AstConstDecl> = parse_enum_def(p);
+                    var num_enum_consts: u64 = enum_consts.len();
+                    for (var i: u64 = 0; i < num_enum_consts; i++) {
+                        consts.push(enum_consts.get(i));
+                    }
+                } else {
+                    parse_consume(p, TOKEN_ENUM);
+                    parse_consume(p, TOKEN_IDENTIFIER);
+                    parse_skip_block(p);
                 }
                 break;
             case TOKEN_STRUCT:
             case TOKEN_PACKED:
                 var struct_def: *AstStructDef = parse_struct_def(p);
-                if (compiler_is_generic_struct_def(struct_def) == 0) {
-                    structs.push(struct_def);
+                if (mode == PARSE_PROGRAM_MODE_FULL) {
+                    if (compiler_is_generic_struct_def(struct_def) == 0) {
+                        structs.push(struct_def);
+                    }
+                    register_struct_type(struct_def);
                 }
-                register_struct_type(struct_def);  // Register immediately for type checking/sizeof
                 break;
             case TOKEN_TRAIT:
                 parse_trait_def(p);
                 break;
             case TOKEN_IMPL:
-                // impl 블록: 내부 함수들을 StructName_methodName으로 변환
                 var impl_funcs: *Vec<*AstFunc> = 0;
                 if (parse_is_impl_trait_block(p) != 0) {
-                    impl_funcs = parse_impl_trait_block(p);
+                    if (mode == PARSE_PROGRAM_MODE_FULL) {
+                        impl_funcs = parse_impl_trait_block(p);
+                    } else {
+                        impl_funcs = parse_impl_trait_block_signature(p);
+                    }
                 } else {
-                    impl_funcs = parse_impl_block(p);
+                    if (mode == PARSE_PROGRAM_MODE_FULL) {
+                        impl_funcs = parse_impl_block(p);
+                    } else {
+                        impl_funcs = parse_impl_block_signature(p);
+                    }
                 }
-                var num_impl_funcs: u64 = impl_funcs.len();
-                for (var i: u64 = 0; i < num_impl_funcs; i++) {
-                    parser_vec_astfunc_push(funcs, impl_funcs.get(i));
-                }
+                parse_append_impl_funcs(funcs, impl_funcs, mode);
                 break;
             case TOKEN_VAR:
-                parse_consume(p, TOKEN_VAR);
-                var tok: *Token = parse_peek(p);
-
-                parse_consume(p, TOKEN_IDENTIFIER);
-                var gtype: *TypeInfo = 0;
-                if (parse_match(p, TOKEN_COLON)) {
-                    // Allow typed globals; preserve type info for codegen.
-                    gtype = parse_type_ex(p);
+                if (mode == PARSE_PROGRAM_MODE_FULL) {
+                    parse_global_var_decl_full(p, consts, globals);
                 } else {
-                    gtype = parse_typeinfo_new(TYPE_U64, 0);
+                    parse_skip_global_var_decl_signature(p);
                 }
-
-                var init_kind: u64 = GLOBAL_INIT_NONE;
-                var init_value: u64 = 0;
-                var init_name_ptr: u64 = 0;
-                var init_name_len: u64 = 0;
-                var init_expr: *AstNode = 0;
-
-                if (parse_match(p, TOKEN_EQ)) {
-                    init_expr = parse_expr(p);
-                    if (init_expr == 0) {
-                        emit_stderr("[ERROR] Global init expression missing\n");
-                        parse_panic_here(p, "Parse error");
-                    }
-                    var init_expr_kind: u64 = ast_kind(init_expr);
-                    if (init_expr_kind == AST_LITERAL) {
-                        var lit: *AstLiteral = (*AstLiteral)init_expr;
-                        init_kind = GLOBAL_INIT_VALUE;
-                        init_value = lit.value;
-                    } else if (init_expr_kind == AST_IDENT) {
-                        var id: *AstIdent = (*AstIdent)init_expr;
-                        init_name_ptr = id.name_ptr;
-                        init_name_len = id.name_len;
-                        // Try to resolve const immediately if available
-                        var resolved_value: u64 = 0;
-                        var found_const: u64 = 0;
-                        if (consts != 0) {
-                            var cn: u64 = consts.len();
-                            for (var ci: u64 = 0; ci < cn; ci++) {
-                                var cdecl: *AstConstDecl = consts.get(ci);
-                                if (str_eq(cdecl.name_ptr, cdecl.name_len, init_name_ptr, init_name_len)) {
-                                    resolved_value = cdecl.value;
-                                    found_const = 1;
-                                    break;
-                                }
-                            }
-                        }
-                        if (found_const != 0) {
-                            init_kind = GLOBAL_INIT_VALUE;
-                            init_value = resolved_value;
-                            init_name_ptr = 0;
-                            init_name_len = 0;
-                        } else {
-                            init_kind = GLOBAL_INIT_CONST;
-                        }
-                    } else if (init_expr_kind == AST_STRUCT_LITERAL) {
-                        if (gtype.type_kind != TYPE_STRUCT || gtype.ptr_depth != 0) {
-                            emit_stderr("[ERROR] Global struct literal requires struct type\n");
-                            parse_panic_here(p, "Parse error");
-                        }
-                        init_kind = GLOBAL_INIT_EXPR;
-                    } else if (init_expr_kind == AST_CALL || init_expr_kind == AST_METHOD_CALL || init_expr_kind == AST_CALL_PTR || init_expr_kind == AST_GENERIC_CALL || init_expr_kind == AST_NEW || init_expr_kind == AST_STACK_CTOR) {
-                        init_kind = GLOBAL_INIT_RUNTIME;
-                    } else {
-                        emit_stderr("[ERROR] Unsupported global init expression\n");
-                        parse_panic_here(p, "Parse error");
-                    }
-                }
-
-                parse_consume(p, TOKEN_SEMICOLON);
-                var ginfo: *GlobalInfo = new GlobalInfo();
-                ginfo.name_ptr = tok.ptr;
-                ginfo.name_len = tok.len;
-                ginfo.typeinfo_ptr = gtype;
-                ginfo.init_kind = init_kind;
-                ginfo.init_value = init_value;
-                ginfo.init_name_ptr = init_name_ptr;
-                ginfo.init_name_len = init_name_len;
-                ginfo.init_expr = (u64)init_expr;
-                globals.push(ginfo);
                 break;
             case TOKEN_IMPORT:
                 imports.push(parse_import_decl(p));
                 break;
             default:
-                var err_tok: *Token = parse_peek(p);
-                var err_ptr: u64 = err_tok.ptr;
-                var err_len: u64 = err_tok.len;
-                emit_stderr("[ERROR] Expected function, const, or import. Got token kind=");
-                print_u64(parse_peek_kind(p));
-                emit_stderr(" text=");
-                emit_stderr_len(err_ptr, err_len);
-                emit_stderr("\n");
-                parse_adv(p);
+                parse_report_unexpected_top_level(p);
                 break;
         }
     }
-    
+
     var prog: *AstProgram = ast_program(funcs, consts, imports);
-    prog.globals_vec = globals;
-    prog.structs_vec = structs;
+    if (mode == PARSE_PROGRAM_MODE_FULL) {
+        prog.globals_vec = globals;
+        prog.structs_vec = structs;
+    }
     return prog;
+}
+
+func parse_program(p: *Parser) -> *AstProgram {
+    push_trace("parse_program", "parser/decl.b", __LINE__);
+    defer pop_trace();
+    return parse_program_impl(p, PARSE_PROGRAM_MODE_FULL);
 }
 
 // ============================================
@@ -1671,91 +1479,7 @@ func parse_program(p: *Parser) -> *AstProgram {
 func parse_program_pass1(p: *Parser) -> *AstProgram {
     push_trace("parse_program_pass1", "parser/decl.b", __LINE__);
     defer pop_trace();
-
-    var funcs: *Vec<*AstFunc> = new Vec<*AstFunc>(16);
-    var consts: *Vec<*AstConstDecl> = new Vec<*AstConstDecl>(1);
-    var imports: *Vec<*AstImport> = new Vec<*AstImport>(1);
-
-    while (parse_peek_kind(p) != TOKEN_EOF) {
-        var k: u64 = parse_peek_kind(p);
-        switch (k) {
-            case TOKEN_FUNC:
-                var sig_ptr: *AstFunc = parse_func_decl_signature(p);
-                if (sig_ptr != 0 && compiler_is_generic_template(sig_ptr) == 0) {
-                    parser_vec_astfunc_push(funcs, sig_ptr);
-                }
-                break;
-            case TOKEN_IMPL:
-                var impl_funcs: *Vec<*AstFunc> = 0;
-                if (parse_is_impl_trait_block(p) != 0) {
-                    impl_funcs = parse_impl_trait_block_signature(p);
-                } else {
-                    impl_funcs = parse_impl_block_signature(p);
-                }
-                var num_impl_funcs: u64 = impl_funcs.len();
-                for (var i: u64 = 0; i < num_impl_funcs; i++) {
-                    var impl_fn_ptr: *AstFunc = impl_funcs.get(i);
-                    if (impl_fn_ptr != 0) {
-                        parser_vec_astfunc_push(funcs, impl_fn_ptr);
-                    }
-                }
-                break;
-            case TOKEN_TRAIT:
-                parse_trait_def(p);
-                break;
-            case TOKEN_STRUCT:
-            case TOKEN_PACKED:
-                parse_struct_def(p);
-                break;
-            case TOKEN_ENUM:
-                parse_consume(p, TOKEN_ENUM);
-                parse_consume(p, TOKEN_IDENTIFIER);
-                parse_skip_block(p);
-                break;
-            case TOKEN_CONST:
-                // const 선언은 ; 까지 스킵
-                parse_consume(p, TOKEN_CONST);
-                parse_consume(p, TOKEN_IDENTIFIER);
-                if (parse_match(p, TOKEN_EQ)) {
-                    while (parse_peek_kind(p) != TOKEN_SEMICOLON && parse_peek_kind(p) != TOKEN_EOF) {
-                        parse_adv(p);
-                    }
-                }
-                parse_consume(p, TOKEN_SEMICOLON);
-                break;
-            case TOKEN_IMPORT:
-                imports.push(parse_import_decl(p));
-                break;
-            case TOKEN_VAR:
-                // 전역 var 선언은 ; 까지 스킵
-                parse_consume(p, TOKEN_VAR);
-                parse_consume(p, TOKEN_IDENTIFIER);
-                if (parse_match(p, TOKEN_COLON)) {
-                    parse_type_ex(p);
-                }
-                if (parse_match(p, TOKEN_EQ)) {
-                    while (parse_peek_kind(p) != TOKEN_SEMICOLON && parse_peek_kind(p) != TOKEN_EOF) {
-                        parse_adv(p);
-                    }
-                }
-                parse_consume(p, TOKEN_SEMICOLON);
-                break;
-            default:
-                var err_tok2: *Token = parse_peek(p);
-                var err_ptr2: u64 = err_tok2.ptr;
-                var err_len2: u64 = err_tok2.len;
-                emit_stderr("[ERROR] Expected function, const, or import. Got token kind=");
-                print_u64(parse_peek_kind(p));
-                emit_stderr(" text=");
-                emit_stderr_len(err_ptr2, err_len2);
-                emit_stderr("\n");
-                parse_adv(p);
-                break;
-        }
-    }
-
-    var prog: *AstProgram = ast_program(funcs, consts, imports);
-    return prog;
+    return parse_program_impl(p, PARSE_PROGRAM_MODE_SIGNATURE);
 }
 
 // ============================================
