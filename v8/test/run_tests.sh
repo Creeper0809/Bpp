@@ -171,7 +171,7 @@ run_matrix_case() {
         case_fail=1
         case_status="FAIL (compile)"
     else
-        if ! nasm -f elf64 -O0 "$asm_file" -o "$obj_file" 2>"$err_file"; then
+        if ! nasm -f elf64 -O1 "$asm_file" -o "$obj_file" 2>"$err_file"; then
             persist_result_file "$err_file" "$err_file_persist"
             case_fail=1
             case_status="FAIL (assemble)"
