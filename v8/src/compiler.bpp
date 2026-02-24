@@ -11,8 +11,11 @@ import lexer;
 import ast;
 import parser.util;
 import parser.decl;
+import module_utils;
 
 const GENERIC_DEBUG = 0;
+const TRAIT_LOOKUP_DEBUG = 0;
+const TRAIT_LOOKUP_LEGACY_M_PREFIX = 1;
 const COMPILER_NOT_FOUND_U64 = 9223372036854775807;
 
 // ============================================
@@ -185,101 +188,6 @@ func read_entire_file(path: u64) -> u64 {
     var buf_u8: []u8 = slice(buf, size + 1);
     buf_u8[total] = 0;
 
-    // Preprocess: split ">>" into "> >" only on global var lines (line starts with "var ").
-    var has_shift_pair: u64 = 0;
-    for (var si0: u64 = 0; si0 + 1 < total; si0++) {
-        if (buf_u8[si0] == 62 && buf_u8[si0 + 1] == 62) {
-            has_shift_pair = 1;
-            break;
-        }
-    }
-    if (has_shift_pair != 0) {
-        var repl_count: u64 = 0;
-        var i: u64 = 0;
-        var line_start: u64 = 1;
-        var in_global_var: u64 = 0;
-        while (i + 1 < total) {
-            var c: u64 = buf_u8[i];
-            if (line_start != 0) {
-                if (c == 118 && i + 3 < total && buf_u8[i + 1] == 97 && buf_u8[i + 2] == 114 && (buf_u8[i + 3] == 32 || buf_u8[i + 3] == 9)) {
-                    in_global_var = 1;
-                    line_start = 0;
-                } else if (c == 10) {
-                    in_global_var = 0;
-                    line_start = 1;
-                } else if (c == 32 || c == 9) {
-                    line_start = 0;
-                    in_global_var = 0;
-                } else {
-                    in_global_var = 0;
-                    line_start = 0;
-                }
-            }
-            if (c == 10) {
-                in_global_var = 0;
-                line_start = 1;
-                i = i + 1;
-                continue;
-            }
-            if (in_global_var != 0 && c == 62 && buf_u8[i + 1] == 62) {
-                repl_count = repl_count + 1;
-                i = i + 2;
-                continue;
-            }
-            i = i + 1;
-        }
-
-        if (repl_count != 0) {
-            var new_size: u64 = total + repl_count;
-            var new_buf: u64 = heap_alloc((new_size + 1) * sizeof(u8));
-            var new_u8: []u8 = slice(new_buf, new_size + 1);
-            var si: u64 = 0;
-            var di: u64 = 0;
-            line_start = 1;
-            in_global_var = 0;
-            while (si < total) {
-                var ch: u64 = buf_u8[si];
-                if (line_start != 0) {
-                    if (ch == 118 && si + 3 < total && buf_u8[si + 1] == 97 && buf_u8[si + 2] == 114 && (buf_u8[si + 3] == 32 || buf_u8[si + 3] == 9)) {
-                        in_global_var = 1;
-                        line_start = 0;
-                    } else if (ch == 10) {
-                        in_global_var = 0;
-                        line_start = 1;
-                    } else if (ch == 32 || ch == 9) {
-                        line_start = 0;
-                        in_global_var = 0;
-                    } else {
-                        in_global_var = 0;
-                        line_start = 0;
-                    }
-                }
-                if (ch == 10) {
-                    new_u8[di] = ch;
-                    di = di + 1;
-                    si = si + 1;
-                    in_global_var = 0;
-                    line_start = 1;
-                    continue;
-                }
-                if (in_global_var != 0 && ch == 62 && si + 1 < total && buf_u8[si + 1] == 62) {
-                    new_u8[di] = 62;
-                    new_u8[di + 1] = 32;
-                    new_u8[di + 2] = 62;
-                    di = di + 3;
-                    si = si + 2;
-                    continue;
-                }
-                new_u8[di] = ch;
-                di = di + 1;
-                si = si + 1;
-            }
-            new_u8[new_size] = 0;
-            buf = new_buf;
-            total = new_size;
-        }
-    }
-
     sys_close(fd);
 
     g_file_ptr = buf;
@@ -325,159 +233,148 @@ func compiler_get_cached_module_source(file_path: u64, file_path_len: u64) -> *N
     return source_info;
 }
 
+// Lexer-only source normalization.
+// Keep file I/O pure and perform tokenization quirks right before lexing.
+func compiler_preprocess_source_for_lexer(source_ptr: u64, source_len: u64) -> *NameInfo {
+    if (source_ptr == 0 || source_len < 2) { return 0; }
+    var source_u8: []u8 = slice(source_ptr, source_len + 1);
+
+    var has_shift_pair: u64 = 0;
+    for (var i0: u64 = 0; i0 + 1 < source_len; i0++) {
+        if (source_u8[i0] == 62 && source_u8[i0 + 1] == 62) {
+            has_shift_pair = 1;
+            break;
+        }
+    }
+    if (has_shift_pair == 0) { return 0; }
+
+    var repl_count: u64 = 0;
+    var i: u64 = 0;
+    var line_start: u64 = 1;
+    var in_global_var: u64 = 0;
+    while (i + 1 < source_len) {
+        var c: u64 = source_u8[i];
+        if (line_start != 0) {
+            if (c == 118 && i + 3 < source_len && source_u8[i + 1] == 97 && source_u8[i + 2] == 114 &&
+                (source_u8[i + 3] == 32 || source_u8[i + 3] == 9)) {
+                in_global_var = 1;
+                line_start = 0;
+            } else if (c == 10) {
+                in_global_var = 0;
+                line_start = 1;
+            } else if (c == 32 || c == 9) {
+                line_start = 0;
+                in_global_var = 0;
+            } else {
+                in_global_var = 0;
+                line_start = 0;
+            }
+        }
+        if (c == 10) {
+            in_global_var = 0;
+            line_start = 1;
+            i = i + 1;
+            continue;
+        }
+        if (in_global_var != 0 && c == 62 && source_u8[i + 1] == 62) {
+            repl_count = repl_count + 1;
+            i = i + 2;
+            continue;
+        }
+        i = i + 1;
+    }
+
+    if (repl_count == 0) { return 0; }
+
+    var new_size: u64 = source_len + repl_count;
+    var new_buf: u64 = heap_alloc((new_size + 1) * sizeof(u8));
+    var new_u8: []u8 = slice(new_buf, new_size + 1);
+    var si: u64 = 0;
+    var di: u64 = 0;
+    line_start = 1;
+    in_global_var = 0;
+    while (si < source_len) {
+        var ch: u64 = source_u8[si];
+        if (line_start != 0) {
+            if (ch == 118 && si + 3 < source_len && source_u8[si + 1] == 97 && source_u8[si + 2] == 114 &&
+                (source_u8[si + 3] == 32 || source_u8[si + 3] == 9)) {
+                in_global_var = 1;
+                line_start = 0;
+            } else if (ch == 10) {
+                in_global_var = 0;
+                line_start = 1;
+            } else if (ch == 32 || ch == 9) {
+                line_start = 0;
+                in_global_var = 0;
+            } else {
+                in_global_var = 0;
+                line_start = 0;
+            }
+        }
+        if (ch == 10) {
+            new_u8[di] = ch;
+            di = di + 1;
+            si = si + 1;
+            in_global_var = 0;
+            line_start = 1;
+            continue;
+        }
+        if (in_global_var != 0 && ch == 62 && si + 1 < source_len && source_u8[si + 1] == 62) {
+            new_u8[di] = 62;
+            new_u8[di + 1] = 32;
+            new_u8[di + 2] = 62;
+            di = di + 3;
+            si = si + 2;
+            continue;
+        }
+        new_u8[di] = ch;
+        di = di + 1;
+        si = si + 1;
+    }
+    new_u8[new_size] = 0;
+    return new NameInfo{new_buf, new_size};
+}
+
+func compiler_set_current_source(file_path: u64, file_path_len: u64) -> u64 {
+    var source_info: *NameInfo = compiler_get_cached_module_source(file_path, file_path_len);
+    if (source_info == 0) { return false; }
+    return true;
+}
+
 func compiler_get_cached_module_tokens(file_path: u64, file_path_len: u64) -> *Vec<*Token> {
     if (g_module_tokens_cache == 0) {
         g_module_tokens_cache = new HashMap<u64, *Vec<*Token>>(64);
     }
 
     var tokens_cached: *Vec<*Token> = g_module_tokens_cache.get(file_path, file_path_len);
-    if (tokens_cached != 0) {
-        var source_info0: *NameInfo = compiler_get_cached_module_source(file_path, file_path_len);
-        if (source_info0 == 0) { return 0; }
-        return tokens_cached;
-    }
+    if (tokens_cached != 0) { return tokens_cached; }
 
     var source_info: *NameInfo = compiler_get_cached_module_source(file_path, file_path_len);
     if (source_info == 0) { return 0; }
+    var lex_ptr: u64 = source_info.ptr;
+    var lex_len: u64 = source_info.len;
+    var preprocessed: *NameInfo = compiler_preprocess_source_for_lexer(lex_ptr, lex_len);
+    if (preprocessed != 0) {
+        lex_ptr = preprocessed.ptr;
+        lex_len = preprocessed.len;
+    }
 
-    var tokens: *Vec<*Token> = lex_all(source_info.ptr, source_info.len);
+    var tokens: *Vec<*Token> = lex_all(lex_ptr, lex_len);
     g_module_tokens_cache.put(file_path, file_path_len, tokens);
     return tokens;
 }
 
-func clone_cstr(src_ptr: u64, src_len: u64) -> u64 {
-    if (src_ptr == 0) { return 0; }
-    var dst_ptr: u64 = heap_alloc((src_len + 1) * sizeof(u8));
-    str_copy(dst_ptr, src_ptr, src_len);
-    var dst_u8: []u8 = slice(dst_ptr, src_len + 1);
-    dst_u8[src_len] = 0;
-    return dst_ptr;
-}
-
 func clone_name_info(src_ptr: u64, src_len: u64) -> *NameInfo {
-    var copied_ptr: u64 = clone_cstr(src_ptr, src_len);
-    return new NameInfo{copied_ptr, src_len};
-}
-
-func clone_ast_import(src: *AstImport, with_symbol_alias: u64) -> *AstImport {
-    if (src == 0) { return 0; }
-    var path_copy: u64 = clone_cstr(src.path_ptr, src.path_len);
-    var sym_copy: u64 = 0;
-    var alias_copy: u64 = 0;
-    var sym_len: u64 = 0;
-    var alias_len: u64 = 0;
-    if (with_symbol_alias != 0 && src.symbol_ptr != 0) {
-        sym_copy = clone_cstr(src.symbol_ptr, src.symbol_len);
-        alias_copy = clone_cstr(src.alias_ptr, src.alias_len);
-        sym_len = src.symbol_len;
-        alias_len = src.alias_len;
-    }
-    return ast_import(path_copy, src.path_len, sym_copy, sym_len, alias_copy, alias_len);
+    return module_util_clone_name_info(src_ptr, src_len);
 }
 
 func prelude_module_info(index: u64, out_ptr: *u64, out_len: *u64) -> u64 {
-    switch (index) {
-        case 0:
-            *out_ptr = (u64)"std/io";
-            *out_len = 6;
-            return true;
-        case 1:
-            *out_ptr = (u64)"std/mem";
-            *out_len = 7;
-            return true;
-        case 2:
-            *out_ptr = (u64)"std/str";
-            *out_len = 7;
-            return true;
-        case 3:
-            *out_ptr = (u64)"std/char";
-            *out_len = 8;
-            return true;
-        case 4:
-            *out_ptr = (u64)"std/util";
-            *out_len = 8;
-            return true;
-        case 5:
-            *out_ptr = (u64)"std/vec";
-            *out_len = 7;
-            return true;
-        case 6:
-            *out_ptr = (u64)"std/hashmap";
-            *out_len = 11;
-            return true;
-        default:
-            *out_ptr = 0;
-            *out_len = 0;
-            return false;
-    }
-}
-
-func build_joined_name(lhs_ptr: u64, lhs_len: u64, rhs_ptr: u64, rhs_len: u64) -> *NameInfo {
-    var full_len: u64 = lhs_len + 1 + rhs_len;
-    var full_ptr: u64 = heap_alloc((full_len + 1) * sizeof(u8));
-    str_copy(full_ptr, lhs_ptr, lhs_len);
-    var full_u8: []u8 = slice(full_ptr, full_len + 1);
-    full_u8[lhs_len] = 95;
-    str_copy(full_ptr + lhs_len + 1, rhs_ptr, rhs_len);
-    full_u8[full_len] = 0;
-    return new NameInfo{full_ptr, full_len};
-}
-
-func build_joined_name_with_suffix(lhs_ptr: u64, lhs_len: u64, rhs_ptr: u64, rhs_len: u64, suffix_ptr: u64, suffix_len: u64) -> *NameInfo {
-    var full_len: u64 = lhs_len + 1 + rhs_len + suffix_len;
-    var full_ptr: u64 = heap_alloc((full_len + 1) * sizeof(u8));
-    str_copy(full_ptr, lhs_ptr, lhs_len);
-    var full_u8: []u8 = slice(full_ptr, full_len + 1);
-    full_u8[lhs_len] = 95;
-    str_copy(full_ptr + lhs_len + 1, rhs_ptr, rhs_len);
-    str_copy(full_ptr + lhs_len + 1 + rhs_len, suffix_ptr, suffix_len);
-    full_u8[full_len] = 0;
-    return new NameInfo{full_ptr, full_len};
+    return module_util_prelude_module_info(index, out_ptr, out_len);
 }
 
 // ============================================
 // Config File Parsing
 // ============================================
-
-// Simple line-by-line config parser
-func find_line_starting_with(content: u64, content_len: u64, prefix: u64, prefix_len: u64) -> u64 {
-    var content_u8: []u8 = slice(content, content_len);
-    for (var i: u64 = 0; i < content_len; ) {
-        // Find start of current line
-        var line_start: u64 = i;
-
-        // Find end of line
-        var line_end: u64 = i;
-        for (; line_end < content_len; line_end++) {
-            if (content_u8[line_end] == 10) { break; }
-        }
-
-        var line_len: u64 = line_end - line_start;
-
-        // Check if line starts with prefix
-        if (line_len >= prefix_len) {
-            if (str_eq(content + line_start, prefix_len, prefix, prefix_len)) {
-                // Found matching line, return pointer to start of value (after prefix)
-                var value_start: u64 = line_start + prefix_len;
-                var value_len: u64 = line_len - prefix_len;
-
-                // Allocate and copy value
-                var value: u64 = heap_alloc((value_len + 1) * sizeof(u8));
-                var value_u8: []u8 = slice(value, value_len + 1);
-                for (var j: u64 = 0; j < value_len; j++) {
-                    value_u8[j] = content_u8[value_start + j];
-                }
-                value_u8[value_len] = 0;
-                return value;
-            }
-        }
-
-        // Move to next line
-        i = line_end + 1;
-    }
-
-    return 0;
-}
 
 // Read config.ini and extract VERSION value
 func read_version_from_config(config_path: u64) -> u64 {
@@ -486,136 +383,21 @@ func read_version_from_config(config_path: u64) -> u64 {
         return 0;
     }
 
-    return find_line_starting_with(content, g_file_len, "VERSION=", 8);
+    return module_util_find_line_starting_with(content, g_file_len, "VERSION=", 8);
 }
 
 // ============================================
 // Module Id + Mangling Helpers
 // ============================================
 
-// Return 1 if s starts with prefix
-func str_has_prefix(s: u64, s_len: u64, prefix: u64, prefix_len: u64) -> u64 {
-    if (s_len < prefix_len) { return false; }
-    var s_u8: []u8 = slice(s, s_len);
-    var prefix_u8: []u8 = slice(prefix, prefix_len);
-    for (var i: u64 = 0; i < prefix_len; i++) {
-        if (s_u8[i] != prefix_u8[i]) { return false; }
-    }
-    return true;
-}
-
 // Returns [ptr,len] struct (16 bytes)
 func module_id_from_path(path: u64, path_len: u64) -> *NameInfo {
-    var start: u64 = 0;
-    var path_u8: []u8 = slice(path, path_len);
-    if (g_lib_dir != 0 && str_has_prefix(path, path_len, g_lib_dir, g_lib_dir_len)) {
-        if (path_len > g_lib_dir_len && path_u8[g_lib_dir_len] == 47) {
-            start = g_lib_dir_len + 1;
-        }
-    }
-    if (start == 0 && g_base_dir != 0 && str_has_prefix(path, path_len, g_base_dir, g_base_dir_len)) {
-        if (path_len > g_base_dir_len && path_u8[g_base_dir_len] == 47) {
-            start = g_base_dir_len + 1;
-        }
-    }
-
-    var end: u64 = path_len;
-    if (end >= 4) {
-        if (path_u8[end - 4] == 46 && path_u8[end - 3] == 98 && path_u8[end - 2] == 112 && path_u8[end - 1] == 112) {
-            end = end - 4;
-        }
-    }
-    if (end == path_len && end >= 2) {
-        if (path_u8[end - 2] == 46 && path_u8[end - 1] == 98) {
-            end = end - 2;
-        }
-    }
-
-    var id_len: u64 = 0;
-    if (end > start) { id_len = end - start; }
-    var id_ptr: u64 = heap_alloc((id_len + 1) * sizeof(u8));
-    var id_u8: []u8 = slice(id_ptr, id_len + 1);
-    for (var i: u64 = 0; i < id_len; i++) {
-        id_u8[i] = path_u8[start + i];
-    }
-    id_u8[id_len] = 0;
-
-    var out: *NameInfo = new NameInfo{id_ptr, id_len};
-    return out;
-}
-
-// Import path already normalized to "a/b" without extension
-func module_id_from_import(path: u64, path_len: u64) -> *NameInfo {
-    return clone_name_info(path, path_len);
-}
-
-func module_prefix_from_id(id_ptr: u64, id_len: u64) -> *NameInfo {
-    var extra: u64 = 0;
-    if (id_len > 0) {
-        var id_u8: []u8 = slice(id_ptr, id_len);
-        var c0: u64 = id_u8[0];
-        if (c0 >= 48 && c0 <= 57) { extra = 1; }
-    }
-
-    var pref_ptr: u64 = heap_alloc((id_len + extra + 1) * sizeof(u8));
-    var pref_u8: []u8 = slice(pref_ptr, id_len + extra + 1);
-    if (extra == 1) {
-        pref_u8[0] = 95;
-    }
-    var id_u8b: []u8 = slice(id_ptr, id_len);
-    for (var i: u64 = 0; i < id_len; i++) {
-        var c: u64 = id_u8b[i];
-        if (c == 47 || c == 46) { c = 95; }
-        pref_u8[extra + i] = c;
-    }
-    pref_u8[id_len + extra] = 0;
-    var out: *NameInfo = new NameInfo{pref_ptr, id_len + extra};
-    return out;
-}
-
-// Returns [ptr,len]
-func mangle_name(prefix_ptr: u64, prefix_len: u64, name_ptr: u64, name_len: u64) -> *NameInfo {
-    if (prefix_len == 0) {
-        var out0: *NameInfo = new NameInfo{name_ptr, name_len};
-        return out0;
-    }
-    var sep_len: u64 = 2;
-    var total: u64 = prefix_len + sep_len + name_len;
-    var buf: u64 = heap_alloc((total + 1) * sizeof(u8));
-    var buf_u8: []u8 = slice(buf, total + 1);
-    var prefix_u8: []u8 = slice(prefix_ptr, prefix_len);
-    var name_u8: []u8 = slice(name_ptr, name_len);
-    for (var i: u64 = 0; i < prefix_len; i++) {
-        buf_u8[i] = prefix_u8[i];
-    }
-    buf_u8[prefix_len] = 95;
-    buf_u8[prefix_len + 1] = 95;
-    for (var j: u64 = 0; j < name_len; j++) {
-        buf_u8[prefix_len + sep_len + j] = name_u8[j];
-    }
-    buf_u8[total] = 0;
-    var out: *NameInfo = new NameInfo{buf, total};
-    return out;
+    return module_util_module_id_from_path(path, path_len, g_lib_dir, g_lib_dir_len, g_base_dir, g_base_dir_len);
 }
 
 // ============================================
 // Module Loading
 // ============================================
-
-func file_exists(path: u64) -> u64 {
-    var fd_i: i64 = (i64)sys_open(path, 0, 0);
-    if (fd_i < 0) { return false; }
-    sys_close((u64)fd_i);
-    return true;
-}
-
-func is_std_alias(module_path: u64, module_len: u64) -> u64 {
-    if (str_eq(module_path, module_len, "io", 2)) { return true; }
-    if (str_eq(module_path, module_len, "util", 4)) { return true; }
-    if (str_eq(module_path, module_len, "vec", 3)) { return true; }
-    if (str_eq(module_path, module_len, "hashmap", 7)) { return true; }
-    return false;
-}
 
 func compiler_resolve_parent_def(parent_desc: *ParentDesc, panic_context: u64) -> *AstStructDef {
     if (parent_desc == 0) { return 0; }
@@ -631,31 +413,9 @@ func compiler_resolve_parent_def(parent_desc: *ParentDesc, panic_context: u64) -
     return parent_def;
 }
 
-func compiler_not_found_u64() -> u64 {
-    return COMPILER_NOT_FOUND_U64;
-}
-
 func compiler_is_not_found_u64(value: u64) -> u64 {
     if (value == COMPILER_NOT_FOUND_U64) { return 1; }
     return 0;
-}
-
-func std_alias_to_module_path(module_path: u64, module_len: u64) -> u64 {
-    if (str_eq(module_path, module_len, "io", 2)) { return "std/io"; }
-    if (str_eq(module_path, module_len, "util", 4)) { return "std/util"; }
-    if (str_eq(module_path, module_len, "vec", 3)) { return "std/vec"; }
-    if (str_eq(module_path, module_len, "hashmap", 7)) { return "std/hashmap"; }
-    return 0;
-}
-
-func is_std_path(module_path: u64, module_len: u64) -> u64 {
-    if (module_len < 4) { return false; }
-    var module_u8: []u8 = slice(module_path, module_len);
-    if (module_u8[0] != 115) { return false; }      // s
-    if (module_u8[1] != 116) { return false; } // t
-    if (module_u8[2] != 100) { return false; } // d
-    if (module_u8[3] != 47) { return false; }  // /
-    return true;
 }
 
 func resolve_module_path(module_path: u64, module_len: u64) -> u64 {
@@ -670,13 +430,13 @@ func resolve_module_path(module_path: u64, module_len: u64) -> u64 {
 
     var prefer_lib: u64 = 0;
 
-    if (is_std_alias(module_path, module_len)) {
-        eff_path = std_alias_to_module_path(module_path, module_len);
+    if (module_util_is_std_alias(module_path, module_len)) {
+        eff_path = module_util_std_alias_to_module_path(module_path, module_len);
         eff_len = str_len(eff_path);
         prefer_lib = 1;
     }
 
-    if (is_std_path(eff_path, eff_len)) {
+    if (module_util_is_std_path(eff_path, eff_len)) {
         prefer_lib = 1;
     }
 
@@ -708,44 +468,48 @@ func resolve_module_path(module_path: u64, module_len: u64) -> u64 {
     var full2: u64;
     if (prefer_lib) {
         full1 = str_concat3(g_lib_dir, g_lib_dir_len, slash, 1, with_ext_bpp, with_ext_bpp_len);
-        if (file_exists(full1)) {
+        if (module_util_file_exists(full1)) {
             g_resolved_module_path_cache.put(module_path, module_len, new NameInfo{full1, str_len(full1)});
             return full1;
         }
         full2 = str_concat3(g_base_dir, g_base_dir_len, slash, 1, with_ext_bpp, with_ext_bpp_len);
-        if (file_exists(full2)) {
+        if (module_util_file_exists(full2)) {
             g_resolved_module_path_cache.put(module_path, module_len, new NameInfo{full2, str_len(full2)});
             return full2;
         }
 
         full1 = str_concat3(g_lib_dir, g_lib_dir_len, slash, 1, with_ext, with_ext_len);
-        if (file_exists(full1)) {
+        if (module_util_file_exists(full1)) {
             g_resolved_module_path_cache.put(module_path, module_len, new NameInfo{full1, str_len(full1)});
             return full1;
         }
         full2 = str_concat3(g_base_dir, g_base_dir_len, slash, 1, with_ext, with_ext_len);
-        g_resolved_module_path_cache.put(module_path, module_len, new NameInfo{full2, str_len(full2)});
+        if (module_util_file_exists(full2)) {
+            g_resolved_module_path_cache.put(module_path, module_len, new NameInfo{full2, str_len(full2)});
+        }
         return full2;
     }
 
     full1 = str_concat3(g_base_dir, g_base_dir_len, slash, 1, with_ext_bpp, with_ext_bpp_len);
-    if (file_exists(full1)) {
+    if (module_util_file_exists(full1)) {
         g_resolved_module_path_cache.put(module_path, module_len, new NameInfo{full1, str_len(full1)});
         return full1;
     }
     full2 = str_concat3(g_lib_dir, g_lib_dir_len, slash, 1, with_ext_bpp, with_ext_bpp_len);
-    if (file_exists(full2)) {
+    if (module_util_file_exists(full2)) {
         g_resolved_module_path_cache.put(module_path, module_len, new NameInfo{full2, str_len(full2)});
         return full2;
     }
 
     full1 = str_concat3(g_base_dir, g_base_dir_len, slash, 1, with_ext, with_ext_len);
-    if (file_exists(full1)) {
+    if (module_util_file_exists(full1)) {
         g_resolved_module_path_cache.put(module_path, module_len, new NameInfo{full1, str_len(full1)});
         return full1;
     }
     full2 = str_concat3(g_lib_dir, g_lib_dir_len, slash, 1, with_ext, with_ext_len);
-    g_resolved_module_path_cache.put(module_path, module_len, new NameInfo{full2, str_len(full2)});
+    if (module_util_file_exists(full2)) {
+        g_resolved_module_path_cache.put(module_path, module_len, new NameInfo{full2, str_len(full2)});
+    }
     return full2;
 }
 
@@ -1147,7 +911,7 @@ func compiler_set_all_globals(globals: *Vec<*GlobalInfo>) -> u64 {
 }
 
 func prelude_try_symbol(module_path: u64, module_len: u64, name_ptr: u64, name_len: u64) -> *NameInfo {
-    var mod_id: *NameInfo = module_id_from_import(module_path, module_len);
+    var mod_id: *NameInfo = module_util_module_id_from_import(module_path, module_len);
     if (mod_id == 0) { return 0; }
     var mod_ptr: u64 = mod_id.ptr;
     var mod_len: u64 = mod_id.len;
@@ -1178,16 +942,6 @@ func prelude_try_symbol(module_path: u64, module_len: u64, name_ptr: u64, name_l
         }
     }
     return 0;
-}
-
-func load_std_prelude_modules() -> u64 {
-    for (var i: u64 = 0; i < PRELUDE_MODULE_COUNT; i++) {
-        var module_ptr: u64 = 0;
-        var module_len: u64 = 0;
-        if (prelude_module_info(i, &module_ptr, &module_len) == 0) { continue; }
-        if (!load_module_by_name(module_ptr, module_len)) { return false; }
-    }
-    return true;
 }
 
 func resolve_prelude_alias_lazy(name_ptr: u64, name_len: u64) -> *NameInfo {
@@ -1445,7 +1199,7 @@ func finalize_import_aliases() -> u64 {
             var imp_alias_ptr: u64 = imp.alias_ptr;
             var imp_alias_len: u64 = imp.alias_len;
 
-            var imp_mod_id: *NameInfo = module_id_from_import(imp_path, imp_len);
+            var imp_mod_id: *NameInfo = module_util_module_id_from_import(imp_path, imp_len);
             var imp_mod_ptr: u64 = imp_mod_id.ptr;
             var imp_mod_len: u64 = imp_mod_id.len;
 
@@ -1492,7 +1246,7 @@ func compiler_mangle_symbol_name(orig_ptr: u64, orig_len: u64, prefix_ptr: u64, 
     if (preserve_main != 0 && orig_len == 4 && str_eq(orig_ptr, orig_len, "main", 4)) {
         return new NameInfo{orig_ptr, orig_len};
     }
-    return mangle_name(prefix_ptr, prefix_len, orig_ptr, orig_len);
+    return module_util_mangle_name(prefix_ptr, prefix_len, orig_ptr, orig_len);
 }
 
 func compiler_ensure_func_module_map() -> *HashMap<u64, *NameInfo> {
@@ -1726,8 +1480,7 @@ func load_module_pass1(file_path: u64, file_path_len: u64) -> u64 {
 
     if (!compiler_pass1_load_imports_recursive(imports_copy)) { return false; }
 
-    var source_info: *NameInfo = compiler_get_cached_module_source(file_path, file_path_len);
-    if (source_info == 0) {
+    if (compiler_set_current_source(file_path, file_path_len) == 0) {
         compiler_report_module_open_error(file_path, file_path_len);
         return false;
     }
@@ -1747,7 +1500,7 @@ func load_std_prelude() -> u64 {
         var module_len: u64 = 0;
         if (prelude_module_info(i, &module_ptr, &module_len) == 0) { continue; }
         if (!load_module_by_name(module_ptr, module_len)) { return false; }
-        var module_id: *NameInfo = module_id_from_import(module_ptr, module_len);
+        var module_id: *NameInfo = module_util_module_id_from_import(module_ptr, module_len);
         prelude_import_all_from_module(module_id.ptr, module_id.len);
     }
     g_prelude_loaded = 1;
@@ -1780,7 +1533,7 @@ func compiler_load_module_import_deps_pass1(file_path: u64, file_path_len: u64) 
 
 func compiler_module_identity(file_path: u64, file_path_len: u64, module_ptr_out: *u64, module_len_out: *u64, prefix_ptr_out: *u64, prefix_len_out: *u64) -> u64 {
     var module_id: *NameInfo = module_id_from_path(file_path, file_path_len);
-    var module_prefix: *NameInfo = module_prefix_from_id(module_id.ptr, module_id.len);
+    var module_prefix: *NameInfo = module_util_module_prefix_from_id(module_id.ptr, module_id.len);
     *module_ptr_out = module_id.ptr;
     *module_len_out = module_id.len;
     *prefix_ptr_out = module_prefix.ptr;
@@ -1858,6 +1611,10 @@ func load_module(file_path: u64, file_path_len: u64) -> u64 {
 
     var tokens: *Vec<*Token> = compiler_get_cached_module_tokens(file_path, file_path_len);
     if (tokens == 0) {
+        compiler_report_module_open_error(file_path, file_path_len);
+        return false;
+    }
+    if (compiler_set_current_source(file_path, file_path_len) == 0) {
         compiler_report_module_open_error(file_path, file_path_len);
         return false;
     }
@@ -1958,10 +1715,6 @@ func compiler_is_trait_name(name_ptr: u64, name_len: u64) -> u64 {
     var td: *TraitDef = compiler_get_trait_def(name_ptr, name_len);
     if (td == 0) { return false; }
     return true;
-}
-
-func compiler_get_trait_defs() -> *Vec<*TraitDef> {
-    return g_all_traits_vec;
 }
 
 func compiler_register_trait_impl(trait_impl: *TraitImpl) -> u64 {
@@ -2086,93 +1839,47 @@ func compiler_find_generic_suffix_index(name_ptr: u64, name_len: u64) -> u64 {
     return name_len;
 }
 
+func compiler_generic_adopt_impl_params(params_vec: *Vec<*GenericParam>, name_ptr: u64, name_len: u64, is_def: u64) -> *Vec<*GenericParam> {
+    if (params_vec != 0 && params_vec.len() != 0) { return params_vec; }
+    if (compiler_is_impl_context() == 0) { return params_vec; }
+
+    var tpl: *GenericStructTemplate = compiler_find_generic_struct_template_by_name(g_impl_prefix_ptr, g_impl_prefix_len);
+    if (tpl == 0 || tpl.params_vec == 0 || tpl.params_vec.len() == 0) { return params_vec; }
+
+    if (GENERIC_DEBUG != 0) {
+        if (is_def != 0) {
+            emit_stderr("[DEBUG] impl generic params adopted for func def: ");
+        } else {
+            emit_stderr("[DEBUG] impl generic params adopted for func sig: ");
+        }
+        emit_stderr_len(name_ptr, name_len);
+        emit_stderr("\n");
+    }
+    return tpl.params_vec;
+}
+
+func compiler_generic_register_name(name_ptr: u64, name_len: u64) -> *NameInfo {
+    if (g_impl_prefix_ptr == 0 || g_impl_prefix_len == 0) {
+        return new NameInfo{name_ptr, name_len};
+    }
+    return module_util_build_joined_name(g_impl_prefix_ptr, g_impl_prefix_len, name_ptr, name_len);
+}
+
 func compiler_register_generic_func_sig(name_ptr: u64, name_len: u64, params_vec: *Vec<*GenericParam>, func_sig: *AstFunc) -> u64 {
-    if (params_vec == 0 || params_vec.len() == 0) {
-        if (compiler_is_impl_context() != 0) {
-            var tpl0: *GenericStructTemplate = compiler_find_generic_struct_template_by_name(g_impl_prefix_ptr, g_impl_prefix_len);
-            if (tpl0 != 0) {
-                if (tpl0.params_vec != 0 && tpl0.params_vec.len() > 0) {
-                    params_vec = tpl0.params_vec;
-                    if (GENERIC_DEBUG != 0) {
-                        emit_stderr("[DEBUG] impl generic params adopted for func sig: ");
-                        emit_stderr_len(name_ptr, name_len);
-                        emit_stderr("\n");
-                    }
-                }
-            }
-        }
-    }
+    params_vec = compiler_generic_adopt_impl_params(params_vec, name_ptr, name_len, 0);
     if (params_vec == 0 || params_vec.len() == 0) { return 0; }
-    var reg_name_ptr: u64 = name_ptr;
-    var reg_name_len: u64 = name_len;
-    if (g_impl_prefix_ptr != 0 && g_impl_prefix_len != 0) {
-        var combined: *Vec<u64> = new Vec<u64>(g_impl_prefix_len + name_len + 1);
-        var impl_prefix_u8: []u8 = slice(g_impl_prefix_ptr, g_impl_prefix_len);
-        for (var i: u64 = 0; i < g_impl_prefix_len; i++) {
-            combined.push(impl_prefix_u8[i]);
-        }
-        combined.push(95);
-        var name_u8: []u8 = slice(name_ptr, name_len);
-        for (var j: u64 = 0; j < name_len; j++) {
-            combined.push(name_u8[j]);
-        }
-        var cname_len: u64 = combined.len();
-        var cname_ptr: u64 = heap_alloc((cname_len + 1) * sizeof(u8));
-        var cname_u8: []u8 = slice(cname_ptr, cname_len + 1);
-        for (var k: u64 = 0; k < cname_len; k++) {
-            cname_u8[k] = combined.get(k);
-        }
-        cname_u8[cname_len] = 0;
-        reg_name_ptr = cname_ptr;
-        reg_name_len = cname_len;
-    }
-    var tpl: *GenericFuncTemplate = compiler_get_or_create_generic_template(reg_name_ptr, reg_name_len, params_vec);
+    var reg_name: *NameInfo = compiler_generic_register_name(name_ptr, name_len);
+    var tpl: *GenericFuncTemplate = compiler_get_or_create_generic_template(reg_name.ptr, reg_name.len, params_vec);
     tpl.params_vec = params_vec;
     tpl.func_sig = func_sig;
     return 0;
 }
 
 func compiler_register_generic_func_def(name_ptr: u64, name_len: u64, params_vec: *Vec<*GenericParam>, func_def: *AstFunc) -> u64 {
-    if (params_vec == 0 || params_vec.len() == 0) {
-        if (compiler_is_impl_context() != 0) {
-            var tpl1: *GenericStructTemplate = compiler_find_generic_struct_template_by_name(g_impl_prefix_ptr, g_impl_prefix_len);
-            if (tpl1 != 0) {
-                if (tpl1.params_vec != 0 && tpl1.params_vec.len() > 0) {
-                    params_vec = tpl1.params_vec;
-                    if (GENERIC_DEBUG != 0) {
-                        emit_stderr("[DEBUG] impl generic params adopted for func def: ");
-                        emit_stderr_len(name_ptr, name_len);
-                        emit_stderr("\n");
-                    }
-                }
-            }
-        }
-    }
+    params_vec = compiler_generic_adopt_impl_params(params_vec, name_ptr, name_len, 1);
     if (params_vec == 0 || params_vec.len() == 0) { return 0; }
-    var reg_name_ptr: u64 = name_ptr;
-    var reg_name_len: u64 = name_len;
-    if (g_impl_prefix_ptr != 0 && g_impl_prefix_len != 0) {
-        var combined: *Vec<u64> = new Vec<u64>(g_impl_prefix_len + name_len + 1);
-        var impl_prefix_u8: []u8 = slice(g_impl_prefix_ptr, g_impl_prefix_len);
-        for (var i: u64 = 0; i < g_impl_prefix_len; i++) {
-            combined.push(impl_prefix_u8[i]);
-        }
-        combined.push(95);
-        var name_u8: []u8 = slice(name_ptr, name_len);
-        for (var j: u64 = 0; j < name_len; j++) {
-            combined.push(name_u8[j]);
-        }
-        var cname_len: u64 = combined.len();
-        var cname_ptr: u64 = heap_alloc((cname_len + 1) * sizeof(u8));
-        var cname_u8: []u8 = slice(cname_ptr, cname_len + 1);
-        for (var k: u64 = 0; k < cname_len; k++) {
-            cname_u8[k] = combined.get(k);
-        }
-        cname_u8[cname_len] = 0;
-        reg_name_ptr = cname_ptr;
-        reg_name_len = cname_len;
-    }
-    var tpl: *GenericFuncTemplate = compiler_get_or_create_generic_template(reg_name_ptr, reg_name_len, params_vec);
+    var reg_name: *NameInfo = compiler_generic_register_name(name_ptr, name_len);
+    var tpl: *GenericFuncTemplate = compiler_get_or_create_generic_template(reg_name.ptr, reg_name.len, params_vec);
     tpl.params_vec = params_vec;
     tpl.func_def = func_def;
     if (g_generic_func_ptrs == 0) { g_generic_func_ptrs = new Vec<*GenericFuncTemplate>(16); }
@@ -2284,28 +1991,6 @@ func compiler_alias_generic_template_by_func_ptr(fn_ptr: *AstFunc, new_name_ptr:
     if (g_generic_funcs == 0) { g_generic_funcs = new HashMap<u64, *GenericFuncTemplate>(64); }
     var tpl: *GenericFuncTemplate = tpl_ptr;
     g_generic_funcs.put(new_name_ptr, new_name_len, tpl);
-    return 0;
-}
-
-func compiler_clone_generic_template_for_impl(fn_ptr: *AstFunc, new_name_ptr: u64, new_name_len: u64) -> u64 {
-    var tpl_ptr: *GenericFuncTemplate = compiler_find_generic_template_by_func_ptr(fn_ptr);
-    if (tpl_ptr == 0) { return 0; }
-    if (g_generic_funcs == 0) { g_generic_funcs = new HashMap<u64, *GenericFuncTemplate>(64); }
-    var existing: *GenericFuncTemplate = g_generic_funcs.get(new_name_ptr, new_name_len);
-    if (existing != 0) { return 0; }
-
-    var src: *GenericFuncTemplate = tpl_ptr;
-    var tpl: *GenericFuncTemplate = new GenericFuncTemplate();
-    tpl.name_ptr = new_name_ptr;
-    tpl.name_len = new_name_len;
-    tpl.mangled_ptr = 0;
-    tpl.mangled_len = 0;
-    tpl.params_vec = src.params_vec;
-    tpl.func_sig = src.func_sig;
-    tpl.func_def = src.func_def;
-    g_generic_funcs.put(new_name_ptr, new_name_len, tpl);
-    if (g_generic_func_ptrs == 0) { g_generic_func_ptrs = new Vec<*GenericFuncTemplate>(16); }
-    g_generic_func_ptrs.push(tpl);
     return 0;
 }
 
@@ -2957,7 +2642,7 @@ func generic_clone_args_vec(args: *Vec<*AstNode>, bindings: *Vec<*GenericBinding
     return out;
 }
 
-    func generic_clone_expr(node: *AstNode, bindings: *Vec<*GenericBinding>) -> *AstNode {
+func generic_clone_expr(node: *AstNode, bindings: *Vec<*GenericBinding>) -> *AstNode {
     if (node == 0) { return 0; }
     var kind: u64 = ast_kind(node);
     switch (kind) {
@@ -2996,7 +2681,7 @@ func generic_clone_args_vec(args: *Vec<*AstNode>, bindings: *Vec<*GenericBinding
                     var ti: *TypeInfo = ga.type_ptr;
                     if (ti.type_kind == TYPE_GENERIC) {
                         var chk: *GenericBinding = generic_find_binding(bindings, GENERIC_KIND_TYPE, ti.struct_name_ptr, ti.struct_name_len);
-                        if (chk == 0) {
+                        if (chk == 0 && GENERIC_DEBUG != 0) {
                             emit_stderr("[DEBUG] Missing binding for generic arg in call: ");
                             emit_stderr_len(gc.name_ptr, gc.name_len);
                             emit_stderr(" arg=");
@@ -3303,17 +2988,20 @@ func generic_get_or_create_instance(tpl_ptr: *GenericFuncTemplate, bindings: *Ve
     return name_info;
 }
 
-func generic_build_bindings_for_explicit(tpl_ptr: *GenericFuncTemplate, gargs: *Vec<*GenericArg>) -> *Vec<*GenericBinding> {
-    var tpl: *GenericFuncTemplate = tpl_ptr;
+func generic_build_bindings_core(params_vec: *Vec<*GenericParam>, gargs: *Vec<*GenericArg>) -> *Vec<*GenericBinding> {
+    if (params_vec == 0 || gargs == 0) {
+        emit_stderr("[ERROR] Missing generic params/args\n");
+        panic("Parse error");
+    }
     var bindings: *Vec<*GenericBinding> = new Vec<*GenericBinding>(4);
-    var pn: u64 = tpl.params_vec.len();
+    var pn: u64 = params_vec.len();
     var an: u64 = gargs.len();
     if (pn != an) {
         emit_stderr("[ERROR] Generic argument count mismatch\n");
         panic("Parse error");
     }
     for (var i: u64 = 0; i < pn; i++) {
-        var gp: *GenericParam = tpl.params_vec.get(i);
+        var gp: *GenericParam = params_vec.get(i);
         var ga: *GenericArg = gargs.get(i);
         if (gp.kind == GENERIC_KIND_TYPE) {
             if (ga.kind != GENERIC_KIND_TYPE) {
@@ -3338,39 +3026,14 @@ func generic_build_bindings_for_explicit(tpl_ptr: *GenericFuncTemplate, gargs: *
     return bindings;
 }
 
+func generic_build_bindings_for_explicit(tpl_ptr: *GenericFuncTemplate, gargs: *Vec<*GenericArg>) -> *Vec<*GenericBinding> {
+    var tpl: *GenericFuncTemplate = tpl_ptr;
+    return generic_build_bindings_core(tpl.params_vec, gargs);
+}
+
 func generic_build_bindings_for_struct(tpl_ptr: *GenericStructTemplate, gargs: *Vec<*GenericArg>) -> *Vec<*GenericBinding> {
     var tpl: *GenericStructTemplate = tpl_ptr;
-    var bindings: *Vec<*GenericBinding> = new Vec<*GenericBinding>(4);
-    var pn: u64 = tpl.params_vec.len();
-    var an: u64 = gargs.len();
-    if (pn != an) {
-        emit_stderr("[ERROR] Generic argument count mismatch\n");
-        panic("Parse error");
-    }
-    for (var i: u64 = 0; i < pn; i++) {
-        var gp: *GenericParam = tpl.params_vec.get(i);
-        var ga: *GenericArg = gargs.get(i);
-        if (gp.kind == GENERIC_KIND_TYPE) {
-            if (ga.kind != GENERIC_KIND_TYPE) {
-                emit_stderr("[ERROR] Expected type generic argument\n");
-                panic("Parse error");
-            }
-            if (generic_bind_type(bindings, gp.name_ptr, gp.name_len, ga.type_ptr) != 0) {
-                emit_stderr("[ERROR] Conflicting generic type bindings\n");
-                panic("Parse error");
-            }
-        } else {
-            if (ga.kind != GENERIC_KIND_VALUE) {
-                emit_stderr("[ERROR] Expected value generic argument\n");
-                panic("Parse error");
-            }
-            if (generic_bind_value(bindings, gp.name_ptr, gp.name_len, ga.value) != 0) {
-                emit_stderr("[ERROR] Conflicting generic value bindings\n");
-                panic("Parse error");
-            }
-        }
-    }
-    return bindings;
+    return generic_build_bindings_core(tpl.params_vec, gargs);
 }
 
 func generic_clone_struct(template_def: *AstStructDef, bindings: *Vec<*GenericBinding>, new_name_ptr: u64, new_name_len: u64) -> *AstStructDef {
@@ -3923,11 +3586,11 @@ func compiler_build_method_name(struct_name_ptr: u64, struct_name_len: u64, meth
 }
 
 func compiler_build_method_name_base(struct_name_ptr: u64, base_len: u64, method_ptr: u64, method_len: u64, suffix_len: u64) -> *NameInfo {
-    return build_joined_name_with_suffix(struct_name_ptr, base_len, method_ptr, method_len, struct_name_ptr + base_len, suffix_len);
+    return module_util_build_joined_name_with_suffix(struct_name_ptr, base_len, method_ptr, method_len, struct_name_ptr + base_len, suffix_len);
 }
 
 func compiler_build_scoped_name(base_ptr: u64, base_len: u64, member_ptr: u64, member_len: u64) -> *NameInfo {
-    return build_joined_name(base_ptr, base_len, member_ptr, member_len);
+    return module_util_build_joined_name(base_ptr, base_len, member_ptr, member_len);
 }
 
 // ============================================
@@ -3935,41 +3598,15 @@ func compiler_build_scoped_name(base_ptr: u64, base_len: u64, member_ptr: u64, m
 // ============================================
 
 func compiler_build_name_concat2(a_ptr: u64, a_len: u64, b_ptr: u64, b_len: u64) -> *NameInfo {
-    var total_len: u64 = a_len + b_len;
-    var total_ptr: u64 = heap_alloc((total_len + 1) * sizeof(u8));
-    str_copy(total_ptr, a_ptr, a_len);
-    str_copy(total_ptr + a_len, b_ptr, b_len);
-    var out_u8: []u8 = slice(total_ptr, total_len + 1);
-    out_u8[total_len] = 0;
-    return new NameInfo{total_ptr, total_len};
+    return module_util_name_concat2(a_ptr, a_len, b_ptr, b_len);
 }
 
 func compiler_build_name_concat4(a_ptr: u64, a_len: u64, b_ptr: u64, b_len: u64, c_ptr: u64, c_len: u64, d_ptr: u64, d_len: u64) -> *NameInfo {
-    var total_len: u64 = a_len + b_len + c_len + d_len;
-    var total_ptr: u64 = heap_alloc((total_len + 1) * sizeof(u8));
-    var offset: u64 = 0;
-    str_copy(total_ptr + offset, a_ptr, a_len); offset = offset + a_len;
-    str_copy(total_ptr + offset, b_ptr, b_len); offset = offset + b_len;
-    str_copy(total_ptr + offset, c_ptr, c_len); offset = offset + c_len;
-    str_copy(total_ptr + offset, d_ptr, d_len);
-    var out_u8: []u8 = slice(total_ptr, total_len + 1);
-    out_u8[total_len] = 0;
-    return new NameInfo{total_ptr, total_len};
+    return module_util_name_concat4(a_ptr, a_len, b_ptr, b_len, c_ptr, c_len, d_ptr, d_len);
 }
 
 func compiler_build_name_concat6(a_ptr: u64, a_len: u64, b_ptr: u64, b_len: u64, c_ptr: u64, c_len: u64, d_ptr: u64, d_len: u64, e_ptr: u64, e_len: u64, f_ptr: u64, f_len: u64) -> *NameInfo {
-    var total_len: u64 = a_len + b_len + c_len + d_len + e_len + f_len;
-    var total_ptr: u64 = heap_alloc((total_len + 1) * sizeof(u8));
-    var offset: u64 = 0;
-    str_copy(total_ptr + offset, a_ptr, a_len); offset = offset + a_len;
-    str_copy(total_ptr + offset, b_ptr, b_len); offset = offset + b_len;
-    str_copy(total_ptr + offset, c_ptr, c_len); offset = offset + c_len;
-    str_copy(total_ptr + offset, d_ptr, d_len); offset = offset + d_len;
-    str_copy(total_ptr + offset, e_ptr, e_len); offset = offset + e_len;
-    str_copy(total_ptr + offset, f_ptr, f_len);
-    var out_u8: []u8 = slice(total_ptr, total_len + 1);
-    out_u8[total_len] = 0;
-    return new NameInfo{total_ptr, total_len};
+    return module_util_name_concat6(a_ptr, a_len, b_ptr, b_len, c_ptr, c_len, d_ptr, d_len, e_ptr, e_len, f_ptr, f_len);
 }
 
 func compiler_is_vptr_field_name(name_ptr: u64, name_len: u64) -> u64 {
@@ -4020,9 +3657,11 @@ func compiler_find_trait_impl_method(impl_info: *TraitImpl, name_ptr: u64, name_
 func compiler_find_trait_method_index(trait_ptr: u64, trait_len: u64, name_ptr: u64, name_len: u64) -> u64 {
     var td: *TraitDef = compiler_get_trait_def(trait_ptr, trait_len);
     if (td == 0 || td.methods_vec == 0) {
-        emit_stderr("[DEBUG] Trait def missing for: ");
-        emit_stderr_len(trait_ptr, trait_len);
-        emit_stderr("\n");
+        if (TRAIT_LOOKUP_DEBUG != 0) {
+            emit_stderr("[DEBUG] Trait def missing for: ");
+            emit_stderr_len(trait_ptr, trait_len);
+            emit_stderr("\n");
+        }
         return COMPILER_NOT_FOUND_U64;
     }
     var n: u64 = td.methods_vec.len();
@@ -4030,7 +3669,7 @@ func compiler_find_trait_method_index(trait_ptr: u64, trait_len: u64, name_ptr: 
         var tm: *TraitMethod = td.methods_vec.get(i);
         if (str_eq(tm.name_ptr, tm.name_len, name_ptr, name_len)) { return tm.index; }
     }
-    if (name_len > 1) {
+    if (TRAIT_LOOKUP_LEGACY_M_PREFIX != 0 && name_len > 1) {
         var name_u8: []u8 = slice(name_ptr, name_len);
         if (name_u8[0] == 109) {
             var alt_ptr: u64 = name_ptr + 1;
@@ -4041,16 +3680,18 @@ func compiler_find_trait_method_index(trait_ptr: u64, trait_len: u64, name_ptr: 
             }
         }
     }
-    emit_stderr("[DEBUG] Trait method lookup failed. Trait=");
-    emit_stderr_len(trait_ptr, trait_len);
-    emit_stderr(" name=");
-    emit_stderr_len(name_ptr, name_len);
-    emit_stderr("\n");
-    for (var k: u64 = 0; k < n; k++) {
-        var tm3: *TraitMethod = td.methods_vec.get(k);
-        emit_stderr("[DEBUG] Trait method: ");
-        emit_stderr_len(tm3.name_ptr, tm3.name_len);
+    if (TRAIT_LOOKUP_DEBUG != 0) {
+        emit_stderr("[DEBUG] Trait method lookup failed. Trait=");
+        emit_stderr_len(trait_ptr, trait_len);
+        emit_stderr(" name=");
+        emit_stderr_len(name_ptr, name_len);
         emit_stderr("\n");
+        for (var k: u64 = 0; k < n; k++) {
+            var tm3: *TraitMethod = td.methods_vec.get(k);
+            emit_stderr("[DEBUG] Trait method: ");
+            emit_stderr_len(tm3.name_ptr, tm3.name_len);
+            emit_stderr("\n");
+        }
     }
     return COMPILER_NOT_FOUND_U64;
 }
@@ -4170,30 +3811,11 @@ func compiler_insert_vptr_field(struct_def: *AstStructDef, trait_ptr: u64, trait
 }
 
 func compiler_clone_param(src: *Param) -> *Param {
-    var p: *Param = new Param();
-    p.name_ptr = src.name_ptr;
-    p.name_len = src.name_len;
-    p.type_kind = src.type_kind;
-    p.ptr_depth = src.ptr_depth;
-    p.is_tagged = src.is_tagged;
-    p.struct_name_ptr = src.struct_name_ptr;
-    p.struct_name_len = src.struct_name_len;
-    p.tag_layout_ptr = src.tag_layout_ptr;
-    p.tag_layout_len = src.tag_layout_len;
-    p.elem_type_kind = src.elem_type_kind;
-    p.elem_ptr_depth = src.elem_ptr_depth;
-    p.array_len = src.array_len;
-    p.array_len_is_param = src.array_len_is_param;
-    p.array_len_param_ptr = src.array_len_param_ptr;
-    p.array_len_param_len = src.array_len_param_len;
-    return p;
+    return module_util_clone_param(src);
 }
 
 func compiler_is_self_type(type_kind: u64, struct_name_ptr: u64, struct_name_len: u64) -> u64 {
-    if (type_kind != TYPE_STRUCT) { return false; }
-    if (struct_name_ptr == 0 || struct_name_len == 0) { return false; }
-    if (str_eq(struct_name_ptr, struct_name_len, "Self", 4) != 0) { return true; }
-    return false;
+    return module_util_is_self_type(type_kind, struct_name_ptr, struct_name_len);
 }
 
 func compiler_build_trait_thunk_func(thunk_name_ptr: u64, thunk_name_len: u64, trait_def: *TraitDef, trait_method: *TraitMethod, impl_method: *TraitImplMethod, struct_ptr: u64, struct_len: u64, vptr_offset: u64) -> *AstFunc {
@@ -4245,11 +3867,7 @@ func compiler_build_trait_thunk_func(thunk_name_ptr: u64, thunk_name_len: u64, t
 }
 
 func compiler_trait_method_error(prefix: u64, method_ptr: u64, method_len: u64) -> u64 {
-    emit_stderr(prefix);
-    emit_stderr_len(method_ptr, method_len);
-    emit_stderr("\n");
-    panic("Parse error");
-    return 0;
+    return module_util_trait_method_error(prefix, method_ptr, method_len);
 }
 
 func compiler_validate_struct_trait_inheritance(sd: *AstStructDef) -> u64 {
@@ -4494,21 +4112,8 @@ func compiler_finalize_traits() -> u64 {
     return 0;
 }
 
-func compiler_nameinfo_vec_contains(names: *Vec<*NameInfo>, name_ptr: u64, name_len: u64) -> u64 {
-    if (names == 0) { return 0; }
-    var n: u64 = names.len();
-    for (var i: u64 = 0; i < n; i++) {
-        var item: *NameInfo = names.get(i);
-        if (str_eq(item.ptr, item.len, name_ptr, name_len)) { return 1; }
-    }
-    return 0;
-}
-
 func compiler_nameinfo_vec_push_unique(names: *Vec<*NameInfo>, item: *NameInfo) -> u64 {
-    if (names == 0 || item == 0) { return 0; }
-    if (compiler_nameinfo_vec_contains(names, item.ptr, item.len) != 0) { return 0; }
-    names.push(item);
-    return 0;
+    return module_util_nameinfo_vec_push_unique(names, item);
 }
 
 func compiler_collect_parent_abst_methods(parent_def: *AstStructDef, out: *Vec<*NameInfo>) -> u64 {
@@ -4640,44 +4245,10 @@ func compiler_insert_global_init_func() -> u64 {
 }
 
 func setup_paths(filename: u64, filename_len: u64) -> u64 {
-    return setup_paths_with_compiler(0, 0, filename, filename_len);
+    return setup_paths_with_compiler(filename, filename_len);
 }
 
-func extract_version_from_compiler_path(path: u64, path_len: u64) -> *NameInfo {
-    if (path == 0 || path_len == 0) { return 0; }
-    var base: u64 = path_basename_noext(path, path_len);
-    var base_len: u64 = str_len(base);
-    var needle: u64 = "_stage";
-    for (var i: u64 = 0; i + 6 <= base_len; i++) {
-        if (str_eq(base + i, 6, needle, 6)) {
-            var vlen: u64 = i;
-            if (vlen == 0) { return 0; }
-            var vptr: u64 = heap_alloc((vlen + 1) * sizeof(u8));
-            str_copy(vptr, base, vlen);
-            var vptr_u8: []u8 = slice(vptr, vlen + 1);
-            vptr_u8[vlen] = 0;
-            var out: *NameInfo = new NameInfo{vptr, vlen};
-            return out;
-        }
-    }
-    // Fallback: accept direct version name (e.g., v3_20.out -> v3_20)
-    if (base_len >= 2) {
-        var base_u8: []u8 = slice(base, base_len);
-        var c0: u64 = base_u8[0];
-        var c1: u64 = base_u8[1];
-        if (c0 == 118 && c1 >= 48 && c1 <= 57) { // 'v' + digit
-            var vptr2: u64 = heap_alloc((base_len + 1) * sizeof(u8));
-            str_copy(vptr2, base, base_len);
-            var vptr2_u8: []u8 = slice(vptr2, base_len + 1);
-            vptr2_u8[base_len] = 0;
-            var out2: *NameInfo = new NameInfo{vptr2, base_len};
-            return out2;
-        }
-    }
-    return 0;
-}
-
-func setup_paths_with_compiler(compiler_path: u64, compiler_len: u64, filename: u64, filename_len: u64) -> u64 {
+func setup_paths_with_compiler(filename: u64, filename_len: u64) -> u64 {
     g_base_dir = path_dirname(filename, filename_len);
     g_base_dir_len = str_len(g_base_dir);
 
