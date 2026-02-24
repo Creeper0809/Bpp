@@ -11,6 +11,7 @@ import std.io;
 import std.vec;
 import std.util;
 import std.str;
+import std.hashmap;
 import types;
 import ast;
 import compiler;
@@ -24,11 +25,14 @@ import emitter.symtab;
 var g_symtab: *Symtab;                       // Symbol table for current function
 var g_label_counter;                // Label counter for unique labels
 var g_consts: *Vec<*ConstInfo>;                // Global constants table
+var g_consts_map: *HashMap<u64, *ConstInfo>;   // Const lookup cache: name -> const info
 var g_strings: *Vec<*StringEntry>;             // String literals table
+var g_strings_map: *HashMap<u64, *StringEntry>; // String dedup cache: literal -> entry
 var g_floats: *Vec<*FloatEntry>;               // Float literals table
 var g_loop_labels: *Vec<u64>;                  // Stack of loop end labels for break
 var g_loop_continue_labels: *Vec<u64>;         // Stack of loop continue labels
 var g_globals: *Vec<*GlobalInfo>;              // Global variables list
+var g_globals_map: *HashMap<u64, *GlobalInfo>; // Global lookup cache: name -> global info
 var g_defer_stack: *Vec<*AstNode>;              // Stack of deferred statements
 var g_defer_markers: *Vec<u64>;                 // Block scope markers for defer
 var g_defer_loop_markers: *Vec<u64>;            // Loop/switch scope markers for defer
@@ -47,10 +51,18 @@ func emitter_get_symtab() -> *Symtab { return g_symtab; }
 func emitter_set_symtab(s: *Symtab) -> u64 { g_symtab = s; }
 
 func emitter_get_globals() -> *Vec<*GlobalInfo> { return g_globals; }
-func emitter_set_globals(g: *Vec<*GlobalInfo>) -> u64 { g_globals = g; }
+func emitter_set_globals(g: *Vec<*GlobalInfo>) -> u64 {
+    g_globals = g;
+    emitter_rebuild_globals_map();
+    return 0;
+}
 
 func emitter_get_consts() -> *Vec<*ConstInfo> { return g_consts; }
-func emitter_set_consts(c: *Vec<*ConstInfo>) -> u64 { g_consts = c; }
+func emitter_set_consts(c: *Vec<*ConstInfo>) -> u64 {
+    g_consts = c;
+    emitter_rebuild_consts_map();
+    return 0;
+}
 
 func emitter_get_loop_labels() -> *Vec<u64> { return g_loop_labels; }
 func emitter_get_continue_labels() -> *Vec<u64> { return g_loop_continue_labels; }
@@ -83,13 +95,52 @@ func emitter_init() -> u64 {
     
     g_label_counter = 0;
     g_strings = new Vec<*StringEntry>(32);
+    g_strings_map = new HashMap<u64, *StringEntry>(64);
     g_floats = new Vec<*FloatEntry>(32);
     g_loop_labels = new Vec<u64>(16);
     g_loop_continue_labels = new Vec<u64>(16);
     g_consts = new Vec<*ConstInfo>(64);
+    g_consts_map = new HashMap<u64, *ConstInfo>(128);
+    g_globals_map = new HashMap<u64, *GlobalInfo>(128);
     g_defer_stack = new Vec<*AstNode>(32);
     g_defer_markers = new Vec<u64>(32);
     g_defer_loop_markers = new Vec<u64>(16);
+}
+
+func emitter_rebuild_globals_map() -> u64 {
+    var cap: u64 = 16;
+    if (g_globals != 0 && g_globals.len() > 0) {
+        cap = g_globals.len() * 2;
+        if (cap < 16) { cap = 16; }
+    }
+    g_globals_map = new HashMap<u64, *GlobalInfo>(cap);
+    if (g_globals == 0) { return 0; }
+
+    var len: u64 = g_globals.len();
+    for (var i: u64 = 0; i < len; i++) {
+        var ginfo: *GlobalInfo = g_globals.get(i);
+        if (ginfo == 0) { continue; }
+        g_globals_map.put(ginfo.name_ptr, ginfo.name_len, ginfo);
+    }
+    return 0;
+}
+
+func emitter_rebuild_consts_map() -> u64 {
+    var cap: u64 = 16;
+    if (g_consts != 0 && g_consts.len() > 0) {
+        cap = g_consts.len() * 2;
+        if (cap < 16) { cap = 16; }
+    }
+    g_consts_map = new HashMap<u64, *ConstInfo>(cap);
+    if (g_consts == 0) { return 0; }
+
+    var len: u64 = g_consts.len();
+    for (var i: u64 = 0; i < len; i++) {
+        var cinfo: *ConstInfo = g_consts.get(i);
+        if (cinfo == 0) { continue; }
+        g_consts_map.put(cinfo.name_ptr, cinfo.name_len, cinfo);
+    }
+    return 0;
 }
 
 func emitter_set_globals_from_prog(globals: *Vec<*GlobalInfo>) -> u64 {
@@ -98,16 +149,23 @@ func emitter_set_globals_from_prog(globals: *Vec<*GlobalInfo>) -> u64 {
     } else {
         g_globals = globals;
     }
+    emitter_rebuild_globals_map();
+    return 0;
 }
 
 func emitter_load_consts(consts: *Vec<*AstConstDecl>) -> u64 {
     g_consts = new Vec<*ConstInfo>(64);
+    g_consts_map = new HashMap<u64, *ConstInfo>(128);
+    if (consts == 0) { return 0; }
+
     var clen: u64 = consts.len();
     for (var ci: u64 = 0; ci < clen; ci++) {
         var const_decl: *AstConstDecl = consts.get(ci);
         var cinfo_struct: *ConstInfo = new ConstInfo{const_decl.name_ptr, const_decl.name_len, const_decl.value};
         g_consts.push(cinfo_struct);
+        g_consts_map.put(const_decl.name_ptr, const_decl.name_len, cinfo_struct);
     }
+    return 0;
 }
 
 // ============================================
@@ -115,6 +173,12 @@ func emitter_load_consts(consts: *Vec<*AstConstDecl>) -> u64 {
 // ============================================
 
 func is_global_var(name_ptr: u64, name_len: u64) -> u64 {
+    if (g_globals_map != 0) {
+        var gm: *GlobalInfo = g_globals_map.get(name_ptr, name_len);
+        if (gm != 0) { return true; }
+        return false;
+    }
+
     var len: u64 = g_globals.len();
     for (var i: u64 = 0; i < len; i++) {
         var ginfo: *GlobalInfo = g_globals.get(i);
@@ -190,6 +254,14 @@ func emit_asm_text_with_alias(text_vec: *Vec<u64>) -> u64 {
 // ============================================
 
 func const_find(name_ptr: u64, name_len: u64) -> ConstResult {
+    if (g_consts_map != 0) {
+        var cached: *ConstInfo = g_consts_map.get(name_ptr, name_len);
+        if (cached != 0) {
+            return ConstResult{1, cached.value};
+        }
+        return ConstResult{0, 0};
+    }
+
     var len: u64 = g_consts.len();
     for (var i: u64 = 0; i < len; i++) {
         var cinfo: *ConstInfo = g_consts.get(i);
@@ -227,17 +299,17 @@ func emit_label_def(n: u64) -> u64 {
 
 func string_table_init() -> u64 {
     g_strings = new Vec<*StringEntry>(32);
+    g_strings_map = new HashMap<u64, *StringEntry>(64);
+    return 0;
 }
 
 func string_get_label(str_ptr: u64, str_len: u64) -> u64 {
-    var count: u64 = g_strings.len();
-
-    for (var i: u64 = 0; i < count; i++) {
-        var str_entry: *StringEntry = g_strings.get(i);
-        
-        if (str_eq(str_entry.str_ptr, str_entry.str_len, str_ptr, str_len)) {
-            return str_entry.label_id;
-        }
+    if (g_strings_map == 0) {
+        g_strings_map = new HashMap<u64, *StringEntry>(64);
+    }
+    var cached: *StringEntry = g_strings_map.get(str_ptr, str_len);
+    if (cached != 0) {
+        return cached.label_id;
     }
     
     var label_id: u64 = g_label_counter;
@@ -245,6 +317,7 @@ func string_get_label(str_ptr: u64, str_len: u64) -> u64 {
     
     var str_entry: *StringEntry = new StringEntry{str_ptr, str_len, label_id};
     g_strings.push(str_entry);
+    g_strings_map.put(str_ptr, str_len, str_entry);
     
     return label_id;
 }
