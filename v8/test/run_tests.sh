@@ -3,6 +3,7 @@
 # Runs all tests
 
 set -e
+set -o pipefail
 
 # Load version from config.ini
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -28,8 +29,47 @@ fi
 COMPILER="$ROOT_DIR/bin/${VERSION}_stage1"
 TEST_DIR="${VERSION}/test/source"
 IR_TEST_DIR="${VERSION}/test/ir"
-BUILD_DIR="build/${VERSION}_tests"
-RESULTS_DIR="build/test_results"
+BUILD_DIR_BASE="build/${VERSION}_tests"
+RESULTS_DIR_BASE="build/test_results"
+
+TEST_FAST_IO=${TEST_FAST_IO:-0}
+TEST_QUIET=${TEST_QUIET:-0}
+KEEP_TEST_ARTIFACTS=${KEEP_TEST_ARTIFACTS:-1}
+TEST_JOBS=${TEST_JOBS:-0}
+FAST_IO_ACTIVE=0
+
+BUILD_DIR="$BUILD_DIR_BASE"
+RESULTS_DIR="$RESULTS_DIR_BASE"
+if [ "$TEST_FAST_IO" -eq 1 ] && [ -d "/dev/shm" ] && [ -w "/dev/shm" ]; then
+    WORK_DIR="$(mktemp -d "/dev/shm/bpp_${VERSION}_tests_XXXXXX")"
+    BUILD_DIR="$WORK_DIR/${VERSION}_tests"
+    RESULTS_DIR="$WORK_DIR/test_results"
+    FAST_IO_ACTIVE=1
+    trap 'rm -rf "$WORK_DIR"' EXIT
+fi
+
+persist_result_file() {
+    local src="$1"
+    local dst="$2"
+    if [ "$FAST_IO_ACTIVE" -eq 1 ] && [ -f "$src" ]; then
+        mkdir -p "$(dirname "$dst")"
+        cp "$src" "$dst"
+    fi
+}
+
+detect_test_jobs() {
+    if [ "$TEST_JOBS" -gt 0 ]; then
+        return
+    fi
+    local detected=4
+    if command -v nproc >/dev/null 2>&1; then
+        detected="$(nproc)"
+    fi
+    if [ "$detected" -lt 1 ]; then
+        detected=1
+    fi
+    TEST_JOBS="$detected"
+}
 
 # Colors
 GREEN='\033[0;32m'
@@ -40,6 +80,7 @@ NC='\033[0m' # No Color
 # Create directories
 mkdir -p "$BUILD_DIR"
 mkdir -p "$RESULTS_DIR"
+mkdir -p "$RESULTS_DIR_BASE"
 
 # Counters
 TOTAL=0
@@ -61,10 +102,206 @@ echo "========================================"
 echo "${VERSION} Compiler Test Suite"
 echo "========================================"
 echo ""
+if [ "$FAST_IO_ACTIVE" -eq 1 ] && [ "$TEST_QUIET" -eq 0 ]; then
+    echo "[INFO] Fast test I/O enabled: $WORK_DIR"
+    echo ""
+fi
+
+detect_test_jobs
+if [ "$TEST_QUIET" -eq 0 ]; then
+    echo "[INFO] Parallel jobs: $TEST_JOBS"
+    echo ""
+fi
+
+JOBS_DIR="$RESULTS_DIR/.jobs"
+mkdir -p "$JOBS_DIR"
+rm -f "$JOBS_DIR"/*.result 2>/dev/null || true
+RUN_TAG="run_$$"
+CASE_RESULT_FILES=()
+IR_RESULT_FILES=()
+
+launch_job_with_limit() {
+    while [ "$(jobs -rp | wc -l)" -ge "$TEST_JOBS" ]; do
+        wait -n || true
+    done
+    "$@" &
+}
+
+run_matrix_case() {
+    set +e
+    local case_num="$1"
+    local test_file="$2"
+    local test_name="$3"
+    local mode="$4"
+    local opt="$5"
+    local expected="$6"
+    local result_file="$7"
+
+    local case_tag="[$case_num] Testing $test_name ($mode $opt)"
+    local case_pass=0
+    local case_fail=0
+    local case_stress_pass=0
+    local case_stress_fail=0
+    local case_stability_pass=0
+    local case_stability_fail=0
+    local case_status="PASS"
+
+    local asm_file="$BUILD_DIR/${test_name}.${mode}.${opt}.asm"
+    local obj_file="$BUILD_DIR/${test_name}.${mode}.${opt}.o"
+    local bin_file="$BUILD_DIR/${test_name}.${mode}.${opt}"
+    local out_file="$RESULTS_DIR/${test_name}.${mode}.${opt}.out"
+    local err_file="$RESULTS_DIR/${test_name}.${mode}.${opt}.err"
+    local out_file_persist="$RESULTS_DIR_BASE/${test_name}.${mode}.${opt}.out"
+    local err_file_persist="$RESULTS_DIR_BASE/${test_name}.${mode}.${opt}.err"
+
+    rm -f "$out_file" "$err_file"
+
+    local ir_flag=""
+    if [ "$mode" = "ssa" ]; then
+        ir_flag="-dump-ssa"
+    fi
+    local opt_flag=""
+    if [ "$opt" = "O1" ]; then
+        opt_flag="-O1"
+    fi
+
+    if ! $COMPILER $opt_flag $ir_flag -asm "$test_file" > "$asm_file" 2>"$err_file"; then
+        echo "Compilation failed" > "$err_file"
+        persist_result_file "$err_file" "$err_file_persist"
+        case_fail=1
+        case_status="FAIL (compile)"
+    else
+        if ! nasm -f elf64 -O0 "$asm_file" -o "$obj_file" 2>"$err_file"; then
+            persist_result_file "$err_file" "$err_file_persist"
+            case_fail=1
+            case_status="FAIL (assemble)"
+        elif ! ld "$obj_file" -o "$bin_file" 2>>"$err_file"; then
+            persist_result_file "$err_file" "$err_file_persist"
+            case_fail=1
+            case_status="FAIL (link)"
+        else
+            timeout 5s "$bin_file" >/dev/null 2>/dev/null
+            local exit_code="$?"
+            if [ "$exit_code" -eq "$expected" ]; then
+                case_pass=1
+                if [ "$STRESS_RUNS" -gt 0 ]; then
+                    local stress_ok=1
+                    local i=0
+                    local stress_exit=0
+                    for ((i=1; i<=STRESS_RUNS; i++)); do
+                        timeout 5s "$bin_file" >/dev/null 2>/dev/null
+                        stress_exit="$?"
+                        if [ "$stress_exit" -ne "$expected" ]; then
+                            stress_ok=0
+                            break
+                        fi
+                    done
+                    if [ "$stress_ok" -eq 1 ]; then
+                        case_stress_pass=1
+                    else
+                        case_stress_fail=1
+                        case_fail=$((case_fail + 1))
+                        case_status="STRESS FAIL (run=$i, exit=$stress_exit, expect=$expected)"
+                    fi
+                fi
+
+                if [ "$case_stress_fail" -eq 0 ] && [ "$STABILITY_RUNS" -gt 0 ]; then
+                    local stability_ok=1
+                    local j=0
+                    local stability_exit=0
+                    for ((j=1; j<=STABILITY_RUNS; j++)); do
+                        timeout 5s "$bin_file" >/dev/null 2>/dev/null
+                        stability_exit="$?"
+                        if [ "$stability_exit" -ne "$expected" ]; then
+                            stability_ok=0
+                            break
+                        fi
+                    done
+                    if [ "$stability_ok" -eq 1 ]; then
+                        case_stability_pass=1
+                    else
+                        case_stability_fail=1
+                        case_fail=$((case_fail + 1))
+                        case_status="STABILITY FAIL (run=$j, exit=$stability_exit, expect=$expected)"
+                    fi
+                fi
+            else
+                timeout 5s "$bin_file" > "$out_file" 2>&1
+                persist_result_file "$out_file" "$out_file_persist"
+                case_fail=1
+                case_status="FAIL (exit=$exit_code, expect=$expected)"
+            fi
+        fi
+    fi
+
+    if [ "$KEEP_TEST_ARTIFACTS" -eq 0 ]; then
+        rm -f "$asm_file" "$obj_file" "$bin_file" "$out_file" "$err_file"
+    fi
+
+    {
+        echo "CASE_TAG=\"$case_tag\""
+        echo "CASE_STATUS=\"$case_status\""
+        echo "CASE_PASS=$case_pass"
+        echo "CASE_FAIL=$case_fail"
+        echo "CASE_STRESS_PASS=$case_stress_pass"
+        echo "CASE_STRESS_FAIL=$case_stress_fail"
+        echo "CASE_STABILITY_PASS=$case_stability_pass"
+        echo "CASE_STABILITY_FAIL=$case_stability_fail"
+    } > "$result_file"
+    return 0
+}
+
+run_ir_case() {
+    set +e
+    local case_num="$1"
+    local test_file="$2"
+    local test_name="$3"
+    local result_file="$4"
+
+    local case_tag="[$case_num] IR $test_name"
+    local case_pass=0
+    local case_fail=0
+    local case_status="PASS"
+
+    local ssa_out="$RESULTS_DIR/${test_name}.ssa.ir"
+    local addr_out="$RESULTS_DIR/${test_name}.3addr.ir"
+    local err_file="$RESULTS_DIR/${test_name}.ir.err"
+    local err_file_persist="$RESULTS_DIR_BASE/${test_name}.ir.err"
+    rm -f "$err_file"
+
+    if ! $COMPILER -dump-ssa "$test_file" > "$ssa_out" 2>"$err_file"; then
+        persist_result_file "$err_file" "$err_file_persist"
+        case_fail=1
+        case_status="FAIL (ssa dump)"
+    elif ! grep -q "phi" "$ssa_out"; then
+        case_fail=1
+        case_status="FAIL (ssa missing phi)"
+    elif ! $COMPILER -dump-ir "$test_file" > "$addr_out" 2>>"$err_file"; then
+        persist_result_file "$err_file" "$err_file_persist"
+        case_fail=1
+        case_status="FAIL (3addr dump)"
+    elif grep -q "phi" "$addr_out"; then
+        case_fail=1
+        case_status="FAIL (3addr has phi)"
+    else
+        case_pass=1
+    fi
+
+    if [ "$KEEP_TEST_ARTIFACTS" -eq 0 ]; then
+        rm -f "$ssa_out" "$addr_out" "$err_file"
+    fi
+
+    {
+        echo "CASE_TAG=\"$case_tag\""
+        echo "CASE_STATUS=\"$case_status\""
+        echo "CASE_PASS=$case_pass"
+        echo "CASE_FAIL=$case_fail"
+    } > "$result_file"
+    return 0
+}
 
 # Find all test files (exclude module files)
 TEST_FILES=$(ls $TEST_DIR/*.bpp 2>/dev/null | grep -E '/[0-9]+_' | sort -V)
-
 if [ -z "$TEST_FILES" ]; then
     echo "No test files found in $TEST_DIR"
     exit 1
@@ -72,18 +309,16 @@ fi
 
 for TEST_FILE in $TEST_FILES; do
     TEST_NAME=$(basename "$TEST_FILE" .bpp)
-
     CONTENT_HASH=$(awk '{if ($0 !~ /^\/\/ (Covers:|Mode:|Opt:|Expect exit code:)/) print}' "$TEST_FILE" | md5sum | awk '{print $1}')
     if [ -n "${SEEN_HASH[$CONTENT_HASH]}" ]; then
-        echo "[SKIP] Duplicate content: $TEST_NAME (same as ${SEEN_HASH[$CONTENT_HASH]})"
+        if [ "$TEST_QUIET" -eq 0 ]; then
+            echo "[SKIP] Duplicate content: $TEST_NAME (same as ${SEEN_HASH[$CONTENT_HASH]})"
+        fi
         continue
     fi
     SEEN_HASH[$CONTENT_HASH]="$TEST_NAME"
 
-    # Parse test directives from the test file using awk for cleaner extraction.
     EXPECTED=$(grep -m1 -E '^// Expect exit code:' "$TEST_FILE" | awk -F': ' '{print $2}' | tr -d ' ' || echo "0")
-
-    # Fallback to 0 if EXPECTED is empty after parsing.
     if [ -z "$EXPECTED" ]; then
         EXPECTED=0
     fi
@@ -91,109 +326,44 @@ for TEST_FILE in $TEST_FILES; do
     for MODE in nossa ssa; do
         for OPT in O0 O1; do
             TOTAL=$((TOTAL + 1))
-            echo -n "[$TOTAL] Testing $TEST_NAME ($MODE $OPT)... "
-
-            ASM_FILE="$BUILD_DIR/${TEST_NAME}.${MODE}.${OPT}.asm"
-            OBJ_FILE="$BUILD_DIR/${TEST_NAME}.${MODE}.${OPT}.o"
-            BIN_FILE="$BUILD_DIR/${TEST_NAME}.${MODE}.${OPT}"
-            OUT_FILE="$RESULTS_DIR/${TEST_NAME}.${MODE}.${OPT}.out"
-            ERR_FILE="$RESULTS_DIR/${TEST_NAME}.${MODE}.${OPT}.err"
-
-            # Set compiler flags based on mode/opt matrix.
-            IR_FLAG=""
-            if [ "$MODE" = "ssa" ]; then
-                IR_FLAG="-dump-ssa"
-            fi
-
-            OPT_FLAG=""
-            if [ "$OPT" = "O1" ]; then
-                OPT_FLAG="-O1"
-            fi
-
-            if ! $COMPILER $OPT_FLAG $IR_FLAG -asm "$TEST_FILE" 2>/dev/null > "$ASM_FILE"; then
-                echo -e "${RED}FAIL (compile)${NC}"
-                echo "Compilation failed" > "$ERR_FILE"
-                FAILED=$((FAILED + 1))
-                continue
-            fi
-
-            # Assemble
-            if ! nasm -f elf64 "$ASM_FILE" -o "$OBJ_FILE" 2>"$ERR_FILE"; then
-                echo -e "${RED}FAIL (assemble)${NC}"
-                FAILED=$((FAILED + 1))
-                continue
-            fi
-
-            # Link
-            if ! ld "$OBJ_FILE" -o "$BIN_FILE" 2>>"$ERR_FILE"; then
-                echo -e "${RED}FAIL (link)${NC}"
-                FAILED=$((FAILED + 1))
-                continue
-            fi
-
-            # Run (compare exit code with expected)
-            set +e
-            timeout 5s "$BIN_FILE" > "$OUT_FILE" 2>&1
-            EXIT_CODE=$?
-            set -e
-
-            if [ "$EXIT_CODE" -eq "$EXPECTED" ]; then
-                echo -e "${GREEN}PASS${NC} (exit=$EXIT_CODE)"
-                PASSED=$((PASSED + 1))
-            else
-                echo -e "${RED}FAIL${NC} (exit=$EXIT_CODE, expect=$EXPECTED)"
-                FAILED=$((FAILED + 1))
-                continue
-            fi
-
-            # Stress test: run the binary multiple times to catch flakiness.
-            if [ "$STRESS_RUNS" -gt 0 ]; then
-                STRESS_OK=1
-                for ((i=1; i<=STRESS_RUNS; i++)); do
-                    set +e
-                    timeout 5s "$BIN_FILE" > "$OUT_FILE" 2>&1
-                    STRESS_EXIT=$?
-                    set -e
-                    if [ "$STRESS_EXIT" -ne "$EXPECTED" ]; then
-                        STRESS_OK=0
-                        break
-                    fi
-                done
-                if [ "$STRESS_OK" -eq 1 ]; then
-                    echo -e "${GREEN}STRESS PASS${NC} (runs=$STRESS_RUNS)"
-                    STRESS_PASSED=$((STRESS_PASSED + 1))
-                else
-                    echo -e "${RED}STRESS FAIL${NC} (run=$i, exit=$STRESS_EXIT, expect=$EXPECTED)"
-                    STRESS_FAILED=$((STRESS_FAILED + 1))
-                    FAILED=$((FAILED + 1))
-                    continue
-                fi
-            fi
-
-            # Stability test: shorter loop with an explicit label.
-            if [ "$STABILITY_RUNS" -gt 0 ]; then
-                STABILITY_OK=1
-                for ((i=1; i<=STABILITY_RUNS; i++)); do
-                    set +e
-                    timeout 5s "$BIN_FILE" > "$OUT_FILE" 2>&1
-                    STABILITY_EXIT=$?
-                    set -e
-                    if [ "$STABILITY_EXIT" -ne "$EXPECTED" ]; then
-                        STABILITY_OK=0
-                        break
-                    fi
-                done
-                if [ "$STABILITY_OK" -eq 1 ]; then
-                    echo -e "${GREEN}STABILITY PASS${NC} (runs=$STABILITY_RUNS)"
-                    STABILITY_PASSED=$((STABILITY_PASSED + 1))
-                else
-                    echo -e "${RED}STABILITY FAIL${NC} (run=$i, exit=$STABILITY_EXIT, expect=$EXPECTED)"
-                    STABILITY_FAILED=$((STABILITY_FAILED + 1))
-                    FAILED=$((FAILED + 1))
-                fi
-            fi
+            RESULT_FILE="$JOBS_DIR/${RUN_TAG}_case_${TOTAL}.result"
+            CASE_RESULT_FILES+=("$RESULT_FILE")
+            launch_job_with_limit run_matrix_case "$TOTAL" "$TEST_FILE" "$TEST_NAME" "$MODE" "$OPT" "$EXPECTED" "$RESULT_FILE"
         done
     done
+done
+
+wait || true
+
+for RESULT_FILE in "${CASE_RESULT_FILES[@]}"; do
+    if [ ! -f "$RESULT_FILE" ]; then
+        FAILED=$((FAILED + 1))
+        continue
+    fi
+    CASE_TAG=""
+    CASE_STATUS=""
+    CASE_PASS=0
+    CASE_FAIL=0
+    CASE_STRESS_PASS=0
+    CASE_STRESS_FAIL=0
+    CASE_STABILITY_PASS=0
+    CASE_STABILITY_FAIL=0
+    source "$RESULT_FILE"
+
+    PASSED=$((PASSED + CASE_PASS))
+    FAILED=$((FAILED + CASE_FAIL))
+    STRESS_PASSED=$((STRESS_PASSED + CASE_STRESS_PASS))
+    STRESS_FAILED=$((STRESS_FAILED + CASE_STRESS_FAIL))
+    STABILITY_PASSED=$((STABILITY_PASSED + CASE_STABILITY_PASS))
+    STABILITY_FAILED=$((STABILITY_FAILED + CASE_STABILITY_FAIL))
+
+    if [ "$TEST_QUIET" -eq 0 ]; then
+        if [ "$CASE_FAIL" -eq 0 ]; then
+            echo -e "${GREEN}${CASE_TAG} ${CASE_STATUS}${NC}"
+        else
+            echo -e "${RED}${CASE_TAG} ${CASE_STATUS}${NC}"
+        fi
+    fi
 done
 
 IR_TEST_FILES=$(ls $IR_TEST_DIR/*.bpp 2>/dev/null | sort -V)
@@ -208,36 +378,33 @@ fi
 for TEST_FILE in $IR_TEST_FILES; do
     TOTAL=$((TOTAL + 1))
     TEST_NAME=$(basename "$TEST_FILE" .bpp)
+    RESULT_FILE="$JOBS_DIR/${RUN_TAG}_ir_${TOTAL}.result"
+    IR_RESULT_FILES+=("$RESULT_FILE")
+    launch_job_with_limit run_ir_case "$TOTAL" "$TEST_FILE" "$TEST_NAME" "$RESULT_FILE"
+done
 
-    echo -n "[$TOTAL] IR $TEST_NAME... "
+wait || true
 
-    SSA_OUT="$RESULTS_DIR/${TEST_NAME}.ssa.ir"
-    ADDR_OUT="$RESULTS_DIR/${TEST_NAME}.3addr.ir"
-    ERR_FILE="$RESULTS_DIR/${TEST_NAME}.ir.err"
-
-    if ! $COMPILER -dump-ssa "$TEST_FILE" > "$SSA_OUT" 2>"$ERR_FILE"; then
-        echo -e "${RED}FAIL${NC} (ssa dump)"
+for RESULT_FILE in "${IR_RESULT_FILES[@]}"; do
+    if [ ! -f "$RESULT_FILE" ]; then
         FAILED=$((FAILED + 1))
         continue
     fi
-    if ! grep -q "phi" "$SSA_OUT"; then
-        echo -e "${RED}FAIL${NC} (ssa missing phi)"
-        FAILED=$((FAILED + 1))
-        continue
-    fi
-    if ! $COMPILER -dump-ir "$TEST_FILE" > "$ADDR_OUT" 2>>"$ERR_FILE"; then
-        echo -e "${RED}FAIL${NC} (3addr dump)"
-        FAILED=$((FAILED + 1))
-        continue
-    fi
-    if grep -q "phi" "$ADDR_OUT"; then
-        echo -e "${RED}FAIL${NC} (3addr has phi)"
-        FAILED=$((FAILED + 1))
-        continue
-    fi
+    CASE_TAG=""
+    CASE_STATUS=""
+    CASE_PASS=0
+    CASE_FAIL=0
+    source "$RESULT_FILE"
+    PASSED=$((PASSED + CASE_PASS))
+    FAILED=$((FAILED + CASE_FAIL))
 
-    echo -e "${GREEN}PASS${NC}"
-    PASSED=$((PASSED + 1))
+    if [ "$TEST_QUIET" -eq 0 ]; then
+        if [ "$CASE_FAIL" -eq 0 ]; then
+            echo -e "${GREEN}${CASE_TAG} ${CASE_STATUS}${NC}"
+        else
+            echo -e "${RED}${CASE_TAG} ${CASE_STATUS}${NC}"
+        fi
+    fi
 done
 
 echo ""

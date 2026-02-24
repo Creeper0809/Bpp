@@ -54,6 +54,7 @@ var g_prelude_aliases: *HashMap<u64, *NameInfo> = new HashMap<u64, *NameInfo>(12
 var g_prelude_miss_cache: *HashMap<u64, u64> = new HashMap<u64, u64>(256);              // HashMap: alias -> 1 when confirmed not in prelude
 var g_prelude_loaded: u64 = 0;
 var g_module_exports: *HashMap<u64, *Vec<*ExportEntry>> = new HashMap<u64, *Vec<*ExportEntry>>(64);     // HashMap: module_id -> exports vec
+var g_module_export_maps: *HashMap<u64, *HashMap<u64, *NameInfo>> = new HashMap<u64, *HashMap<u64, *NameInfo>>(64);  // HashMap: module_id -> export name map
 var g_func_module_map: *HashMap<u64, *NameInfo> = new HashMap<u64, *NameInfo>(128);    // HashMap: mangled func -> module_id
 var g_global_module_map: *HashMap<u64, *NameInfo> = new HashMap<u64, *NameInfo>(128);  // HashMap: mangled global -> module_id
 var g_current_module_ptr = 0;
@@ -560,6 +561,21 @@ func module_exports_get(module_ptr: u64, module_len: u64) -> *Vec<*ExportEntry> 
     return g_module_exports.?get(module_ptr, module_len);
 }
 
+func module_export_map_get(module_ptr: u64, module_len: u64) -> *HashMap<u64, *NameInfo> {
+    return g_module_export_maps.?get(module_ptr, module_len);
+}
+
+func module_export_map_ensure(module_ptr: u64, module_len: u64) -> *HashMap<u64, *NameInfo> {
+    if (g_module_export_maps == 0) {
+        g_module_export_maps = new HashMap<u64, *HashMap<u64, *NameInfo>>(64);
+    }
+    var existing: *HashMap<u64, *NameInfo> = g_module_export_maps.get(module_ptr, module_len);
+    if (existing != 0) { return existing; }
+    var map: *HashMap<u64, *NameInfo> = new HashMap<u64, *NameInfo>(128);
+    g_module_export_maps.put(module_ptr, module_len, map);
+    return map;
+}
+
 func module_exports_ensure(module_ptr: u64, module_len: u64) -> *Vec<*ExportEntry> {
     if (g_module_exports == 0) {
         g_module_exports = new HashMap<u64, *Vec<*ExportEntry>>(64);
@@ -575,6 +591,11 @@ func add_module_export(module_ptr: u64, module_len: u64, name_ptr: u64, name_len
     var exports: *Vec<*ExportEntry> = module_exports_ensure(module_ptr, module_len);
     var entry: *ExportEntry = new ExportEntry{name_ptr, name_len, mangled_ptr, mangled_len};
     exports.push(entry);
+    var export_map: *HashMap<u64, *NameInfo> = module_export_map_ensure(module_ptr, module_len);
+    if (export_map.has(name_ptr, name_len) == 0) {
+        var info: *NameInfo = new NameInfo{mangled_ptr, mangled_len};
+        export_map.put(name_ptr, name_len, info);
+    }
     return 0;
 }
 
@@ -708,6 +729,16 @@ func prelude_try_symbol(module_path: u64, module_len: u64, name_ptr: u64, name_l
     if (mod_id == 0) { return 0; }
     var mod_ptr: u64 = mod_id.ptr;
     var mod_len: u64 = mod_id.len;
+
+    var export_map: *HashMap<u64, *NameInfo> = module_export_map_get(mod_ptr, mod_len);
+    if (export_map != 0) {
+        var mapped: *NameInfo = export_map.get(name_ptr, name_len);
+        if (mapped != 0) {
+            add_prelude_alias(name_ptr, name_len, mapped.ptr, mapped.len);
+            return mapped;
+        }
+    }
+
     var exports: *Vec<*ExportEntry> = module_exports_get(mod_ptr, mod_len);
     if (exports == 0) { return 0; }
 
@@ -809,15 +840,22 @@ func resolve_name(name_ptr: u64, name_len: u64) -> *NameInfo {
     }
 
     if (g_current_module_ptr != 0 && g_current_module_len != 0) {
+        var export_map: *HashMap<u64, *NameInfo> = module_export_map_get(g_current_module_ptr, g_current_module_len);
+        var mapped: *NameInfo = export_map.?get(name_ptr, name_len);
+        if (mapped != 0) { return mapped; }
+
+        // Fallback for legacy module states; also backfill map for next lookup.
         var exports: *Vec<*ExportEntry> = module_exports_get(g_current_module_ptr, g_current_module_len);
         if (exports != 0) {
             var n: u64 = exports.len();
             for (var i: u64 = 0; i < n; i++) {
                 var e: *ExportEntry = exports.get(i);
-                var n_ptr: u64 = e.name_ptr;
-                var n_len: u64 = e.name_len;
-                if (str_eq(n_ptr, n_len, name_ptr, name_len)) {
+                if (str_eq(e.name_ptr, e.name_len, name_ptr, name_len)) {
                     var info: *NameInfo = new NameInfo{e.mangled_ptr, e.mangled_len};
+                    var export_map2: *HashMap<u64, *NameInfo> = module_export_map_ensure(g_current_module_ptr, g_current_module_len);
+                    if (export_map2.has(name_ptr, name_len) == 0) {
+                        export_map2.put(name_ptr, name_len, info);
+                    }
                     return info;
                 }
             }

@@ -24,6 +24,10 @@ SRC_FILE="$SCRIPT_DIR/src/main.bpp"
 TEST_SCRIPT="$SCRIPT_DIR/test/run_tests.sh"
 BASE_COMPILER="${VERSION}_base"
 NASM_FLAGS="-felf64 -O0"
+TEST_FAST_IO="${TEST_FAST_IO:-1}"
+TEST_QUIET="${TEST_QUIET:-1}"
+KEEP_TEST_ARTIFACTS="${KEEP_TEST_ARTIFACTS:-0}"
+TEST_JOBS="${TEST_JOBS:-0}"
 
 # Use RAM disk for large self-host ASM I/O when available (no build step skipped).
 ASM_WORK_DIR="$BUILD_DIR"
@@ -106,18 +110,17 @@ cp "${STAGE2_ASM}" "build/${VERSION}_stage2.asm"
 
 # Step 5: 테스트 실행
 echo "[5/6] Running Tests..."
-bash ${TEST_SCRIPT} bin/${VERSION}_stage1 2>&1 | tail -15
+TEST_FAST_IO="$TEST_FAST_IO" TEST_QUIET="$TEST_QUIET" KEEP_TEST_ARTIFACTS="$KEEP_TEST_ARTIFACTS" \
+TEST_JOBS="$TEST_JOBS" \
+  bash ${TEST_SCRIPT} bin/${VERSION}_stage1 2>&1 | tail -15
 
 # Step 6: 바이너리(.out) 생성 (기본 실행 경로)
 echo ""
-    echo "[6/6] Generating Executable..."
-rm -f out.s out.o a.out
-BASE_NAME=$(basename "${SRC_FILE}" .bpp)
-./bin/${VERSION}_stage1 ${SRC_FILE} >/dev/null
-if [ -f "${BASE_NAME}.out" ]; then
-    mv "${BASE_NAME}.out" build/${VERSION}.out
-fi
-rm -f "${BASE_NAME}.s" "${BASE_NAME}.o"
+echo "[6/6] Generating Executable..."
+OUT_OBJ="build/${VERSION}.out.o"
+nasm ${NASM_FLAGS} "${STAGE2_ASM}" -o "${OUT_OBJ}"
+ld "${OUT_OBJ}" -o "build/${VERSION}.out"
+rm -f "${OUT_OBJ}"
 
 echo ""
 echo "========================================="
