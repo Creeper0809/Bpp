@@ -3016,7 +3016,7 @@ func generic_clone_expr_generic_call(gc: *AstGenericCall, bindings: *Vec<*Generi
         gargs.push(ng);
     }
     var args_g: *Vec<*AstNode> = generic_clone_args_vec(gc.args_vec, bindings);
-    return ast_generic_call(gc.name_ptr, gc.name_len, gargs, args_g);
+    return ast_generic_call_with_origin(gc.name_ptr, gc.name_len, gargs, args_g, gc.origin);
 }
 
 func generic_clone_expr_new(nw: *AstNew, bindings: *Vec<*GenericBinding>) -> *AstNode {
@@ -3071,7 +3071,7 @@ func generic_clone_expr(node: *AstNode, bindings: *Vec<*GenericBinding>) -> *Ast
         case AST_CALL:
             var call: *AstCall = (*AstCall)node;
             var args: *Vec<*AstNode> = generic_clone_args_vec(call.args_vec, bindings);
-            return ast_call(call.name_ptr, call.name_len, args);
+            return ast_call_with_origin(call.name_ptr, call.name_len, args, call.origin);
         case AST_GENERIC_CALL:
             return generic_clone_expr_generic_call((*AstGenericCall)node, bindings);
         case AST_ADDR_OF:
@@ -3633,23 +3633,23 @@ func generic_process_generic_call_expr(gc: *AstGenericCall, symtab: *HashMap<u64
     var bindings: *Vec<*GenericBinding> = generic_build_bindings_for_explicit(tpl_ptr, gc.generic_args_vec);
     var name_info: *NameInfo = generic_get_or_create_instance(tpl_ptr, bindings);
     var args_new: *Vec<*AstNode> = generic_process_args_vec(gc.args_vec, symtab);
-    return ast_call(name_info.ptr, name_info.len, args_new);
+    return ast_call_with_origin(name_info.ptr, name_info.len, args_new, gc.origin);
 }
 
 func generic_process_call_expr(call: *AstCall, symtab: *HashMap<u64, *TypeInfo>) -> *AstNode {
     var tpl_ptr: *GenericFuncTemplate = generic_resolve_template(call.name_ptr, call.name_len);
     if (tpl_ptr == 0) {
         var args_new2: *Vec<*AstNode> = generic_process_args_vec(call.args_vec, symtab);
-        return ast_call(call.name_ptr, call.name_len, args_new2);
+        return ast_call_with_origin(call.name_ptr, call.name_len, args_new2, call.origin);
     }
     var bindings2: *Vec<*GenericBinding> = generic_build_bindings_by_infer(tpl_ptr, call.args_vec, symtab);
     if (bindings2 == 0) {
         var args_fallback: *Vec<*AstNode> = generic_process_args_vec(call.args_vec, symtab);
-        return ast_call(call.name_ptr, call.name_len, args_fallback);
+        return ast_call_with_origin(call.name_ptr, call.name_len, args_fallback, call.origin);
     }
     var name_info2: *NameInfo = generic_get_or_create_instance(tpl_ptr, bindings2);
     var args_new3: *Vec<*AstNode> = generic_process_args_vec(call.args_vec, symtab);
-    return ast_call(name_info2.ptr, name_info2.len, args_new3);
+    return ast_call_with_origin(name_info2.ptr, name_info2.len, args_new3, call.origin);
 }
 
 func generic_process_new_expr(nw: *AstNew, symtab: *HashMap<u64, *TypeInfo>) -> *AstNode {
@@ -3825,6 +3825,223 @@ func generic_process_stmt(stmt: *AstNode, symtab: *HashMap<u64, *TypeInfo>) -> u
     }
 }
 
+func compiler_validate_direct_impl_call_name(name_ptr: u64, name_len: u64, origin: u64, owner_ptr: u64, owner_len: u64) -> u64 {
+    if (origin != AST_CALL_ORIGIN_DIRECT) { return 0; }
+    if (compiler_is_impl_method(name_ptr, name_len) == 0) { return 0; }
+    if (owner_ptr != 0 && owner_len != 0) { return 0; }
+    emit_stderr("[ERROR] Direct call to impl-lowered method is not allowed: ");
+    emit_stderr_len(name_ptr, name_len);
+    emit_stderr("\n");
+    panic("Compiler error");
+    return 0;
+}
+
+func compiler_validate_direct_impl_calls_args(args: *Vec<*AstNode>, owner_ptr: u64, owner_len: u64) -> u64 {
+    if (args == 0) { return 0; }
+    var n: u64 = args.len();
+    for (var i: u64 = 0; i < n; i++) {
+        compiler_validate_direct_impl_calls_expr(args.get(i), owner_ptr, owner_len);
+    }
+    return 0;
+}
+
+func compiler_validate_direct_impl_calls_expr(expr: *AstNode, owner_ptr: u64, owner_len: u64) -> u64 {
+    if (expr == 0) { return 0; }
+    var kind: u64 = ast_kind(expr);
+    switch (kind) {
+        case AST_CALL:
+            var call: *AstCall = (*AstCall)expr;
+            compiler_validate_direct_impl_call_name(call.name_ptr, call.name_len, call.origin, owner_ptr, owner_len);
+            compiler_validate_direct_impl_calls_args(call.args_vec, owner_ptr, owner_len);
+            break;
+        case AST_GENERIC_CALL:
+            var gcall: *AstGenericCall = (*AstGenericCall)expr;
+            compiler_validate_direct_impl_call_name(gcall.name_ptr, gcall.name_len, gcall.origin, owner_ptr, owner_len);
+            compiler_validate_direct_impl_calls_args(gcall.args_vec, owner_ptr, owner_len);
+            break;
+        case AST_CALL_PTR:
+            var cp: *AstCallPtr = (*AstCallPtr)expr;
+            compiler_validate_direct_impl_calls_expr(cp.callee, owner_ptr, owner_len);
+            compiler_validate_direct_impl_calls_args(cp.args_vec, owner_ptr, owner_len);
+            break;
+        case AST_BINARY:
+            var bin: *AstBinary = (*AstBinary)expr;
+            compiler_validate_direct_impl_calls_expr(bin.left, owner_ptr, owner_len);
+            compiler_validate_direct_impl_calls_expr(bin.right, owner_ptr, owner_len);
+            break;
+        case AST_UNARY:
+            var un: *AstUnary = (*AstUnary)expr;
+            compiler_validate_direct_impl_calls_expr(un.operand, owner_ptr, owner_len);
+            break;
+        case AST_ADDR_OF:
+            var ao: *AstAddrOf = (*AstAddrOf)expr;
+            compiler_validate_direct_impl_calls_expr(ao.operand, owner_ptr, owner_len);
+            break;
+        case AST_DEREF:
+            var dr: *AstDeref = (*AstDeref)expr;
+            compiler_validate_direct_impl_calls_expr(dr.operand, owner_ptr, owner_len);
+            break;
+        case AST_DEREF8:
+            var dr8: *AstDeref8 = (*AstDeref8)expr;
+            compiler_validate_direct_impl_calls_expr(dr8.operand, owner_ptr, owner_len);
+            break;
+        case AST_CAST:
+            var cs: *AstCast = (*AstCast)expr;
+            compiler_validate_direct_impl_calls_expr(cs.expr, owner_ptr, owner_len);
+            break;
+        case AST_MEMBER_ACCESS:
+        case AST_SAFE_MEMBER_ACCESS:
+            var ma: *AstMemberAccess = (*AstMemberAccess)expr;
+            compiler_validate_direct_impl_calls_expr(ma.object, owner_ptr, owner_len);
+            break;
+        case AST_METHOD_CALL:
+        case AST_SAFE_METHOD_CALL:
+            var mc: *AstMethodCall = (*AstMethodCall)expr;
+            compiler_validate_direct_impl_calls_expr(mc.receiver, owner_ptr, owner_len);
+            compiler_validate_direct_impl_calls_args(mc.args_vec, owner_ptr, owner_len);
+            break;
+        case AST_INDEX:
+            var ix: *AstIndex = (*AstIndex)expr;
+            compiler_validate_direct_impl_calls_expr(ix.base, owner_ptr, owner_len);
+            compiler_validate_direct_impl_calls_expr(ix.index, owner_ptr, owner_len);
+            break;
+        case AST_SLICE:
+            var sl: *AstSlice = (*AstSlice)expr;
+            compiler_validate_direct_impl_calls_expr(sl.ptr_expr, owner_ptr, owner_len);
+            compiler_validate_direct_impl_calls_expr(sl.len_expr, owner_ptr, owner_len);
+            break;
+        case AST_TRY:
+            var tr: *AstTry = (*AstTry)expr;
+            compiler_validate_direct_impl_calls_expr(tr.operand, owner_ptr, owner_len);
+            break;
+        case AST_SIZEOF_EXPR:
+            var se: *AstSizeofExpr = (*AstSizeofExpr)expr;
+            compiler_validate_direct_impl_calls_expr(se.expr, owner_ptr, owner_len);
+            break;
+        case AST_STRUCT_LITERAL:
+            var lit: *AstStructLiteral = (*AstStructLiteral)expr;
+            compiler_validate_direct_impl_calls_args(lit.values_vec, owner_ptr, owner_len);
+            break;
+        case AST_NEW:
+            var nw: *AstNew = (*AstNew)expr;
+            compiler_validate_direct_impl_calls_expr(nw.literal_expr, owner_ptr, owner_len);
+            compiler_validate_direct_impl_calls_args(nw.ctor_args_vec, owner_ptr, owner_len);
+            break;
+        case AST_STACK_CTOR:
+            var sc: *AstStackCtor = (*AstStackCtor)expr;
+            compiler_validate_direct_impl_calls_args(sc.ctor_args_vec, owner_ptr, owner_len);
+            break;
+        default:
+            break;
+    }
+    return 0;
+}
+
+func compiler_validate_direct_impl_calls_stmt(stmt: *AstNode, owner_ptr: u64, owner_len: u64) -> u64 {
+    if (stmt == 0) { return 0; }
+    var kind: u64 = ast_kind(stmt);
+    switch (kind) {
+        case AST_RETURN:
+            var r: *AstReturn = (*AstReturn)stmt;
+            compiler_validate_direct_impl_calls_expr(r.expr, owner_ptr, owner_len);
+            break;
+        case AST_VAR_DECL:
+            var vd: *AstVarDecl = (*AstVarDecl)stmt;
+            compiler_validate_direct_impl_calls_expr(vd.init_expr, owner_ptr, owner_len);
+            break;
+        case AST_ASSIGN:
+            var asn: *AstAssign = (*AstAssign)stmt;
+            compiler_validate_direct_impl_calls_expr(asn.target, owner_ptr, owner_len);
+            compiler_validate_direct_impl_calls_expr(asn.value, owner_ptr, owner_len);
+            break;
+        case AST_EXPR_STMT:
+            var es: *AstExprStmt = (*AstExprStmt)stmt;
+            compiler_validate_direct_impl_calls_expr(es.expr, owner_ptr, owner_len);
+            break;
+        case AST_IF:
+            var ifs: *AstIf = (*AstIf)stmt;
+            compiler_validate_direct_impl_calls_expr(ifs.cond, owner_ptr, owner_len);
+            compiler_validate_direct_impl_calls_stmt(ifs.then_block, owner_ptr, owner_len);
+            compiler_validate_direct_impl_calls_stmt(ifs.else_block, owner_ptr, owner_len);
+            break;
+        case AST_WHILE:
+            var wl: *AstWhile = (*AstWhile)stmt;
+            compiler_validate_direct_impl_calls_expr(wl.cond, owner_ptr, owner_len);
+            compiler_validate_direct_impl_calls_stmt(wl.body, owner_ptr, owner_len);
+            break;
+        case AST_FOR:
+            var fr: *AstFor = (*AstFor)stmt;
+            compiler_validate_direct_impl_calls_stmt(fr.init, owner_ptr, owner_len);
+            compiler_validate_direct_impl_calls_expr(fr.cond, owner_ptr, owner_len);
+            compiler_validate_direct_impl_calls_expr(fr.update, owner_ptr, owner_len);
+            compiler_validate_direct_impl_calls_stmt(fr.body, owner_ptr, owner_len);
+            break;
+        case AST_SWITCH:
+            var sw: *AstSwitch = (*AstSwitch)stmt;
+            compiler_validate_direct_impl_calls_expr(sw.expr, owner_ptr, owner_len);
+            if (sw.cases_vec != 0) {
+                var cn: u64 = sw.cases_vec.len();
+                for (var ci: u64 = 0; ci < cn; ci++) {
+                    compiler_validate_direct_impl_calls_stmt(sw.cases_vec.get(ci), owner_ptr, owner_len);
+                }
+            }
+            break;
+        case AST_CASE:
+            var cs: *AstCase = (*AstCase)stmt;
+            compiler_validate_direct_impl_calls_expr(cs.value, owner_ptr, owner_len);
+            compiler_validate_direct_impl_calls_stmt(cs.body, owner_ptr, owner_len);
+            break;
+        case AST_BLOCK:
+            var blk: *AstBlock = (*AstBlock)stmt;
+            if (blk.stmts_vec != 0) {
+                var n: u64 = blk.stmts_vec.len();
+                for (var i: u64 = 0; i < n; i++) {
+                    compiler_validate_direct_impl_calls_stmt(blk.stmts_vec.get(i), owner_ptr, owner_len);
+                }
+            }
+            break;
+        case AST_DEFER:
+            var df: *AstDefer = (*AstDefer)stmt;
+            compiler_validate_direct_impl_calls_stmt(df.stmt, owner_ptr, owner_len);
+            break;
+        case AST_DELETE:
+            var dl: *AstDelete = (*AstDelete)stmt;
+            compiler_validate_direct_impl_calls_expr(dl.expr, owner_ptr, owner_len);
+            break;
+        default:
+            break;
+    }
+    return 0;
+}
+
+func compiler_validate_direct_impl_calls() -> u64 {
+    if (g_all_funcs != 0) {
+        var fn_count: u64 = g_all_funcs.len();
+        for (var i: u64 = 0; i < fn_count; i++) {
+            var fn: *AstFunc = g_all_funcs.get(i);
+            if (fn == 0 || fn.body == 0) { continue; }
+            var owner_info: *NameInfo = compiler_get_impl_method_owner(fn.name_ptr, fn.name_len);
+            var owner_ptr: u64 = 0;
+            var owner_len: u64 = 0;
+            if (owner_info != 0) {
+                owner_ptr = owner_info.ptr;
+                owner_len = owner_info.len;
+            }
+            compiler_validate_direct_impl_calls_stmt(fn.body, owner_ptr, owner_len);
+        }
+    }
+
+    if (g_all_globals != 0) {
+        var gn: u64 = g_all_globals.len();
+        for (var gi: u64 = 0; gi < gn; gi++) {
+            var ginfo: *GlobalInfo = g_all_globals.get(gi);
+            if (ginfo == 0 || ginfo.init_expr == 0) { continue; }
+            compiler_validate_direct_impl_calls_expr((*AstNode)ginfo.init_expr, 0, 0);
+        }
+    }
+    return 0;
+}
+
 func compiler_is_super_expr(expr: *AstNode) -> u64 {
     if (expr == 0) { return 0; }
     var kind: u64 = ast_kind(expr);
@@ -3972,7 +4189,7 @@ func compiler_lower_super_method_call_expr(mc: *AstMethodCall, owner_ptr: u64, o
     for (var i: u64 = 0; i < arg_count; i++) {
         lowered_args.push(mc.args_vec.get(i));
     }
-    return (*AstNode)ast_call(lowered_name.ptr, lowered_name.len, lowered_args);
+    return (*AstNode)ast_call_with_origin(lowered_name.ptr, lowered_name.len, lowered_args, AST_CALL_ORIGIN_MEMBER_LOWERED);
 }
 
 func compiler_lower_super_expr(expr: *AstNode, owner_ptr: u64, owner_len: u64) -> *AstNode {
