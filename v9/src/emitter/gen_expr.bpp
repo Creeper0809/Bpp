@@ -172,6 +172,7 @@ func cg_stack_ctor_resolve_constructor(sc: *AstStackCtor, call_ptr_out: *u64, ca
 }
 
 func cg_stack_ctor_emit_constructor_call(sc: *AstStackCtor, symtab: *Symtab, call_ptr: u64, call_len: u64) -> u64 {
+    var fn_ctor: *AstFunc = typeinfo_find_func(call_ptr, call_len);
     var args: *Vec<*AstNode> = sc.ctor_args_vec;
     var nargs: u64 = 0;
     if (args != 0) { nargs = args.len(); }
@@ -181,7 +182,8 @@ func cg_stack_ctor_emit_constructor_call(sc: *AstStackCtor, symtab: *Symtab, cal
         while (ai > 0) {
             ai = ai - 1;
             var arg: *AstNode = args.get(ai);
-            total_arg_words = total_arg_words + _cg_sysv_push_call_arg(arg, symtab);
+            var param: *Param = cg_call_param_at(fn_ctor, ai + 1);
+            total_arg_words = total_arg_words + cg_call_push_arg_with_param(arg, param, symtab);
         }
     }
     emit("    push r12\n");
@@ -283,6 +285,7 @@ func cg_alloc_tmp_struct(symtab: *Symtab, struct_size: u64) -> u64 {
 
 func cg_call_sret_to_offset(call_ptr: u64, dest_offset: u64, symtab: *Symtab) -> u64 {
     var call: *AstCall = (*AstCall)call_ptr;
+    var fn_call: *AstFunc = typeinfo_find_func(call.name_ptr, call.name_len);
     var args: *Vec<*AstNode> = call.args_vec;
     var nargs: u64 = 0;
     if (args != 0) { nargs = args.len(); }
@@ -292,7 +295,8 @@ func cg_call_sret_to_offset(call_ptr: u64, dest_offset: u64, symtab: *Symtab) ->
         while (i > 0) {
             i = i - 1;
             var arg: *AstNode = args.get(i);
-            total_arg_words = total_arg_words + _cg_sysv_push_call_arg(arg, symtab);
+            var param: *Param = cg_call_param_at(fn_call, i);
+            total_arg_words = total_arg_words + cg_call_push_arg_with_param(arg, param, symtab);
         }
     }
 
@@ -330,6 +334,26 @@ func cg_method_call_ret_struct_size(mc: *AstMethodCall, symtab: *Symtab) -> u64 
 
 func cg_method_call_sret_to_offset(mc: *AstMethodCall, dest_offset: u64, symtab: *Symtab) -> u64 {
     var receiver: u64 = mc.receiver;
+    var type_info: *TypeInfo = get_expr_type_with_symtab((*AstNode)receiver, symtab);
+    var struct_name_ptr: u64 = 0;
+    var struct_name_len: u64 = 0;
+    if (type_info != 0) {
+        struct_name_ptr = type_info.struct_name_ptr;
+        struct_name_len = type_info.struct_name_len;
+    }
+    var name_info: *NameInfo = compiler_build_method_name(struct_name_ptr, struct_name_len, mc.method_ptr, mc.method_len);
+    var resolved_ptr: u64 = name_info.ptr;
+    var resolved_len: u64 = name_info.len;
+    var resolved: *NameInfo = resolve_name(name_info.ptr, name_info.len);
+    if (resolved != 0) {
+        resolved_ptr = resolved.ptr;
+        resolved_len = resolved.len;
+    }
+    var fn_call: *AstFunc = typeinfo_find_func(resolved_ptr, resolved_len);
+    if (fn_call == 0) {
+        fn_call = typeinfo_find_func(name_info.ptr, name_info.len);
+    }
+
     var args: *Vec<*AstNode> = mc.args_vec;
     var nargs: u64 = 0;
     if (args != 0) { nargs = args.len(); }
@@ -340,11 +364,11 @@ func cg_method_call_sret_to_offset(mc: *AstMethodCall, dest_offset: u64, symtab:
         while (i > 0) {
             i = i - 1;
             var arg: *AstNode = args.get(i);
-            total_arg_words = total_arg_words + _cg_sysv_push_call_arg(arg, symtab);
+            var param: *Param = cg_call_param_at(fn_call, i + 1);
+            total_arg_words = total_arg_words + cg_call_push_arg_with_param(arg, param, symtab);
         }
     }
 
-    var type_info: *TypeInfo = get_expr_type_with_symtab((*AstNode)receiver, symtab);
     var recv_is_ptr: u64 = 0;
     if (type_info != 0 && type_info.ptr_depth > 0) {
         recv_is_ptr = 1;
@@ -360,22 +384,6 @@ func cg_method_call_sret_to_offset(mc: *AstMethodCall, dest_offset: u64, symtab:
     }
     emit("    push rax\n");
     total_arg_words = total_arg_words + 1;
-
-    var struct_name_ptr: u64 = 0;
-    var struct_name_len: u64 = 0;
-    if (type_info != 0) {
-        struct_name_ptr = type_info.struct_name_ptr;
-        struct_name_len = type_info.struct_name_len;
-    }
-
-    var name_info: *NameInfo = compiler_build_method_name(struct_name_ptr, struct_name_len, mc.method_ptr, mc.method_len);
-    var resolved_ptr: u64 = name_info.ptr;
-    var resolved_len: u64 = name_info.len;
-    var resolved: *NameInfo = resolve_name(name_info.ptr, name_info.len);
-    if (resolved != 0) {
-        resolved_ptr = resolved.ptr;
-        resolved_len = resolved.len;
-    }
 
     emit("    lea rdi, [rbp");
     emit_signed_disp(dest_offset);
@@ -627,6 +635,70 @@ func _cg_sysv_push_call_arg(arg: *AstNode, symtab: *Symtab) -> u64 {
     cg_expr(arg);
     emit("    push rax\n");
     return 1;
+}
+
+func cg_call_param_at(fn: *AstFunc, index: u64) -> *Param {
+    if (fn == 0 || fn.params_vec == 0) { return 0; }
+    if (index >= fn.params_vec.len()) { return 0; }
+    return fn.params_vec.get(index);
+}
+
+func cg_call_push_arg_with_param(arg: *AstNode, expected: *Param, symtab: *Symtab) -> u64 {
+    if (expected == 0) { return _cg_sysv_push_call_arg(arg, symtab); }
+    if (expected.type_kind != TYPE_STRUCT || expected.ptr_depth == 0) {
+        return _cg_sysv_push_call_arg(arg, symtab);
+    }
+
+    var at: *TypeInfo = get_expr_type_with_symtab((*AstNode)arg, symtab);
+    if (at == 0) { return _cg_sysv_push_call_arg(arg, symtab); }
+    if (at.type_kind != TYPE_STRUCT || at.ptr_depth == 0) {
+        return _cg_sysv_push_call_arg(arg, symtab);
+    }
+
+    var src_name_ptr: u64 = at.struct_name_ptr;
+    var src_name_len: u64 = at.struct_name_len;
+    var src_resolved: *NameInfo = resolve_name(src_name_ptr, src_name_len);
+    if (src_resolved != 0) {
+        src_name_ptr = src_resolved.ptr;
+        src_name_len = src_resolved.len;
+    }
+
+    var expected_name_ptr: u64 = expected.struct_name_ptr;
+    var expected_name_len: u64 = expected.struct_name_len;
+    var expected_resolved: *NameInfo = resolve_name(expected_name_ptr, expected_name_len);
+    if (expected_resolved != 0) {
+        expected_name_ptr = expected_resolved.ptr;
+        expected_name_len = expected_resolved.len;
+    }
+
+    if (str_eq(src_name_ptr, src_name_len, expected_name_ptr, expected_name_len) != 0) {
+        cg_expr(arg);
+        if (at.is_tagged == 1) { emit_tagged_mask(); }
+        emit("    push rax\n");
+        return 1;
+    }
+
+    var src_def: *AstStructDef = get_struct_def(src_name_ptr, src_name_len);
+    if (src_def == 0 && (src_name_ptr != at.struct_name_ptr || src_name_len != at.struct_name_len)) {
+        src_def = get_struct_def(at.struct_name_ptr, at.struct_name_len);
+    }
+    if (src_def != 0) {
+        var up_offset: u64 = 0;
+        var up_def: *AstStructDef = 0;
+        var found_upcast: u64 = typeinfo_find_parent_offset(src_def, expected_name_ptr, expected_name_len, &up_offset, &up_def);
+        if (found_upcast == 0 && (expected_name_ptr != expected.struct_name_ptr || expected_name_len != expected.struct_name_len)) {
+            found_upcast = typeinfo_find_parent_offset(src_def, expected.struct_name_ptr, expected.struct_name_len, &up_offset, &up_def);
+        }
+        if (found_upcast != 0) {
+            cg_expr(arg);
+            if (at.is_tagged == 1) { emit_tagged_mask(); }
+            cg_emit_adjust_rax_add(up_offset);
+            emit("    push rax\n");
+            return 1;
+        }
+    }
+
+    return _cg_sysv_push_call_arg(arg, symtab);
 }
 
 func cg_index_addr(node: u64, symtab: *Symtab) -> u64 {
@@ -918,6 +990,10 @@ func cg_expr_call(node: u64, symtab: *Symtab) -> u64 {
         }
         return;
     }
+    var fn_call_direct: *AstFunc = typeinfo_find_func(name_ptr, name_len);
+    if (fn_call_direct == 0) {
+        fn_call_direct = typeinfo_find_func(resolved_ptr, resolved_len);
+    }
     var args: *Vec<*AstNode> = call.args_vec;
     var nargs: u64 = 0;
     if (args != 0) { nargs = args.len(); }
@@ -927,7 +1003,8 @@ func cg_expr_call(node: u64, symtab: *Symtab) -> u64 {
         while (i > 0) {
             i = i - 1;
             var arg: *AstNode = args.get(i);
-            total_arg_words = total_arg_words + _cg_sysv_push_call_arg(arg, symtab);
+            var param: *Param = cg_call_param_at(fn_call_direct, i);
+            total_arg_words = total_arg_words + cg_call_push_arg_with_param(arg, param, symtab);
         }
     }
     var stack_words: u64 = _cg_sysv_pop_arg_regs(total_arg_words);
@@ -1506,6 +1583,7 @@ func cg_new_invoke_constructor(nw: *AstNew, symtab: *Symtab) -> u64 {
         call_len = alt_call_len;
     }
 
+    var fn_ctor: *AstFunc = typeinfo_find_func(call_ptr, call_len);
     var args: *Vec<*AstNode> = nw.ctor_args_vec;
     var nargs: u64 = args.len();
     var total_arg_words: u64 = 0;
@@ -1514,7 +1592,8 @@ func cg_new_invoke_constructor(nw: *AstNew, symtab: *Symtab) -> u64 {
         while (ai > 0) {
             ai = ai - 1;
             var arg: *AstNode = args.get(ai);
-            total_arg_words = total_arg_words + _cg_sysv_push_call_arg(arg, symtab);
+            var param: *Param = cg_call_param_at(fn_ctor, ai + 1);
+            total_arg_words = total_arg_words + cg_call_push_arg_with_param(arg, param, symtab);
         }
     }
     emit("    push r12\n");
@@ -2613,14 +2692,15 @@ func cg_member_access_lvalue(node: u64, symtab: *Symtab) -> u64 {
 // Method Call Code Generation
 // ============================================
 
-func cg_method_push_user_args(args: *Vec<*AstNode>, nargs: u64, symtab: *Symtab) -> u64 {
+func cg_method_push_user_args(args: *Vec<*AstNode>, nargs: u64, fn_sig: *AstFunc, param_base_index: u64, symtab: *Symtab) -> u64 {
     var total_arg_words: u64 = 0;
     if (nargs != 0) {
         var i: u64 = nargs;
         while (i > 0) {
             i = i - 1;
             var arg: *AstNode = args.get(i);
-            total_arg_words = total_arg_words + _cg_sysv_push_call_arg(arg, symtab);
+            var param: *Param = cg_call_param_at(fn_sig, param_base_index + i);
+            total_arg_words = total_arg_words + cg_call_push_arg_with_param(arg, param, symtab);
         }
     }
     return total_arg_words;
@@ -2769,7 +2849,7 @@ func cg_safe_method_call_trait_ptr(method_call: *AstMethodCall, recv_ti: *TypeIn
     var tmp_offset_t: u64 = 0;
     cg_method_prepare_safe_receiver(receiver, recv_ti, label_null_t, symtab, &tmp_offset_t);
 
-    var total_arg_words_t: u64 = cg_method_push_user_args(args, nargs, symtab);
+    var total_arg_words_t: u64 = cg_method_push_user_args(args, nargs, 0, 0, symtab);
     total_arg_words_t = total_arg_words_t + cg_method_push_receiver_from_tmp(tmp_offset_t);
     var stack_words_t: u64 = _cg_sysv_pop_arg_regs(total_arg_words_t);
     cg_method_emit_trait_vtable_call(method_index, stack_words_t);
@@ -2824,7 +2904,7 @@ func cg_safe_method_call_struct_ptr(method_call: *AstMethodCall, recv_ti: *TypeI
         var tmp_offset_v: u64 = 0;
         cg_method_prepare_safe_receiver(receiver, recv_ti, label_null_v, symtab, &tmp_offset_v);
 
-        var total_arg_words_v: u64 = cg_method_push_user_args(args, nargs, symtab);
+        var total_arg_words_v: u64 = cg_method_push_user_args(args, nargs, 0, 0, symtab);
         total_arg_words_v = total_arg_words_v + cg_method_push_virtual_receiver_from_tmp(tmp_offset_v, recv_ti, virt_trait.ptr, virt_trait.len);
         var stack_words_v: u64 = _cg_sysv_pop_arg_regs(total_arg_words_v);
         cg_method_emit_trait_vtable_call(method_index_v, stack_words_v);
@@ -2849,6 +2929,9 @@ func cg_safe_method_call_struct_ptr(method_call: *AstMethodCall, recv_ti: *TypeI
     }
 
     var fn: *AstFunc = typeinfo_find_func(resolved_ptr, resolved_len);
+    if (fn == 0) {
+        fn = typeinfo_find_func(name_info.ptr, name_info.len);
+    }
     if (fn == 0 && recv_ti.struct_def != 0) {
         fn = compiler_find_method_func_in_hierarchy(recv_ti.struct_def, method_ptr, method_len);
         if (fn != 0) {
@@ -2873,7 +2956,7 @@ func cg_safe_method_call_struct_ptr(method_call: *AstMethodCall, recv_ti: *TypeI
     var tmp_offset: u64 = 0;
     cg_method_prepare_safe_receiver(receiver, recv_ti, label_null, symtab, &tmp_offset);
 
-    var total_arg_words: u64 = cg_method_push_user_args(args, nargs, symtab);
+    var total_arg_words: u64 = cg_method_push_user_args(args, nargs, fn, 1, symtab);
     total_arg_words = total_arg_words + cg_method_push_receiver_from_tmp(tmp_offset);
     var stack_words: u64 = _cg_sysv_pop_arg_regs(total_arg_words);
     cg_method_emit_direct_call(resolved_ptr, resolved_len, stack_words);
@@ -2934,7 +3017,7 @@ func cg_method_call(node: u64, symtab: *Symtab) -> u64 {
             panic("Codegen error");
         }
 
-        total_arg_words = cg_method_push_user_args(args, nargs, symtab);
+        total_arg_words = cg_method_push_user_args(args, nargs, 0, 0, symtab);
         total_arg_words = total_arg_words + cg_method_push_receiver(receiver, recv_ti, 1);
         var stack_words_t2: u64 = _cg_sysv_pop_arg_regs(total_arg_words);
         cg_method_emit_trait_vtable_call(method_index, stack_words_t2);
@@ -2961,7 +3044,7 @@ func cg_method_call(node: u64, symtab: *Symtab) -> u64 {
                     emit_stderr("\n");
                     panic("Codegen error");
                 }
-                total_arg_words = cg_method_push_user_args(args, nargs, symtab);
+                total_arg_words = cg_method_push_user_args(args, nargs, 0, 0, symtab);
                 total_arg_words = total_arg_words + cg_method_push_virtual_receiver(receiver, recv_ti, virt_trait.ptr, virt_trait.len);
                 var stack_words_v: u64 = _cg_sysv_pop_arg_regs(total_arg_words);
                 cg_method_emit_trait_vtable_call(method_index_v, stack_words_v);
@@ -2969,13 +3052,7 @@ func cg_method_call(node: u64, symtab: *Symtab) -> u64 {
             }
         }
     }
-    
-    // Push user args (in reverse order)
-    total_arg_words = cg_method_push_user_args(args, nargs, symtab);
-    
-    // Push receiver address (first arg = self)
-    total_arg_words = total_arg_words + cg_method_push_receiver(receiver, recv_ti, recv_is_ptr);
-    
+
     // Get receiver type to determine struct name
     var type_info: *TypeInfo = recv_ti;
     if (type_info == 0 || type_info.struct_name_ptr == 0 || type_info.struct_name_len == 0) {
@@ -3008,6 +3085,13 @@ func cg_method_call(node: u64, symtab: *Symtab) -> u64 {
             resolved_len = fn_fallback.name_len;
         }
     }
+
+    var fn_direct: *AstFunc = typeinfo_find_func(resolved_ptr, resolved_len);
+    if (fn_direct == 0) {
+        fn_direct = typeinfo_find_func(name_info.ptr, name_info.len);
+    }
+    total_arg_words = cg_method_push_user_args(args, nargs, fn_direct, 1, symtab);
+    total_arg_words = total_arg_words + cg_method_push_receiver(receiver, recv_ti, recv_is_ptr);
 
     var stack_words: u64 = _cg_sysv_pop_arg_regs(total_arg_words);
 
