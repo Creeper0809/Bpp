@@ -582,6 +582,103 @@ func get_field_offset(struct_def: *AstStructDef, field_name_ptr: u64, field_name
 // Forward declarations for symtab functions (imported by codegen)
 // We need g_symtab from emitter module
 
+func typeinfo_method_call_ret(mc: *AstMethodCall, symtab: *Symtab, is_safe: u64) -> *TypeInfo {
+    if (g_funcs_vec == 0) { return typeinfo_make(TYPE_I64, 0); }
+    var recv_ti: *TypeInfo = get_expr_type_with_symtab(mc.receiver, symtab);
+    if (recv_ti == 0) { return typeinfo_make(TYPE_I64, 0); }
+
+    if (is_safe != 0) {
+        var safe_mode: u64 = compiler_safe_receiver_mode(recv_ti);
+        if (safe_mode == COMPILER_SAFE_RECV_INVALID) {
+            if (recv_ti.ptr_depth == 0) {
+                emit_stderr("[ERROR] Safe method call requires pointer receiver\n");
+            }
+            return typeinfo_make(TYPE_I64, 0);
+        }
+    }
+
+    var is_trait_recv: u64 = 0;
+    if (recv_ti.type_kind == TYPE_TRAIT || compiler_is_trait_name(recv_ti.struct_name_ptr, recv_ti.struct_name_len) != 0) {
+        is_trait_recv = 1;
+    }
+    if (is_trait_recv != 0) {
+        var trait_def: *TraitDef = compiler_get_trait_def(recv_ti.struct_name_ptr, recv_ti.struct_name_len);
+        if (trait_def == 0) { return typeinfo_make(TYPE_I64, 0); }
+        var mcount: u64 = trait_def.methods_vec.len();
+        for (var mi: u64 = 0; mi < mcount; mi++) {
+            var tm: *TraitMethod = trait_def.methods_vec.get(mi);
+            if (str_eq(tm.name_ptr, tm.name_len, mc.method_ptr, mc.method_len)) {
+                var sig: *AstFunc = tm.sig;
+                if (is_safe != 0 && sig.ret_type == TYPE_STRUCT && sig.ret_ptr_depth == 0) {
+                    emit_stderr("[ERROR] Safe method call cannot return struct by value\n");
+                    return typeinfo_make(TYPE_I64, 0);
+                }
+                if (is_safe != 0) { return typeinfo_from_func_ret(sig, 1); }
+                return typeinfo_from_func_ret(sig, 0);
+            }
+        }
+        return typeinfo_make(TYPE_I64, 0);
+    }
+
+    if (recv_ti.type_kind != TYPE_STRUCT) { return typeinfo_make(TYPE_I64, 0); }
+
+    var name_info: *NameInfo = compiler_build_method_name(recv_ti.struct_name_ptr, recv_ti.struct_name_len, mc.method_ptr, mc.method_len);
+    var fn: *AstFunc = typeinfo_find_func(name_info.ptr, name_info.len);
+    if (fn == 0) { return typeinfo_make(TYPE_I64, 0); }
+    if (is_safe != 0 && fn.ret_type == TYPE_STRUCT && fn.ret_ptr_depth == 0) {
+        emit_stderr("[ERROR] Safe method call cannot return struct by value\n");
+        return typeinfo_make(TYPE_I64, 0);
+    }
+    if (is_safe != 0) { return typeinfo_from_func_ret(fn, 1); }
+    return typeinfo_from_func_ret(fn, 0);
+}
+
+func typeinfo_try_value_type(tr: *AstTry, symtab: *Symtab) -> *TypeInfo {
+    var opt_ti: *TypeInfo = get_expr_type_with_symtab(tr.operand, symtab);
+    if (opt_ti == 0) { return 0; }
+    var try_kind: u64 = compiler_try_kind_from_typeinfo(opt_ti);
+    if (try_kind == COMPILER_TRY_KIND_INVALID) { return 0; }
+
+    var value_ptr: u64 = 0;
+    var value_len: u64 = 0;
+    var check_ptr: u64 = 0;
+    var check_len: u64 = 0;
+    if (compiler_try_field_names(try_kind, &check_ptr, &check_len, &value_ptr, &value_len) == 0) {
+        return 0;
+    }
+
+    var struct_def: *AstStructDef = compiler_try_resolve_struct_def(opt_ti);
+    if (struct_def == 0) { return 0; }
+    var field: *FieldDesc = get_field_desc(struct_def, value_ptr, value_len);
+    if (field == 0) { return 0; }
+    return typeinfo_from_field_desc(field, 0);
+}
+
+func typeinfo_safe_member_access_type(sm: *AstMemberAccess, symtab: *Symtab) -> *TypeInfo {
+    var sobj_ti: *TypeInfo = get_expr_type_with_symtab(sm.object, symtab);
+    if (sobj_ti == 0) { return 0; }
+    var recv_mode: u64 = compiler_safe_receiver_mode(sobj_ti);
+    if (recv_mode == COMPILER_SAFE_RECV_INVALID) {
+        if (sobj_ti.ptr_depth == 0) {
+            emit_stderr("[ERROR] Safe member access requires pointer receiver\n");
+        }
+        return 0;
+    }
+    if (recv_mode != COMPILER_SAFE_RECV_STRUCT_PTR) { return 0; }
+
+    var sstruct_def: *AstStructDef = sobj_ti.struct_def;
+    if (sstruct_def == 0) { return 0; }
+    var sfield: *FieldDesc = typeinfo_find_field_desc_scoped(sstruct_def, sm.parent_ptr, sm.parent_len, sm.member_ptr, sm.member_len);
+    if (sfield == 0) { return 0; }
+    var sfield_type: u64 = sfield.type_kind;
+    var sfield_ptr_depth: u64 = sfield.ptr_depth;
+    if (sfield_type == TYPE_STRUCT && sfield_ptr_depth == 0) {
+        emit_stderr("[ERROR] Safe member access on struct value is not supported\n");
+        return 0;
+    }
+    return typeinfo_from_field_desc(sfield, 0);
+}
+
 func get_expr_type_with_symtab(node: *AstNode, symtab: *Symtab) -> *TypeInfo {
     var kind: u64 = ast_kind(node);
 
@@ -671,72 +768,11 @@ func get_expr_type_with_symtab(node: *AstNode, symtab: *Symtab) -> *TypeInfo {
     }
 
     if (kind == AST_METHOD_CALL) {
-        if (g_funcs_vec != 0) {
-            var mc: *AstMethodCall = (*AstMethodCall)node;
-            var receiver: u64 = mc.receiver;
-            var recv_ti: *TypeInfo = get_expr_type_with_symtab(receiver, symtab);
-            if (recv_ti == 0) { return typeinfo_make(TYPE_I64, 0); }
-            if (recv_ti.type_kind == TYPE_TRAIT || compiler_is_trait_name(recv_ti.struct_name_ptr, recv_ti.struct_name_len) != 0) {
-                var trait_def: *TraitDef = compiler_get_trait_def(recv_ti.struct_name_ptr, recv_ti.struct_name_len);
-                if (trait_def == 0) { return typeinfo_make(TYPE_I64, 0); }
-                var mcount: u64 = trait_def.methods_vec.len();
-                for (var mi: u64 = 0; mi < mcount; mi++) {
-                    var tm: *TraitMethod = trait_def.methods_vec.get(mi);
-                    if (str_eq(tm.name_ptr, tm.name_len, mc.method_ptr, mc.method_len)) {
-                        return typeinfo_from_func_ret(tm.sig, 1);
-                    }
-                }
-                return typeinfo_make(TYPE_I64, 0);
-            }
-            if (recv_ti.type_kind != TYPE_STRUCT) { return typeinfo_make(TYPE_I64, 0); }
-
-            var name_info: *NameInfo = compiler_build_method_name(recv_ti.struct_name_ptr, recv_ti.struct_name_len, mc.method_ptr, mc.method_len);
-            var fn2: *AstFunc = typeinfo_find_func(name_info.ptr, name_info.len);
-            if (fn2 != 0) { return typeinfo_from_func_ret(fn2, 0); }
-        }
-        return typeinfo_make(TYPE_I64, 0);
+        return typeinfo_method_call_ret((*AstMethodCall)node, symtab, 0);
     }
 
     if (kind == AST_SAFE_METHOD_CALL) {
-        if (g_funcs_vec != 0) {
-            var smc: *AstMethodCall = (*AstMethodCall)node;
-            var sreceiver: u64 = smc.receiver;
-            var srecv_ti: *TypeInfo = get_expr_type_with_symtab(sreceiver, symtab);
-            if (srecv_ti == 0) { return typeinfo_make(TYPE_I64, 0); }
-            if (srecv_ti.ptr_depth == 0) {
-                emit_stderr("[ERROR] Safe method call requires pointer receiver\n");
-                return typeinfo_make(TYPE_I64, 0);
-            }
-            if (srecv_ti.type_kind == TYPE_TRAIT || compiler_is_trait_name(srecv_ti.struct_name_ptr, srecv_ti.struct_name_len) != 0) {
-                var trait_def2: *TraitDef = compiler_get_trait_def(srecv_ti.struct_name_ptr, srecv_ti.struct_name_len);
-                if (trait_def2 == 0) { return typeinfo_make(TYPE_I64, 0); }
-                var mcount2: u64 = trait_def2.methods_vec.len();
-                for (var mi2: u64 = 0; mi2 < mcount2; mi2++) {
-                    var tm2: *TraitMethod = trait_def2.methods_vec.get(mi2);
-                    if (str_eq(tm2.name_ptr, tm2.name_len, smc.method_ptr, smc.method_len)) {
-                        var sig2: *AstFunc = tm2.sig;
-                        if (sig2.ret_type == TYPE_STRUCT && sig2.ret_ptr_depth == 0) {
-                            emit_stderr("[ERROR] Safe method call cannot return struct by value\n");
-                            return typeinfo_make(TYPE_I64, 0);
-                        }
-                        return typeinfo_from_func_ret(sig2, 1);
-                    }
-                }
-                return typeinfo_make(TYPE_I64, 0);
-            }
-            if (srecv_ti.type_kind != TYPE_STRUCT) { return typeinfo_make(TYPE_I64, 0); }
-
-            var sname_info: *NameInfo = compiler_build_method_name(srecv_ti.struct_name_ptr, srecv_ti.struct_name_len, smc.method_ptr, smc.method_len);
-            var sfn2: *AstFunc = typeinfo_find_func(sname_info.ptr, sname_info.len);
-            if (sfn2 != 0) {
-                if (sfn2.ret_type == TYPE_STRUCT && sfn2.ret_ptr_depth == 0) {
-                    emit_stderr("[ERROR] Safe method call cannot return struct by value\n");
-                    return typeinfo_make(TYPE_I64, 0);
-                }
-                return typeinfo_from_func_ret(sfn2, 1);
-            }
-        }
-        return typeinfo_make(TYPE_I64, 0);
+        return typeinfo_method_call_ret((*AstMethodCall)node, symtab, 1);
     }
     
     if (kind == AST_IDENT) {
@@ -824,33 +860,7 @@ func get_expr_type_with_symtab(node: *AstNode, symtab: *Symtab) -> *TypeInfo {
     }
 
     if (kind == AST_TRY) {
-        var tr: *AstTry = (*AstTry)node;
-        var opt_ti: *TypeInfo = get_expr_type_with_symtab(tr.operand, symtab);
-        if (opt_ti == 0) { return 0; }
-        if (opt_ti.type_kind != TYPE_STRUCT || opt_ti.ptr_depth != 0) { return 0; }
-
-        var base_len: u64 = compiler_find_generic_suffix_index(opt_ti.struct_name_ptr, opt_ti.struct_name_len);
-        var value_ptr: u64 = 0;
-        var value_len: u64 = 0;
-        if (str_eq(opt_ti.struct_name_ptr, base_len, "Option", 6)) {
-            value_ptr = (u64)"value";
-            value_len = 5;
-        } else if (str_eq(opt_ti.struct_name_ptr, base_len, "Result", 6)) {
-            value_ptr = (u64)"ok";
-            value_len = 2;
-        } else {
-            return 0;
-        }
-
-        var struct_def: *AstStructDef = opt_ti.struct_def;
-        if (struct_def == 0) {
-            struct_def = get_struct_def(opt_ti.struct_name_ptr, opt_ti.struct_name_len);
-        }
-        if (struct_def == 0) { return 0; }
-
-        var field: *FieldDesc = get_field_desc(struct_def, value_ptr, value_len);
-        if (field == 0) { return 0; }
-        return typeinfo_from_field_desc(field, 0);
+        return typeinfo_try_value_type((*AstTry)node, symtab);
     }
     
     if (kind == AST_ADDR_OF) {
@@ -963,33 +973,7 @@ func get_expr_type_with_symtab(node: *AstNode, symtab: *Symtab) -> *TypeInfo {
     }
 
     if (kind == AST_SAFE_MEMBER_ACCESS) {
-        var sm: *AstMemberAccess = (*AstMemberAccess)node;
-        var sobj: u64 = sm.object;
-        var sm_ptr: u64 = sm.member_ptr;
-        var sm_len: u64 = sm.member_len;
-        var sparent_ptr: u64 = sm.parent_ptr;
-        var sparent_len: u64 = sm.parent_len;
-
-        var sobj_ti: *TypeInfo = get_expr_type_with_symtab(sobj, symtab);
-        if (sobj_ti == 0) { return 0; }
-        if (sobj_ti.ptr_depth == 0) {
-            emit_stderr("[ERROR] Safe member access requires pointer receiver\n");
-            return 0;
-        }
-        if (sobj_ti.type_kind != TYPE_STRUCT) { return 0; }
-
-        var sstruct_def: *AstStructDef = sobj_ti.struct_def;
-        if (sstruct_def == 0) { return 0; }
-
-        var sfield: *FieldDesc = typeinfo_find_field_desc_scoped(sstruct_def, sparent_ptr, sparent_len, sm_ptr, sm_len);
-        if (sfield == 0) { return 0; }
-        var sfield_type: u64 = sfield.type_kind;
-        var sfield_ptr_depth: u64 = sfield.ptr_depth;
-        if (sfield_type == TYPE_STRUCT && sfield_ptr_depth == 0) {
-            emit_stderr("[ERROR] Safe member access on struct value is not supported\n");
-            return 0;
-        }
-        return typeinfo_from_field_desc(sfield, 0);
+        return typeinfo_safe_member_access_type((*AstMemberAccess)node, symtab);
     }
     
     if (kind == AST_STRUCT_LITERAL) {

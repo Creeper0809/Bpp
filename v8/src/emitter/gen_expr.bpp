@@ -2486,6 +2486,88 @@ func cg_member_access_lvalue(node: u64, symtab: *Symtab) -> u64 {
 // Method Call Code Generation
 // ============================================
 
+func cg_method_push_user_args(args: *Vec<*AstNode>, nargs: u64, symtab: *Symtab) -> u64 {
+    var total_arg_words: u64 = 0;
+    if (nargs != 0) {
+        var i: u64 = nargs;
+        while (i > 0) {
+            i = i - 1;
+            var arg: *AstNode = args.get(i);
+            total_arg_words = total_arg_words + _cg_sysv_push_call_arg(arg, symtab);
+        }
+    }
+    return total_arg_words;
+}
+
+func cg_method_push_receiver_from_tmp(tmp_offset: u64) -> u64 {
+    emit("    mov rax, [rbp");
+    emit_signed_disp(tmp_offset);
+    emit("]\n");
+    emit("    push rax\n");
+    return 1;
+}
+
+func cg_method_push_receiver(receiver: u64, recv_ti: *TypeInfo, recv_is_ptr: u64) -> u64 {
+    if (recv_is_ptr != 0) {
+        cg_expr(receiver);
+        if (recv_ti != 0 && recv_ti.is_tagged == 1) {
+            emit_tagged_mask();
+        }
+    } else {
+        cg_lvalue(receiver);
+    }
+    emit("    push rax\n");
+    return 1;
+}
+
+func cg_method_stack_cleanup(stack_words: u64) -> u64 {
+    if (stack_words > 0) {
+        emit("    add rsp, ");
+        emit_u64(stack_words * 8);
+        emit_nl();
+    }
+    return 0;
+}
+
+func cg_method_emit_trait_vtable_call(method_index: u64, stack_words: u64) -> u64 {
+    emit("    mov rax, [rdi]\n");
+    if (method_index != 0) {
+        emit("    add rax, ");
+        emit_u64(method_index * 8);
+        emit_nl();
+    }
+    emit("    mov rax, [rax]\n");
+    emit("    call rax\n");
+    cg_method_stack_cleanup(stack_words);
+    return 0;
+}
+
+func cg_method_emit_direct_call(resolved_ptr: u64, resolved_len: u64, stack_words: u64) -> u64 {
+    emit("    call ");
+    emit_len(resolved_ptr, resolved_len);
+    emit_nl();
+    cg_method_stack_cleanup(stack_words);
+    return 0;
+}
+
+func cg_method_prepare_safe_receiver(receiver: u64, recv_ti: *TypeInfo, label_null: u64, symtab: *Symtab, out_tmp_offset: *u64) -> u64 {
+    cg_expr(receiver);
+    if (recv_ti.is_tagged == 1) {
+        emit_tagged_mask();
+    }
+    emit("    test rax, rax\n");
+    emit("    je ");
+    emit_label(label_null);
+    emit_nl();
+
+    var tmp_offset: u64 = cg_alloc_tmp_struct(symtab, 8);
+    emit("    mov [rbp");
+    emit_signed_disp(tmp_offset);
+    emit("], rax\n");
+    *out_tmp_offset = tmp_offset;
+    return 0;
+}
+
 func cg_safe_method_call(node: u64, symtab: *Symtab) -> u64 {
     var method_call: *AstMethodCall = (*AstMethodCall)node;
     var receiver: u64 = method_call.receiver;
@@ -2513,51 +2595,13 @@ func cg_safe_method_call(node: u64, symtab: *Symtab) -> u64 {
         var label_null_t: u64 = new_label();
         var label_end_t: u64 = new_label();
 
-        cg_expr(receiver);
-        if (recv_ti.is_tagged == 1) {
-            emit_tagged_mask();
-        }
-        emit("    test rax, rax\n");
-        emit("    je ");
-        emit_label(label_null_t);
-        emit_nl();
+        var tmp_offset_t: u64 = 0;
+        cg_method_prepare_safe_receiver(receiver, recv_ti, label_null_t, symtab, &tmp_offset_t);
 
-        var tmp_offset: u64 = cg_alloc_tmp_struct(symtab, 8);
-        emit("    mov [rbp");
-        emit_signed_disp(tmp_offset);
-        emit("], rax\n");
-
-        var total_arg_words_t: u64 = 0;
-        if (nargs != 0) {
-            var i_t: u64 = nargs;
-            while (i_t > 0) {
-                i_t = i_t - 1;
-                var arg_t: *AstNode = args.get(i_t);
-                total_arg_words_t = total_arg_words_t + _cg_sysv_push_call_arg(arg_t, symtab);
-            }
-        }
-
-        emit("    mov rax, [rbp");
-        emit_signed_disp(tmp_offset);
-        emit("]\n");
-        emit("    push rax\n");
-        total_arg_words_t = total_arg_words_t + 1;
-
+        var total_arg_words_t: u64 = cg_method_push_user_args(args, nargs, symtab);
+        total_arg_words_t = total_arg_words_t + cg_method_push_receiver_from_tmp(tmp_offset_t);
         var stack_words_t: u64 = _cg_sysv_pop_arg_regs(total_arg_words_t);
-        emit("    mov rax, [rdi]\n");
-        if (method_index != 0) {
-            emit("    add rax, ");
-            emit_u64(method_index * 8);
-            emit_nl();
-        }
-        emit("    mov rax, [rax]\n");
-        emit("    call rax\n");
-
-        if (stack_words_t > 0) {
-            emit("    add rsp, ");
-            emit_u64(stack_words_t * 8);
-            emit_nl();
-        }
+        cg_method_emit_trait_vtable_call(method_index, stack_words_t);
 
         emit("    jmp ");
         emit_label(label_end_t);
@@ -2601,46 +2645,13 @@ func cg_safe_method_call(node: u64, symtab: *Symtab) -> u64 {
     var label_null: u64 = new_label();
     var label_end: u64 = new_label();
 
-    cg_expr(receiver);
-    if (recv_ti.is_tagged == 1) {
-        emit_tagged_mask();
-    }
-    emit("    test rax, rax\n");
-    emit("    je ");
-    emit_label(label_null);
-    emit_nl();
+    var tmp_offset: u64 = 0;
+    cg_method_prepare_safe_receiver(receiver, recv_ti, label_null, symtab, &tmp_offset);
 
-    var tmp_offset: u64 = cg_alloc_tmp_struct(symtab, 8);
-    emit("    mov [rbp");
-    emit_signed_disp(tmp_offset);
-    emit("], rax\n");
-
-    var total_arg_words: u64 = 0;
-    if (nargs != 0) {
-        var i: u64 = nargs;
-        while (i > 0) {
-            i = i - 1;
-            var arg: *AstNode = args.get(i);
-            total_arg_words = total_arg_words + _cg_sysv_push_call_arg(arg, symtab);
-        }
-    }
-
-    emit("    mov rax, [rbp");
-    emit_signed_disp(tmp_offset);
-    emit("]\n");
-    emit("    push rax\n");
-    total_arg_words = total_arg_words + 1;
-
+    var total_arg_words: u64 = cg_method_push_user_args(args, nargs, symtab);
+    total_arg_words = total_arg_words + cg_method_push_receiver_from_tmp(tmp_offset);
     var stack_words: u64 = _cg_sysv_pop_arg_regs(total_arg_words);
-    emit("    call ");
-    emit_len(resolved_ptr, resolved_len);
-    emit_nl();
-
-    if (stack_words > 0) {
-        emit("    add rsp, ");
-        emit_u64(stack_words * 8);
-        emit_nl();
-    }
+    cg_method_emit_direct_call(resolved_ptr, resolved_len, stack_words);
 
     emit("    jmp ");
     emit_label(label_end);
@@ -2679,61 +2690,18 @@ func cg_method_call(node: u64, symtab: *Symtab) -> u64 {
             panic("Codegen error");
         }
 
-        if (nargs != 0) {
-            var i_t2: u64 = nargs;
-            while (i_t2 > 0) {
-                i_t2 = i_t2 - 1;
-                var arg_t2: *AstNode = args.get(i_t2);
-                total_arg_words = total_arg_words + _cg_sysv_push_call_arg(arg_t2, symtab);
-            }
-        }
-
-        cg_expr(receiver);
-        if (recv_ti.is_tagged == 1) {
-            emit_tagged_mask();
-        }
-        emit("    push rax\n");
-        total_arg_words = total_arg_words + 1;
-
+        total_arg_words = cg_method_push_user_args(args, nargs, symtab);
+        total_arg_words = total_arg_words + cg_method_push_receiver(receiver, recv_ti, 1);
         var stack_words_t2: u64 = _cg_sysv_pop_arg_regs(total_arg_words);
-        emit("    mov rax, [rdi]\n");
-        if (method_index != 0) {
-            emit("    add rax, ");
-            emit_u64(method_index * 8);
-            emit_nl();
-        }
-        emit("    mov rax, [rax]\n");
-        emit("    call rax\n");
-
-        if (stack_words_t2 > 0) {
-            emit("    add rsp, ");
-            emit_u64(stack_words_t2 * 8);
-            emit_nl();
-        }
+        cg_method_emit_trait_vtable_call(method_index, stack_words_t2);
         return 0;
     }
     
     // Push user args (in reverse order)
-    if (nargs != 0) {
-        var i: u64 = nargs;
-        while (i > 0) {
-            i = i - 1;
-            var arg: *AstNode = args.get(i);
-            total_arg_words = total_arg_words + _cg_sysv_push_call_arg(arg, symtab);
-        }
-    }
+    total_arg_words = cg_method_push_user_args(args, nargs, symtab);
     
     // Push receiver address (first arg = self)
-    if (recv_is_ptr != 0) {
-        cg_expr(receiver);
-        if (recv_ti.is_tagged == 1) {
-            emit_tagged_mask();
-        }
-    } else {
-        cg_lvalue(receiver);
-    }
-    emit("    push rax\n");
-    total_arg_words = total_arg_words + 1;
+    total_arg_words = total_arg_words + cg_method_push_receiver(receiver, recv_ti, recv_is_ptr);
     
     // Get receiver type to determine struct name
     var type_info: *TypeInfo = recv_ti;
@@ -2763,14 +2731,5 @@ func cg_method_call(node: u64, symtab: *Symtab) -> u64 {
 
     var stack_words: u64 = _cg_sysv_pop_arg_regs(total_arg_words);
 
-    emit("    call ");
-    emit_len(resolved_ptr, resolved_len);
-    emit_nl();
-    
-    // Clean up stack (receiver + user args)
-    if (stack_words > 0) {
-        emit("    add rsp, ");
-        emit_u64(stack_words * 8);
-        emit_nl();
-    }
+    cg_method_emit_direct_call(resolved_ptr, resolved_len, stack_words);
 }
