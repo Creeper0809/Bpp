@@ -466,6 +466,109 @@ func _cg_sysv_pop_arg_regs_sret(total_words: u64) -> u64 {
     return _cg_sysv_pop_arg_regs_common(total_words, 5, 1);
 }
 
+func cg_push_struct_words_from_tmp(tmp_offset: u64, struct_size: u64) -> u64 {
+    if (struct_size <= 8) {
+        emit("    mov rax, [rbp");
+        emit_signed_disp(tmp_offset);
+        emit("]\n");
+        emit("    push rax\n");
+        return 1;
+    }
+    if (struct_size <= 16) {
+        emit("    mov rbx, [rbp");
+        var tmp_hi: u64 = tmp_offset + 8;
+        emit_signed_disp(tmp_hi);
+        emit("]\n");
+        emit("    mov rax, [rbp");
+        emit_signed_disp(tmp_offset);
+        emit("]\n");
+        emit("    push rbx\n");
+        emit("    push rax\n");
+        return 2;
+    }
+    emit("    lea rax, [rbp");
+    emit_signed_disp(tmp_offset);
+    emit("]\n");
+    emit("    push rax\n");
+    return 1;
+}
+
+func cg_sysv_push_slice_arg(arg: *AstNode, arg_kind: u64) -> u64 {
+    if (arg_kind == AST_SLICE) {
+        var slice_node: *AstSlice = (*AstSlice)arg;
+        cg_expr(slice_node.len_expr);
+        emit("    push rax\n");
+        cg_expr(slice_node.ptr_expr);
+        emit("    push rax\n");
+    } else {
+        cg_lvalue(arg);
+        emit("    mov rbx, [rax+8]\n");
+        emit("    push rbx\n");
+        emit("    mov rbx, [rax]\n");
+        emit("    push rbx\n");
+    }
+    return 2;
+}
+
+func cg_sysv_push_struct_arg(arg: *AstNode, arg_kind: u64, struct_size: u64, symtab: *Symtab) -> u64 {
+    if (arg_kind == AST_STACK_CTOR) {
+        var tmp_offset_sc: u64 = cg_alloc_tmp_struct(symtab, struct_size);
+        cg_stack_ctor_init_to_offset((*AstStackCtor)arg, tmp_offset_sc, symtab);
+        return cg_push_struct_words_from_tmp(tmp_offset_sc, struct_size);
+    }
+    if (arg_kind == AST_CALL) {
+        if (struct_size <= 8) {
+            cg_expr(arg);
+            emit("    push rax\n");
+            return 1;
+        } else if (struct_size <= 16) {
+            cg_expr(arg);
+            emit("    push rdx\n");
+            emit("    push rax\n");
+            return 2;
+        }
+        var tmp_offset2: u64 = cg_alloc_tmp_struct(symtab, struct_size);
+        cg_call_sret_to_offset(arg, tmp_offset2, symtab);
+        emit("    lea rax, [rbp");
+        emit_signed_disp(tmp_offset2);
+        emit("]\n");
+        emit("    push rax\n");
+        return 1;
+    }
+    if (struct_size <= 8) {
+        cg_lvalue(arg);
+        emit("    mov rax, [rax]\n");
+        emit("    push rax\n");
+        return 1;
+    } else if (struct_size <= 16) {
+        cg_lvalue(arg);
+        emit("    mov rbx, [rax+8]\n");
+        emit("    push rbx\n");
+        emit("    mov rbx, [rax]\n");
+        emit("    push rbx\n");
+        return 2;
+    }
+    // Larger structs: materialize into a stack temp and pass pointer
+    var tmp_offset: u64 = cg_alloc_tmp_struct(symtab, struct_size);
+    if (arg_kind == AST_CALL) {
+        cg_call_sret_to_offset(arg, tmp_offset, symtab);
+    } else {
+        cg_lvalue(arg);
+        emit("    mov rbx, rax\n");
+        emit("    lea r8, [rbp");
+        emit_signed_disp(tmp_offset);
+        emit("]\n");
+
+        emit_copy_bytes_with_regs("rbx", 3, "r8", 2, struct_size);
+    }
+
+    emit("    lea rax, [rbp");
+    emit_signed_disp(tmp_offset);
+    emit("]\n");
+    emit("    push rax\n");
+    return 1;
+}
+
 func _cg_sysv_push_call_arg(arg: *AstNode, symtab: *Symtab) -> u64 {
     var arg_kind: u64 = ast_kind(arg);
     if (arg_kind == AST_CALL) {
@@ -498,101 +601,11 @@ func _cg_sysv_push_call_arg(arg: *AstNode, symtab: *Symtab) -> u64 {
     var at: *TypeInfo = get_expr_type_with_symtab((*AstNode)arg, symtab);
     if (at != 0) {
         if (at.type_kind == TYPE_SLICE && at.ptr_depth == 0) {
-            if (arg_kind == AST_SLICE) {
-                var slice_node: *AstSlice = (*AstSlice)arg;
-                cg_expr(slice_node.len_expr);
-                emit("    push rax\n");
-                cg_expr(slice_node.ptr_expr);
-                emit("    push rax\n");
-            } else {
-                cg_lvalue(arg);
-                emit("    mov rbx, [rax+8]\n");
-                emit("    push rbx\n");
-                emit("    mov rbx, [rax]\n");
-                emit("    push rbx\n");
-            }
-            return 2;
+            return cg_sysv_push_slice_arg(arg, arg_kind);
         }
         if (at.type_kind == TYPE_STRUCT && at.ptr_depth == 0) {
             var struct_size: u64 = sizeof_type(TYPE_STRUCT, 0, at.struct_name_ptr, at.struct_name_len);
-            if (arg_kind == AST_STACK_CTOR) {
-                var tmp_offset_sc: u64 = cg_alloc_tmp_struct(symtab, struct_size);
-                cg_stack_ctor_init_to_offset((*AstStackCtor)arg, tmp_offset_sc, symtab);
-                if (struct_size <= 8) {
-                    emit("    mov rax, [rbp");
-                    emit_signed_disp(tmp_offset_sc);
-                    emit("]\n");
-                    emit("    push rax\n");
-                    return 1;
-                } else if (struct_size <= 16) {
-                    emit("    mov rbx, [rbp");
-                    var tmp_hi: u64 = tmp_offset_sc + 8;
-                    emit_signed_disp(tmp_hi);
-                    emit("]\n");
-                    emit("    mov rax, [rbp");
-                    emit_signed_disp(tmp_offset_sc);
-                    emit("]\n");
-                    emit("    push rbx\n");
-                    emit("    push rax\n");
-                    return 2;
-                }
-                emit("    lea rax, [rbp");
-                emit_signed_disp(tmp_offset_sc);
-                emit("]\n");
-                emit("    push rax\n");
-                return 1;
-            }
-            if (arg_kind == AST_CALL) {
-                if (struct_size <= 8) {
-                    cg_expr(arg);
-                    emit("    push rax\n");
-                    return 1;
-                } else if (struct_size <= 16) {
-                    cg_expr(arg);
-                    emit("    push rdx\n");
-                    emit("    push rax\n");
-                    return 2;
-                }
-                var tmp_offset2: u64 = cg_alloc_tmp_struct(symtab, struct_size);
-                cg_call_sret_to_offset(arg, tmp_offset2, symtab);
-                emit("    lea rax, [rbp");
-                emit_signed_disp(tmp_offset2);
-                emit("]\n");
-                emit("    push rax\n");
-                return 1;
-            }
-            if (struct_size <= 8) {
-                cg_lvalue(arg);
-                emit("    mov rax, [rax]\n");
-                emit("    push rax\n");
-                return 1;
-            } else if (struct_size <= 16) {
-                cg_lvalue(arg);
-                emit("    mov rbx, [rax+8]\n");
-                emit("    push rbx\n");
-                emit("    mov rbx, [rax]\n");
-                emit("    push rbx\n");
-                return 2;
-            }
-            // Larger structs: materialize into a stack temp and pass pointer
-            var tmp_offset: u64 = cg_alloc_tmp_struct(symtab, struct_size);
-            if (arg_kind == AST_CALL) {
-                cg_call_sret_to_offset(arg, tmp_offset, symtab);
-            } else {
-                cg_lvalue(arg);
-                emit("    mov rbx, rax\n");
-                emit("    lea r8, [rbp");
-                emit_signed_disp(tmp_offset);
-                emit("]\n");
-
-                emit_copy_bytes_with_regs("rbx", 3, "r8", 2, struct_size);
-            }
-
-            emit("    lea rax, [rbp");
-            emit_signed_disp(tmp_offset);
-            emit("]\n");
-            emit("    push rax\n");
-            return 1;
+            return cg_sysv_push_struct_arg(arg, arg_kind, struct_size, symtab);
         }
     }
     cg_expr(arg);
@@ -646,6 +659,104 @@ func cg_index_addr(node: u64, symtab: *Symtab) -> u64 {
     emit("    pop rbx\n");
     emit("    add rax, rbx\n");
     return;
+}
+
+func cg_try_materialize_operand(operand: u64, op_kind: u64, struct_size: u64, tmp_offset: u64, symtab: *Symtab) -> u64 {
+    if (struct_size > 16) {
+        if (op_kind == AST_CALL) {
+            cg_call_sret_to_offset(operand, tmp_offset, symtab);
+        } else if (op_kind == AST_METHOD_CALL) {
+            cg_method_call_sret_to_offset((*AstMethodCall)operand, tmp_offset, symtab);
+        } else {
+            cg_lvalue(operand);
+            emit("    mov rbx, rax\n");
+            emit("    lea r8, [rbp");
+            emit_signed_disp(tmp_offset);
+            emit("]\n");
+            emit_copy_bytes_with_regs("rbx", 3, "r8", 2, struct_size);
+        }
+        return;
+    }
+    if (op_kind == AST_CALL || op_kind == AST_METHOD_CALL || op_kind == AST_CALL_PTR) {
+        cg_expr(operand);
+        emit("    lea rbx, [rbp");
+        emit_signed_disp(tmp_offset);
+        emit("]\n");
+        emit("    mov [rbx], rax\n");
+        if (struct_size > 8) {
+            emit("    mov [rbx+8], rdx\n");
+        }
+    } else {
+        cg_lvalue(operand);
+        emit("    mov rbx, rax\n");
+        emit("    lea r8, [rbp");
+        emit_signed_disp(tmp_offset);
+        emit("]\n");
+        emit_copy_bytes_with_regs("rbx", 3, "r8", 2, struct_size);
+    }
+    return;
+}
+
+func cg_try_emit_fail_return(tmp_offset: u64, check_off: u64, ret_struct_name_ptr: u64, ret_struct_name_len: u64, label_ok: u64) -> u64 {
+    emit("    lea rbx, [rbp");
+    emit_signed_disp(tmp_offset);
+    emit("]\n");
+    emit("    mov rax, [rbx");
+    if (check_off != 0) { emit("+"); emit_u64(check_off); }
+    emit("]\n");
+    emit("    test rax, rax\n");
+    emit("    jne ");
+    emit_label(label_ok);
+    emit_nl();
+
+    var ret_struct_size: u64 = sizeof_type(TYPE_STRUCT, 0, ret_struct_name_ptr, ret_struct_name_len);
+    if (ret_struct_size > 16) {
+        emit_copy_bytes_with_regs("rbx", 3, "rdi", 3, ret_struct_size);
+    } else if (ret_struct_size <= 8) {
+        emit("    mov rax, [rbx]\n");
+    } else {
+        emit("    mov rax, [rbx]\n");
+        emit("    mov rdx, [rbx+8]\n");
+    }
+    emit("    mov rsp, rbp\n");
+    emit("    pop rbp\n");
+    emit("    ret\n");
+    return;
+}
+
+func cg_try_emit_value_load(value_desc: *FieldDesc, value_off: u64) -> u64 {
+    var value_size: u64 = sizeof_field_desc(value_desc);
+    if (value_size <= 8) {
+        if (value_desc.ptr_depth == 0 && value_desc.type_kind == TYPE_U8) {
+            emit("    movzx rax, byte [rbx");
+            if (value_off != 0) { emit("+"); emit_u64(value_off); }
+            emit("]\n");
+        } else if (value_desc.ptr_depth == 0 && value_desc.type_kind == TYPE_U16) {
+            emit("    movzx rax, word [rbx");
+            if (value_off != 0) { emit("+"); emit_u64(value_off); }
+            emit("]\n");
+        } else if (value_desc.ptr_depth == 0 && value_desc.type_kind == TYPE_U32) {
+            emit("    mov eax, [rbx");
+            if (value_off != 0) { emit("+"); emit_u64(value_off); }
+            emit("]\n");
+        } else {
+            emit("    mov rax, [rbx");
+            if (value_off != 0) { emit("+"); emit_u64(value_off); }
+            emit("]\n");
+        }
+        return;
+    }
+    if (value_size <= 16) {
+        emit("    mov rax, [rbx");
+        if (value_off != 0) { emit("+"); emit_u64(value_off); }
+        emit("]\n");
+        emit("    mov rdx, [rbx");
+        if (value_off + 8 != 0) { emit("+"); emit_u64(value_off + 8); }
+        emit("]\n");
+        return;
+    }
+    emit_stderr("[ERROR] try value size too large for expression result\n");
+    panic("Codegen error");
 }
 
 func cg_try_expr(node: u64, symtab: *Symtab) -> u64 {
@@ -708,104 +819,675 @@ func cg_try_expr(node: u64, symtab: *Symtab) -> u64 {
     var tmp_offset: u64 = cg_alloc_tmp_struct(symtab, struct_size);
     var op_kind: u64 = ast_kind(operand);
 
-    if (struct_size > 16) {
-        if (op_kind == AST_CALL) {
-            cg_call_sret_to_offset(operand, tmp_offset, symtab);
-        } else if (op_kind == AST_METHOD_CALL) {
-            cg_method_call_sret_to_offset((*AstMethodCall)operand, tmp_offset, symtab);
-        } else {
-            cg_lvalue(operand);
-            emit("    mov rbx, rax\n");
-            emit("    lea r8, [rbp");
-            emit_signed_disp(tmp_offset);
-            emit("]\n");
-
-            emit_copy_bytes_with_regs("rbx", 3, "r8", 2, struct_size);
-        }
-    } else {
-        if (op_kind == AST_CALL || op_kind == AST_METHOD_CALL || op_kind == AST_CALL_PTR) {
-            cg_expr(operand);
-            emit("    lea rbx, [rbp");
-            emit_signed_disp(tmp_offset);
-            emit("]\n");
-            emit("    mov [rbx], rax\n");
-            if (struct_size > 8) {
-                emit("    mov [rbx+8], rdx\n");
-            }
-        } else {
-            cg_lvalue(operand);
-            emit("    mov rbx, rax\n");
-            emit("    lea r8, [rbp");
-            emit_signed_disp(tmp_offset);
-            emit("]\n");
-
-            emit_copy_bytes_with_regs("rbx", 3, "r8", 2, struct_size);
-        }
-    }
+    cg_try_materialize_operand(operand, op_kind, struct_size, tmp_offset, symtab);
 
     var label_ok: u64 = new_label();
-    emit("    lea rbx, [rbp");
-    emit_signed_disp(tmp_offset);
-    emit("]\n");
-    emit("    mov rax, [rbx");
-    if (check_off != 0) { emit("+"); emit_u64(check_off); }
-    emit("]\n");
-    emit("    test rax, rax\n");
-    emit("    jne ");
-    emit_label(label_ok);
-    emit_nl();
-
-    var ret_struct_size: u64 = sizeof_type(TYPE_STRUCT, 0, ret_struct_name_ptr, ret_struct_name_len);
-    if (ret_struct_size > 16) {
-        emit_copy_bytes_with_regs("rbx", 3, "rdi", 3, ret_struct_size);
-    } else if (ret_struct_size <= 8) {
-        emit("    mov rax, [rbx]\n");
-    } else {
-        emit("    mov rax, [rbx]\n");
-        emit("    mov rdx, [rbx+8]\n");
-    }
-    emit("    mov rsp, rbp\n");
-    emit("    pop rbp\n");
-    emit("    ret\n");
+    cg_try_emit_fail_return(tmp_offset, check_off, ret_struct_name_ptr, ret_struct_name_len, label_ok);
 
     emit_label_def(label_ok);
-    var value_size: u64 = sizeof_field_desc(value_desc);
-    if (value_size <= 8) {
-        if (value_desc.ptr_depth == 0 && value_desc.type_kind == TYPE_U8) {
-            emit("    movzx rax, byte [rbx");
-            if (value_off != 0) { emit("+"); emit_u64(value_off); }
-            emit("]\n");
-        } else if (value_desc.ptr_depth == 0 && value_desc.type_kind == TYPE_U16) {
-            emit("    movzx rax, word [rbx");
-            if (value_off != 0) { emit("+"); emit_u64(value_off); }
-            emit("]\n");
-        } else if (value_desc.ptr_depth == 0 && value_desc.type_kind == TYPE_U32) {
-            emit("    mov eax, [rbx");
-            if (value_off != 0) { emit("+"); emit_u64(value_off); }
+    cg_try_emit_value_load(value_desc, value_off);
+    return;
+}
+
+func cg_expr_call(node: u64, symtab: *Symtab) -> u64 {
+    var call: *AstCall = (*AstCall)node;
+    var name_ptr: u64 = call.name_ptr;
+    var name_len: u64 = call.name_len;
+    var resolved_ptr: u64 = name_ptr;
+    var resolved_len: u64 = name_len;
+    var resolved: *NameInfo = resolve_name(name_ptr, name_len);
+    if (resolved != 0) {
+        resolved_ptr = resolved.ptr;
+        resolved_len = resolved.len;
+    }
+    var var_type: *TypeInfo = symtab_get_type(symtab, name_ptr, name_len);
+    var is_global: u64 = is_global_var(resolved_ptr, resolved_len);
+    if (var_type != 0 || is_global != 0) {
+        var args2: *Vec<*AstNode> = call.args_vec;
+        var nargs2: u64 = 0;
+        if (args2 != 0) { nargs2 = args2.len(); }
+
+        if (var_type != 0) {
+            var offset2: u64 = symtab_find(symtab, name_ptr, name_len);
+            emit("    mov rax, [rbp");
+            emit_signed_disp(offset2);
             emit("]\n");
         } else {
-            emit("    mov rax, [rbx");
-            if (value_off != 0) { emit("+"); emit_u64(value_off); }
+            emit("    mov rax, [rel _gvar_");
+            emit_len(resolved_ptr, resolved_len);
             emit("]\n");
         }
-    } else if (value_size <= 16) {
-        emit("    mov rax, [rbx");
-        if (value_off != 0) { emit("+"); emit_u64(value_off); }
-        emit("]\n");
-        emit("    mov rdx, [rbx");
-        if (value_off + 8 != 0) { emit("+"); emit_u64(value_off + 8); }
-        emit("]\n");
-    } else {
-        emit_stderr("[ERROR] try value size too large for expression result\n");
-        panic("Codegen error");
+        emit("    push rax\n");
+
+        var total_arg_words2: u64 = 0;
+        if (nargs2 != 0) {
+            var i2: u64 = nargs2;
+            while (i2 > 0) {
+                i2 = i2 - 1;
+                var arg2: *AstNode = args2.get(i2);
+                total_arg_words2 = total_arg_words2 + _cg_sysv_push_call_arg(arg2, symtab);
+            }
+        }
+        var stack_words2: u64 = _cg_sysv_pop_arg_regs(total_arg_words2);
+
+        emit("    pop rax\n");
+        emit("    call rax\n");
+
+        if (stack_words2 > 0) {
+            emit("    add rsp, ");
+            emit_u64(stack_words2 * 8);
+            emit_nl();
+        }
+        return;
+    }
+    var args: *Vec<*AstNode> = call.args_vec;
+    var nargs: u64 = 0;
+    if (args != 0) { nargs = args.len(); }
+    var total_arg_words: u64 = 0;
+    if (nargs != 0) {
+        var i: u64 = nargs;
+        while (i > 0) {
+            i = i - 1;
+            var arg: *AstNode = args.get(i);
+            total_arg_words = total_arg_words + _cg_sysv_push_call_arg(arg, symtab);
+        }
+    }
+    var stack_words: u64 = _cg_sysv_pop_arg_regs(total_arg_words);
+
+    emit("    call ");
+    emit_len(resolved_ptr, resolved_len);
+    emit_nl();
+    
+    if (stack_words > 0) {
+        emit("    add rsp, ");
+        emit_u64(stack_words * 8);
+        emit_nl();
     }
     return;
 }
 
-func cg_expr(node: u64) -> u64 {
-    var kind: u64 = ast_kind(node);
-    var symtab: *Symtab = emitter_get_symtab();
+func cg_expr_call_ptr(node: u64, symtab: *Symtab) -> u64 {
+    var cp: *AstCallPtr = (*AstCallPtr)node;
+    var args3: *Vec<*AstNode> = cp.args_vec;
+    var nargs3: u64 = 0;
+    if (args3 != 0) { nargs3 = args3.len(); }
+
+    // Preserve callee address across arg evaluation.
+    cg_expr(cp.callee);
+    emit("    push rax\n");
+
+    var total_arg_words3: u64 = 0;
+    if (nargs3 != 0) {
+        var i3: u64 = nargs3;
+        while (i3 > 0) {
+            i3 = i3 - 1;
+            var arg3: *AstNode = args3.get(i3);
+            total_arg_words3 = total_arg_words3 + _cg_sysv_push_call_arg(arg3, symtab);
+        }
+    }
+    var stack_words3: u64 = _cg_sysv_pop_arg_regs(total_arg_words3);
+
+    emit("    pop rax\n");
+    emit("    call rax\n");
+
+    if (stack_words3 > 0) {
+        emit("    add rsp, ");
+        emit_u64(stack_words3 * 8);
+        emit_nl();
+    }
+    return;
+}
+
+func cg_expr_stack_ctor(node: u64, symtab: *Symtab) -> u64 {
+    var sc: *AstStackCtor = (*AstStackCtor)node;
+    var sc_ti: *TypeInfo = get_expr_type_with_symtab(node, symtab);
+    if (sc_ti == 0 || sc_ti.type_kind != TYPE_STRUCT || sc_ti.ptr_depth != 0) {
+        emit_stderr("[ERROR] stack constructor expression requires struct value\n");
+        panic("Codegen error");
+    }
+    var sc_size: u64 = sizeof_type(TYPE_STRUCT, 0, sc_ti.struct_name_ptr, sc_ti.struct_name_len);
+    var tmp_offset_expr: u64 = cg_alloc_tmp_struct(symtab, sc_size);
+    cg_stack_ctor_init_to_offset(sc, tmp_offset_expr, symtab);
+    if (sc_size <= 8) {
+        emit("    mov rax, [rbp");
+        emit_signed_disp(tmp_offset_expr);
+        emit("]\n");
+        return;
+    } else if (sc_size <= 16) {
+        emit("    mov rax, [rbp");
+        emit_signed_disp(tmp_offset_expr);
+        emit("]\n");
+        emit("    mov rdx, [rbp");
+        var tmp_expr_hi: u64 = tmp_offset_expr + 8;
+        emit_signed_disp(tmp_expr_hi);
+        emit("]\n");
+        return;
+    }
+    emit_stderr("[ERROR] stack constructor expression requires destination for large structs\n");
+    panic("Codegen error");
+}
+
+func cg_expr_emit_local_typed(var_type: *TypeInfo, offset: u64) -> u64 {
+    if (var_type == 0) { return 0; }
+    if (var_type.ptr_depth != 0) { return 0; }
+    if (var_type.type_kind == TYPE_ARRAY) {
+        emit("    lea rax, [rbp");
+        emit_signed_disp(offset);
+        emit("]\n");
+        return 1;
+    }
+    if (var_type.type_kind == TYPE_SLICE) {
+        emit("    mov rax, [rbp");
+        emit_signed_disp(offset);
+        emit("]\n");
+        return 1;
+    }
+    if (var_type.type_kind == TYPE_U8) {
+        emit("    movzx rax, byte [rbp");
+        emit_signed_disp(offset);
+        emit("]\n");
+        return 1;
+    }
+    if (var_type.type_kind == TYPE_U16) {
+        emit("    movzx rax, word [rbp");
+        emit_signed_disp(offset);
+        emit("]\n");
+        return 1;
+    }
+    if (var_type.type_kind == TYPE_U32) {
+        emit("    mov eax, [rbp");
+        emit_signed_disp(offset);
+        emit("]\n");
+        return 1;
+    }
+    return 0;
+}
+
+func cg_expr_emit_global_typed(gt: *TypeInfo, resolved_ptr: u64, resolved_len: u64) -> u64 {
+    if (gt == 0 || gt.ptr_depth != 0) {
+        return 0;
+    }
+    if (gt.type_kind == TYPE_ARRAY) {
+        emit("    lea rax, [rel _gvar_");
+        emit_len(resolved_ptr, resolved_len);
+        emit("]\n");
+        return 1;
+    }
+    if (gt.type_kind == TYPE_SLICE) {
+        emit("    mov rax, [rel _gvar_");
+        emit_len(resolved_ptr, resolved_len);
+        emit("]\n");
+        return 1;
+    }
+    if (gt.type_kind == TYPE_U8) {
+        emit("    movzx rax, byte [rel _gvar_");
+        emit_len(resolved_ptr, resolved_len);
+        emit("]\n");
+        return 1;
+    }
+    if (gt.type_kind == TYPE_U16) {
+        emit("    movzx rax, word [rel _gvar_");
+        emit_len(resolved_ptr, resolved_len);
+        emit("]\n");
+        return 1;
+    }
+    if (gt.type_kind == TYPE_U32) {
+        emit("    mov eax, [rel _gvar_");
+        emit_len(resolved_ptr, resolved_len);
+        emit("]\n");
+        return 1;
+    }
+    return 0;
+}
+
+func cg_expr_ident(node: u64, symtab: *Symtab) -> u64 {
+    var ident: *AstIdent = (*AstIdent)node;
+    var name_ptr: u64 = ident.name_ptr;
+    var name_len: u64 = ident.name_len;
+    var var_type: *TypeInfo = symtab_get_type(symtab, name_ptr, name_len);
+    if (var_type != 0) {
+        var offset0: u64 = symtab_find(symtab, name_ptr, name_len);
+        if (cg_expr_emit_local_typed(var_type, offset0) != 0) {
+            return;
+        }
+    }
+
+    var resolved_ptr: u64 = name_ptr;
+    var resolved_len: u64 = name_len;
+    var resolved: *NameInfo = resolve_name(name_ptr, name_len);
+    if (resolved != 0) {
+        resolved_ptr = resolved.ptr;
+        resolved_len = resolved.len;
+    }
+
+    var result: ConstResult = const_find(resolved_ptr, resolved_len);
+    if (result.found == 1) {
+        emit("    mov rax, ");
+        emit_u64(result.value);
+        emit_nl();
+        return;
+    }
+
+    if (is_global_var(resolved_ptr, resolved_len)) {
+        var ginfo: *GlobalInfo = _cg_find_global_info(resolved_ptr, resolved_len);
+        if (ginfo != 0) {
+            var gt: *TypeInfo = ginfo.typeinfo_ptr;
+            if (cg_expr_emit_global_typed(gt, resolved_ptr, resolved_len) != 0) {
+                return;
+            }
+        }
+
+        emit("    mov rax, [rel _gvar_");
+        emit_len(resolved_ptr, resolved_len);
+        emit("]\n");
+        return;
+    }
     
+    var offset: u64 = symtab_find(symtab, name_ptr, name_len);
+    emit("    mov rax, [rbp");
+    emit_signed_disp(offset);
+    emit("]\n");
+    return;
+}
+
+func cg_expr_unary(node: u64, symtab: *Symtab) -> u64 {
+    var unary: *AstUnary = (*AstUnary)node;
+    var op: u64 = unary.op;
+    var operand: u64 = unary.operand;
+    
+    cg_expr(operand);
+    if (op == TOKEN_MINUS) {
+        var ot: *TypeInfo = get_expr_type_with_symtab((*AstNode)operand, symtab);
+        if (ot != 0 && ot.ptr_depth == 0 && ot.type_kind == TYPE_F64) {
+            emit("    mov rbx, 1\n");
+            emit("    mov rcx, 63\n");
+            emit("    shl rbx, cl\n");
+            emit("    movq xmm1, rbx\n");
+            emit("    movq xmm0, rax\n");
+            emit("    xorpd xmm0, xmm1\n");
+            emit("    movq rax, xmm0\n");
+            return;
+        }
+        emit("    neg rax\n");
+    }
+    else if (op == TOKEN_BANG) {
+        emit("    test rax, rax\n");
+        emit("    setz al\n");
+        emit("    movzx rax, al\n");
+    } else if (op == TOKEN_TILDE) {
+        emit("    not rax\n");
+    }
+    return;
+}
+
+func cg_expr_addr_of(node: u64, symtab: *Symtab) -> u64 {
+    var addr_of: *AstAddrOf = (*AstAddrOf)node;
+    var operand: u64 = addr_of.operand;
+    if (ast_kind(operand) == AST_IDENT) {
+        var ident: *AstIdent = (*AstIdent)operand;
+        var name_ptr: u64 = ident.name_ptr;
+        var name_len: u64 = ident.name_len;
+        var offset: u64 = symtab_find(symtab, name_ptr, name_len);
+
+        if (offset != 0) {
+            emit("    lea rax, [rbp");
+            emit_signed_disp(offset);
+            emit("]\n");
+            return;
+        }
+
+        if (compiler_func_exists(name_ptr, name_len) != 0) {
+            var resolved_ptr: u64 = name_ptr;
+            var resolved_len: u64 = name_len;
+            var resolved: *NameInfo = resolve_name(name_ptr, name_len);
+            if (resolved != 0) {
+                resolved_ptr = resolved.ptr;
+                resolved_len = resolved.len;
+            }
+            emit("    lea rax, [rel ");
+            emit_len(resolved_ptr, resolved_len);
+            emit("]\n");
+            return;
+        }
+
+        if (compiler_global_exists(name_ptr, name_len) != 0) {
+            var resolved_ptr2: u64 = name_ptr;
+            var resolved_len2: u64 = name_len;
+            var resolved2: *NameInfo = resolve_name(name_ptr, name_len);
+            if (resolved2 != 0) {
+                resolved_ptr2 = resolved2.ptr;
+                resolved_len2 = resolved2.len;
+            }
+            emit("    lea rax, [rel _gvar_");
+            emit_len(resolved_ptr2, resolved_len2);
+            emit("]\n");
+            return;
+        }
+    }
+
+    cg_lvalue(operand);
+    return;
+}
+
+func cg_expr_deref(node: u64, symtab: *Symtab) -> u64 {
+    var deref: *AstDeref = (*AstDeref)node;
+    var operand: u64 = deref.operand;
+    cg_expr(operand);
+    
+    var type_info: *TypeInfo = get_expr_type_with_symtab((*AstNode)operand, symtab);
+    var base_type: u64 = type_info.type_kind;
+    var ptr_depth: u64 = type_info.ptr_depth;
+    if (ptr_depth > 0 && type_info.is_tagged == 1) {
+        emit_tagged_mask();
+    }
+    
+    if (ptr_depth == 1) {
+        if (base_type == TYPE_U8) {
+            emit("    movzx rax, byte [rax]\n");
+            return;
+        }
+        if (base_type == TYPE_U16) {
+            emit("    movzx rax, word [rax]\n");
+            return;
+        }
+        if (base_type == TYPE_U32) {
+            emit("    mov eax, [rax]\n");
+            return;
+        }
+    }
+    emit("    mov rax, [rax]\n");
+    return;
+}
+
+func cg_expr_deref8(node: u64, symtab: *Symtab) -> u64 {
+    var deref8: *AstDeref8 = (*AstDeref8)node;
+    var operand: u64 = deref8.operand;
+    cg_expr(operand);
+    var ti2: *TypeInfo = get_expr_type_with_symtab((*AstNode)operand, symtab);
+    if (ti2 != 0) {
+        if (ti2.ptr_depth > 0 && ti2.is_tagged == 1) {
+            emit_tagged_mask();
+        }
+    }
+    emit("    movzx rax, byte [rax]\n");
+    return;
+}
+
+func cg_expr_index(node: u64, symtab: *Symtab) -> u64 {
+    cg_index_addr(node, symtab);
+    var et: *TypeInfo = get_expr_type_with_symtab((*AstNode)node, symtab);
+    if (et != 0) {
+        if (et.ptr_depth == 0) {
+            if (et.type_kind == TYPE_U8) {
+                emit("    movzx rax, byte [rax]\n");
+                return;
+            }
+            if (et.type_kind == TYPE_U16) {
+                emit("    movzx rax, word [rax]\n");
+                return;
+            }
+            if (et.type_kind == TYPE_U32) {
+                emit("    mov eax, [rax]\n");
+                return;
+            }
+        }
+    }
+    emit("    mov rax, [rax]\n");
+    return;
+}
+
+func cg_expr_cast(node: u64, symtab: *Symtab) -> u64 {
+    var cast: *AstCast = (*AstCast)node;
+    var expr: u64 = cast.expr;
+    if (cast.target_type == TYPE_TRAIT) {
+        var src_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)expr, symtab);
+        if (src_ti == 0 || src_ti.type_kind != TYPE_STRUCT || src_ti.ptr_depth == 0) {
+            emit_stderr("[ERROR] Trait cast requires struct pointer source\n");
+            panic("Codegen error");
+        }
+        var impl_info2: *TraitImpl = compiler_find_trait_impl(cast.struct_name_ptr, cast.struct_name_len, src_ti.struct_name_ptr, src_ti.struct_name_len);
+        if (impl_info2 == 0) {
+            emit_stderr("[ERROR] Struct does not implement trait for cast: ");
+            emit_stderr_len(cast.struct_name_ptr, cast.struct_name_len);
+            emit_stderr("\n");
+            panic("Codegen error");
+        }
+        var struct_def: *AstStructDef = get_struct_def(src_ti.struct_name_ptr, src_ti.struct_name_len);
+        var vptr_name: *NameInfo = compiler_build_vptr_field_name(cast.struct_name_ptr, cast.struct_name_len);
+        var field_offset: u64 = 0;
+        var field_desc: *FieldDesc = 0;
+        var found: u64 = struct_find_field_desc_scoped(struct_def, 0, 0, vptr_name.ptr, vptr_name.len, &field_offset, &field_desc);
+        if (found == 0) {
+            emit_stderr("[ERROR] vptr field not found for trait cast\n");
+            panic("Codegen error");
+        }
+        cg_expr(expr);
+        if (src_ti.is_tagged == 1) { emit_tagged_mask(); }
+        if (field_offset != 0) {
+            emit("    add rax, ");
+            emit_u64(field_offset);
+            emit_nl();
+        }
+        return;
+    }
+    if (cast.target_type == TYPE_STRUCT) {
+        var src_ti2: *TypeInfo = get_expr_type_with_symtab((*AstNode)expr, symtab);
+        if (src_ti2 != 0 && src_ti2.type_kind == TYPE_TRAIT && src_ti2.ptr_depth > 0) {
+            var impl2: *TraitImpl = compiler_find_trait_impl(src_ti2.struct_name_ptr, src_ti2.struct_name_len, cast.struct_name_ptr, cast.struct_name_len);
+            if (impl2 == 0) {
+                emit_stderr("[ERROR] Trait cast target struct not implemented: ");
+                emit_stderr_len(cast.struct_name_ptr, cast.struct_name_len);
+                emit_stderr("\n");
+                panic("Codegen error");
+            }
+            var struct_def2: *AstStructDef = get_struct_def(cast.struct_name_ptr, cast.struct_name_len);
+            var vptr_name2: *NameInfo = compiler_build_vptr_field_name(src_ti2.struct_name_ptr, src_ti2.struct_name_len);
+            var field_offset2: u64 = 0;
+            var field_desc2: *FieldDesc = 0;
+            var found2: u64 = struct_find_field_desc_scoped(struct_def2, 0, 0, vptr_name2.ptr, vptr_name2.len, &field_offset2, &field_desc2);
+            if (found2 == 0) {
+                emit_stderr("[ERROR] vptr field not found for trait cast\n");
+                panic("Codegen error");
+            }
+            cg_expr(expr);
+            if (field_offset2 != 0) {
+                emit("    sub rax, ");
+                emit_u64(field_offset2);
+                emit_nl();
+            }
+            return;
+        }
+    }
+    cg_expr(expr);
+    return;
+}
+
+func cg_expr_sizeof(node: u64) -> u64 {
+    var sizeof_node: *AstSizeof = (*AstSizeof)node;
+    var type_kind: u64 = sizeof_node.type_kind;
+    var ptr_depth: u64 = sizeof_node.ptr_depth;
+    var struct_name_ptr: u64 = sizeof_node.struct_name_ptr;
+    var struct_name_len: u64 = sizeof_node.struct_name_len;
+    var size: u64 = 0;
+    if (type_kind == TYPE_ARRAY || type_kind == TYPE_SLICE) {
+        if (sizeof_node.array_len_is_param != 0) {
+            emit_stderr("[ERROR] sizeof array with unresolved generic length\n");
+            panic("Codegen error");
+        }
+        var ti_ptr: *TypeInfo = 0;
+        if (type_kind == TYPE_ARRAY) {
+            ti_ptr = typeinfo_make_array(ptr_depth, sizeof_node.elem_type_kind, sizeof_node.elem_ptr_depth, struct_name_ptr, struct_name_len, 0, sizeof_node.array_len);
+        } else {
+            ti_ptr = typeinfo_make_slice(ptr_depth, sizeof_node.elem_type_kind, sizeof_node.elem_ptr_depth, struct_name_ptr, struct_name_len, 0);
+        }
+        size = sizeof_type_ex(ti_ptr);
+    } else {
+        // Calculate size at compile time
+        size = sizeof_type(type_kind, ptr_depth, struct_name_ptr, struct_name_len);
+    }
+    
+    // Emit as literal constant
+    emit("    mov rax, ");
+    emit_u64(size);
+    emit_nl();
+    return;
+}
+
+func cg_expr_sizeof_expr(node: u64, symtab: *Symtab) -> u64 {
+    var sz_expr: *AstSizeofExpr = (*AstSizeofExpr)node;
+    var ti_ptr: *TypeInfo = get_expr_type_with_symtab((*AstNode)sz_expr.expr, symtab);
+    var size_val: u64 = 8;
+    if (ti_ptr != 0) {
+        size_val = sizeof_type_ex(ti_ptr);
+    }
+    emit("    mov rax, ");
+    emit_u64(size_val);
+    emit_nl();
+    return;
+}
+
+func cg_new_alloc_zero(size: u64) -> u64 {
+    var malloc_ptr: u64 = (u64)"malloc";
+    var malloc_len: u64 = 6;
+    var malloc_res: *NameInfo = resolve_name(malloc_ptr, malloc_len);
+    if (malloc_res != 0) {
+        malloc_ptr = malloc_res.ptr;
+        malloc_len = malloc_res.len;
+    }
+
+    emit("    mov rdi, ");
+    emit_u64(size);
+    emit_nl();
+    emit("    call ");
+    emit_len(malloc_ptr, malloc_len);
+    emit_nl();
+    emit("    mov r12, rax\n");
+
+    var memset_ptr: u64 = (u64)"memset";
+    var memset_len: u64 = 6;
+    var memset_res: *NameInfo = resolve_name(memset_ptr, memset_len);
+    if (memset_res != 0) {
+        memset_ptr = memset_res.ptr;
+        memset_len = memset_res.len;
+    }
+
+    emit("    mov rdi, r12\n");
+    emit("    xor esi, esi\n");
+    emit("    mov rdx, ");
+    emit_u64(size);
+    emit_nl();
+    emit("    call ");
+    emit_len(memset_ptr, memset_len);
+    emit_nl();
+    return 0;
+}
+
+func cg_new_invoke_constructor(nw: *AstNew, symtab: *Symtab) -> u64 {
+    if (nw.ctor_args_vec == 0) {
+        return 0;
+    }
+    if (nw.type_kind != TYPE_STRUCT) {
+        emit_stderr("[ERROR] new constructor call requires struct type\n");
+        panic("Codegen error");
+    }
+
+    var method_ptr: u64 = (u64)"constructor";
+    var method_len: u64 = 11;
+    var base_len: u64 = compiler_find_generic_suffix_index(nw.struct_name_ptr, nw.struct_name_len);
+    var suffix_len: u64 = nw.struct_name_len - base_len;
+    var name_info: *NameInfo = compiler_build_method_name_base(nw.struct_name_ptr, base_len, method_ptr, method_len, suffix_len);
+    var call_ptr: u64 = name_info.ptr;
+    var call_len: u64 = name_info.len;
+    var resolved: *NameInfo = resolve_name(name_info.ptr, name_info.len);
+    if (resolved != 0) {
+        call_ptr = resolved.ptr;
+        call_len = resolved.len;
+    }
+
+    if (compiler_func_exists(name_info.ptr, name_info.len) == 0) {
+        var alt_info: *NameInfo = compiler_build_method_name_base(nw.struct_name_ptr, base_len, method_ptr, method_len, 0);
+        var alt_call_ptr: u64 = alt_info.ptr;
+        var alt_call_len: u64 = alt_info.len;
+        var alt_res: *NameInfo = resolve_name(alt_info.ptr, alt_info.len);
+        if (alt_res != 0) {
+            alt_call_ptr = alt_res.ptr;
+            alt_call_len = alt_res.len;
+        }
+
+        if (compiler_func_exists(alt_info.ptr, alt_info.len) == 0) {
+            emit_stderr("[ERROR] constructor not found for new\n");
+            emit_stderr_len(nw.struct_name_ptr, nw.struct_name_len);
+            emit_stderr("\n");
+            panic("Codegen error");
+        }
+
+        call_ptr = alt_call_ptr;
+        call_len = alt_call_len;
+    }
+
+    var args: *Vec<*AstNode> = nw.ctor_args_vec;
+    var nargs: u64 = args.len();
+    var total_arg_words: u64 = 0;
+    if (nargs != 0) {
+        var ai: u64 = nargs;
+        while (ai > 0) {
+            ai = ai - 1;
+            var arg: *AstNode = args.get(ai);
+            total_arg_words = total_arg_words + _cg_sysv_push_call_arg(arg, symtab);
+        }
+    }
+    emit("    push r12\n");
+    total_arg_words = total_arg_words + 1;
+    var stack_words: u64 = _cg_sysv_pop_arg_regs(total_arg_words);
+
+    emit("    call ");
+    emit_len(call_ptr, call_len);
+    emit_nl();
+
+    if (stack_words > 0) {
+        emit("    add rsp, ");
+        emit_u64(stack_words * 8);
+        emit_nl();
+    }
+    return 0;
+}
+
+func cg_expr_new(node: u64, symtab: *Symtab) -> u64 {
+    var nw: *AstNew = (*AstNew)node;
+    if (nw.array_len_is_param != 0) {
+        emit_stderr("[ERROR] new with unresolved generic array length\n");
+        panic("Codegen error");
+    }
+
+    var size: u64 = 0;
+    if (nw.type_kind == TYPE_ARRAY) {
+        var elem_size: u64 = sizeof_type(nw.elem_type_kind, nw.elem_ptr_depth, nw.struct_name_ptr, nw.struct_name_len);
+        size = elem_size * nw.array_len;
+    } else if (nw.type_kind == TYPE_SLICE) {
+        size = 16;
+    } else {
+        size = sizeof_type(nw.type_kind, nw.ptr_depth, nw.struct_name_ptr, nw.struct_name_len);
+    }
+
+    cg_new_alloc_zero(size);
+
+    if (nw.type_kind == TYPE_STRUCT) {
+        cg_emit_trait_vptr_init_at_r12(nw.struct_name_ptr, nw.struct_name_len);
+    }
+
+    if (nw.literal_expr != 0) {
+        if (ast_kind(nw.literal_expr) == AST_STRUCT_LITERAL) {
+            cg_struct_literal_init_ptr(nw.literal_expr);
+        }
+    }
+
+    cg_new_invoke_constructor(nw, symtab);
+
+    emit("    mov rax, r12\n");
+    return;
+}
+
+func cg_expr_try_immediate(kind: u64, node: u64) -> u64 {
     if (kind == AST_LITERAL) {
         var lit: *AstLiteral = (*AstLiteral)node;
         var val: u64 = lit.value;
@@ -817,701 +1499,64 @@ func cg_expr(node: u64) -> u64 {
             emit_u64(val);
         }
         emit_nl();
-        return;
+        return 1;
     }
-
     if (kind == AST_FLOAT) {
         var fl: *AstFloat = (*AstFloat)node;
         var label_id: u64 = float_get_label(fl.str_ptr, fl.str_len);
         emit("    mov rax, [rel _flt");
         emit_u64(label_id);
         emit("]\n");
-        return;
+        return 1;
     }
-    
     if (kind == AST_STRING) {
         var str: *AstString = (*AstString)node;
-        var str_ptr: u64 = str.str_ptr;
-        var str_len: u64 = str.str_len;
-        var label_id: u64 = string_get_label(str_ptr, str_len);
+        var label_id: u64 = string_get_label(str.str_ptr, str.str_len);
         emit("    lea rax, [rel _str");
         emit_u64(label_id);
         emit("]\n");
-        return;
+        return 1;
     }
-    
-    if (kind == AST_IDENT) {
-        var ident: *AstIdent = (*AstIdent)node;
-        var name_ptr: u64 = ident.name_ptr;
-        var name_len: u64 = ident.name_len;
-        var var_type: *TypeInfo = symtab_get_type(symtab, name_ptr, name_len);
-        if (var_type != 0) {
-            var offset: u64 = symtab_find(symtab, name_ptr, name_len);
-            if (var_type.ptr_depth == 0) {
-                if (var_type.type_kind == TYPE_ARRAY) {
-                    emit("    lea rax, [rbp");
-                    emit_signed_disp(offset);
-                    emit("]\n");
-                    return;
-                }
-                if (var_type.type_kind == TYPE_SLICE) {
-                    emit("    mov rax, [rbp");
-                    emit_signed_disp(offset);
-                    emit("]\n");
-                    return;
-                }
-                if (var_type.type_kind == TYPE_U8) {
-                    emit("    movzx rax, byte [rbp");
-                    emit_signed_disp(offset);
-                    emit("]\n");
-                    return;
-                }
-                if (var_type.type_kind == TYPE_U16) {
-                    emit("    movzx rax, word [rbp");
-                    emit_signed_disp(offset);
-                    emit("]\n");
-                    return;
-                }
-                if (var_type.type_kind == TYPE_U32) {
-                    emit("    mov eax, [rbp");
-                    emit_signed_disp(offset);
-                    emit("]\n");
-                    return;
-                }
-            }
-        }
-
-        var resolved_ptr: u64 = name_ptr;
-        var resolved_len: u64 = name_len;
-        var resolved: *NameInfo = resolve_name(name_ptr, name_len);
-        if (resolved != 0) {
-            resolved_ptr = resolved.ptr;
-            resolved_len = resolved.len;
-        }
-
-        var result: ConstResult = const_find(resolved_ptr, resolved_len);
-        if (result.found == 1) {
-            emit("    mov rax, ");
-            emit_u64(result.value);
-            emit_nl();
-            return;
-        }
-
-        if (is_global_var(resolved_ptr, resolved_len)) {
-            var ginfo: *GlobalInfo = _cg_find_global_info(resolved_ptr, resolved_len);
-            if (ginfo != 0) {
-                var gt: *TypeInfo = ginfo.typeinfo_ptr;
-                if (gt != 0 && gt.ptr_depth == 0) {
-                    if (gt.type_kind == TYPE_ARRAY) {
-                        emit("    lea rax, [rel _gvar_");
-                        emit_len(resolved_ptr, resolved_len);
-                        emit("]\n");
-                        return;
-                    }
-                    if (gt.type_kind == TYPE_SLICE) {
-                        emit("    mov rax, [rel _gvar_");
-                        emit_len(resolved_ptr, resolved_len);
-                        emit("]\n");
-                        return;
-                    }
-                    if (gt.type_kind == TYPE_U8) {
-                        emit("    movzx rax, byte [rel _gvar_");
-                        emit_len(resolved_ptr, resolved_len);
-                        emit("]\n");
-                        return;
-                    }
-                    if (gt.type_kind == TYPE_U16) {
-                        emit("    movzx rax, word [rel _gvar_");
-                        emit_len(resolved_ptr, resolved_len);
-                        emit("]\n");
-                        return;
-                    }
-                    if (gt.type_kind == TYPE_U32) {
-                        emit("    mov eax, [rel _gvar_");
-                        emit_len(resolved_ptr, resolved_len);
-                        emit("]\n");
-                        return;
-                    }
-                }
-            }
-
-            emit("    mov rax, [rel _gvar_");
-            emit_len(resolved_ptr, resolved_len);
-            emit("]\n");
-            return;
-        }
-        
-        var offset: u64 = symtab_find(symtab, name_ptr, name_len);
-        emit("    mov rax, [rbp");
-        emit_signed_disp(offset);
-        emit("]\n");
-        return;
+    if (kind == AST_STRUCT_LITERAL) {
+        emit("    xor eax, eax\n");
+        return 1;
     }
-    
-    if (kind == AST_MEMBER_ACCESS) {
-        cg_member_access_expr(node, symtab);
-        return;
-    }
-
-    if (kind == AST_SAFE_MEMBER_ACCESS) {
-        cg_safe_member_access_expr(node, symtab);
-        return;
-    }
-    
-    if (kind == AST_BINARY) {
-        cg_binary_expr(node, symtab);
-        return;
-    }
-    
-    if (kind == AST_UNARY) {
-        var unary: *AstUnary = (*AstUnary)node;
-        var op: u64 = unary.op;
-        var operand: u64 = unary.operand;
-        
-        cg_expr(operand);
-        if (op == TOKEN_MINUS) {
-            var ot: *TypeInfo = get_expr_type_with_symtab((*AstNode)operand, symtab);
-            if (ot != 0 && ot.ptr_depth == 0 && ot.type_kind == TYPE_F64) {
-                emit("    mov rbx, 1\n");
-                emit("    mov rcx, 63\n");
-                emit("    shl rbx, cl\n");
-                emit("    movq xmm1, rbx\n");
-                emit("    movq xmm0, rax\n");
-                emit("    xorpd xmm0, xmm1\n");
-                emit("    movq rax, xmm0\n");
-                return;
-            }
-            emit("    neg rax\n");
-        }
-        else if (op == TOKEN_BANG) {
-            emit("    test rax, rax\n");
-            emit("    setz al\n");
-            emit("    movzx rax, al\n");
-        } else if (op == TOKEN_TILDE) {
-            emit("    not rax\n");
-        }
-        return;
-    }
-
-    if (kind == AST_TRY) {
-        cg_try_expr(node, symtab);
-        return;
-    }
-    
-    if (kind == AST_ADDR_OF) {
-        var addr_of: *AstAddrOf = (*AstAddrOf)node;
-        var operand: u64 = addr_of.operand;
-        if (ast_kind(operand) == AST_IDENT) {
-            var ident: *AstIdent = (*AstIdent)operand;
-            var name_ptr: u64 = ident.name_ptr;
-            var name_len: u64 = ident.name_len;
-            var offset: u64 = symtab_find(symtab, name_ptr, name_len);
-
-            if (offset != 0) {
-                emit("    lea rax, [rbp");
-                emit_signed_disp(offset);
-                emit("]\n");
-                return;
-            }
-
-            if (compiler_func_exists(name_ptr, name_len) != 0) {
-                var resolved_ptr: u64 = name_ptr;
-                var resolved_len: u64 = name_len;
-                var resolved: *NameInfo = resolve_name(name_ptr, name_len);
-                if (resolved != 0) {
-                    resolved_ptr = resolved.ptr;
-                    resolved_len = resolved.len;
-                }
-                emit("    lea rax, [rel ");
-                emit_len(resolved_ptr, resolved_len);
-                emit("]\n");
-                return;
-            }
-
-            if (compiler_global_exists(name_ptr, name_len) != 0) {
-                var resolved_ptr2: u64 = name_ptr;
-                var resolved_len2: u64 = name_len;
-                var resolved2: *NameInfo = resolve_name(name_ptr, name_len);
-                if (resolved2 != 0) {
-                    resolved_ptr2 = resolved2.ptr;
-                    resolved_len2 = resolved2.len;
-                }
-                emit("    lea rax, [rel _gvar_");
-                emit_len(resolved_ptr2, resolved_len2);
-                emit("]\n");
-                return;
-            }
-        }
-
-        cg_lvalue(operand);
-        return;
-    }
-    
-    if (kind == AST_DEREF) {
-        var deref: *AstDeref = (*AstDeref)node;
-        var operand: u64 = deref.operand;
-        cg_expr(operand);
-        
-        var type_info: *TypeInfo = get_expr_type_with_symtab((*AstNode)operand, symtab);
-        var base_type: u64 = type_info.type_kind;
-        var ptr_depth: u64 = type_info.ptr_depth;
-        if (ptr_depth > 0 && type_info.is_tagged == 1) {
-            emit_tagged_mask();
-        }
-        
-        if (ptr_depth == 1) {
-            if (base_type == TYPE_U8) {
-                emit("    movzx rax, byte [rax]\n");
-                return;
-            }
-            if (base_type == TYPE_U16) {
-                emit("    movzx rax, word [rax]\n");
-                return;
-            }
-            if (base_type == TYPE_U32) {
-                emit("    mov eax, [rax]\n");
-                return;
-            }
-        }
-        emit("    mov rax, [rax]\n");
-        return;
-    }
-    
-    if (kind == AST_DEREF8) {
-        var deref8: *AstDeref8 = (*AstDeref8)node;
-        var operand: u64 = deref8.operand;
-        cg_expr(operand);
-        var ti2: *TypeInfo = get_expr_type_with_symtab((*AstNode)operand, symtab);
-        if (ti2 != 0) {
-            if (ti2.ptr_depth > 0 && ti2.is_tagged == 1) {
-                emit_tagged_mask();
-            }
-        }
-        emit("    movzx rax, byte [rax]\n");
-        return;
-    }
-
-    if (kind == AST_INDEX) {
-        cg_index_addr(node, symtab);
-        var et: *TypeInfo = get_expr_type_with_symtab((*AstNode)node, symtab);
-        if (et != 0) {
-            if (et.ptr_depth == 0) {
-                if (et.type_kind == TYPE_U8) {
-                    emit("    movzx rax, byte [rax]\n");
-                    return;
-                }
-                if (et.type_kind == TYPE_U16) {
-                    emit("    movzx rax, word [rax]\n");
-                    return;
-                }
-                if (et.type_kind == TYPE_U32) {
-                    emit("    mov eax, [rax]\n");
-                    return;
-                }
-            }
-        }
-        emit("    mov rax, [rax]\n");
-        return;
-    }
-
     if (kind == AST_SLICE) {
         emit_stderr("[ERROR] Slice literal cannot be used as rvalue\n");
         panic("Codegen error");
+        return 1;
     }
-    
-    if (kind == AST_CAST) {
-        var cast: *AstCast = (*AstCast)node;
-        var expr: u64 = cast.expr;
-        if (cast.target_type == TYPE_TRAIT) {
-            var src_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)expr, symtab);
-            if (src_ti == 0 || src_ti.type_kind != TYPE_STRUCT || src_ti.ptr_depth == 0) {
-                emit_stderr("[ERROR] Trait cast requires struct pointer source\n");
-                panic("Codegen error");
-            }
-            var impl_info2: *TraitImpl = compiler_find_trait_impl(cast.struct_name_ptr, cast.struct_name_len, src_ti.struct_name_ptr, src_ti.struct_name_len);
-            if (impl_info2 == 0) {
-                emit_stderr("[ERROR] Struct does not implement trait for cast: ");
-                emit_stderr_len(cast.struct_name_ptr, cast.struct_name_len);
-                emit_stderr("\n");
-                panic("Codegen error");
-            }
-            var struct_def: *AstStructDef = get_struct_def(src_ti.struct_name_ptr, src_ti.struct_name_len);
-            var vptr_name: *NameInfo = compiler_build_vptr_field_name(cast.struct_name_ptr, cast.struct_name_len);
-            var field_offset: u64 = 0;
-            var field_desc: *FieldDesc = 0;
-            var found: u64 = struct_find_field_desc_scoped(struct_def, 0, 0, vptr_name.ptr, vptr_name.len, &field_offset, &field_desc);
-            if (found == 0) {
-                emit_stderr("[ERROR] vptr field not found for trait cast\n");
-                panic("Codegen error");
-            }
-            cg_expr(expr);
-            if (src_ti.is_tagged == 1) { emit_tagged_mask(); }
-            if (field_offset != 0) {
-                emit("    add rax, ");
-                emit_u64(field_offset);
-                emit_nl();
-            }
-            return;
-        }
-        if (cast.target_type == TYPE_STRUCT) {
-            var src_ti2: *TypeInfo = get_expr_type_with_symtab((*AstNode)expr, symtab);
-            if (src_ti2 != 0 && src_ti2.type_kind == TYPE_TRAIT && src_ti2.ptr_depth > 0) {
-                var impl2: *TraitImpl = compiler_find_trait_impl(src_ti2.struct_name_ptr, src_ti2.struct_name_len, cast.struct_name_ptr, cast.struct_name_len);
-                if (impl2 == 0) {
-                    emit_stderr("[ERROR] Trait cast target struct not implemented: ");
-                    emit_stderr_len(cast.struct_name_ptr, cast.struct_name_len);
-                    emit_stderr("\n");
-                    panic("Codegen error");
-                }
-                var struct_def2: *AstStructDef = get_struct_def(cast.struct_name_ptr, cast.struct_name_len);
-                var vptr_name2: *NameInfo = compiler_build_vptr_field_name(src_ti2.struct_name_ptr, src_ti2.struct_name_len);
-                var field_offset2: u64 = 0;
-                var field_desc2: *FieldDesc = 0;
-                var found2: u64 = struct_find_field_desc_scoped(struct_def2, 0, 0, vptr_name2.ptr, vptr_name2.len, &field_offset2, &field_desc2);
-                if (found2 == 0) {
-                    emit_stderr("[ERROR] vptr field not found for trait cast\n");
-                    panic("Codegen error");
-                }
-                cg_expr(expr);
-                if (field_offset2 != 0) {
-                    emit("    sub rax, ");
-                    emit_u64(field_offset2);
-                    emit_nl();
-                }
-                return;
-            }
-        }
-        cg_expr(expr);
-        return;
-    }
-    
-    if (kind == AST_SIZEOF) {
-        var sizeof_node: *AstSizeof = (*AstSizeof)node;
-        var type_kind: u64 = sizeof_node.type_kind;
-        var ptr_depth: u64 = sizeof_node.ptr_depth;
-        var struct_name_ptr: u64 = sizeof_node.struct_name_ptr;
-        var struct_name_len: u64 = sizeof_node.struct_name_len;
-        var size: u64 = 0;
-        if (type_kind == TYPE_ARRAY || type_kind == TYPE_SLICE) {
-            if (sizeof_node.array_len_is_param != 0) {
-                emit_stderr("[ERROR] sizeof array with unresolved generic length\n");
-                panic("Codegen error");
-            }
-            var ti_ptr: *TypeInfo = 0;
-            if (type_kind == TYPE_ARRAY) {
-                ti_ptr = typeinfo_make_array(ptr_depth, sizeof_node.elem_type_kind, sizeof_node.elem_ptr_depth, struct_name_ptr, struct_name_len, 0, sizeof_node.array_len);
-            } else {
-                ti_ptr = typeinfo_make_slice(ptr_depth, sizeof_node.elem_type_kind, sizeof_node.elem_ptr_depth, struct_name_ptr, struct_name_len, 0);
-            }
-            size = sizeof_type_ex(ti_ptr);
-        } else {
-            // Calculate size at compile time
-            size = sizeof_type(type_kind, ptr_depth, struct_name_ptr, struct_name_len);
-        }
-        
-        // Emit as literal constant
-        emit("    mov rax, ");
-        emit_u64(size);
-        emit_nl();
-        return;
-    }
+    return 0;
+}
 
-    if (kind == AST_SIZEOF_EXPR) {
-        var sz_expr: *AstSizeofExpr = (*AstSizeofExpr)node;
-        var ti_ptr: *TypeInfo = get_expr_type_with_symtab((*AstNode)sz_expr.expr, symtab);
-        var size_val: u64 = 8;
-        if (ti_ptr != 0) {
-            size_val = sizeof_type_ex(ti_ptr);
-        }
-        emit("    mov rax, ");
-        emit_u64(size_val);
-        emit_nl();
-        return;
-    }
+func cg_expr_dispatch_with_symtab(kind: u64, node: u64, symtab: *Symtab) -> u64 {
+    if (kind == AST_IDENT) { cg_expr_ident(node, symtab); return 1; }
+    if (kind == AST_MEMBER_ACCESS) { cg_member_access_expr(node, symtab); return 1; }
+    if (kind == AST_SAFE_MEMBER_ACCESS) { cg_safe_member_access_expr(node, symtab); return 1; }
+    if (kind == AST_BINARY) { cg_binary_expr(node, symtab); return 1; }
+    if (kind == AST_UNARY) { cg_expr_unary(node, symtab); return 1; }
+    if (kind == AST_TRY) { cg_try_expr(node, symtab); return 1; }
+    if (kind == AST_ADDR_OF) { cg_expr_addr_of(node, symtab); return 1; }
+    if (kind == AST_DEREF) { cg_expr_deref(node, symtab); return 1; }
+    if (kind == AST_DEREF8) { cg_expr_deref8(node, symtab); return 1; }
+    if (kind == AST_INDEX) { cg_expr_index(node, symtab); return 1; }
+    if (kind == AST_CAST) { cg_expr_cast(node, symtab); return 1; }
+    if (kind == AST_SIZEOF) { cg_expr_sizeof(node); return 1; }
+    if (kind == AST_SIZEOF_EXPR) { cg_expr_sizeof_expr(node, symtab); return 1; }
+    if (kind == AST_NEW) { cg_expr_new(node, symtab); return 1; }
+    if (kind == AST_CALL) { cg_expr_call(node, symtab); return 1; }
+    if (kind == AST_CALL_PTR) { cg_expr_call_ptr(node, symtab); return 1; }
+    if (kind == AST_METHOD_CALL) { cg_method_call(node, symtab); return 1; }
+    if (kind == AST_SAFE_METHOD_CALL) { cg_safe_method_call(node, symtab); return 1; }
+    if (kind == AST_STACK_CTOR) { cg_expr_stack_ctor(node, symtab); return 1; }
+    return 0;
+}
 
-    if (kind == AST_NEW) {
-        var nw: *AstNew = (*AstNew)node;
-        if (nw.array_len_is_param != 0) {
-            emit_stderr("[ERROR] new with unresolved generic array length\n");
-            panic("Codegen error");
-        }
-
-        var size: u64 = 0;
-        if (nw.type_kind == TYPE_ARRAY) {
-            var elem_size: u64 = sizeof_type(nw.elem_type_kind, nw.elem_ptr_depth, nw.struct_name_ptr, nw.struct_name_len);
-            size = elem_size * nw.array_len;
-        } else if (nw.type_kind == TYPE_SLICE) {
-            size = 16;
-        } else {
-            size = sizeof_type(nw.type_kind, nw.ptr_depth, nw.struct_name_ptr, nw.struct_name_len);
-        }
-
-        var malloc_ptr: u64 = (u64)"malloc";
-        var malloc_len: u64 = 6;
-        var malloc_res: *NameInfo = resolve_name(malloc_ptr, malloc_len);
-        if (malloc_res != 0) {
-            malloc_ptr = malloc_res.ptr;
-            malloc_len = malloc_res.len;
-        }
-
-        emit("    mov rdi, ");
-        emit_u64(size);
-        emit_nl();
-        emit("    call ");
-        emit_len(malloc_ptr, malloc_len);
-        emit_nl();
-        emit("    mov r12, rax\n");
-
-        var memset_ptr: u64 = (u64)"memset";
-        var memset_len: u64 = 6;
-        var memset_res: *NameInfo = resolve_name(memset_ptr, memset_len);
-        if (memset_res != 0) {
-            memset_ptr = memset_res.ptr;
-            memset_len = memset_res.len;
-        }
-
-        emit("    mov rdi, r12\n");
-        emit("    xor esi, esi\n");
-        emit("    mov rdx, ");
-        emit_u64(size);
-        emit_nl();
-        emit("    call ");
-        emit_len(memset_ptr, memset_len);
-        emit_nl();
-
-        if (nw.type_kind == TYPE_STRUCT) {
-            cg_emit_trait_vptr_init_at_r12(nw.struct_name_ptr, nw.struct_name_len);
-        }
-
-        if (nw.literal_expr != 0) {
-            if (ast_kind(nw.literal_expr) == AST_STRUCT_LITERAL) {
-                cg_struct_literal_init_ptr(nw.literal_expr);
-            }
-        }
-
-        if (nw.ctor_args_vec != 0) {
-            if (nw.type_kind != TYPE_STRUCT) {
-                emit_stderr("[ERROR] new constructor call requires struct type\n");
-                panic("Codegen error");
-            }
-
-            var method_ptr: u64 = (u64)"constructor";
-            var method_len: u64 = 11;
-            var base_len: u64 = compiler_find_generic_suffix_index(nw.struct_name_ptr, nw.struct_name_len);
-            var suffix_len: u64 = nw.struct_name_len - base_len;
-            var name_info: *NameInfo = compiler_build_method_name_base(nw.struct_name_ptr, base_len, method_ptr, method_len, suffix_len);
-            var call_ptr: u64 = name_info.ptr;
-            var call_len: u64 = name_info.len;
-            var resolved: *NameInfo = resolve_name(name_info.ptr, name_info.len);
-            if (resolved != 0) {
-                call_ptr = resolved.ptr;
-                call_len = resolved.len;
-            }
-
-            if (compiler_func_exists(name_info.ptr, name_info.len) == 0) {
-                var alt_info: *NameInfo = compiler_build_method_name_base(nw.struct_name_ptr, base_len, method_ptr, method_len, 0);
-                var alt_call_ptr: u64 = alt_info.ptr;
-                var alt_call_len: u64 = alt_info.len;
-                var alt_res: *NameInfo = resolve_name(alt_info.ptr, alt_info.len);
-                if (alt_res != 0) {
-                    alt_call_ptr = alt_res.ptr;
-                    alt_call_len = alt_res.len;
-                }
-
-                if (compiler_func_exists(alt_info.ptr, alt_info.len) == 0) {
-                    emit_stderr("[ERROR] constructor not found for new\n");
-                    emit_stderr_len(nw.struct_name_ptr, nw.struct_name_len);
-                    emit_stderr("\n");
-                    panic("Codegen error");
-                }
-
-                call_ptr = alt_call_ptr;
-                call_len = alt_call_len;
-            }
-
-            var args: *Vec<*AstNode> = nw.ctor_args_vec;
-            var nargs: u64 = args.len();
-            var total_arg_words: u64 = 0;
-            if (nargs != 0) {
-                var ai: u64 = nargs;
-                while (ai > 0) {
-                    ai = ai - 1;
-                    var arg: *AstNode = args.get(ai);
-                    total_arg_words = total_arg_words + _cg_sysv_push_call_arg(arg, symtab);
-                }
-            }
-            emit("    push r12\n");
-            total_arg_words = total_arg_words + 1;
-            var stack_words: u64 = _cg_sysv_pop_arg_regs(total_arg_words);
-
-            emit("    call ");
-            emit_len(call_ptr, call_len);
-            emit_nl();
-
-            if (stack_words > 0) {
-                emit("    add rsp, ");
-                emit_u64(stack_words * 8);
-                emit_nl();
-            }
-        }
-
-        emit("    mov rax, r12\n");
-        return;
-    }
-    
-    if (kind == AST_CALL) {
-        var call: *AstCall = (*AstCall)node;
-        var name_ptr: u64 = call.name_ptr;
-        var name_len: u64 = call.name_len;
-        var resolved_ptr: u64 = name_ptr;
-        var resolved_len: u64 = name_len;
-        var resolved: *NameInfo = resolve_name(name_ptr, name_len);
-        if (resolved != 0) {
-            resolved_ptr = resolved.ptr;
-            resolved_len = resolved.len;
-        }
-        var var_type: *TypeInfo = symtab_get_type(symtab, name_ptr, name_len);
-        var is_global: u64 = is_global_var(resolved_ptr, resolved_len);
-        if (var_type != 0 || is_global != 0) {
-            var args2: *Vec<*AstNode> = call.args_vec;
-            var nargs2: u64 = 0;
-            if (args2 != 0) { nargs2 = args2.len(); }
-
-            if (var_type != 0) {
-                var offset2: u64 = symtab_find(symtab, name_ptr, name_len);
-                emit("    mov rax, [rbp");
-                emit_signed_disp(offset2);
-                emit("]\n");
-            } else {
-                emit("    mov rax, [rel _gvar_");
-                emit_len(resolved_ptr, resolved_len);
-                emit("]\n");
-            }
-            emit("    push rax\n");
-
-            var total_arg_words2: u64 = 0;
-            if (nargs2 != 0) {
-                var i2: u64 = nargs2;
-                while (i2 > 0) {
-                    i2 = i2 - 1;
-                    var arg2: *AstNode = args2.get(i2);
-                    total_arg_words2 = total_arg_words2 + _cg_sysv_push_call_arg(arg2, symtab);
-                }
-            }
-            var stack_words2: u64 = _cg_sysv_pop_arg_regs(total_arg_words2);
-
-            emit("    pop rax\n");
-            emit("    call rax\n");
-
-            if (stack_words2 > 0) {
-                emit("    add rsp, ");
-                emit_u64(stack_words2 * 8);
-                emit_nl();
-            }
-            return;
-        }
-        var args: *Vec<*AstNode> = call.args_vec;
-        var nargs: u64 = 0;
-        if (args != 0) { nargs = args.len(); }
-        var total_arg_words: u64 = 0;
-        if (nargs != 0) {
-            var i: u64 = nargs;
-            while (i > 0) {
-                i = i - 1;
-                var arg: *AstNode = args.get(i);
-                total_arg_words = total_arg_words + _cg_sysv_push_call_arg(arg, symtab);
-            }
-        }
-        var stack_words: u64 = _cg_sysv_pop_arg_regs(total_arg_words);
-
-        emit("    call ");
-        emit_len(resolved_ptr, resolved_len);
-        emit_nl();
-        
-        if (stack_words > 0) {
-            emit("    add rsp, ");
-            emit_u64(stack_words * 8);
-            emit_nl();
-        }
-        return;
-    }
-
-    if (kind == AST_CALL_PTR) {
-        var cp: *AstCallPtr = (*AstCallPtr)node;
-        var args3: *Vec<*AstNode> = cp.args_vec;
-        var nargs3: u64 = 0;
-        if (args3 != 0) { nargs3 = args3.len(); }
-
-        // Preserve callee address across arg evaluation.
-        cg_expr(cp.callee);
-        emit("    push rax\n");
-
-        var total_arg_words3: u64 = 0;
-        if (nargs3 != 0) {
-            var i3: u64 = nargs3;
-            while (i3 > 0) {
-                i3 = i3 - 1;
-                var arg3: *AstNode = args3.get(i3);
-                total_arg_words3 = total_arg_words3 + _cg_sysv_push_call_arg(arg3, symtab);
-            }
-        }
-        var stack_words3: u64 = _cg_sysv_pop_arg_regs(total_arg_words3);
-
-        emit("    pop rax\n");
-        emit("    call rax\n");
-
-        if (stack_words3 > 0) {
-            emit("    add rsp, ");
-            emit_u64(stack_words3 * 8);
-            emit_nl();
-        }
-        return;
-    }
-    
-    if (kind == AST_METHOD_CALL) {
-        cg_method_call(node, symtab);
-        return;
-    }
-
-    if (kind == AST_SAFE_METHOD_CALL) {
-        cg_safe_method_call(node, symtab);
-        return;
-    }
-    
-    if (kind == AST_STRUCT_LITERAL) {
-        // Struct literals should only appear in var initializers (handled in cg_stmt)
-        emit("    xor eax, eax\n");
-        return;
-    }
-
-    if (kind == AST_STACK_CTOR) {
-        var sc: *AstStackCtor = (*AstStackCtor)node;
-        var sc_ti: *TypeInfo = get_expr_type_with_symtab(node, symtab);
-        if (sc_ti == 0 || sc_ti.type_kind != TYPE_STRUCT || sc_ti.ptr_depth != 0) {
-            emit_stderr("[ERROR] stack constructor expression requires struct value\n");
-            panic("Codegen error");
-        }
-        var sc_size: u64 = sizeof_type(TYPE_STRUCT, 0, sc_ti.struct_name_ptr, sc_ti.struct_name_len);
-        var tmp_offset_expr: u64 = cg_alloc_tmp_struct(symtab, sc_size);
-        cg_stack_ctor_init_to_offset(sc, tmp_offset_expr, symtab);
-        if (sc_size <= 8) {
-            emit("    mov rax, [rbp");
-            emit_signed_disp(tmp_offset_expr);
-            emit("]\n");
-            return;
-        } else if (sc_size <= 16) {
-            emit("    mov rax, [rbp");
-            emit_signed_disp(tmp_offset_expr);
-            emit("]\n");
-            emit("    mov rdx, [rbp");
-            var tmp_expr_hi: u64 = tmp_offset_expr + 8;
-            emit_signed_disp(tmp_expr_hi);
-            emit("]\n");
-            return;
-        }
-        emit_stderr("[ERROR] stack constructor expression requires destination for large structs\n");
-        panic("Codegen error");
-    }
+func cg_expr(node: u64) -> u64 {
+    var kind: u64 = ast_kind(node);
+    if (cg_expr_try_immediate(kind, node) != 0) { return; }
+    var symtab: *Symtab = emitter_get_symtab();
+    cg_expr_dispatch_with_symtab(kind, node, symtab);
 }
 
 func cg_struct_literal_init_ptr(init: u64) -> u64 {
@@ -1647,248 +1692,167 @@ func cg_safe_member_access_expr(node: u64, symtab: *Symtab) -> u64 {
     return 0;
 }
 
-func cg_member_access_expr(node: u64, symtab: *Symtab) -> u64 {
-    var member_access: *AstMemberAccess = (*AstMemberAccess)node;
-    var object: u64 = member_access.object;
-    var member_ptr: u64 = member_access.member_ptr;
-    var member_len: u64 = member_access.member_len;
-    var parent_ptr: u64 = member_access.parent_ptr;
-    var parent_len: u64 = member_access.parent_len;
-    
-    var ot: *TypeInfo = get_expr_type_with_symtab((*AstNode)object, symtab);
-    if (ot != 0) {
-        if (ot.ptr_depth > 0 && ot.is_tagged == 1 && ot.tag_layout_ptr != 0) {
-            var layout_info: *AstStructDef = cg_require_tagged_layout_struct(ot.tag_layout_ptr, ot.tag_layout_len);
-            cg_expr(object);
-            cg_emit_tagged_layout_extract_from_rax(layout_info, member_ptr, member_len);
-            return;
-        }
-        if (ot.ptr_depth > 0 && ot.type_kind == TYPE_STRUCT) {
-            cg_expr(object);
-            if (ot.is_tagged == 1) {
-                emit_tagged_mask();
-            }
-
-            var struct_def_ptr: *AstStructDef = ot.struct_def;
-            if (struct_def_ptr == 0) {
-                emit("    ; ERROR: Struct definition not found for pointer type\n");
-                return;
-            }
-
-            var field_offset_ptr: u64 = 0;
-            var field_desc_ptr: *FieldDesc = 0;
-            var found_ptr: u64 = struct_find_field_desc_scoped(struct_def_ptr, parent_ptr, parent_len, member_ptr, member_len, &field_offset_ptr, &field_desc_ptr);
-            if (found_ptr == 0) { return; }
-            if (field_offset_ptr > 0) {
-                emit("    add rax, ");
-                emit_u64(field_offset_ptr);
-                emit("\n");
-            }
-            if (field_desc_ptr == 0) { return; }
-            var fd_ptr: *FieldDesc = field_desc_ptr;
-            if (fd_ptr.type_kind == TYPE_ARRAY) { return; }
-            cg_emit_field_load_from_rax(fd_ptr);
-            return;
-        }
-        if (ot.ptr_depth == 0 && ot.type_kind == TYPE_STRUCT && ot.struct_def != 0) {
-            var struct_info: *AstStructDef = ot.struct_def;
-            var packed_flag2: u64 = struct_info.is_packed;
-            if (packed_flag2 == 1) {
-                var total_bits2: u64 = get_packed_layout_total_bits(struct_info);
-                var field_offset2: u64 = get_packed_field_bit_offset(struct_info, member_ptr, member_len);
-                var field_width2: u64 = get_packed_field_bit_width(struct_info, member_ptr, member_len);
-                var shift_bits2: u64 = field_offset2;
-                var size_bytes2: u64 = (total_bits2 + 7) / 8;
-
-                if (total_bits2 > 64 || (field_offset2 + field_width2) > 64) {
-                    var byte_offset2: u64 = field_offset2 / 8;
-                    var bit_shift2: u64 = field_offset2 % 8;
-                    var byte_width2: u64 = (field_width2 + 7) / 8;
-
-                    cg_lvalue(object);
-                    if (byte_offset2 > 0) {
-                        emit("    add rax, ");
-                        emit_u64(byte_offset2);
-                        emit("\n");
-                    }
-
-                    if (byte_width2 == 1) {
-                        emit("    movzx rax, byte [rax]\n");
-                    } else if (byte_width2 == 2) {
-                        emit("    movzx rax, word [rax]\n");
-                    } else if (byte_width2 == 4) {
-                        emit("    mov eax, [rax]\n");
-                    } else {
-                        emit("    mov rax, [rax]\n");
-                    }
-
-                    if (bit_shift2 > 0) {
-                        emit("    mov rcx, ");
-                        emit_u64(bit_shift2);
-                        emit_nl();
-                        emit("    shr rax, cl\n");
-                    }
-                    if (field_width2 < 64) {
-                        emit_mask_to_rdx(field_width2);
-                        emit("    and rax, rdx\n");
-                    }
-                    return;
-                }
-
-                cg_lvalue(object);
-                if (size_bytes2 == 1) {
-                    emit("    movzx rax, byte [rax]\n");
-                } else if (size_bytes2 == 2) {
-                    emit("    movzx rax, word [rax]\n");
-                } else if (size_bytes2 == 4) {
-                    emit("    mov eax, [rax]\n");
-                } else {
-                    emit("    mov rax, [rax]\n");
-                }
-                if (shift_bits2 > 0) {
-                    emit("    mov rcx, ");
-                    emit_u64(shift_bits2);
-                    emit_nl();
-                    emit("    shr rax, cl\n");
-                }
-                if (field_width2 < 64) {
-                    emit_mask_to_rdx(field_width2);
-                    emit("    and rax, rdx\n");
-                }
-                return;
-            }
-        }
+func cg_member_load_sized_at_rax(size_bytes: u64) -> u64 {
+    if (size_bytes == 1) {
+        emit("    movzx rax, byte [rax]\n");
+        return 0;
     }
-
-    var obj_kind: u64 = ast_kind(object);
-    
-    // Handle ptr.field (object is AST_DEREF)
-    if (obj_kind == AST_DEREF) {
-        var deref_obj: *AstDeref = (*AstDeref)object;
-        var ptr_expr: u64 = deref_obj.operand;
-        
-        // Evaluate pointer expression to get pointer value
-        cg_expr(ptr_expr);
-        
-        // Get pointer type to find struct_def
-        var ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)ptr_expr, symtab);
-        if (ti == 0) {
-            emit("    ; ERROR: Cannot determine pointer type in arrow operator\n");
-            return;
-        }
-
-        var base_type: u64 = ti.type_kind;
-        var ptr_depth: u64 = ti.ptr_depth;
-        if (ptr_depth > 0 && ti.is_tagged == 1) {
-            emit_tagged_mask();
-        }
-        emit("    push rax\n");
-        
-        if (ptr_depth == 0 || base_type != TYPE_STRUCT) {
-            emit("    ; ERROR: Arrow operator requires pointer to struct\n");
-            return;
-        }
-        
-        // Get struct_def from pointer's base type
-        var struct_def: *AstStructDef = ti.struct_def;
-        if (struct_def == 0) {
-            emit("    ; ERROR: Struct definition not found for pointer type\n");
-            return;
-        }
-        
-        var field_offset: u64 = 0;
-        var field_desc: *FieldDesc = 0;
-        var found_field: u64 = struct_find_field_desc_scoped(struct_def, parent_ptr, parent_len, member_ptr, member_len, &field_offset, &field_desc);
-        if (found_field == 0) { return; }
-        
-        // Pop pointer value, add field offset
-        emit("    pop rax\n");
-        if (field_offset > 0) {
-            emit("    add rax, ");
-            emit_u64(field_offset);
-            emit("\n");
-        }
-        if (field_desc == 0) { return; }
-        var fd: *FieldDesc = field_desc;
-        if (fd.type_kind == TYPE_ARRAY) { return; }
-        cg_emit_field_load_from_rax(fd);
-        return;
+    if (size_bytes == 2) {
+        emit("    movzx rax, word [rax]\n");
+        return 0;
     }
-    
-    // Handle nested member access: outer.inner.field
-    if (obj_kind == AST_MEMBER_ACCESS) {
-        var nt: *TypeInfo = get_expr_type_with_symtab((*AstNode)object, symtab);
-        if (nt == 0) {
-            emit("    ; ERROR: Nested member access type not found\n");
-            return;
-        }
-        if (nt.type_kind != TYPE_STRUCT || nt.struct_def == 0) {
-            emit("    ; ERROR: Nested member access on non-struct\n");
-            return;
-        }
+    if (size_bytes == 4) {
+        emit("    mov eax, [rax]\n");
+        return 0;
+    }
+    emit("    mov rax, [rax]\n");
+    return 0;
+}
 
-        var field_offset_n: u64 = 0;
-        var field_desc_n: *FieldDesc = 0;
-        var found_n: u64 = struct_find_field_desc_scoped(nt.struct_def, parent_ptr, parent_len, member_ptr, member_len, &field_offset_n, &field_desc_n);
-        if (found_n == 0) { return; }
+func cg_member_emit_load_or_deref(field_desc: *FieldDesc, load_when_missing: u64) -> u64 {
+    if (field_desc == 0) {
+        if (load_when_missing != 0) {
+            emit("    mov rax, [rax]\n");
+        }
+        return 1;
+    }
+    if (field_desc.type_kind == TYPE_ARRAY) { return 1; }
+    cg_emit_field_load_from_rax(field_desc);
+    return 1;
+}
+
+func cg_member_emit_struct_field_at_rax(struct_def: *AstStructDef, parent_ptr: u64, parent_len: u64, member_ptr: u64, member_len: u64, load_when_missing: u64) -> u64 {
+    var field_offset: u64 = 0;
+    var field_desc: *FieldDesc = 0;
+    var found: u64 = struct_find_field_desc_scoped(struct_def, parent_ptr, parent_len, member_ptr, member_len, &field_offset, &field_desc);
+    if (found == 0) { return 0; }
+    cg_member_add_offset_to_rax(field_offset);
+    cg_member_emit_load_or_deref(field_desc, load_when_missing);
+    return 1;
+}
+
+func cg_member_expr_tagged_layout(object: u64, ot: *TypeInfo, member_ptr: u64, member_len: u64) -> u64 {
+    var layout_info: *AstStructDef = cg_require_tagged_layout_struct(ot.tag_layout_ptr, ot.tag_layout_len);
+    cg_expr(object);
+    cg_emit_tagged_layout_extract_from_rax(layout_info, member_ptr, member_len);
+    return 0;
+}
+
+func cg_member_expr_ptr_struct(object: u64, ot: *TypeInfo, parent_ptr: u64, parent_len: u64, member_ptr: u64, member_len: u64) -> u64 {
+    cg_expr(object);
+    if (ot.is_tagged == 1) {
+        emit_tagged_mask();
+    }
+    var struct_def_ptr: *AstStructDef = ot.struct_def;
+    if (struct_def_ptr == 0) {
+        emit("    ; ERROR: Struct definition not found for pointer type\n");
+        return 0;
+    }
+    cg_member_emit_struct_field_at_rax(struct_def_ptr, parent_ptr, parent_len, member_ptr, member_len, 0);
+    return 0;
+}
+
+func cg_member_expr_packed_struct(object: u64, struct_info: *AstStructDef, member_ptr: u64, member_len: u64) -> u64 {
+    var total_bits: u64 = get_packed_layout_total_bits(struct_info);
+    var field_offset: u64 = get_packed_field_bit_offset(struct_info, member_ptr, member_len);
+    var field_width: u64 = get_packed_field_bit_width(struct_info, member_ptr, member_len);
+    var size_bytes: u64 = (total_bits + 7) / 8;
+
+    if (total_bits > 64 || (field_offset + field_width) > 64) {
+        var byte_offset: u64 = field_offset / 8;
+        var bit_shift: u64 = field_offset % 8;
+        var byte_width: u64 = (field_width + 7) / 8;
 
         cg_lvalue(object);
-        if (field_offset_n > 0) {
-            emit("    add rax, ");
-            emit_u64(field_offset_n);
-            emit("\n");
-        }
+        cg_member_add_offset_to_rax(byte_offset);
+        cg_member_load_sized_at_rax(byte_width);
 
-        if (field_desc_n != 0) {
-            var fdn: *FieldDesc = field_desc_n;
-            if (fdn.type_kind == TYPE_ARRAY) { return; }
-            cg_emit_field_load_from_rax(fdn);
-            return;
+        if (bit_shift > 0) {
+            emit("    mov rcx, ");
+            emit_u64(bit_shift);
+            emit_nl();
+            emit("    shr rax, cl\n");
         }
-        emit("    mov rax, [rax]\n");
-        return;
+        if (field_width < 64) {
+            emit_mask_to_rdx(field_width);
+            emit("    and rax, rdx\n");
+        }
+        return 0;
     }
 
-    // Handle indexed member access: arr[i].field
-    if (obj_kind == AST_INDEX) {
-        var it: *TypeInfo = get_expr_type_with_symtab((*AstNode)object, symtab);
-        if (it == 0) {
-            emit("    ; ERROR: Indexed member access type not found\n");
-            return;
-        }
-        if (it.type_kind != TYPE_STRUCT || it.struct_def == 0) {
-            emit("    ; ERROR: Indexed member access on non-struct\n");
-            return;
-        }
-
-        var idx_field_offset: u64 = 0;
-        var idx_field_desc: *FieldDesc = 0;
-        var found_idx: u64 = struct_find_field_desc_scoped(it.struct_def, parent_ptr, parent_len, member_ptr, member_len, &idx_field_offset, &idx_field_desc);
-        if (found_idx == 0) { return; }
-
-        cg_lvalue(object);
-        if (idx_field_offset > 0) {
-            emit("    add rax, ");
-            emit_u64(idx_field_offset);
-            emit("\n");
-        }
-
-        if (idx_field_desc != 0) {
-            var ifd: *FieldDesc = idx_field_desc;
-            if (ifd.type_kind == TYPE_ARRAY) { return; }
-            cg_emit_field_load_from_rax(ifd);
-            return;
-        }
-        emit("    mov rax, [rax]\n");
-        return;
+    cg_lvalue(object);
+    cg_member_load_sized_at_rax(size_bytes);
+    if (field_offset > 0) {
+        emit("    mov rcx, ");
+        emit_u64(field_offset);
+        emit_nl();
+        emit("    shr rax, cl\n");
     }
-    
-    // Handle obj.field (object is AST_IDENT)
-    if (obj_kind != AST_IDENT) {
-        emit("    ; ERROR: Member access on non-identifier\n");
-        return;
+    if (field_width < 64) {
+        emit_mask_to_rdx(field_width);
+        emit("    and rax, rdx\n");
     }
-    
+    return 0;
+}
+
+func cg_member_expr_deref(object: u64, symtab: *Symtab, parent_ptr: u64, parent_len: u64, member_ptr: u64, member_len: u64) -> u64 {
+    var deref_obj: *AstDeref = (*AstDeref)object;
+    var ptr_expr: u64 = deref_obj.operand;
+
+    cg_expr(ptr_expr);
+
+    var ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)ptr_expr, symtab);
+    if (ti == 0) {
+        emit("    ; ERROR: Cannot determine pointer type in arrow operator\n");
+        return 0;
+    }
+    if (ti.ptr_depth > 0 && ti.is_tagged == 1) {
+        emit_tagged_mask();
+    }
+    if (ti.ptr_depth == 0 || ti.type_kind != TYPE_STRUCT) {
+        emit("    ; ERROR: Arrow operator requires pointer to struct\n");
+        return 0;
+    }
+    var struct_def: *AstStructDef = ti.struct_def;
+    if (struct_def == 0) {
+        emit("    ; ERROR: Struct definition not found for pointer type\n");
+        return 0;
+    }
+    cg_member_emit_struct_field_at_rax(struct_def, parent_ptr, parent_len, member_ptr, member_len, 0);
+    return 0;
+}
+
+func cg_member_expr_nested(object: u64, symtab: *Symtab, parent_ptr: u64, parent_len: u64, member_ptr: u64, member_len: u64) -> u64 {
+    var nt: *TypeInfo = get_expr_type_with_symtab((*AstNode)object, symtab);
+    if (nt == 0) {
+        emit("    ; ERROR: Nested member access type not found\n");
+        return 0;
+    }
+    if (nt.type_kind != TYPE_STRUCT || nt.struct_def == 0) {
+        emit("    ; ERROR: Nested member access on non-struct\n");
+        return 0;
+    }
+    cg_lvalue(object);
+    cg_member_emit_struct_field_at_rax(nt.struct_def, parent_ptr, parent_len, member_ptr, member_len, 1);
+    return 0;
+}
+
+func cg_member_expr_indexed(object: u64, symtab: *Symtab, parent_ptr: u64, parent_len: u64, member_ptr: u64, member_len: u64) -> u64 {
+    var it: *TypeInfo = get_expr_type_with_symtab((*AstNode)object, symtab);
+    if (it == 0) {
+        emit("    ; ERROR: Indexed member access type not found\n");
+        return 0;
+    }
+    if (it.type_kind != TYPE_STRUCT || it.struct_def == 0) {
+        emit("    ; ERROR: Indexed member access on non-struct\n");
+        return 0;
+    }
+    cg_lvalue(object);
+    cg_member_emit_struct_field_at_rax(it.struct_def, parent_ptr, parent_len, member_ptr, member_len, 1);
+    return 0;
+}
+
+func cg_member_expr_ident(object: u64, symtab: *Symtab, parent_ptr: u64, parent_len: u64, member_ptr: u64, member_len: u64) -> u64 {
     var obj_ident: *AstIdent = (*AstIdent)object;
     var obj_name_ptr: u64 = obj_ident.name_ptr;
     var obj_name_len: u64 = obj_ident.name_len;
@@ -1900,6 +1864,7 @@ func cg_member_access_expr(node: u64, symtab: *Symtab) -> u64 {
         resolved_ptr = resolved.ptr;
         resolved_len = resolved.len;
     }
+
     var ginfo: *GlobalInfo = _cg_find_global_info(resolved_ptr, resolved_len);
     if (ginfo == 0 && (resolved_ptr != obj_name_ptr || resolved_len != obj_name_len)) {
         ginfo = _cg_find_global_info(obj_name_ptr, obj_name_len);
@@ -1915,195 +1880,160 @@ func cg_member_access_expr(node: u64, symtab: *Symtab) -> u64 {
         }
         if (struct_def_g == 0) {
             emit("    ; ERROR: Struct definition not found in global lvalue\n");
-            return;
+            return 0;
         }
-        var field_offset_g: u64 = 0;
-        var field_desc_g: *FieldDesc = 0;
-        var found_g: u64 = struct_find_field_desc_scoped(struct_def_g, parent_ptr, parent_len, member_ptr, member_len, &field_offset_g, &field_desc_g);
-        if (found_g == 0) { return; }
         emit("    lea rax, [rel _gvar_");
         emit_len(resolved_ptr, resolved_len);
         emit("]\n");
-        if (field_offset_g > 0) {
-            emit("    add rax, ");
-            emit_u64(field_offset_g);
-            emit("\n");
-        }
-        if (field_desc_g != 0) {
-            var fdg: *FieldDesc = field_desc_g;
-            if (fdg.type_kind == TYPE_ARRAY) { return; }
-            cg_emit_field_load_from_rax(fdg);
-            return;
-        }
-        emit("    mov rax, [rax]\n");
-        return;
+        cg_member_emit_struct_field_at_rax(struct_def_g, parent_ptr, parent_len, member_ptr, member_len, 1);
+        return 0;
     }
-    
-    // Get variable info from symtab
+
     var var_offset: u64 = symtab_find(symtab, obj_name_ptr, obj_name_len);
     var var_ti: *TypeInfo = symtab_get_type(symtab, obj_name_ptr, obj_name_len);
-    var type_kind: u64 = var_ti.type_kind;
-    
-    if (type_kind != TYPE_STRUCT) {
-        emit("    ; ERROR: Member access on non-struct type\n");
-        return;
+    if (var_ti == 0) {
+        emit("    ; ERROR: Member access type not found in symtab\n");
+        return 0;
     }
-    
-    // Get struct_def directly from type_info
+    if (var_ti.type_kind != TYPE_STRUCT) {
+        emit("    ; ERROR: Member access on non-struct type\n");
+        return 0;
+    }
+
     var struct_def: *AstStructDef = var_ti.struct_def;
-    
     if (struct_def == 0) {
         emit("    ; ERROR: Struct definition not found in type_info\n");
-        return;
+        return 0;
     }
-    
-    var field_offset: u64 = 0;
-    var field_desc: *FieldDesc = 0;
-    var found_local: u64 = struct_find_field_desc_scoped(struct_def, parent_ptr, parent_len, member_ptr, member_len, &field_offset, &field_desc);
-    if (found_local == 0) { return; }
-    
-    // Calculate address: lea rax, [rbp + var_offset + field_offset]
+
     emit("    lea rax, [rbp");
-    var total_offset: u64 = var_offset + field_offset;
-    emit_signed_disp(total_offset);
+    emit_signed_disp(var_offset);
     emit("]\n");
-    
-    if (field_desc != 0) {
-        var fd3: *FieldDesc = field_desc;
-        if (fd3.type_kind == TYPE_ARRAY) { return; }
-        cg_emit_field_load_from_rax(fd3);
+    cg_member_emit_struct_field_at_rax(struct_def, parent_ptr, parent_len, member_ptr, member_len, 1);
+    return 0;
+}
+
+func cg_member_access_expr(node: u64, symtab: *Symtab) -> u64 {
+    var member_access: *AstMemberAccess = (*AstMemberAccess)node;
+    var object: u64 = member_access.object;
+    var member_ptr: u64 = member_access.member_ptr;
+    var member_len: u64 = member_access.member_len;
+    var parent_ptr: u64 = member_access.parent_ptr;
+    var parent_len: u64 = member_access.parent_len;
+
+    var ot: *TypeInfo = get_expr_type_with_symtab((*AstNode)object, symtab);
+    if (ot != 0) {
+        if (ot.ptr_depth > 0 && ot.is_tagged == 1 && ot.tag_layout_ptr != 0) {
+            cg_member_expr_tagged_layout(object, ot, member_ptr, member_len);
+            return;
+        }
+        if (ot.ptr_depth > 0 && ot.type_kind == TYPE_STRUCT) {
+            cg_member_expr_ptr_struct(object, ot, parent_ptr, parent_len, member_ptr, member_len);
+            return;
+        }
+        if (ot.ptr_depth == 0 && ot.type_kind == TYPE_STRUCT && ot.struct_def != 0 && ot.struct_def.is_packed == 1) {
+            cg_member_expr_packed_struct(object, ot.struct_def, member_ptr, member_len);
+            return;
+        }
+    }
+
+    var obj_kind: u64 = ast_kind(object);
+    if (obj_kind == AST_DEREF) {
+        cg_member_expr_deref(object, symtab, parent_ptr, parent_len, member_ptr, member_len);
         return;
     }
-    emit("    mov rax, [rax]\n");
+    if (obj_kind == AST_MEMBER_ACCESS) {
+        cg_member_expr_nested(object, symtab, parent_ptr, parent_len, member_ptr, member_len);
+        return;
+    }
+    if (obj_kind == AST_INDEX) {
+        cg_member_expr_indexed(object, symtab, parent_ptr, parent_len, member_ptr, member_len);
+        return;
+    }
+    if (obj_kind == AST_IDENT) {
+        cg_member_expr_ident(object, symtab, parent_ptr, parent_len, member_ptr, member_len);
+        return;
+    }
+
+    emit("    ; ERROR: Member access on non-identifier\n");
 }
 
 // ============================================
 // Binary Expression
 // ============================================
 
-func cg_binary_expr(node: u64, symtab: *Symtab) -> u64 {
-    var binary: *AstBinary = (*AstBinary)node;
-    var op: u64 = binary.op;
-    var left: u64 = binary.left;
-    var right: u64 = binary.right;
+func cg_binary_short_circuit_and(left: u64, right: u64) -> u64 {
+    var l_false: u64 = new_label();
+    var l_end: u64 = new_label();
 
-    // Short-circuit evaluation for && and ||
-    if (op == TOKEN_ANDAND) {
-        var l_false: u64 = new_label();
-        var l_end: u64 = new_label();
-
-        cg_expr(left);
-        emit("    test rax, rax\n");
-        emit("    jz ");
-        emit_label(l_false);
-        emit("\n");
-
-        cg_expr(right);
-        emit("    test rax, rax\n");
-        emit("    setne al\n");
-        emit("    movzx rax, al\n");
-        emit("    jmp ");
-        emit_label(l_end);
-        emit("\n");
-
-        emit_label_def(l_false);
-        emit("    xor eax, eax\n");
-        emit_label_def(l_end);
-        return;
-    }
-
-    if (op == TOKEN_OROR) {
-        var l_true: u64 = new_label();
-        var l_end: u64 = new_label();
-
-        cg_expr(left);
-        emit("    test rax, rax\n");
-        emit("    jnz ");
-        emit_label(l_true);
-        emit("\n");
-
-        cg_expr(right);
-        emit("    test rax, rax\n");
-        emit("    setne al\n");
-        emit("    movzx rax, al\n");
-        emit("    jmp ");
-        emit_label(l_end);
-        emit("\n");
-
-        emit_label_def(l_true);
-        emit("    mov eax, 1\n");
-        emit_label_def(l_end);
-        return;
-    }
-    
-    // Standard binary: evaluate both sides
     cg_expr(left);
-    emit("    push rax\n");
-    cg_expr(right);
-    emit("    mov rbx, rax\n");
-    emit("    pop rax\n");
+    emit("    test rax, rax\n");
+    emit("    jz ");
+    emit_label(l_false);
+    emit("\n");
 
-    var left_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)left, symtab);
-    var right_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)right, symtab);
-    var is_float: u64 = 0;
-    if (left_ti != 0 && right_ti != 0) {
-        if (left_ti.ptr_depth == 0 && right_ti.ptr_depth == 0 && left_ti.type_kind == TYPE_F64 && right_ti.type_kind == TYPE_F64) {
-            is_float = 1;
-        }
+    cg_expr(right);
+    emit("    test rax, rax\n");
+    emit("    setne al\n");
+    emit("    movzx rax, al\n");
+    emit("    jmp ");
+    emit_label(l_end);
+    emit("\n");
+
+    emit_label_def(l_false);
+    emit("    xor eax, eax\n");
+    emit_label_def(l_end);
+    return;
+}
+
+func cg_binary_short_circuit_or(left: u64, right: u64) -> u64 {
+    var l_true: u64 = new_label();
+    var l_end: u64 = new_label();
+
+    cg_expr(left);
+    emit("    test rax, rax\n");
+    emit("    jnz ");
+    emit_label(l_true);
+    emit("\n");
+
+    cg_expr(right);
+    emit("    test rax, rax\n");
+    emit("    setne al\n");
+    emit("    movzx rax, al\n");
+    emit("    jmp ");
+    emit_label(l_end);
+    emit("\n");
+
+    emit_label_def(l_true);
+    emit("    mov eax, 1\n");
+    emit_label_def(l_end);
+    return;
+}
+
+func cg_binary_emit_float_op(op: u64) -> u64 {
+    if (op == TOKEN_PLUS) { emit("    addsd xmm0, xmm1\n"); }
+    else if (op == TOKEN_MINUS) { emit("    subsd xmm0, xmm1\n"); }
+    else if (op == TOKEN_STAR) { emit("    mulsd xmm0, xmm1\n"); }
+    else if (op == TOKEN_SLASH) { emit("    divsd xmm0, xmm1\n"); }
+    else if (op == TOKEN_LT || op == TOKEN_GT || op == TOKEN_LTEQ || op == TOKEN_GTEQ || op == TOKEN_EQEQ || op == TOKEN_BANGEQ) {
+        emit("    ucomisd xmm0, xmm1\n");
+        if (op == TOKEN_LT) { emit("    setb al\n"); }
+        else if (op == TOKEN_GT) { emit("    seta al\n"); }
+        else if (op == TOKEN_LTEQ) { emit("    setbe al\n"); }
+        else if (op == TOKEN_GTEQ) { emit("    setae al\n"); }
+        else if (op == TOKEN_EQEQ) { emit("    sete al\n"); }
+        else if (op == TOKEN_BANGEQ) { emit("    setne al\n"); }
+        emit("    movzx rax, al\n");
+        return 1;
+    } else {
+        emit_stderr("[ERROR] Unsupported float operator\n");
+        panic("Codegen error");
     }
-    if (left_ti != 0 && right_ti != 0) {
-        var l_is_f: u64 = (left_ti.ptr_depth == 0 && left_ti.type_kind == TYPE_F64);
-        var r_is_f: u64 = (right_ti.ptr_depth == 0 && right_ti.type_kind == TYPE_F64);
-        if (l_is_f != r_is_f) {
-            emit_stderr("[ERROR] Mixed float/integer binary operation is not supported\n");
-            panic("Codegen error");
-        }
-    }
-    if (is_float != 0) {
-        emit("    movq xmm0, rax\n");
-        emit("    movq xmm1, rbx\n");
-        if (op == TOKEN_PLUS) { emit("    addsd xmm0, xmm1\n"); }
-        else if (op == TOKEN_MINUS) { emit("    subsd xmm0, xmm1\n"); }
-        else if (op == TOKEN_STAR) { emit("    mulsd xmm0, xmm1\n"); }
-        else if (op == TOKEN_SLASH) { emit("    divsd xmm0, xmm1\n"); }
-        else if (op == TOKEN_LT || op == TOKEN_GT || op == TOKEN_LTEQ || op == TOKEN_GTEQ || op == TOKEN_EQEQ || op == TOKEN_BANGEQ) {
-            emit("    ucomisd xmm0, xmm1\n");
-            if (op == TOKEN_LT) { emit("    setb al\n"); }
-            else if (op == TOKEN_GT) { emit("    seta al\n"); }
-            else if (op == TOKEN_LTEQ) { emit("    setbe al\n"); }
-            else if (op == TOKEN_GTEQ) { emit("    setae al\n"); }
-            else if (op == TOKEN_EQEQ) { emit("    sete al\n"); }
-            else if (op == TOKEN_BANGEQ) { emit("    setne al\n"); }
-            emit("    movzx rax, al\n");
-            return;
-        } else {
-            emit_stderr("[ERROR] Unsupported float operator\n");
-            panic("Codegen error");
-        }
-        emit("    movq rax, xmm0\n");
-        return;
-    }
-    
-    // Pointer arithmetic scaling
-    var left_ti2: *TypeInfo = left_ti;
-    if (left_ti2 == 0) { left_ti2 = typeinfo_make(TYPE_I64, 0); }
-    var ptr_depth: u64 = left_ti2.ptr_depth;
-    var use_signed: u64 = 0;
-    if (left_ti2.type_kind == TYPE_I64 && left_ti2.ptr_depth == 0) {
-        use_signed = 1;
-    }
-    
-    if (ptr_depth > 0) {
-        if (op == TOKEN_PLUS || op == TOKEN_MINUS) {
-            var psize: u64 = get_pointee_size(left_ti2.type_kind, ptr_depth);
-            if (psize > 1) {
-                emit("    imul rbx, ");
-                emit_u64(psize);
-                emit_nl();
-            }
-        }
-    }
-    
+    emit("    movq rax, xmm0\n");
+    return 1;
+}
+
+func cg_binary_emit_int_op(op: u64, use_signed: u64) -> u64 {
     // Arithmetic operators
     if (op == TOKEN_PLUS) { emit("    add rax, rbx\n"); }
     else if (op == TOKEN_MINUS) { emit("    sub rax, rbx\n"); }
@@ -2132,7 +2062,7 @@ func cg_binary_expr(node: u64, symtab: *Symtab) -> u64 {
     else if (op == TOKEN_AMPERSAND) { emit("    and rax, rbx\n"); }
     else if (op == TOKEN_PIPE) { emit("    or rax, rbx\n"); }
     // Shift operators
-    else if (op == TOKEN_LSHIFT) { 
+    else if (op == TOKEN_LSHIFT) {
         emit("    mov rcx, rbx\n");
         emit("    shl rax, cl\n");
     }
@@ -2176,6 +2106,77 @@ func cg_binary_expr(node: u64, symtab: *Symtab) -> u64 {
         emit("    setne al\n");
         emit("    movzx rax, al\n");
     }
+    return;
+}
+
+func cg_binary_expr(node: u64, symtab: *Symtab) -> u64 {
+    var binary: *AstBinary = (*AstBinary)node;
+    var op: u64 = binary.op;
+    var left: u64 = binary.left;
+    var right: u64 = binary.right;
+
+    // Short-circuit evaluation for && and ||
+    if (op == TOKEN_ANDAND) {
+        cg_binary_short_circuit_and(left, right);
+        return;
+    }
+
+    if (op == TOKEN_OROR) {
+        cg_binary_short_circuit_or(left, right);
+        return;
+    }
+    
+    // Standard binary: evaluate both sides
+    cg_expr(left);
+    emit("    push rax\n");
+    cg_expr(right);
+    emit("    mov rbx, rax\n");
+    emit("    pop rax\n");
+
+    var left_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)left, symtab);
+    var right_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)right, symtab);
+    var is_float: u64 = 0;
+    if (left_ti != 0 && right_ti != 0) {
+        if (left_ti.ptr_depth == 0 && right_ti.ptr_depth == 0 && left_ti.type_kind == TYPE_F64 && right_ti.type_kind == TYPE_F64) {
+            is_float = 1;
+        }
+    }
+    if (left_ti != 0 && right_ti != 0) {
+        var l_is_f: u64 = (left_ti.ptr_depth == 0 && left_ti.type_kind == TYPE_F64);
+        var r_is_f: u64 = (right_ti.ptr_depth == 0 && right_ti.type_kind == TYPE_F64);
+        if (l_is_f != r_is_f) {
+            emit_stderr("[ERROR] Mixed float/integer binary operation is not supported\n");
+            panic("Codegen error");
+        }
+    }
+    if (is_float != 0) {
+        emit("    movq xmm0, rax\n");
+        emit("    movq xmm1, rbx\n");
+        cg_binary_emit_float_op(op);
+        return;
+    }
+    
+    // Pointer arithmetic scaling
+    var left_ti2: *TypeInfo = left_ti;
+    if (left_ti2 == 0) { left_ti2 = typeinfo_make(TYPE_I64, 0); }
+    var ptr_depth: u64 = left_ti2.ptr_depth;
+    var use_signed: u64 = 0;
+    if (left_ti2.type_kind == TYPE_I64 && left_ti2.ptr_depth == 0) {
+        use_signed = 1;
+    }
+    
+    if (ptr_depth > 0) {
+        if (op == TOKEN_PLUS || op == TOKEN_MINUS) {
+            var psize: u64 = get_pointee_size(left_ti2.type_kind, ptr_depth);
+            if (psize > 1) {
+                emit("    imul rbx, ");
+                emit_u64(psize);
+                emit_nl();
+            }
+        }
+    }
+    
+    cg_binary_emit_int_op(op, use_signed);
 }
 
 // ============================================
@@ -2284,142 +2285,123 @@ func cg_member_resolve_field_offset(struct_def: *AstStructDef, parent_ptr: u64, 
     return 1;
 }
 
-func cg_member_access_lvalue(node: u64, symtab: *Symtab) -> u64 {
-    var member_access: *AstMemberAccess = (*AstMemberAccess)node;
-    var object: u64 = member_access.object;
-    var member_ptr: u64 = member_access.member_ptr;
-    var member_len: u64 = member_access.member_len;
-    var parent_ptr: u64 = member_access.parent_ptr;
-    var parent_len: u64 = member_access.parent_len;
-
-    var obj_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)object, symtab);
-    if (obj_ti != 0 && obj_ti.ptr_depth > 0 && obj_ti.type_kind == TYPE_STRUCT) {
-        cg_expr(object);
-        if (obj_ti.is_tagged == 1) {
-            emit_tagged_mask();
-        }
-        var struct_def_ptr: *AstStructDef = obj_ti.struct_def;
-        if (struct_def_ptr == 0) {
-            emit("    ; ERROR: Struct definition not found for pointer type\n");
-            return;
-        }
-        var field_offset_ptr: u64 = 0;
-        if (cg_member_resolve_field_offset(struct_def_ptr, parent_ptr, parent_len, member_ptr, member_len, &field_offset_ptr) == 0) { return; }
-        cg_member_add_offset_to_rax(field_offset_ptr);
-        return;
+func cg_member_lvalue_ptr_struct(object: u64, obj_ti: *TypeInfo, parent_ptr: u64, parent_len: u64, member_ptr: u64, member_len: u64) -> u64 {
+    cg_expr(object);
+    if (obj_ti.is_tagged == 1) {
+        emit_tagged_mask();
     }
-    
-    var obj_kind: u64 = ast_kind(object);
-    
-    // Handle ptr.field (object is AST_DEREF)
-    if (obj_kind == AST_DEREF) {
-        var deref_obj: *AstDeref = (*AstDeref)object;
-        var ptr_expr: u64 = deref_obj.operand;
-        
-        // Evaluate pointer expression to get pointer value
-        cg_expr(ptr_expr);
-        
-        // Get pointer type to find struct_def
-        var ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)ptr_expr, symtab);
-        if (ti == 0) {
-            emit("    ; ERROR: Cannot determine pointer type in arrow operator\n");
-            return;
-        }
-
-        var base_type: u64 = ti.type_kind;
-        var ptr_depth: u64 = ti.ptr_depth;
-        if (ptr_depth > 0 && ti.is_tagged == 1) {
-            emit_tagged_mask();
-        }
-        emit("    push rax\n");
-        
-        if (ptr_depth == 0 || base_type != TYPE_STRUCT) {
-            emit("    ; ERROR: Arrow operator requires pointer to struct\n");
-            return;
-        }
-        
-        // Get struct_def from pointer's base type
-        var struct_def: *AstStructDef = ti.struct_def;
-        if (struct_def == 0) {
-            emit("    ; ERROR: Struct definition not found for pointer type\n");
-            return;
-        }
-        
-        var field_offset: u64 = 0;
-        if (cg_member_resolve_field_offset(struct_def, parent_ptr, parent_len, member_ptr, member_len, &field_offset) == 0) { return; }
-        
-        // Pop pointer value and add field offset
-        emit("    pop rax\n");
-        cg_member_add_offset_to_rax(field_offset);
-        return;
+    var struct_def_ptr: *AstStructDef = obj_ti.struct_def;
+    if (struct_def_ptr == 0) {
+        emit("    ; ERROR: Struct definition not found for pointer type\n");
+        return 0;
     }
+    var field_offset_ptr: u64 = 0;
+    if (cg_member_resolve_field_offset(struct_def_ptr, parent_ptr, parent_len, member_ptr, member_len, &field_offset_ptr) == 0) { return 0; }
+    cg_member_add_offset_to_rax(field_offset_ptr);
+    return 1;
+}
+
+func cg_member_lvalue_deref(object: u64, symtab: *Symtab, parent_ptr: u64, parent_len: u64, member_ptr: u64, member_len: u64) -> u64 {
+    var deref_obj: *AstDeref = (*AstDeref)object;
+    var ptr_expr: u64 = deref_obj.operand;
     
-    // Handle nested member access: outer.inner.field (lvalue)
-    if (obj_kind == AST_MEMBER_ACCESS) {
-        // Recursively get the address of the nested object
-        cg_lvalue(object);
-        emit("    push rax\n");
-        
-        // Get the type of the nested object
-        var obj_lv_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)object, symtab);
-        if (obj_lv_ti == 0) {
-            emit("    ; ERROR: Cannot determine type of nested member in lvalue\n");
-            return;
-        }
-        var base_type: u64 = obj_lv_ti.type_kind;
-        if (base_type != TYPE_STRUCT) {
-            emit("    ; ERROR: Nested member access on non-struct in lvalue\n");
-            return;
-        }
-        
-        var struct_def: *AstStructDef = obj_lv_ti.struct_def;
-        if (struct_def == 0) {
-            emit("    ; ERROR: Struct definition not found for nested lvalue\n");
-            return;
-        }
-        
-        var field_offset: u64 = 0;
-        if (cg_member_resolve_field_offset(struct_def, parent_ptr, parent_len, member_ptr, member_len, &field_offset) == 0) { return; }
-        
-        // Pop base address and add field offset
-        emit("    pop rax\n");
-        cg_member_add_offset_to_rax(field_offset);
-        return;
+    // Evaluate pointer expression to get pointer value
+    cg_expr(ptr_expr);
+    
+    // Get pointer type to find struct_def
+    var ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)ptr_expr, symtab);
+    if (ti == 0) {
+        emit("    ; ERROR: Cannot determine pointer type in arrow operator\n");
+        return 1;
     }
 
-    // Handle indexed member access: arr[i].field (lvalue)
-    if (obj_kind == AST_INDEX) {
-        cg_lvalue(object);
-        emit("    push rax\n");
-
-        var idx_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)object, symtab);
-        if (idx_ti == 0) {
-            emit("    ; ERROR: Cannot determine type of indexed member in lvalue\n");
-            return;
-        }
-        if (idx_ti.type_kind != TYPE_STRUCT) {
-            emit("    ; ERROR: Indexed member access on non-struct in lvalue\n");
-            return;
-        }
-        var idx_struct_def: *AstStructDef = idx_ti.struct_def;
-        if (idx_struct_def == 0) {
-            emit("    ; ERROR: Struct definition not found for indexed lvalue\n");
-            return;
-        }
-
-        var idx_field_offset: u64 = 0;
-        if (cg_member_resolve_field_offset(idx_struct_def, parent_ptr, parent_len, member_ptr, member_len, &idx_field_offset) == 0) { return; }
-        emit("    pop rax\n");
-        cg_member_add_offset_to_rax(idx_field_offset);
-        return;
+    var base_type: u64 = ti.type_kind;
+    var ptr_depth: u64 = ti.ptr_depth;
+    if (ptr_depth > 0 && ti.is_tagged == 1) {
+        emit_tagged_mask();
+    }
+    emit("    push rax\n");
+    
+    if (ptr_depth == 0 || base_type != TYPE_STRUCT) {
+        emit("    ; ERROR: Arrow operator requires pointer to struct\n");
+        return 1;
     }
     
-    // Handle obj.field (object is AST_IDENT)
-    if (obj_kind != AST_IDENT) {
-        emit("    ; ERROR: Member access on non-identifier in lvalue\n");
-        return;
+    // Get struct_def from pointer's base type
+    var struct_def: *AstStructDef = ti.struct_def;
+    if (struct_def == 0) {
+        emit("    ; ERROR: Struct definition not found for pointer type\n");
+        return 1;
     }
     
+    var field_offset: u64 = 0;
+    if (cg_member_resolve_field_offset(struct_def, parent_ptr, parent_len, member_ptr, member_len, &field_offset) == 0) { return 1; }
+    
+    // Pop pointer value and add field offset
+    emit("    pop rax\n");
+    cg_member_add_offset_to_rax(field_offset);
+    return 1;
+}
+
+func cg_member_lvalue_nested(object: u64, symtab: *Symtab, parent_ptr: u64, parent_len: u64, member_ptr: u64, member_len: u64) -> u64 {
+    // Recursively get the address of the nested object
+    cg_lvalue(object);
+    emit("    push rax\n");
+    
+    // Get the type of the nested object
+    var obj_lv_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)object, symtab);
+    if (obj_lv_ti == 0) {
+        emit("    ; ERROR: Cannot determine type of nested member in lvalue\n");
+        return 1;
+    }
+    var base_type: u64 = obj_lv_ti.type_kind;
+    if (base_type != TYPE_STRUCT) {
+        emit("    ; ERROR: Nested member access on non-struct in lvalue\n");
+        return 1;
+    }
+    
+    var struct_def: *AstStructDef = obj_lv_ti.struct_def;
+    if (struct_def == 0) {
+        emit("    ; ERROR: Struct definition not found for nested lvalue\n");
+        return 1;
+    }
+    
+    var field_offset: u64 = 0;
+    if (cg_member_resolve_field_offset(struct_def, parent_ptr, parent_len, member_ptr, member_len, &field_offset) == 0) { return 1; }
+    
+    // Pop base address and add field offset
+    emit("    pop rax\n");
+    cg_member_add_offset_to_rax(field_offset);
+    return 1;
+}
+
+func cg_member_lvalue_index(object: u64, symtab: *Symtab, parent_ptr: u64, parent_len: u64, member_ptr: u64, member_len: u64) -> u64 {
+    cg_lvalue(object);
+    emit("    push rax\n");
+
+    var idx_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)object, symtab);
+    if (idx_ti == 0) {
+        emit("    ; ERROR: Cannot determine type of indexed member in lvalue\n");
+        return 1;
+    }
+    if (idx_ti.type_kind != TYPE_STRUCT) {
+        emit("    ; ERROR: Indexed member access on non-struct in lvalue\n");
+        return 1;
+    }
+    var idx_struct_def: *AstStructDef = idx_ti.struct_def;
+    if (idx_struct_def == 0) {
+        emit("    ; ERROR: Struct definition not found for indexed lvalue\n");
+        return 1;
+    }
+
+    var idx_field_offset: u64 = 0;
+    if (cg_member_resolve_field_offset(idx_struct_def, parent_ptr, parent_len, member_ptr, member_len, &idx_field_offset) == 0) { return 1; }
+    emit("    pop rax\n");
+    cg_member_add_offset_to_rax(idx_field_offset);
+    return 1;
+}
+
+func cg_member_lvalue_ident(object: u64, symtab: *Symtab, parent_ptr: u64, parent_len: u64, member_ptr: u64, member_len: u64) -> u64 {
     var obj_ident: *AstIdent = (*AstIdent)object;
     var obj_name_ptr: u64 = obj_ident.name_ptr;
     var obj_name_len: u64 = obj_ident.name_len;
@@ -2446,15 +2428,15 @@ func cg_member_access_lvalue(node: u64, symtab: *Symtab) -> u64 {
         }
         if (struct_def_g == 0) {
             emit("    ; ERROR: Struct definition not found in global lvalue\n");
-            return;
+            return 1;
         }
         var field_offset_g: u64 = 0;
-        if (cg_member_resolve_field_offset(struct_def_g, parent_ptr, parent_len, member_ptr, member_len, &field_offset_g) == 0) { return; }
+        if (cg_member_resolve_field_offset(struct_def_g, parent_ptr, parent_len, member_ptr, member_len, &field_offset_g) == 0) { return 1; }
         emit("    lea rax, [rel _gvar_");
         emit_len(resolved_ptr, resolved_len);
         emit("]\n");
         cg_member_add_offset_to_rax(field_offset_g);
-        return;
+        return 1;
     }
     
     // Get variable info from symtab
@@ -2469,17 +2451,57 @@ func cg_member_access_lvalue(node: u64, symtab: *Symtab) -> u64 {
     
     if (struct_def == 0) {
         emit("    ; ERROR: Struct definition not found in lvalue\n");
-        return;
+        return 1;
     }
     
     var field_offset: u64 = 0;
-    if (cg_member_resolve_field_offset(struct_def, parent_ptr, parent_len, member_ptr, member_len, &field_offset) == 0) { return; }
+    if (cg_member_resolve_field_offset(struct_def, parent_ptr, parent_len, member_ptr, member_len, &field_offset) == 0) { return 1; }
     
     // Calculate address: lea rax, [rbp + var_offset + field_offset]
     emit("    lea rax, [rbp");
     var total_offset: u64 = var_offset + field_offset;
     emit_signed_disp(total_offset);
     emit("]\n");
+    return 1;
+}
+
+func cg_member_access_lvalue(node: u64, symtab: *Symtab) -> u64 {
+    var member_access: *AstMemberAccess = (*AstMemberAccess)node;
+    var object: u64 = member_access.object;
+    var member_ptr: u64 = member_access.member_ptr;
+    var member_len: u64 = member_access.member_len;
+    var parent_ptr: u64 = member_access.parent_ptr;
+    var parent_len: u64 = member_access.parent_len;
+
+    var obj_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)object, symtab);
+    if (obj_ti != 0 && obj_ti.ptr_depth > 0 && obj_ti.type_kind == TYPE_STRUCT) {
+        cg_member_lvalue_ptr_struct(object, obj_ti, parent_ptr, parent_len, member_ptr, member_len);
+        return;
+    }
+
+    var obj_kind: u64 = ast_kind(object);
+
+    if (obj_kind == AST_DEREF) {
+        cg_member_lvalue_deref(object, symtab, parent_ptr, parent_len, member_ptr, member_len);
+        return;
+    }
+
+    if (obj_kind == AST_MEMBER_ACCESS) {
+        cg_member_lvalue_nested(object, symtab, parent_ptr, parent_len, member_ptr, member_len);
+        return;
+    }
+
+    if (obj_kind == AST_INDEX) {
+        cg_member_lvalue_index(object, symtab, parent_ptr, parent_len, member_ptr, member_len);
+        return;
+    }
+
+    if (obj_kind == AST_IDENT) {
+        cg_member_lvalue_ident(object, symtab, parent_ptr, parent_len, member_ptr, member_len);
+        return;
+    }
+
+    emit("    ; ERROR: Member access on non-identifier in lvalue\n");
 }
 
 // ============================================
