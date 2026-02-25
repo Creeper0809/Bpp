@@ -1171,6 +1171,9 @@ func compiler_register_module_exports_funcs(funcs: *Vec<*AstFunc>, module_ptr: u
     var num_funcs: u64 = funcs.len();
     for (var i: u64 = 0; i < num_funcs; i++) {
         var fn: *AstFunc = funcs.get(i);
+        compiler_finalize_impl_method_name_if_needed(fn);
+        compiler_register_finalized_impl_method(fn);
+
         var orig_ptr: u64 = fn.name_ptr;
         var orig_len: u64 = fn.name_len;
         var mangled_info: *NameInfo = compiler_mangle_symbol_name(orig_ptr, orig_len, prefix_ptr, prefix_len, 1);
@@ -1359,7 +1362,10 @@ func compiler_pass1_register_func_sigs(prog_sig: *AstProgram) -> u64 {
     var sig_funcs: *Vec<*AstFunc> = prog_sig.funcs_vec;
     var num_sig_funcs: u64 = sig_funcs.len();
     for (var i: u64 = 0; i < num_sig_funcs; i++) {
-        g_all_func_sigs.push(sig_funcs.get(i));
+        var sig_fn: *AstFunc = sig_funcs.get(i);
+        compiler_finalize_impl_method_name_if_needed(sig_fn);
+        compiler_register_finalized_impl_method(sig_fn);
+        g_all_func_sigs.push(sig_fn);
     }
     return 0;
 }
@@ -1937,6 +1943,41 @@ func compiler_register_impl_method(name_ptr: u64, name_len: u64) -> u64 {
     return compiler_register_impl_method_ex(name_ptr, name_len, 0, 0, ACCESS_PUBLIC);
 }
 
+func compiler_finalize_impl_method_name_if_needed(fn: *AstFunc) -> u64 {
+    if (fn == 0) { return 0; }
+    if (fn.impl_owner_ptr == 0 || fn.impl_owner_len == 0) { return 0; }
+    if (fn.impl_name_finalized != 0) { return 0; }
+
+    var original_name_ptr: u64 = fn.impl_original_name_ptr;
+    var original_name_len: u64 = fn.impl_original_name_len;
+    if (original_name_ptr == 0 || original_name_len == 0) {
+        original_name_ptr = fn.name_ptr;
+        original_name_len = fn.name_len;
+        fn.impl_original_name_ptr = original_name_ptr;
+        fn.impl_original_name_len = original_name_len;
+    }
+
+    var name_info: *NameInfo = compiler_build_method_name(fn.impl_owner_ptr, fn.impl_owner_len, original_name_ptr, original_name_len);
+    fn.name_ptr = name_info.ptr;
+    fn.name_len = name_info.len;
+    fn.impl_name_finalized = 1;
+    return 0;
+}
+
+func compiler_register_finalized_impl_method(fn: *AstFunc) -> u64 {
+    if (fn == 0) { return 0; }
+    if (fn.impl_owner_ptr == 0 || fn.impl_owner_len == 0) { return 0; }
+    compiler_register_impl_method_ex(fn.name_ptr, fn.name_len, fn.impl_owner_ptr, fn.impl_owner_len, fn.impl_method_access);
+    compiler_register_impl_method_func(fn.name_ptr, fn.name_len, fn);
+    compiler_alias_generic_template_by_func_ptr(fn, fn.name_ptr, fn.name_len);
+
+    var resolved_method: *NameInfo = resolve_name(fn.name_ptr, fn.name_len);
+    if (resolved_method != 0) {
+        compiler_alias_generic_template_by_func_ptr(fn, resolved_method.ptr, resolved_method.len);
+    }
+    return 0;
+}
+
 func compiler_get_impl_method_access(name_ptr: u64, name_len: u64) -> u64 {
     if (g_impl_method_access == 0) { return ACCESS_PUBLIC; }
     if (g_impl_method_access.has(name_ptr, name_len) == 0) { return ACCESS_PUBLIC; }
@@ -2449,6 +2490,12 @@ func generic_make_typeinfo_from_vardecl(decl: *AstVarDecl) -> *TypeInfo {
 }
 
 func generic_infer_from_typeinfo(tk: u64, pd: u64, sn_ptr: u64, sn_len: u64, elem_k: u64, elem_pd: u64, array_len: u64, array_len_is_param: u64, array_param_ptr: u64, array_param_len: u64, arg_ti: *TypeInfo, bindings: *Vec<*GenericBinding>) -> u64 {
+    if (arg_ti == 0) { return true; }
+    if (arg_ti.type_kind == TYPE_VOID && arg_ti.ptr_depth == 0 && arg_ti.struct_name_ptr == 0 && arg_ti.struct_name_len == 0 &&
+        arg_ti.elem_type_kind == 0 && arg_ti.elem_ptr_depth == 0 && arg_ti.array_len == 0) {
+        return true;
+    }
+
     if (tk == TYPE_GENERIC) {
         if (arg_ti.ptr_depth < pd) {
             return true;
@@ -2789,6 +2836,10 @@ func generic_type_u64() -> *TypeInfo {
     return generic_make_typeinfo_from_fields(TYPE_U64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 }
 
+func generic_type_unknown() -> *TypeInfo {
+    return generic_make_typeinfo_from_fields(TYPE_VOID, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+}
+
 func generic_type_u8_ptr() -> *TypeInfo {
     return generic_make_typeinfo_from_fields(TYPE_U8, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 }
@@ -2865,8 +2916,14 @@ func generic_infer_expr_type(expr: *AstNode, symtab: *HashMap<u64, *TypeInfo>) -
             if (ginfo != 0) {
                 if (ginfo.typeinfo_ptr != 0) { return ginfo.typeinfo_ptr; }
             }
-            // fallback: consts assumed u64
-            return generic_type_u64();
+            var const_res: *ConstResult = (*ConstResult)compiler_find_const(id.name_ptr, id.name_len);
+            if (const_res != 0 && const_res.found != 0) {
+                return generic_type_u64();
+            }
+            if (compiler_func_exists(id.name_ptr, id.name_len) != 0) {
+                return generic_type_u8_ptr();
+            }
+            return generic_type_unknown();
         case AST_SUPER:
             return generic_type_u64();
         case AST_ADDR_OF:
@@ -3929,6 +3986,29 @@ func compiler_try_resolve_generic_struct_template(name_ptr: u64, name_len: u64, 
     return 1;
 }
 
+func compiler_try_resolve_generic_struct_type_instance(name_ptr: u64, name_len: u64, generic_args: *Vec<*GenericArg>, out_name_info: **NameInfo) -> u64 {
+    var tpl: *GenericStructTemplate = 0;
+    if (compiler_try_resolve_generic_struct_template(name_ptr, name_len, &tpl) == 0) {
+        return 0;
+    }
+    var bindings: *Vec<*GenericBinding> = generic_build_bindings_for_struct(tpl, generic_args);
+    var name_info: *NameInfo = generic_struct_get_or_create_instance(tpl, bindings);
+    if (name_info == 0) { return 0; }
+    *out_name_info = name_info;
+    return 1;
+}
+
+func compiler_resolve_generic_struct_type_instance(name_ptr: u64, name_len: u64, generic_args: *Vec<*GenericArg>) -> *NameInfo {
+    var out: *NameInfo = 0;
+    if (compiler_try_resolve_generic_struct_type_instance(name_ptr, name_len, generic_args, &out) != 0) {
+        return out;
+    }
+    emit_stderr("[ERROR] Generic struct template not found: ");
+    emit_stderr_len(name_ptr, name_len);
+    emit_stderr("\n");
+    panic("Compiler error");
+}
+
 func compiler_lower_parse_sugar_args(args: *Vec<*AstNode>) -> u64 {
     if (args == 0) { return 0; }
     var n: u64 = args.len();
@@ -4220,6 +4300,112 @@ func compiler_lower_parse_sugar() -> u64 {
             if (ginfo == 0 || ginfo.init_expr == 0) { continue; }
             ginfo.init_expr = (u64)compiler_lower_parse_sugar_expr((*AstNode)ginfo.init_expr);
         }
+    }
+    return 0;
+}
+
+func compiler_set_global_init_none(ginfo: *GlobalInfo) -> u64 {
+    if (ginfo == 0) { return 0; }
+    ginfo.init_kind = GLOBAL_INIT_NONE;
+    ginfo.init_value = 0;
+    ginfo.init_name_ptr = 0;
+    ginfo.init_name_len = 0;
+    return 0;
+}
+
+func compiler_set_global_init_value(ginfo: *GlobalInfo, value: u64) -> u64 {
+    if (ginfo == 0) { return 0; }
+    ginfo.init_kind = GLOBAL_INIT_VALUE;
+    ginfo.init_value = value;
+    ginfo.init_name_ptr = 0;
+    ginfo.init_name_len = 0;
+    return 0;
+}
+
+func compiler_set_global_init_const_name(ginfo: *GlobalInfo, name_ptr: u64, name_len: u64) -> u64 {
+    if (ginfo == 0) { return 0; }
+    ginfo.init_kind = GLOBAL_INIT_CONST;
+    ginfo.init_value = 0;
+    ginfo.init_name_ptr = name_ptr;
+    ginfo.init_name_len = name_len;
+    return 0;
+}
+
+func compiler_set_global_init_expr(ginfo: *GlobalInfo) -> u64 {
+    if (ginfo == 0) { return 0; }
+    ginfo.init_kind = GLOBAL_INIT_EXPR;
+    ginfo.init_value = 0;
+    ginfo.init_name_ptr = 0;
+    ginfo.init_name_len = 0;
+    return 0;
+}
+
+func compiler_set_global_init_runtime(ginfo: *GlobalInfo) -> u64 {
+    if (ginfo == 0) { return 0; }
+    ginfo.init_kind = GLOBAL_INIT_RUNTIME;
+    ginfo.init_value = 0;
+    ginfo.init_name_ptr = 0;
+    ginfo.init_name_len = 0;
+    return 0;
+}
+
+func compiler_finalize_single_global_init_kind(ginfo: *GlobalInfo) -> u64 {
+    if (ginfo == 0 || ginfo.init_expr == 0) {
+        compiler_set_global_init_none(ginfo);
+        return 0;
+    }
+
+    var expr: *AstNode = (*AstNode)ginfo.init_expr;
+    var kind: u64 = ast_kind(expr);
+
+    if (kind == AST_GENERIC_STRUCT_LITERAL) {
+        var lowered: *AstNode = compiler_lower_parse_sugar_generic_struct_literal((*AstGenericStructLiteral)expr);
+        ginfo.init_expr = (u64)lowered;
+        expr = lowered;
+        kind = ast_kind(expr);
+    }
+
+    if (kind == AST_LITERAL) {
+        var lit: *AstLiteral = (*AstLiteral)expr;
+        compiler_set_global_init_value(ginfo, lit.value);
+        return 0;
+    }
+
+    if (kind == AST_IDENT) {
+        var id: *AstIdent = (*AstIdent)expr;
+        var const_res: *ConstResult = (*ConstResult)compiler_find_const(id.name_ptr, id.name_len);
+        if (const_res != 0 && const_res.found != 0) {
+            compiler_set_global_init_value(ginfo, const_res.value);
+        } else {
+            compiler_set_global_init_const_name(ginfo, id.name_ptr, id.name_len);
+        }
+        return 0;
+    }
+
+    if (kind == AST_STRUCT_LITERAL) {
+        if (ginfo.typeinfo_ptr == 0 || ginfo.typeinfo_ptr.type_kind != TYPE_STRUCT || ginfo.typeinfo_ptr.ptr_depth != 0) {
+            emit_stderr("[ERROR] Global struct literal requires struct type\n");
+            panic("Compiler error");
+        }
+        compiler_set_global_init_expr(ginfo);
+        return 0;
+    }
+
+    if (kind == AST_CALL || kind == AST_METHOD_CALL || kind == AST_CALL_PTR || kind == AST_GENERIC_CALL || kind == AST_STATIC_GENERIC_CALL || kind == AST_NEW || kind == AST_STACK_CTOR) {
+        compiler_set_global_init_runtime(ginfo);
+        return 0;
+    }
+
+    emit_stderr("[ERROR] Unsupported global init expression\n");
+    panic("Compiler error");
+    return 0;
+}
+
+func compiler_finalize_global_init_kinds() -> u64 {
+    if (g_all_globals == 0) { return 0; }
+    var n: u64 = g_all_globals.len();
+    for (var i: u64 = 0; i < n; i++) {
+        compiler_finalize_single_global_init_kind(g_all_globals.get(i));
     }
     return 0;
 }
