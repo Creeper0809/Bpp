@@ -33,6 +33,12 @@ const SSA_LIVE_R9  = 32;
 const SSA_LIVE_R10 = 64;
 const SSA_LIVE_R11 = 128;
 
+struct SSALiveBlockIndexMap {
+    public idx_map: *u64;
+    public idx_cap: u64;
+    public undef_idx: u64;
+}
+
 func _ssa_live_all_mask() -> u64 {
     return SSA_LIVE_RAX | SSA_LIVE_RBX | SSA_LIVE_RCX | SSA_LIVE_RDX | SSA_LIVE_R8 | SSA_LIVE_R9 | SSA_LIVE_R10 | SSA_LIVE_R11;
 }
@@ -204,7 +210,13 @@ func _ssa_inst_call_def_mask(inst: *SSAInstruction) -> u64 {
     return def_mask;
 }
 
-func _ssa_inst_use_def_mask(inst: *SSAInstruction, use_out: u64, def_out: u64) -> u64 {
+struct SSAInstUseDefMask {
+    public use_mask: u64;
+    public def_mask: u64;
+}
+
+func _ssa_inst_use_def_mask(inst: *SSAInstruction) -> SSAInstUseDefMask {
+    var result: SSAInstUseDefMask;
     var op: u64 = ssa_inst_get_op(inst);
     var use_mask: u64 = 0;
     var def_mask: u64 = 0;
@@ -236,9 +248,9 @@ func _ssa_inst_use_def_mask(inst: *SSAInstruction, use_out: u64, def_out: u64) -
         if (inst.dest != 0) { def_mask = _ssa_phys_mask(inst.dest); }
     }
 
-    *(use_out) = use_mask;
-    *(def_out) = def_mask;
-    return 0;
+    result.use_mask = use_mask;
+    result.def_mask = def_mask;
+    return result;
 }
 
 func _ssa_emit_asm_with_save(text_vec: *Vec<u64>, live_mask: u64) -> u64 {
@@ -292,10 +304,10 @@ func _ssa_emit_call_slice_store(info_ptr: u64, addr_opr: u64, live_mask: u64) ->
     var save_words: u64 = _ssa_live_mask_word_count(save_mask);
     _ssa_call_emit_save_regs(save_mask);
 
-    var reg_count: u64 = 0;
-    var stack_args: u64 = 0;
-    var align_pad: u64 = 0;
-    _ssa_call_prepare_stack_layout(nargs, save_words, 1, &reg_count, &stack_args, &align_pad);
+    var layout: SSACallStackLayout = _ssa_call_prepare_stack_layout(nargs, save_words, 1);
+    var reg_count: u64 = layout.reg_count;
+    var stack_args: u64 = layout.stack_args;
+    var align_pad: u64 = layout.align_pad;
 
     _ssa_emit_push_reg(ssa_operand_value(addr_opr));
     _ssa_call_emit_push_args(args_vec, nargs);
@@ -350,16 +362,16 @@ func _ssa_block_collect_insts(block: *SSABlock) -> *Vec<*SSAInstruction> {
     return v;
 }
 
-func _ssa_block_collect_inst_lists(blocks: []*SSABlock, bcount: u64) -> *Vec<u64> {
-    var lists: *Vec<u64> = new Vec<u64>(bcount + 1);
+func _ssa_block_collect_inst_lists(blocks: []*SSABlock, bcount: u64) -> *Vec<*Vec<*SSAInstruction>> {
+    var lists: *Vec<*Vec<*SSAInstruction>> = new Vec<*Vec<*SSAInstruction>>(bcount + 1);
     for (var bi: u64 = 0; bi < bcount; bi++) {
-        lists.push((u64)_ssa_block_collect_insts(_ssa_block_ptr_at(blocks, bi)));
+        lists.push(_ssa_block_collect_insts(_ssa_block_ptr_at(blocks, bi)));
     }
     return lists;
 }
 
-func _ssa_block_inst_list_at(lists: *Vec<u64>, bi: u64) -> *Vec<*SSAInstruction> {
-    return (*Vec<*SSAInstruction>)lists.get(bi);
+func _ssa_block_inst_list_at(lists: *Vec<*Vec<*SSAInstruction>>, bi: u64) -> *Vec<*SSAInstruction> {
+    return lists.get(bi);
 }
 
 func _ssa_live_init_block_state(blocks: []*SSABlock, bcount: u64, live_in: *Vec<u64>, live_out: *Vec<u64>, phi_use: *Vec<u64>) -> u64 {
@@ -371,7 +383,7 @@ func _ssa_live_init_block_state(blocks: []*SSABlock, bcount: u64, live_in: *Vec<
     return 0;
 }
 
-func _ssa_live_make_block_idx_map(blocks: []*SSABlock, bcount: u64, idx_cap_out: u64, undef_idx_out: u64) -> *u64 {
+func _ssa_live_make_block_idx_map(blocks: []*SSABlock, bcount: u64) -> *SSALiveBlockIndexMap {
     var max_block_id: u64 = 0;
     for (var bi: u64 = 0; bi < bcount; bi++) {
         var b: *SSABlock = _ssa_block_ptr_at(blocks, bi);
@@ -390,20 +402,21 @@ func _ssa_live_make_block_idx_map(blocks: []*SSABlock, bcount: u64, idx_cap_out:
         var b2: *SSABlock = _ssa_block_ptr_at(blocks, bi2);
         idx_map[b2.id] = bi2;
     }
-
-    *(idx_cap_out) = idx_cap;
-    *(undef_idx_out) = undef_idx;
-    return idx_map;
+    var info: *SSALiveBlockIndexMap = new SSALiveBlockIndexMap();
+    info.idx_map = idx_map;
+    info.idx_cap = idx_cap;
+    info.undef_idx = undef_idx;
+    return info;
 }
 
-func _ssa_live_out_mask_for_block(block: *SSABlock, idx_map: *u64, idx_cap: u64, undef_idx: u64, live_in: *Vec<u64>, phi_use: *Vec<u64>) -> u64 {
+func _ssa_live_out_mask_for_block(block: *SSABlock, idx_info: *SSALiveBlockIndexMap, live_in: *Vec<u64>, phi_use: *Vec<u64>) -> u64 {
     var out_mask: u64 = 0;
     var succ_count: u64 = ssa_slice_len(block.succs);
     for (var si: u64 = 0; si < succ_count; si++) {
         var succ: *SSABlock = _ssa_block_succ_at(block, si);
-        if (succ.id >= idx_cap) { continue; }
-        var sidx: u64 = idx_map[succ.id];
-        if (sidx == undef_idx) { continue; }
+        if (succ.id >= idx_info.idx_cap) { continue; }
+        var sidx: u64 = idx_info.idx_map[succ.id];
+        if (sidx == idx_info.undef_idx) { continue; }
         out_mask = out_mask | live_in.get(sidx);
         out_mask = out_mask | phi_use.get(sidx);
     }
@@ -413,22 +426,22 @@ func _ssa_live_out_mask_for_block(block: *SSABlock, idx_map: *u64, idx_cap: u64,
 func _ssa_live_transfer_reverse(insts: *Vec<*SSAInstruction>, live: u64, all_mask: u64) -> u64 {
     for (var idx: i64 = (i64)insts.len() - 1; idx >= 0; idx = idx - 1) {
         var cur: *SSAInstruction = insts.get((u64)idx);
-        var use_mask: u64 = 0;
-        var def_mask: u64 = 0;
-        _ssa_inst_use_def_mask(cur, &use_mask, &def_mask);
+        var masks: SSAInstUseDefMask = _ssa_inst_use_def_mask(cur);
+        var use_mask: u64 = masks.use_mask;
+        var def_mask: u64 = masks.def_mask;
         live = (live & (all_mask ^ def_mask)) | use_mask;
     }
     return live;
 }
 
-func _ssa_live_solve_fixed_point(blocks: []*SSABlock, bcount: u64, inst_lists: *Vec<u64>, idx_map: *u64, idx_cap: u64, undef_idx: u64, live_in: *Vec<u64>, live_out: *Vec<u64>, phi_use: *Vec<u64>, all_mask: u64) -> u64 {
+func _ssa_live_solve_fixed_point(blocks: []*SSABlock, bcount: u64, inst_lists: *Vec<*Vec<*SSAInstruction>>, idx_info: *SSALiveBlockIndexMap, live_in: *Vec<u64>, live_out: *Vec<u64>, phi_use: *Vec<u64>, all_mask: u64) -> u64 {
     var changed: u64 = 1;
     while (changed != 0) {
         changed = 0;
         for (var bi: i64 = (i64)bcount - 1; bi >= 0; bi = bi - 1) {
             var bi_u: u64 = (u64)bi;
             var b: *SSABlock = _ssa_block_ptr_at(blocks, bi_u);
-            var out_mask: u64 = _ssa_live_out_mask_for_block(b, idx_map, idx_cap, undef_idx, live_in, phi_use);
+            var out_mask: u64 = _ssa_live_out_mask_for_block(b, idx_info, live_in, phi_use);
             var insts: *Vec<*SSAInstruction> = _ssa_block_inst_list_at(inst_lists, bi_u);
             var in_mask: u64 = _ssa_live_transfer_reverse(insts, out_mask, all_mask);
 
@@ -445,16 +458,16 @@ func _ssa_live_solve_fixed_point(blocks: []*SSABlock, bcount: u64, inst_lists: *
     return 0;
 }
 
-func _ssa_live_fill_inst_map(map: *Vec<u64>, bcount: u64, inst_lists: *Vec<u64>, live_out: *Vec<u64>, all_mask: u64) -> u64 {
+func _ssa_live_fill_inst_map(map: *Vec<u64>, bcount: u64, inst_lists: *Vec<*Vec<*SSAInstruction>>, live_out: *Vec<u64>, all_mask: u64) -> u64 {
     for (var bi: u64 = 0; bi < bcount; bi++) {
         var live: u64 = live_out.get(bi);
         var insts: *Vec<*SSAInstruction> = _ssa_block_inst_list_at(inst_lists, bi);
         for (var idx: i64 = (i64)insts.len() - 1; idx >= 0; idx = idx - 1) {
             var cur: *SSAInstruction = insts.get((u64)idx);
             _ssa_live_map_put(map, (u64)cur, live);
-            var use_mask: u64 = 0;
-            var def_mask: u64 = 0;
-            _ssa_inst_use_def_mask(cur, &use_mask, &def_mask);
+            var masks2: SSAInstUseDefMask = _ssa_inst_use_def_mask(cur);
+            var use_mask: u64 = masks2.use_mask;
+            var def_mask: u64 = masks2.def_mask;
             live = (live & (all_mask ^ def_mask)) | use_mask;
         }
     }
@@ -470,12 +483,10 @@ func _ssa_build_live_map(fn: *SSAFunction) -> *Vec<u64> {
     var phi_use: *Vec<u64> = new Vec<u64>(bcount + 1);
     _ssa_live_init_block_state(blocks, bcount, live_in, live_out, phi_use);
 
-    var idx_cap: u64 = 0;
-    var undef_idx: u64 = 0;
-    var idx_map: *u64 = _ssa_live_make_block_idx_map(blocks, bcount, &idx_cap, &undef_idx);
-    var inst_lists: *Vec<u64> = _ssa_block_collect_inst_lists(blocks, bcount);
+    var idx_info: *SSALiveBlockIndexMap = _ssa_live_make_block_idx_map(blocks, bcount);
+    var inst_lists: *Vec<*Vec<*SSAInstruction>> = _ssa_block_collect_inst_lists(blocks, bcount);
     var all_mask: u64 = _ssa_live_all_mask();
-    _ssa_live_solve_fixed_point(blocks, bcount, inst_lists, idx_map, idx_cap, undef_idx, live_in, live_out, phi_use, all_mask);
+    _ssa_live_solve_fixed_point(blocks, bcount, inst_lists, idx_info, live_in, live_out, phi_use, all_mask);
 
     var map: *Vec<u64> = new Vec<u64>(256);
     _ssa_live_fill_inst_map(map, bcount, inst_lists, live_out, all_mask);
@@ -1094,7 +1105,14 @@ func _ssa_call_emit_pop_arg_regs(reg_count: u64) -> u64 {
     return 0;
 }
 
-func _ssa_call_prepare_stack_layout(nargs: u64, save_words: u64, extra_words: u64, reg_count_out: u64, stack_args_out: u64, align_pad_out: u64) -> u64 {
+struct SSACallStackLayout {
+    public reg_count: u64;
+    public stack_args: u64;
+    public align_pad: u64;
+}
+
+func _ssa_call_prepare_stack_layout(nargs: u64, save_words: u64, extra_words: u64) -> SSACallStackLayout {
+    var layout: SSACallStackLayout;
     var reg_count: u64 = nargs;
     if (reg_count > 6) { reg_count = 6; }
     var stack_args: u64 = nargs - reg_count;
@@ -1104,10 +1122,10 @@ func _ssa_call_prepare_stack_layout(nargs: u64, save_words: u64, extra_words: u6
         emit("    sub rsp, 8\n");
         align_pad = 1;
     }
-    *(reg_count_out) = reg_count;
-    *(stack_args_out) = stack_args;
-    *(align_pad_out) = align_pad;
-    return 0;
+    layout.reg_count = reg_count;
+    layout.stack_args = stack_args;
+    layout.align_pad = align_pad;
+    return layout;
 }
 
 func _ssa_call_emit_target(is_ptr: u64, callee_reg: u64, name_ptr: u64, name_len: u64) -> u64 {
@@ -1141,10 +1159,10 @@ func _ssa_emit_call_common(
     var save_words: u64 = _ssa_live_mask_word_count(save_mask);
     _ssa_call_emit_save_regs(save_mask);
 
-    var reg_count: u64 = 0;
-    var stack_args: u64 = 0;
-    var align_pad: u64 = 0;
-    _ssa_call_prepare_stack_layout(nargs, save_words, 0, &reg_count, &stack_args, &align_pad);
+    var layout2: SSACallStackLayout = _ssa_call_prepare_stack_layout(nargs, save_words, 0);
+    var reg_count: u64 = layout2.reg_count;
+    var stack_args: u64 = layout2.stack_args;
+    var align_pad: u64 = layout2.align_pad;
 
     _ssa_call_emit_push_args(args_vec, nargs);
     _ssa_call_emit_pop_arg_regs(reg_count);
@@ -1692,28 +1710,40 @@ func _ssa_emit_ret(inst: *SSAInstruction) -> u64 {
     return 0;
 }
 
-func _ssa_ret_slice_heap_prepare_meta(inst: *SSAInstruction, elem_size_out: *u64, ex_ptr_val_out: *u64, ex_len_val_out: *u64, ex_ptr_is_reg_out: *u64, ex_len_is_reg_out: *u64) -> u64 {
+struct SSARetSliceHeapMeta {
+    public has_ex: u64;
+    public elem_size: u64;
+    public ex_ptr_val: u64;
+    public ex_len_val: u64;
+    public ex_ptr_is_reg: u64;
+    public ex_len_is_reg: u64;
+}
+
+func _ssa_ret_slice_heap_prepare_meta(inst: *SSAInstruction) -> SSARetSliceHeapMeta {
+    var meta: SSARetSliceHeapMeta;
+
     var elem_size: u64 = inst.dest;
     if (elem_size == 0) {
         elem_size = ssa_ret_slice_heap_get((u64)inst);
     }
 
-    var ex_elem: u64 = 0;
-    var ex_ptr_val: u64 = 0;
-    var ex_len_val: u64 = 0;
-    var ex_ptr_is_reg: u64 = 0;
-    var ex_len_is_reg: u64 = 0;
-    var has_ex: u64 = ssa_ret_slice_heap_get_ex((u64)inst, &ex_elem, &ex_ptr_val, &ex_len_val, &ex_ptr_is_reg, &ex_len_is_reg);
-    if (has_ex != 0 && ex_elem != 0) {
-        elem_size = ex_elem;
+    var ex_info: SSARetSliceHeapQueryEx = ssa_ret_slice_heap_get_ex((u64)inst);
+    var has_ex: u64 = ex_info.found;
+    var ex_ptr_val: u64 = ex_info.ptr_val;
+    var ex_len_val: u64 = ex_info.len_val;
+    var ex_ptr_is_reg: u64 = ex_info.ptr_is_reg;
+    var ex_len_is_reg: u64 = ex_info.len_is_reg;
+    if (has_ex != 0 && ex_info.elem_size != 0) {
+        elem_size = ex_info.elem_size;
     }
 
-    *elem_size_out = elem_size;
-    *ex_ptr_val_out = ex_ptr_val;
-    *ex_len_val_out = ex_len_val;
-    *ex_ptr_is_reg_out = ex_ptr_is_reg;
-    *ex_len_is_reg_out = ex_len_is_reg;
-    return has_ex;
+    meta.has_ex = has_ex;
+    meta.elem_size = elem_size;
+    meta.ex_ptr_val = ex_ptr_val;
+    meta.ex_len_val = ex_len_val;
+    meta.ex_ptr_is_reg = ex_ptr_is_reg;
+    meta.ex_len_is_reg = ex_len_is_reg;
+    return meta;
 }
 
 func _ssa_ret_slice_heap_emit_len_setup(inst: *SSAInstruction, has_ex: u64, ex_len_val: u64, ex_len_is_reg: u64) -> u64 {
@@ -1824,15 +1854,10 @@ func _ssa_ret_slice_heap_emit_alloc_copy_and_ret(elem_size: u64) -> u64 {
 
 func _ssa_emit_ret_slice_heap(inst: *SSAInstruction) -> u64 {
     _ssa_ensure_heap_brk_global();
-    var elem_size: u64 = 0;
-    var ex_ptr_val: u64 = 0;
-    var ex_len_val: u64 = 0;
-    var ex_ptr_is_reg: u64 = 0;
-    var ex_len_is_reg: u64 = 0;
-    var has_ex: u64 = _ssa_ret_slice_heap_prepare_meta(inst, &elem_size, &ex_ptr_val, &ex_len_val, &ex_ptr_is_reg, &ex_len_is_reg);
-    _ssa_ret_slice_heap_emit_len_setup(inst, has_ex, ex_len_val, ex_len_is_reg);
-    _ssa_ret_slice_heap_emit_src_setup(inst, has_ex, ex_ptr_val, ex_ptr_is_reg);
-    _ssa_ret_slice_heap_emit_alloc_copy_and_ret(elem_size);
+    var meta: SSARetSliceHeapMeta = _ssa_ret_slice_heap_prepare_meta(inst);
+    _ssa_ret_slice_heap_emit_len_setup(inst, meta.has_ex, meta.ex_len_val, meta.ex_len_is_reg);
+    _ssa_ret_slice_heap_emit_src_setup(inst, meta.has_ex, meta.ex_ptr_val, meta.ex_ptr_is_reg);
+    _ssa_ret_slice_heap_emit_alloc_copy_and_ret(meta.elem_size);
     return 0;
 }
 

@@ -168,6 +168,63 @@ struct Stat {
     public size: u64;
 }
 
+struct CompilerDeclLookup {
+    public found: u64;
+    public owner_ptr: u64;
+    public owner_len: u64;
+    public access: u64;
+    public sig: *AstFunc;
+}
+
+struct CompilerModuleIdentity {
+    public module_ptr: u64;
+    public module_len: u64;
+    public prefix_ptr: u64;
+    public prefix_len: u64;
+}
+
+struct CompilerTryFieldNames {
+    public found: u64;
+    public check_ptr: u64;
+    public check_len: u64;
+    public value_ptr: u64;
+    public value_len: u64;
+}
+
+struct CompilerResolvedStructName {
+    public found: u64;
+    public resolved_ptr: u64;
+    public resolved_len: u64;
+    public struct_def: *AstStructDef;
+}
+
+struct CompilerResolvedParent {
+    public parent_ptr: u64;
+    public parent_len: u64;
+    public parent_def: *AstStructDef;
+}
+
+struct CompilerImplTraitStruct {
+    public trait_def: *TraitDef;
+    public struct_def: *AstStructDef;
+}
+
+struct CompilerVtableStructInfo {
+    public vtable_struct_def: *AstStructDef;
+    public vtable_name_ptr: u64;
+    public vtable_name_len: u64;
+}
+
+func compiler_decl_lookup_none(default_access: u64) -> CompilerDeclLookup {
+    var lookup: CompilerDeclLookup;
+    lookup.found = 0;
+    lookup.owner_ptr = 0;
+    lookup.owner_len = 0;
+    lookup.access = default_access;
+    lookup.sig = 0;
+    return lookup;
+}
+
 // ============================================
 // File Reading
 // ============================================
@@ -848,10 +905,9 @@ func resolve_prelude_alias_lazy(name_ptr: u64, name_len: u64) -> *NameInfo {
     }
 
     for (var i: u64 = 0; i < PRELUDE_MODULE_COUNT; i++) {
-        var module_ptr: u64 = 0;
-        var module_len: u64 = 0;
-        if (module_util_prelude_module_info(i, &module_ptr, &module_len) == 0) { continue; }
-        var info: *NameInfo = prelude_try_symbol(module_ptr, module_len, name_ptr, name_len);
+        var prelude_info: ModulePreludeInfo = module_util_prelude_module_info(i);
+        if (prelude_info.found == 0) { continue; }
+        var info: *NameInfo = prelude_try_symbol(prelude_info.ptr, prelude_info.len, name_ptr, name_len);
         if (info != 0) { return info; }
     }
     if (g_prelude_miss_cache == 0) {
@@ -1389,11 +1445,10 @@ func load_std_prelude() -> u64 {
     compiler_invalidate_resolve_name_cache();
 
     for (var i: u64 = 0; i < PRELUDE_MODULE_COUNT; i++) {
-        var module_ptr: u64 = 0;
-        var module_len: u64 = 0;
-        if (module_util_prelude_module_info(i, &module_ptr, &module_len) == 0) { continue; }
-        if (!load_module_by_name(module_ptr, module_len)) { return false; }
-        var module_id: *NameInfo = module_util_module_id_from_import(module_ptr, module_len);
+        var prelude_info: ModulePreludeInfo = module_util_prelude_module_info(i);
+        if (prelude_info.found == 0) { continue; }
+        if (!load_module_by_name(prelude_info.ptr, prelude_info.len)) { return false; }
+        var module_id: *NameInfo = module_util_module_id_from_import(prelude_info.ptr, prelude_info.len);
         prelude_import_all_from_module(module_id.ptr, module_id.len);
     }
     g_prelude_loaded = 1;
@@ -1424,14 +1479,15 @@ func compiler_load_module_import_deps_pass1(file_path: u64, file_path_len: u64) 
     return true;
 }
 
-func compiler_module_identity(file_path: u64, file_path_len: u64, module_ptr_out: *u64, module_len_out: *u64, prefix_ptr_out: *u64, prefix_len_out: *u64) -> u64 {
+func compiler_module_identity(file_path: u64, file_path_len: u64) -> CompilerModuleIdentity {
+    var identity: CompilerModuleIdentity;
     var module_id: *NameInfo = module_id_from_path(file_path, file_path_len);
     var module_prefix: *NameInfo = module_util_module_prefix_from_id(module_id.ptr, module_id.len);
-    *module_ptr_out = module_id.ptr;
-    *module_len_out = module_id.len;
-    *prefix_ptr_out = module_prefix.ptr;
-    *prefix_len_out = module_prefix.len;
-    return 0;
+    identity.module_ptr = module_id.ptr;
+    identity.module_len = module_id.len;
+    identity.prefix_ptr = module_prefix.ptr;
+    identity.prefix_len = module_prefix.len;
+    return identity;
 }
 
 func compiler_merge_program_consts(prog: *AstProgram) -> u64 {
@@ -1513,16 +1569,12 @@ func load_module(file_path: u64, file_path_len: u64) -> u64 {
     }
     
     // Module identity for mangling
-    var module_ptr: u64 = 0;
-    var module_len: u64 = 0;
-    var prefix_ptr: u64 = 0;
-    var prefix_len: u64 = 0;
-    compiler_module_identity(file_path, file_path_len, &module_ptr, &module_len, &prefix_ptr, &prefix_len);
+    var module_identity: CompilerModuleIdentity = compiler_module_identity(file_path, file_path_len);
     
     // Pass 2: full parse with bodies
     var p: *Parser = parse_new(tokens);
     var prog: *AstProgram = parse_program(p);
-    compiler_merge_module_program(file_path, file_path_len, prog, module_ptr, module_len, prefix_ptr, prefix_len);
+    compiler_merge_module_program(file_path, file_path_len, prog, module_identity.module_ptr, module_identity.module_len, module_identity.prefix_ptr, module_identity.prefix_len);
 
     return true;
 }
@@ -1734,26 +1786,30 @@ func compiler_try_kind_from_typeinfo(ti: *TypeInfo) -> u64 {
     return COMPILER_TRY_KIND_INVALID;
 }
 
-func compiler_try_field_names(kind: u64, out_check_ptr: *u64, out_check_len: *u64, out_value_ptr: *u64, out_value_len: *u64) -> u64 {
+func compiler_try_field_names(kind: u64) -> CompilerTryFieldNames {
+    var names: CompilerTryFieldNames;
+    names.found = 0;
+    names.check_ptr = 0;
+    names.check_len = 0;
+    names.value_ptr = 0;
+    names.value_len = 0;
     if (kind == COMPILER_TRY_KIND_OPTION) {
-        *out_check_ptr = (u64)"is_some";
-        *out_check_len = 7;
-        *out_value_ptr = (u64)"value";
-        *out_value_len = 5;
-        return true;
+        names.found = 1;
+        names.check_ptr = (u64)"is_some";
+        names.check_len = 7;
+        names.value_ptr = (u64)"value";
+        names.value_len = 5;
+        return names;
     }
     if (kind == COMPILER_TRY_KIND_RESULT) {
-        *out_check_ptr = (u64)"is_ok";
-        *out_check_len = 5;
-        *out_value_ptr = (u64)"ok";
-        *out_value_len = 2;
-        return true;
+        names.found = 1;
+        names.check_ptr = (u64)"is_ok";
+        names.check_len = 5;
+        names.value_ptr = (u64)"ok";
+        names.value_len = 2;
+        return names;
     }
-    *out_check_ptr = 0;
-    *out_check_len = 0;
-    *out_value_ptr = 0;
-    *out_value_len = 0;
-    return false;
+    return names;
 }
 
 func compiler_try_return_matches_type(value_ti: *TypeInfo, ret_type: u64, ret_ptr_depth: u64, ret_struct_name_ptr: u64, ret_struct_name_len: u64) -> u64 {
@@ -2583,8 +2639,9 @@ func compiler_struct_is_same_or_descendant(child_ptr: u64, child_len: u64, ances
     return false;
 }
 
-func _compiler_find_method_decl_in_hierarchy(struct_def: *AstStructDef, method_ptr: u64, method_len: u64, depth: u64, owner_ptr_out: *u64, owner_len_out: *u64, access_out: *u64, sig_out: **AstFunc) -> u64 {
-    if (struct_def == 0) { return 0; }
+func _compiler_find_method_decl_in_hierarchy(struct_def: *AstStructDef, method_ptr: u64, method_len: u64, depth: u64) -> CompilerDeclLookup {
+    var lookup: CompilerDeclLookup = compiler_decl_lookup_none(ACCESS_PUBLIC);
+    if (struct_def == 0) { return lookup; }
     if (depth > 64) {
         emit_stderr("[ERROR] Inheritance depth exceeded\n");
         panic("Compiler error");
@@ -2592,44 +2649,35 @@ func _compiler_find_method_decl_in_hierarchy(struct_def: *AstStructDef, method_p
 
     var method_name: *NameInfo = compiler_build_method_name(struct_def.name_ptr, struct_def.name_len, method_ptr, method_len);
     if (compiler_is_impl_method(method_name.ptr, method_name.len) != 0) {
-        *owner_ptr_out = struct_def.name_ptr;
-        *owner_len_out = struct_def.name_len;
-        *access_out = compiler_get_impl_method_access(method_name.ptr, method_name.len);
-        *sig_out = compiler_get_func(method_name.ptr, method_name.len);
-        return 1;
+        lookup.found = 1;
+        lookup.owner_ptr = struct_def.name_ptr;
+        lookup.owner_len = struct_def.name_len;
+        lookup.access = compiler_get_impl_method_access(method_name.ptr, method_name.len);
+        lookup.sig = compiler_get_func(method_name.ptr, method_name.len);
+        return lookup;
     }
 
     if (compiler_is_abst_method(struct_def.name_ptr, struct_def.name_len, method_ptr, method_len) != 0) {
-        *owner_ptr_out = struct_def.name_ptr;
-        *owner_len_out = struct_def.name_len;
-        *access_out = compiler_get_abst_method_access(struct_def.name_ptr, struct_def.name_len, method_ptr, method_len);
-        *sig_out = compiler_get_abst_method_sig(struct_def.name_ptr, struct_def.name_len, method_ptr, method_len);
-        return 1;
+        lookup.found = 1;
+        lookup.owner_ptr = struct_def.name_ptr;
+        lookup.owner_len = struct_def.name_len;
+        lookup.access = compiler_get_abst_method_access(struct_def.name_ptr, struct_def.name_len, method_ptr, method_len);
+        lookup.sig = compiler_get_abst_method_sig(struct_def.name_ptr, struct_def.name_len, method_ptr, method_len);
+        return lookup;
     }
 
-    if (struct_def.parents_vec == 0) { return 0; }
+    if (struct_def.parents_vec == 0) { return lookup; }
     var parents: *Vec<*ParentDesc> = struct_def.parents_vec;
     var pn: u64 = parents.len();
     var found: u64 = 0;
-    var owner_ptr_tmp: u64 = 0;
-    var owner_len_tmp: u64 = 0;
-    var access_tmp: u64 = ACCESS_PUBLIC;
-    var sig_tmp: *AstFunc = 0;
+    var first_hit: CompilerDeclLookup = compiler_decl_lookup_none(ACCESS_PUBLIC);
     for (var i: u64 = 0; i < pn; i++) {
         var parent_desc: *ParentDesc = parents.get(i);
         var parent_def: *AstStructDef = compiler_resolve_parent_def(parent_desc, "Compiler error");
-        var owner_ptr_c: u64 = 0;
-        var owner_len_c: u64 = 0;
-        var access_c: u64 = ACCESS_PUBLIC;
-        var sig_c: *AstFunc = 0;
-        if (_compiler_find_method_decl_in_hierarchy(parent_def, method_ptr, method_len, depth + 1, &owner_ptr_c, &owner_len_c, &access_c, &sig_c) != 0) {
+        var child_lookup: CompilerDeclLookup = _compiler_find_method_decl_in_hierarchy(parent_def, method_ptr, method_len, depth + 1);
+        if (child_lookup.found != 0) {
             found = found + 1;
-            if (found == 1) {
-                owner_ptr_tmp = owner_ptr_c;
-                owner_len_tmp = owner_len_c;
-                access_tmp = access_c;
-                sig_tmp = sig_c;
-            }
+            if (found == 1) { first_hit = child_lookup; }
         }
     }
     if (found > 1) {
@@ -2640,19 +2688,15 @@ func _compiler_find_method_decl_in_hierarchy(struct_def: *AstStructDef, method_p
         emit_stderr("\n");
         panic("Compiler error");
     }
-    if (found == 0) { return 0; }
-
-    *owner_ptr_out = owner_ptr_tmp;
-    *owner_len_out = owner_len_tmp;
-    *access_out = access_tmp;
-    *sig_out = sig_tmp;
-    return 1;
+    if (found == 0) { return lookup; }
+    return first_hit;
 }
 
-func compiler_find_method_decl_in_hierarchy(struct_ptr: u64, struct_len: u64, method_ptr: u64, method_len: u64, owner_ptr_out: *u64, owner_len_out: *u64, access_out: *u64, sig_out: **AstFunc) -> u64 {
+func compiler_find_method_decl_in_hierarchy(struct_ptr: u64, struct_len: u64, method_ptr: u64, method_len: u64) -> CompilerDeclLookup {
+    var lookup: CompilerDeclLookup = compiler_decl_lookup_none(ACCESS_PUBLIC);
     var sd: *AstStructDef = get_struct_def(struct_ptr, struct_len);
-    if (sd == 0) { return 0; }
-    return _compiler_find_method_decl_in_hierarchy(sd, method_ptr, method_len, 0, owner_ptr_out, owner_len_out, access_out, sig_out);
+    if (sd == 0) { return lookup; }
+    return _compiler_find_method_decl_in_hierarchy(sd, method_ptr, method_len, 0);
 }
 
 func compiler_check_field_access(field_desc: *FieldDesc) -> u64 {
@@ -2661,14 +2705,11 @@ func compiler_check_field_access(field_desc: *FieldDesc) -> u64 {
 }
 
 func compiler_check_method_access(struct_ptr: u64, struct_len: u64, method_ptr: u64, method_len: u64) -> u64 {
-    var owner_ptr: u64 = 0;
-    var owner_len: u64 = 0;
-    var access: u64 = ACCESS_PUBLIC;
-    var sig: *AstFunc = 0;
-    if (compiler_find_method_decl_in_hierarchy(struct_ptr, struct_len, method_ptr, method_len, &owner_ptr, &owner_len, &access, &sig) == 0) {
+    var lookup: CompilerDeclLookup = compiler_find_method_decl_in_hierarchy(struct_ptr, struct_len, method_ptr, method_len);
+    if (lookup.found == 0) {
         return 1;
     }
-    return compiler_can_access_member(owner_ptr, owner_len, access);
+    return compiler_can_access_member(lookup.owner_ptr, lookup.owner_len, lookup.access);
 }
 
 func compiler_is_virtual_trait_name(name_ptr: u64, name_len: u64) -> u64 {
@@ -2898,8 +2939,8 @@ func generic_infer_expr_type(expr: *AstNode, symtab: *HashMap<u64, *TypeInfo>) -
                                                      sc3.elem_type_kind, sc3.elem_ptr_depth, sc3.array_len, sc3.array_len_is_param, sc3.array_len_param_ptr, sc3.array_len_param_len);
         case AST_GENERIC_STRUCT_LITERAL:
             var gsl: *AstGenericStructLiteral = (*AstGenericStructLiteral)expr;
-            var tpl: *GenericStructTemplate = 0;
-            if (compiler_try_resolve_generic_struct_template(gsl.name_ptr, gsl.name_len, &tpl) == 0) {
+            var tpl: *GenericStructTemplate = compiler_try_resolve_generic_struct_template(gsl.name_ptr, gsl.name_len);
+            if (tpl == 0) {
                 return generic_type_u64();
             }
             var bindings_gsl: *Vec<*GenericBinding> = generic_build_bindings_for_struct(tpl, gsl.generic_args_vec);
@@ -3860,7 +3901,13 @@ func generic_process_stmt(stmt: *AstNode, symtab: *HashMap<u64, *TypeInfo>) -> u
     }
 }
 
-func compiler_try_resolve_struct_name(name_ptr: u64, name_len: u64, resolved_ptr_out: *u64, resolved_len_out: *u64, struct_def_out: **AstStructDef) -> u64 {
+func compiler_try_resolve_struct_name(name_ptr: u64, name_len: u64) -> CompilerResolvedStructName {
+    var result: CompilerResolvedStructName;
+    result.found = 0;
+    result.resolved_ptr = name_ptr;
+    result.resolved_len = name_len;
+    result.struct_def = 0;
+
     var resolved_ptr: u64 = name_ptr;
     var resolved_len: u64 = name_len;
     var struct_def: *AstStructDef = get_struct_def(resolved_ptr, resolved_len);
@@ -3875,14 +3922,15 @@ func compiler_try_resolve_struct_name(name_ptr: u64, name_len: u64, resolved_ptr
             }
         }
     }
-    if (struct_def == 0) { return 0; }
-    *resolved_ptr_out = resolved_ptr;
-    *resolved_len_out = resolved_len;
-    *struct_def_out = struct_def;
-    return 1;
+    if (struct_def == 0) { return result; }
+    result.found = 1;
+    result.resolved_ptr = resolved_ptr;
+    result.resolved_len = resolved_len;
+    result.struct_def = struct_def;
+    return result;
 }
 
-func compiler_try_resolve_generic_struct_template(name_ptr: u64, name_len: u64, tpl_out: **GenericStructTemplate) -> u64 {
+func compiler_try_resolve_generic_struct_template(name_ptr: u64, name_len: u64) -> *GenericStructTemplate {
     var tpl: *GenericStructTemplate = compiler_find_generic_struct_template_by_name(name_ptr, name_len);
     if (tpl == 0) {
         var resolved_name: *NameInfo = resolve_name(name_ptr, name_len);
@@ -3890,14 +3938,12 @@ func compiler_try_resolve_generic_struct_template(name_ptr: u64, name_len: u64, 
             tpl = compiler_find_generic_struct_template_by_name(resolved_name.ptr, resolved_name.len);
         }
     }
-    if (tpl == 0) { return 0; }
-    *tpl_out = tpl;
-    return 1;
+    return tpl;
 }
 
 func compiler_try_resolve_generic_struct_type_instance(name_ptr: u64, name_len: u64, generic_args: *Vec<*GenericArg>, out_name_info: **NameInfo) -> u64 {
-    var tpl: *GenericStructTemplate = 0;
-    if (compiler_try_resolve_generic_struct_template(name_ptr, name_len, &tpl) == 0) {
+    var tpl: *GenericStructTemplate = compiler_try_resolve_generic_struct_template(name_ptr, name_len);
+    if (tpl == 0) {
         return 0;
     }
     var bindings: *Vec<*GenericBinding> = generic_build_bindings_for_struct(tpl, generic_args);
@@ -3920,22 +3966,20 @@ func compiler_lower_parse_sugar_ctor_call(call: *AstCall) -> *AstNode {
     if (call == 0) { return 0; }
     if (call.origin != AST_CALL_ORIGIN_DIRECT) { return (*AstNode)call; }
 
-    var struct_ptr: u64 = 0;
-    var struct_len: u64 = 0;
-    var struct_def: *AstStructDef = 0;
-    if (compiler_try_resolve_struct_name(call.name_ptr, call.name_len, &struct_ptr, &struct_len, &struct_def) == 0) {
+    var ctor_struct: CompilerResolvedStructName = compiler_try_resolve_struct_name(call.name_ptr, call.name_len);
+    if (ctor_struct.found == 0) {
         return (*AstNode)call;
     }
 
-    return (*AstNode)ast_stack_ctor(TYPE_STRUCT, 0, 0, struct_ptr, struct_len, 0, 0, 0, 0, 0, 0, 0, 0, call.args_vec);
+    return (*AstNode)ast_stack_ctor(TYPE_STRUCT, 0, 0, ctor_struct.resolved_ptr, ctor_struct.resolved_len, 0, 0, 0, 0, 0, 0, 0, 0, call.args_vec);
 }
 
 func compiler_lower_parse_sugar_generic_ctor_call(gcall: *AstGenericCall) -> *AstNode {
     if (gcall == 0) { return 0; }
     if (gcall.origin != AST_CALL_ORIGIN_DIRECT) { return (*AstNode)gcall; }
 
-    var tpl: *GenericStructTemplate = 0;
-    if (compiler_try_resolve_generic_struct_template(gcall.name_ptr, gcall.name_len, &tpl) == 0) {
+    var tpl: *GenericStructTemplate = compiler_try_resolve_generic_struct_template(gcall.name_ptr, gcall.name_len);
+    if (tpl == 0) {
         return (*AstNode)gcall;
     }
 
@@ -3947,8 +3991,8 @@ func compiler_lower_parse_sugar_generic_ctor_call(gcall: *AstGenericCall) -> *As
 func compiler_lower_parse_sugar_generic_struct_literal(gsl: *AstGenericStructLiteral) -> *AstNode {
     if (gsl == 0) { return 0; }
 
-    var tpl: *GenericStructTemplate = 0;
-    if (compiler_try_resolve_generic_struct_template(gsl.name_ptr, gsl.name_len, &tpl) == 0) {
+    var tpl: *GenericStructTemplate = compiler_try_resolve_generic_struct_template(gsl.name_ptr, gsl.name_len);
+    if (tpl == 0) {
         emit_stderr("[ERROR] Generic struct template not found: ");
         emit_stderr_len(gsl.name_ptr, gsl.name_len);
         emit_stderr("\n");
@@ -3968,17 +4012,15 @@ func compiler_lower_parse_sugar_generic_struct_literal(gsl: *AstGenericStructLit
 func compiler_lower_parse_sugar_static_generic_method_call(sgc: *AstStaticGenericCall) -> *AstNode {
     if (sgc == 0) { return 0; }
 
-    var struct_ptr: u64 = 0;
-    var struct_len: u64 = 0;
-    var struct_def: *AstStructDef = 0;
-    if (compiler_try_resolve_struct_name(sgc.struct_name_ptr, sgc.struct_name_len, &struct_ptr, &struct_len, &struct_def) == 0) {
+    var static_struct: CompilerResolvedStructName = compiler_try_resolve_struct_name(sgc.struct_name_ptr, sgc.struct_name_len);
+    if (static_struct.found == 0) {
         emit_stderr("[ERROR] static generic method owner type not found: ");
         emit_stderr_len(sgc.struct_name_ptr, sgc.struct_name_len);
         emit_stderr("\n");
         panic("Compiler error");
     }
 
-    var lowered_name: *NameInfo = compiler_build_method_name(struct_ptr, struct_len, sgc.method_ptr, sgc.method_len);
+    var lowered_name: *NameInfo = compiler_build_method_name(static_struct.resolved_ptr, static_struct.resolved_len, sgc.method_ptr, sgc.method_len);
     return (*AstNode)ast_generic_call_with_origin(lowered_name.ptr, lowered_name.len, sgc.generic_args_vec, sgc.args_vec, AST_CALL_ORIGIN_MEMBER_LOWERED);
 }
 
@@ -3987,10 +4029,8 @@ func compiler_lower_parse_sugar_static_method_call(mc: *AstMethodCall, is_safe: 
     if (ast_kind(mc.receiver) != AST_IDENT) { return (*AstNode)mc; }
 
     var recv_id: *AstIdent = (*AstIdent)mc.receiver;
-    var struct_ptr: u64 = 0;
-    var struct_len: u64 = 0;
-    var struct_def: *AstStructDef = 0;
-    if (compiler_try_resolve_struct_name(recv_id.name_ptr, recv_id.name_len, &struct_ptr, &struct_len, &struct_def) == 0) {
+    var static_recv_struct: CompilerResolvedStructName = compiler_try_resolve_struct_name(recv_id.name_ptr, recv_id.name_len);
+    if (static_recv_struct.found == 0) {
         return (*AstNode)mc;
     }
 
@@ -3999,7 +4039,7 @@ func compiler_lower_parse_sugar_static_method_call(mc: *AstMethodCall, is_safe: 
         panic("Compiler error");
     }
 
-    var lowered_name: *NameInfo = compiler_build_method_name(struct_ptr, struct_len, mc.method_ptr, mc.method_len);
+    var lowered_name: *NameInfo = compiler_build_method_name(static_recv_struct.resolved_ptr, static_recv_struct.resolved_len, mc.method_ptr, mc.method_len);
     return (*AstNode)ast_call_with_origin(lowered_name.ptr, lowered_name.len, mc.args_vec, AST_CALL_ORIGIN_MEMBER_LOWERED);
 }
 
@@ -4549,7 +4589,12 @@ func compiler_super_require_member_form() -> u64 {
     return 0;
 }
 
-func compiler_super_resolve_parent(owner_ptr: u64, owner_len: u64, parent_ptr_out: *u64, parent_len_out: *u64, parent_def_out: **AstStructDef) -> u64 {
+func compiler_super_resolve_parent(owner_ptr: u64, owner_len: u64) -> CompilerResolvedParent {
+    var result: CompilerResolvedParent;
+    result.parent_ptr = 0;
+    result.parent_len = 0;
+    result.parent_def = 0;
+
     if (owner_ptr == 0 || owner_len == 0) {
         emit_stderr("[ERROR] 'super' is only allowed inside impl methods\n");
         panic("Compiler error");
@@ -4573,10 +4618,10 @@ func compiler_super_resolve_parent(owner_ptr: u64, owner_len: u64, parent_ptr_ou
 
     var parent_desc: *ParentDesc = owner_def.parents_vec.get(0);
     var parent_def: *AstStructDef = compiler_resolve_parent_def(parent_desc, "Compiler error");
-    *parent_ptr_out = parent_def.name_ptr;
-    *parent_len_out = parent_def.name_len;
-    *parent_def_out = parent_def;
-    return 0;
+    result.parent_ptr = parent_def.name_ptr;
+    result.parent_len = parent_def.name_len;
+    result.parent_def = parent_def;
+    return result;
 }
 
 func compiler_super_check_access(owner_ptr: u64, owner_len: u64, member_owner_ptr: u64, member_owner_len: u64, access: u64, member_ptr: u64, member_len: u64, kind_msg: u64) -> u64 {
@@ -4618,10 +4663,10 @@ func compiler_lower_super_member_access_expr(ma: *AstMemberAccess, owner_ptr: u6
         panic("Compiler error");
     }
 
-    var parent_ptr: u64 = 0;
-    var parent_len: u64 = 0;
-    var parent_def: *AstStructDef = 0;
-    compiler_super_resolve_parent(owner_ptr, owner_len, &parent_ptr, &parent_len, &parent_def);
+    var resolved_parent: CompilerResolvedParent = compiler_super_resolve_parent(owner_ptr, owner_len);
+    var parent_ptr: u64 = resolved_parent.parent_ptr;
+    var parent_len: u64 = resolved_parent.parent_len;
+    var parent_def: *AstStructDef = resolved_parent.parent_def;
 
     var field_desc: *FieldDesc = _compiler_find_field_desc_unscoped(parent_def, ma.member_ptr, ma.member_len, 0);
     if (field_desc == 0) {
@@ -4649,16 +4694,13 @@ func compiler_lower_super_method_call_expr(mc: *AstMethodCall, owner_ptr: u64, o
         panic("Compiler error");
     }
 
-    var parent_ptr: u64 = 0;
-    var parent_len: u64 = 0;
-    var parent_def: *AstStructDef = 0;
-    compiler_super_resolve_parent(owner_ptr, owner_len, &parent_ptr, &parent_len, &parent_def);
+    var resolved_parent2: CompilerResolvedParent = compiler_super_resolve_parent(owner_ptr, owner_len);
+    var parent_ptr: u64 = resolved_parent2.parent_ptr;
+    var parent_len: u64 = resolved_parent2.parent_len;
+    var parent_def: *AstStructDef = resolved_parent2.parent_def;
 
-    var member_owner_ptr: u64 = 0;
-    var member_owner_len: u64 = 0;
-    var member_access: u64 = ACCESS_PUBLIC;
-    var member_sig: *AstFunc = 0;
-    if (compiler_find_method_decl_in_hierarchy(parent_ptr, parent_len, mc.method_ptr, mc.method_len, &member_owner_ptr, &member_owner_len, &member_access, &member_sig) == 0) {
+    var member_lookup: CompilerDeclLookup = compiler_find_method_decl_in_hierarchy(parent_ptr, parent_len, mc.method_ptr, mc.method_len);
+    if (member_lookup.found == 0) {
         emit_stderr("[ERROR] super method not found: ");
         emit_stderr_len(parent_ptr, parent_len);
         emit_stderr(".");
@@ -4667,7 +4709,9 @@ func compiler_lower_super_method_call_expr(mc: *AstMethodCall, owner_ptr: u64, o
         panic("Compiler error");
     }
 
-    compiler_super_check_access(owner_ptr, owner_len, member_owner_ptr, member_owner_len, member_access, mc.method_ptr, mc.method_len, "method");
+    compiler_super_check_access(owner_ptr, owner_len, member_lookup.owner_ptr, member_lookup.owner_len, member_lookup.access, mc.method_ptr, mc.method_len, "method");
+    var member_owner_ptr: u64 = member_lookup.owner_ptr;
+    var member_owner_len: u64 = member_lookup.owner_len;
     if (member_owner_ptr == 0 || member_owner_len == 0) {
         member_owner_ptr = parent_ptr;
         member_owner_len = parent_len;
@@ -5331,7 +5375,11 @@ func compiler_validate_all_struct_trait_inheritance() -> u64 {
     return 0;
 }
 
-func compiler_get_impl_trait_and_struct(impl_info: *TraitImpl, trait_def_out: **TraitDef, struct_def_out: **AstStructDef) -> u64 {
+func compiler_get_impl_trait_and_struct(impl_info: *TraitImpl) -> CompilerImplTraitStruct {
+    var pair: CompilerImplTraitStruct;
+    pair.trait_def = 0;
+    pair.struct_def = 0;
+
     var trait_def: *TraitDef = compiler_get_trait_def(impl_info.trait_ptr, impl_info.trait_len);
     if (trait_def == 0) {
         emit_stderr("[ERROR] Trait not found for impl: ");
@@ -5352,18 +5400,26 @@ func compiler_get_impl_trait_and_struct(impl_info: *TraitImpl, trait_def_out: **
         panic("Parse error");
     }
 
-    *trait_def_out = trait_def;
-    *struct_def_out = struct_def;
-    return 0;
+    pair.trait_def = trait_def;
+    pair.struct_def = struct_def;
+    return pair;
 }
 
-func compiler_get_or_create_vtable_struct(trait_def: *TraitDef, trait_ptr: u64, trait_len: u64, vtable_name_ptr_out: *u64, vtable_name_len_out: *u64) -> *AstStructDef {
+func compiler_get_or_create_vtable_struct(trait_def: *TraitDef, trait_ptr: u64, trait_len: u64) -> CompilerVtableStructInfo {
+    var info: CompilerVtableStructInfo;
+    info.vtable_struct_def = 0;
+    info.vtable_name_ptr = 0;
+    info.vtable_name_len = 0;
+
     var vtable_name: *NameInfo = compiler_build_vtable_struct_name(trait_ptr, trait_len);
-    *vtable_name_ptr_out = vtable_name.ptr;
-    *vtable_name_len_out = vtable_name.len;
+    info.vtable_name_ptr = vtable_name.ptr;
+    info.vtable_name_len = vtable_name.len;
 
     var vtable_struct_def: *AstStructDef = get_struct_def(vtable_name.ptr, vtable_name.len);
-    if (vtable_struct_def != 0) { return vtable_struct_def; }
+    if (vtable_struct_def != 0) {
+        info.vtable_struct_def = vtable_struct_def;
+        return info;
+    }
 
     var vtable_fields: *Vec<*FieldDesc> = new Vec<*FieldDesc>(trait_def.methods_vec.len());
     var mcount: u64 = trait_def.methods_vec.len();
@@ -5390,7 +5446,8 @@ func compiler_get_or_create_vtable_struct(trait_def: *TraitDef, trait_ptr: u64, 
     }
     vtable_struct_def = ast_struct_def(vtable_name.ptr, vtable_name.len, 0, vtable_fields, 0, 0);
     register_struct_type(vtable_struct_def);
-    return vtable_struct_def;
+    info.vtable_struct_def = vtable_struct_def;
+    return info;
 }
 
 func compiler_get_trait_impl_vptr_offset(impl_info: *TraitImpl, struct_def: *AstStructDef, vtable_name_ptr: u64, vtable_name_len: u64) -> u64 {
@@ -5561,13 +5618,14 @@ func compiler_register_trait_default_impl_method(impl_info: *TraitImpl, trait_me
 }
 
 func compiler_finalize_single_trait_impl(impl_info: *TraitImpl) -> u64 {
-    var trait_def: *TraitDef = 0;
-    var struct_def: *AstStructDef = 0;
-    compiler_get_impl_trait_and_struct(impl_info, &trait_def, &struct_def);
+    var impl_types: CompilerImplTraitStruct = compiler_get_impl_trait_and_struct(impl_info);
+    var trait_def: *TraitDef = impl_types.trait_def;
+    var struct_def: *AstStructDef = impl_types.struct_def;
 
-    var vtable_name_ptr: u64 = 0;
-    var vtable_name_len: u64 = 0;
-    var vtable_struct_def: *AstStructDef = compiler_get_or_create_vtable_struct(trait_def, impl_info.trait_ptr, impl_info.trait_len, &vtable_name_ptr, &vtable_name_len);
+    var vtable_info: CompilerVtableStructInfo = compiler_get_or_create_vtable_struct(trait_def, impl_info.trait_ptr, impl_info.trait_len);
+    var vtable_name_ptr: u64 = vtable_info.vtable_name_ptr;
+    var vtable_name_len: u64 = vtable_info.vtable_name_len;
+    var vtable_struct_def: *AstStructDef = vtable_info.vtable_struct_def;
     impl_info.vtable_struct_def = vtable_struct_def;
 
     var vptr_offset: u64 = compiler_get_trait_impl_vptr_offset(impl_info, struct_def, vtable_name_ptr, vtable_name_len);
@@ -5654,44 +5712,35 @@ func compiler_collect_self_and_parent_abst_methods(struct_def: *AstStructDef, ou
     return 0;
 }
 
-func _compiler_find_abst_decl_in_hierarchy(struct_def: *AstStructDef, method_ptr: u64, method_len: u64, depth: u64, owner_ptr_out: *u64, owner_len_out: *u64, access_out: *u64, sig_out: **AstFunc) -> u64 {
-    if (struct_def == 0) { return 0; }
+func _compiler_find_abst_decl_in_hierarchy(struct_def: *AstStructDef, method_ptr: u64, method_len: u64, depth: u64) -> CompilerDeclLookup {
+    var lookup: CompilerDeclLookup = compiler_decl_lookup_none(ACCESS_PRIVATE);
+    if (struct_def == 0) { return lookup; }
     if (depth > 64) {
         emit_stderr("[ERROR] Inheritance depth exceeded\n");
         panic("Compiler error");
     }
 
     if (compiler_is_abst_method(struct_def.name_ptr, struct_def.name_len, method_ptr, method_len) != 0) {
-        *owner_ptr_out = struct_def.name_ptr;
-        *owner_len_out = struct_def.name_len;
-        *access_out = compiler_get_abst_method_access(struct_def.name_ptr, struct_def.name_len, method_ptr, method_len);
-        *sig_out = compiler_get_abst_method_sig(struct_def.name_ptr, struct_def.name_len, method_ptr, method_len);
-        return 1;
+        lookup.found = 1;
+        lookup.owner_ptr = struct_def.name_ptr;
+        lookup.owner_len = struct_def.name_len;
+        lookup.access = compiler_get_abst_method_access(struct_def.name_ptr, struct_def.name_len, method_ptr, method_len);
+        lookup.sig = compiler_get_abst_method_sig(struct_def.name_ptr, struct_def.name_len, method_ptr, method_len);
+        return lookup;
     }
 
-    if (struct_def.parents_vec == 0) { return 0; }
+    if (struct_def.parents_vec == 0) { return lookup; }
     var parents: *Vec<*ParentDesc> = struct_def.parents_vec;
     var pn: u64 = parents.len();
     var found: u64 = 0;
-    var owner_ptr_tmp: u64 = 0;
-    var owner_len_tmp: u64 = 0;
-    var access_tmp: u64 = ACCESS_PRIVATE;
-    var sig_tmp: *AstFunc = 0;
+    var first_hit: CompilerDeclLookup = compiler_decl_lookup_none(ACCESS_PRIVATE);
     for (var i: u64 = 0; i < pn; i++) {
         var parent_desc: *ParentDesc = parents.get(i);
         var parent_def: *AstStructDef = compiler_resolve_parent_def(parent_desc, "Compiler error");
-        var owner_ptr_c: u64 = 0;
-        var owner_len_c: u64 = 0;
-        var access_c: u64 = ACCESS_PRIVATE;
-        var sig_c: *AstFunc = 0;
-        if (_compiler_find_abst_decl_in_hierarchy(parent_def, method_ptr, method_len, depth + 1, &owner_ptr_c, &owner_len_c, &access_c, &sig_c) != 0) {
+        var child_lookup: CompilerDeclLookup = _compiler_find_abst_decl_in_hierarchy(parent_def, method_ptr, method_len, depth + 1);
+        if (child_lookup.found != 0) {
             found = found + 1;
-            if (found == 1) {
-                owner_ptr_tmp = owner_ptr_c;
-                owner_len_tmp = owner_len_c;
-                access_tmp = access_c;
-                sig_tmp = sig_c;
-            }
+            if (found == 1) { first_hit = child_lookup; }
         }
     }
     if (found > 1) {
@@ -5702,17 +5751,12 @@ func _compiler_find_abst_decl_in_hierarchy(struct_def: *AstStructDef, method_ptr
         emit_stderr("\n");
         panic("Compiler error");
     }
-    if (found == 0) { return 0; }
-
-    *owner_ptr_out = owner_ptr_tmp;
-    *owner_len_out = owner_len_tmp;
-    *access_out = access_tmp;
-    *sig_out = sig_tmp;
-    return 1;
+    if (found == 0) { return lookup; }
+    return first_hit;
 }
 
-func compiler_find_abst_decl_in_hierarchy(struct_def: *AstStructDef, method_ptr: u64, method_len: u64, owner_ptr_out: *u64, owner_len_out: *u64, access_out: *u64, sig_out: **AstFunc) -> u64 {
-    return _compiler_find_abst_decl_in_hierarchy(struct_def, method_ptr, method_len, 0, owner_ptr_out, owner_len_out, access_out, sig_out);
+func compiler_find_abst_decl_in_hierarchy(struct_def: *AstStructDef, method_ptr: u64, method_len: u64) -> CompilerDeclLookup {
+    return _compiler_find_abst_decl_in_hierarchy(struct_def, method_ptr, method_len, 0);
 }
 
 func compiler_build_virtual_trait_name(base_ptr: u64, base_len: u64) -> *NameInfo {
@@ -5766,11 +5810,8 @@ func compiler_setup_single_virtual_dispatch_trait(base_def: *AstStructDef) -> u6
         var rn: u64 = required.len();
         for (var ri: u64 = 0; ri < rn; ri++) {
             var mi: *NameInfo = required.get(ri);
-            var owner_ptr: u64 = 0;
-            var owner_len: u64 = 0;
-            var access: u64 = ACCESS_PRIVATE;
-            var abst_sig: *AstFunc = 0;
-            if (compiler_find_abst_decl_in_hierarchy(base_def, mi.ptr, mi.len, &owner_ptr, &owner_len, &access, &abst_sig) == 0 || abst_sig == 0) {
+            var abst_lookup: CompilerDeclLookup = compiler_find_abst_decl_in_hierarchy(base_def, mi.ptr, mi.len);
+            if (abst_lookup.found == 0 || abst_lookup.sig == 0) {
                 emit_stderr("[ERROR] abstract signature missing for virtual dispatch: ");
                 emit_stderr_len(base_def.name_ptr, base_def.name_len);
                 emit_stderr(".");
@@ -5782,7 +5823,7 @@ func compiler_setup_single_virtual_dispatch_trait(base_def: *AstStructDef) -> u6
             var tm: *TraitMethod = new TraitMethod();
             tm.name_ptr = mi.ptr;
             tm.name_len = mi.len;
-            tm.sig = compiler_build_virtual_trait_method_sig(abst_sig, mi.ptr, mi.len);
+            tm.sig = compiler_build_virtual_trait_method_sig(abst_lookup.sig, mi.ptr, mi.len);
             tm.index = methods.len();
             methods.push(tm);
         }
@@ -5794,9 +5835,10 @@ func compiler_setup_single_virtual_dispatch_trait(base_def: *AstStructDef) -> u6
         compiler_register_trait_def(trait_def);
     }
 
-    var vtable_name_ptr: u64 = 0;
-    var vtable_name_len: u64 = 0;
-    var vtable_struct_def: *AstStructDef = compiler_get_or_create_vtable_struct(trait_def, trait_name.ptr, trait_name.len, &vtable_name_ptr, &vtable_name_len);
+    var vtable_info2: CompilerVtableStructInfo = compiler_get_or_create_vtable_struct(trait_def, trait_name.ptr, trait_name.len);
+    var vtable_name_ptr: u64 = vtable_info2.vtable_name_ptr;
+    var vtable_name_len: u64 = vtable_info2.vtable_name_len;
+    var vtable_struct_def: *AstStructDef = vtable_info2.vtable_struct_def;
     if (vtable_struct_def == 0) {
         emit_stderr("[ERROR] failed to build virtual vtable struct\n");
         panic("Parse error");
