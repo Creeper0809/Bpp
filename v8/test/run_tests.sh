@@ -154,6 +154,15 @@ run_matrix_case() {
     local out_file_persist="$RESULTS_DIR_BASE/${test_name}.${mode}.${opt}.out"
     local err_file_persist="$RESULTS_DIR_BASE/${test_name}.${mode}.${opt}.err"
 
+    local expect_compile_fail_raw
+    expect_compile_fail_raw=$(grep -m1 -E '^// Expect compile fail:' "$test_file" | awk -F': ' '{print $2}' | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+    local expect_compile_fail=0
+    if [ "$expect_compile_fail_raw" = "1" ] || [ "$expect_compile_fail_raw" = "true" ] || [ "$expect_compile_fail_raw" = "yes" ]; then
+        expect_compile_fail=1
+    fi
+    local expect_error_contains
+    expect_error_contains=$(grep -m1 -E '^// Expect error contains:' "$test_file" | sed -E 's|^// Expect error contains:[[:space:]]*||')
+
     rm -f "$out_file" "$err_file"
 
     local ir_flag=""
@@ -166,12 +175,24 @@ run_matrix_case() {
     fi
 
     if ! $COMPILER $opt_flag $ir_flag -asm "$test_file" > "$asm_file" 2>"$err_file"; then
-        echo "Compilation failed" > "$err_file"
         persist_result_file "$err_file" "$err_file_persist"
-        case_fail=1
-        case_status="FAIL (compile)"
+        if [ "$expect_compile_fail" -eq 1 ]; then
+            if [ -n "$expect_error_contains" ] && ! grep -Fq "$expect_error_contains" "$err_file"; then
+                case_fail=1
+                case_status="FAIL (compile error mismatch)"
+            else
+                case_pass=1
+                case_status="PASS (expected compile fail)"
+            fi
+        else
+            case_fail=1
+            case_status="FAIL (compile)"
+        fi
     else
-        if ! nasm -f elf64 -O1 "$asm_file" -o "$obj_file" 2>"$err_file"; then
+        if [ "$expect_compile_fail" -eq 1 ]; then
+            case_fail=1
+            case_status="FAIL (unexpected compile success)"
+        elif ! nasm -f elf64 -O1 "$asm_file" -o "$obj_file" 2>"$err_file"; then
             persist_result_file "$err_file" "$err_file_persist"
             case_fail=1
             case_status="FAIL (assemble)"
@@ -309,7 +330,7 @@ fi
 
 for TEST_FILE in $TEST_FILES; do
     TEST_NAME=$(basename "$TEST_FILE" .bpp)
-    CONTENT_HASH=$(awk '{if ($0 !~ /^\/\/ (Covers:|Mode:|Opt:|Expect exit code:)/) print}' "$TEST_FILE" | md5sum | awk '{print $1}')
+    CONTENT_HASH=$(awk '{if ($0 !~ /^\/\/ (Covers:|Mode:|Opt:|Expect exit code:|Expect compile fail:|Expect error contains:)/) print}' "$TEST_FILE" | md5sum | awk '{print $1}')
     if [ -n "${SEEN_HASH[$CONTENT_HASH]}" ]; then
         if [ "$TEST_QUIET" -eq 0 ]; then
             echo "[SKIP] Duplicate content: $TEST_NAME (same as ${SEEN_HASH[$CONTENT_HASH]})"

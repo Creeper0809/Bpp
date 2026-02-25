@@ -658,7 +658,21 @@ func parse_struct_parse_packed_field_type(p: *Parser, field_type_kind_out: u64, 
     return 0;
 }
 
-func parse_struct_parse_field(p: *Parser, is_packed: u64) -> *FieldDesc {
+func parse_member_access_modifier(p: *Parser, default_access: u64) -> u64 {
+    if (parse_peek_kind(p) == TOKEN_PUBLIC) {
+        parse_adv(p);
+        return ACCESS_PUBLIC;
+    }
+    if (parse_peek_kind(p) == TOKEN_PRIVATE) {
+        parse_adv(p);
+        return ACCESS_PRIVATE;
+    }
+    return default_access;
+}
+
+func parse_struct_parse_field(p: *Parser, is_packed: u64, struct_name_ptr: u64, struct_name_len: u64) -> *FieldDesc {
+    var access: u64 = parse_member_access_modifier(p, ACCESS_PUBLIC);
+
     var field_name_tok: *Token = parse_peek(p);
     var field_name_ptr: u64 = field_name_tok.ptr;
     var field_name_len: u64 = field_name_tok.len;
@@ -709,6 +723,9 @@ func parse_struct_parse_field(p: *Parser, is_packed: u64) -> *FieldDesc {
     field_desc.elem_type_kind = field_elem_type_kind;
     field_desc.elem_ptr_depth = field_elem_ptr_depth;
     field_desc.array_len = field_array_len;
+    field_desc.access = access;
+    field_desc.owner_struct_ptr = struct_name_ptr;
+    field_desc.owner_struct_len = struct_name_len;
     return field_desc;
 }
 
@@ -743,7 +760,7 @@ func parse_struct_def(p: *Parser) -> *AstStructDef {
     var fields: *Vec<*FieldDesc> = new Vec<*FieldDesc>(8);
     
     while (parse_peek_kind(p) != TOKEN_RBRACE) {
-        fields.push(parse_struct_parse_field(p, is_packed));
+        fields.push(parse_struct_parse_field(p, is_packed, name_ptr, name_len));
     }
     
     parse_consume(p, TOKEN_RBRACE);
@@ -814,7 +831,7 @@ func parse_enum_def(p: *Parser) -> *Vec<*AstConstDecl> {
 // Trait Parsing
 // ============================================
 
-func parse_trait_method_signature(p: *Parser) -> *AstFunc {
+func parse_trait_method_signature(p: *Parser, mode: u64) -> *AstFunc {
     parse_consume(p, TOKEN_FUNC);
 
     var name_tok: *Token = parse_peek(p);
@@ -865,11 +882,24 @@ func parse_trait_method_signature(p: *Parser) -> *AstFunc {
         }
     }
 
-    parse_consume(p, TOKEN_SEMICOLON);
-    return ast_func_ex(name_tok.ptr, name_tok.len, params, ret_type, ret_ptr_depth, ret_is_tagged, ret_struct_name_ptr, ret_struct_name_len, ret_tag_layout_ptr, ret_tag_layout_len, 0);
+    var body: *AstNode = 0;
+    if (parse_peek_kind(p) == TOKEN_SEMICOLON) {
+        parse_adv(p);
+    } else if (parse_peek_kind(p) == TOKEN_LBRACE) {
+        // parse_program full mode is encoded as 0.
+        if (mode == 0) {
+            body = parse_block(p);
+        } else {
+            parse_skip_block(p);
+        }
+    } else {
+        emit_stderr("[ERROR] trait method must end with ';' or method body\n");
+        parse_panic_here(p, "Parse error");
+    }
+    return ast_func_ex(name_tok.ptr, name_tok.len, params, ret_type, ret_ptr_depth, ret_is_tagged, ret_struct_name_ptr, ret_struct_name_len, ret_tag_layout_ptr, ret_tag_layout_len, body);
 }
 
-func parse_trait_def(p: *Parser) -> *TraitDef {
+func parse_trait_def(p: *Parser, mode: u64) -> *TraitDef {
     parse_consume(p, TOKEN_TRAIT);
 
     var name_tok: *Token = parse_peek(p);
@@ -883,10 +913,10 @@ func parse_trait_def(p: *Parser) -> *TraitDef {
     while (parse_peek_kind(p) != TOKEN_RBRACE) {
         if (parse_peek_kind(p) == TOKEN_EOF) { break; }
         if (parse_peek_kind(p) != TOKEN_FUNC) {
-            emit_stderr("[ERROR] trait block can only contain method signatures\n");
+            emit_stderr("[ERROR] trait block can only contain methods\n");
             parse_panic_here(p, "Parse error");
         }
-        var sig: *AstFunc = parse_trait_method_signature(p);
+        var sig: *AstFunc = parse_trait_method_signature(p, mode);
         var tm: *TraitMethod = new TraitMethod();
         tm.name_ptr = sig.name_ptr;
         tm.name_len = sig.name_len;
@@ -992,14 +1022,15 @@ func parse_destructor_decl(p: *Parser, struct_name_ptr: u64, struct_name_len: u6
     return ast_func_ex(name_tok.ptr, name_tok.len, params_out, TYPE_VOID, 0, 0, 0, 0, 0, 0, body);
 }
 
-func parser_finalize_impl_method_name(struct_name_ptr: u64, struct_name_len: u64, func_node: *AstFunc) -> u64 {
+func parser_finalize_impl_method_name(struct_name_ptr: u64, struct_name_len: u64, func_node: *AstFunc, method_access: u64) -> u64 {
     var original_name_ptr: u64 = func_node.name_ptr;
     var original_name_len: u64 = func_node.name_len;
     var name_info: *NameInfo = compiler_build_method_name(struct_name_ptr, struct_name_len, original_name_ptr, original_name_len);
 
     func_node.name_ptr = name_info.ptr;
     func_node.name_len = name_info.len;
-    compiler_register_impl_method(name_info.ptr, name_info.len);
+    compiler_register_impl_method_ex(name_info.ptr, name_info.len, struct_name_ptr, struct_name_len, method_access);
+    compiler_register_impl_method_func(name_info.ptr, name_info.len, func_node);
     compiler_alias_generic_template_by_func_ptr(func_node, name_info.ptr, name_info.len);
 
     var resolved_method: *NameInfo = resolve_name(name_info.ptr, name_info.len);
@@ -1016,16 +1047,53 @@ func parse_impl_parse_func_by_mode(p: *Parser, sig_only: u64) -> *AstFunc {
     return parse_func_decl(p);
 }
 
-func parse_impl_consume_modifiers(p: *Parser, is_static_out: *u64, is_abst_out: *u64) -> u64 {
+func parse_impl_consume_modifiers(p: *Parser, is_static_out: *u64, is_abst_out: *u64, access_out: *u64) -> u64 {
     *is_static_out = 0;
     *is_abst_out = 0;
-    if (parse_peek_kind(p) == TOKEN_STATIC) {
-        *is_static_out = 1;
-        parse_adv(p);
-    }
-    if (parse_peek_kind(p) == TOKEN_ABST) {
-        *is_abst_out = 1;
-        parse_adv(p);
+    *access_out = ACCESS_PUBLIC;
+
+    var seen_access: u64 = 0;
+    while (1) {
+        var k: u64 = parse_peek_kind(p);
+        if (k == TOKEN_PUBLIC) {
+            if (seen_access != 0) {
+                emit_stderr("[ERROR] duplicate access modifier\n");
+                parse_panic_here(p, "Parse error");
+            }
+            *access_out = ACCESS_PUBLIC;
+            seen_access = 1;
+            parse_adv(p);
+            continue;
+        }
+        if (k == TOKEN_PRIVATE) {
+            if (seen_access != 0) {
+                emit_stderr("[ERROR] duplicate access modifier\n");
+                parse_panic_here(p, "Parse error");
+            }
+            *access_out = ACCESS_PRIVATE;
+            seen_access = 1;
+            parse_adv(p);
+            continue;
+        }
+        if (k == TOKEN_STATIC) {
+            if (*is_static_out != 0) {
+                emit_stderr("[ERROR] duplicate static modifier\n");
+                parse_panic_here(p, "Parse error");
+            }
+            *is_static_out = 1;
+            parse_adv(p);
+            continue;
+        }
+        if (k == TOKEN_ABST) {
+            if (*is_abst_out != 0) {
+                emit_stderr("[ERROR] duplicate abstract modifier\n");
+                parse_panic_here(p, "Parse error");
+            }
+            *is_abst_out = 1;
+            parse_adv(p);
+            continue;
+        }
+        break;
     }
     if (*is_static_out != 0 && *is_abst_out != 0) {
         emit_stderr("[ERROR] abstract method cannot be static\n");
@@ -1034,7 +1102,7 @@ func parse_impl_consume_modifiers(p: *Parser, is_static_out: *u64, is_abst_out: 
     return 0;
 }
 
-func parse_impl_try_special_method(p: *Parser, sig_only: u64, struct_name_ptr: u64, struct_name_len: u64, is_static: u64, is_abst: u64, funcs: *Vec<*AstFunc>) -> u64 {
+func parse_impl_try_special_method(p: *Parser, sig_only: u64, struct_name_ptr: u64, struct_name_len: u64, is_static: u64, is_abst: u64, method_access: u64, funcs: *Vec<*AstFunc>) -> u64 {
     var kind: u64 = parse_peek_kind(p);
     if (kind == TOKEN_CONSTRUCTOR) {
         if (is_static != 0) {
@@ -1046,7 +1114,7 @@ func parse_impl_try_special_method(p: *Parser, sig_only: u64, struct_name_ptr: u
             parse_panic_here(p, "Parse error");
         }
         var ctor_node: *AstFunc = parse_constructor_decl(p, struct_name_ptr, struct_name_len, sig_only);
-        parser_finalize_impl_method_name(struct_name_ptr, struct_name_len, ctor_node);
+        parser_finalize_impl_method_name(struct_name_ptr, struct_name_len, ctor_node, method_access);
         funcs.push(ctor_node);
         return 1;
     }
@@ -1060,7 +1128,7 @@ func parse_impl_try_special_method(p: *Parser, sig_only: u64, struct_name_ptr: u
             parse_panic_here(p, "Parse error");
         }
         var dtor_node: *AstFunc = parse_destructor_decl(p, struct_name_ptr, struct_name_len, sig_only);
-        parser_finalize_impl_method_name(struct_name_ptr, struct_name_len, dtor_node);
+        parser_finalize_impl_method_name(struct_name_ptr, struct_name_len, dtor_node, method_access);
         funcs.push(dtor_node);
         return 1;
     }
@@ -1085,22 +1153,23 @@ func parse_impl_block_impl(p: *Parser, sig_only: u64) -> *Vec<*AstFunc> {
 
         var is_static: u64 = 0;
         var is_abst: u64 = 0;
-        parse_impl_consume_modifiers(p, &is_static, &is_abst);
-        if (parse_impl_try_special_method(p, sig_only, struct_name_ptr, struct_name_len, is_static, is_abst, funcs) != 0) {
+        var method_access: u64 = ACCESS_PRIVATE;
+        parse_impl_consume_modifiers(p, &is_static, &is_abst, &method_access);
+        if (parse_impl_try_special_method(p, sig_only, struct_name_ptr, struct_name_len, is_static, is_abst, method_access, funcs) != 0) {
             continue;
         }
 
         if (parse_peek_kind(p) == TOKEN_FUNC) {
             if (is_abst != 0) {
                 var abst_sig: *AstFunc = parse_func_decl_abst_signature(p);
-                compiler_register_abst_method(struct_name_ptr, struct_name_len, abst_sig.name_ptr, abst_sig.name_len);
+                compiler_register_abst_method_ex(struct_name_ptr, struct_name_len, abst_sig.name_ptr, abst_sig.name_len, abst_sig, method_access);
                 continue;
             }
 
             var func_node: *AstFunc = parse_impl_parse_func_by_mode(p, sig_only);
             if (func_node == 0) { continue; }
 
-            parser_finalize_impl_method_name(struct_name_ptr, struct_name_len, func_node);
+            parser_finalize_impl_method_name(struct_name_ptr, struct_name_len, func_node, method_access);
             funcs.push(func_node);
             continue;
         }
@@ -1150,6 +1219,15 @@ func parse_impl_trait_block_impl(p: *Parser, sig_only: u64, register_trait_impl:
     while (parse_peek_kind(p) != TOKEN_RBRACE) {
         if (parse_peek_kind(p) == TOKEN_EOF) { break; }
 
+        var method_access: u64 = ACCESS_PUBLIC;
+        if (parse_peek_kind(p) == TOKEN_PUBLIC) {
+            method_access = ACCESS_PUBLIC;
+            parse_adv(p);
+        } else if (parse_peek_kind(p) == TOKEN_PRIVATE) {
+            method_access = ACCESS_PRIVATE;
+            parse_adv(p);
+        }
+
         if (parse_peek_kind(p) == TOKEN_STATIC) {
             emit_stderr("[ERROR] trait impl methods cannot be static\n");
             parse_panic_here(p, "Parse error");
@@ -1170,7 +1248,7 @@ func parse_impl_trait_block_impl(p: *Parser, sig_only: u64, register_trait_impl:
 
         var original_name_ptr: u64 = func_node.name_ptr;
         var original_name_len: u64 = func_node.name_len;
-        parser_finalize_impl_method_name(struct_name_ptr, struct_name_len, func_node);
+        parser_finalize_impl_method_name(struct_name_ptr, struct_name_len, func_node, method_access);
 
         if (register_trait_impl != 0) {
             var impl_method: *TraitImplMethod = new TraitImplMethod();
@@ -1471,7 +1549,7 @@ func parse_program_impl(p: *Parser, mode: u64) -> *AstProgram {
                 parse_program_handle_struct(p, mode, structs);
                 break;
             case TOKEN_TRAIT:
-                parse_trait_def(p);
+                parse_trait_def(p, mode);
                 break;
             case TOKEN_IMPL:
                 parse_program_handle_impl(p, mode, funcs);

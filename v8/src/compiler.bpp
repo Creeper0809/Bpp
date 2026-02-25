@@ -84,6 +84,14 @@ var g_current_module_len = 0;
 var g_impl_prefix_ptr = 0;
 var g_impl_prefix_len = 0;
 var g_impl_methods: *HashMap<u64, u64> = new HashMap<u64, u64>(64);       // HashMap: impl-lowered name -> 1
+var g_impl_method_access: *HashMap<u64, u64> = new HashMap<u64, u64>(64); // HashMap: impl-lowered name -> access modifier
+var g_impl_method_owner: *HashMap<u64, *NameInfo> = new HashMap<u64, *NameInfo>(64); // HashMap: impl-lowered name -> owner struct
+var g_impl_method_funcs: *HashMap<u64, *AstFunc> = new HashMap<u64, *AstFunc>(64); // HashMap: impl-lowered name -> func pointer
+var g_abst_methods_access: *HashMap<u64, *HashMap<u64, u64>> = 0; // HashMap: struct name -> (method -> access)
+var g_abst_methods_sigs: *HashMap<u64, *HashMap<u64, *AstFunc>> = 0; // HashMap: struct name -> (method -> signature)
+var g_virtual_dispatch_traits: *HashMap<u64, *HashMap<u64, *NameInfo>> = 0; // HashMap: struct -> (method -> virtual trait)
+var g_current_access_struct_ptr: u64 = 0;
+var g_current_access_struct_len: u64 = 0;
 var g_resolve_name_hits: *HashMap<u64, *HashMap<u64, *NameInfo>> = 0;     // HashMap: module_id -> (name -> resolved)
 var g_resolve_name_misses: *HashMap<u64, *HashMap<u64, u64>> = 0;          // HashMap: module_id -> (name -> miss=1)
 var g_reg_aliases: *HashMap<u64, *NameInfo> = new HashMap<u64, *NameInfo>(64);   // HashMap: alias name -> register name
@@ -1141,6 +1149,22 @@ func compiler_ensure_global_module_map() -> *HashMap<u64, *NameInfo> {
     return g_global_module_map;
 }
 
+func compiler_copy_impl_method_metadata_if_needed(orig_ptr: u64, orig_len: u64, mangled_ptr: u64, mangled_len: u64) -> u64 {
+    if (compiler_is_impl_method(orig_ptr, orig_len) == 0) { return 0; }
+    var access: u64 = compiler_get_impl_method_access(orig_ptr, orig_len);
+    var owner: *NameInfo = compiler_get_impl_method_owner(orig_ptr, orig_len);
+    var fn: *AstFunc = compiler_get_impl_method_func(orig_ptr, orig_len);
+    if (owner != 0) {
+        compiler_register_impl_method_ex(mangled_ptr, mangled_len, owner.ptr, owner.len, access);
+    } else {
+        compiler_register_impl_method_ex(mangled_ptr, mangled_len, 0, 0, access);
+    }
+    if (fn != 0) {
+        compiler_register_impl_method_func(mangled_ptr, mangled_len, fn);
+    }
+    return 0;
+}
+
 func compiler_register_module_exports_funcs(funcs: *Vec<*AstFunc>, module_ptr: u64, module_len: u64, prefix_ptr: u64, prefix_len: u64, module_info: *NameInfo) -> u64 {
     if (funcs == 0) { return 0; }
     var func_map: *HashMap<u64, *NameInfo> = compiler_ensure_func_module_map();
@@ -1152,6 +1176,7 @@ func compiler_register_module_exports_funcs(funcs: *Vec<*AstFunc>, module_ptr: u
         var mangled_info: *NameInfo = compiler_mangle_symbol_name(orig_ptr, orig_len, prefix_ptr, prefix_len, 1);
         fn.name_ptr = mangled_info.ptr;
         fn.name_len = mangled_info.len;
+        compiler_copy_impl_method_metadata_if_needed(orig_ptr, orig_len, mangled_info.ptr, mangled_info.len);
 
         add_module_export(module_ptr, module_len, orig_ptr, orig_len, mangled_info.ptr, mangled_info.len);
 
@@ -1837,15 +1862,98 @@ func compiler_is_impl_context() -> u64 {
     return false;
 }
 
-func compiler_register_impl_method(name_ptr: u64, name_len: u64) -> u64 {
-    if (name_ptr == 0 || name_len == 0) { return 0; }
-    if (g_impl_methods == 0) { g_impl_methods = new HashMap<u64, u64>(64); }
-    if (g_impl_methods.has(name_ptr, name_len) != 0) { return 0; }
-    g_impl_methods.put(name_ptr, name_len, 1);
+func compiler_set_current_access_struct(struct_ptr: u64, struct_len: u64) -> u64 {
+    g_current_access_struct_ptr = struct_ptr;
+    g_current_access_struct_len = struct_len;
     return 0;
 }
 
-func compiler_register_abst_method(struct_ptr: u64, struct_len: u64, method_ptr: u64, method_len: u64) -> u64 {
+func compiler_clear_current_access_struct() -> u64 {
+    g_current_access_struct_ptr = 0;
+    g_current_access_struct_len = 0;
+    return 0;
+}
+
+func compiler_get_current_access_struct_ptr() -> u64 {
+    return g_current_access_struct_ptr;
+}
+
+func compiler_get_current_access_struct_len() -> u64 {
+    return g_current_access_struct_len;
+}
+
+func compiler_set_current_access_struct_from_func(func_ptr: u64, func_len: u64) -> u64 {
+    compiler_clear_current_access_struct();
+    if (g_impl_method_owner == 0) { return 0; }
+    var owner: *NameInfo = g_impl_method_owner.get(func_ptr, func_len);
+    if (owner == 0) { return 0; }
+    compiler_set_current_access_struct(owner.ptr, owner.len);
+    return 0;
+}
+
+func compiler_register_impl_method_ex(name_ptr: u64, name_len: u64, owner_struct_ptr: u64, owner_struct_len: u64, access: u64) -> u64 {
+    if (name_ptr == 0 || name_len == 0) { return 0; }
+    if (g_impl_methods == 0) { g_impl_methods = new HashMap<u64, u64>(64); }
+    if (g_impl_method_access == 0) { g_impl_method_access = new HashMap<u64, u64>(64); }
+    if (g_impl_method_owner == 0) { g_impl_method_owner = new HashMap<u64, *NameInfo>(64); }
+    g_impl_methods.put(name_ptr, name_len, 1);
+    g_impl_method_access.put(name_ptr, name_len, access);
+    if (owner_struct_ptr != 0 && owner_struct_len != 0) {
+        g_impl_method_owner.put(name_ptr, name_len, new NameInfo{owner_struct_ptr, owner_struct_len});
+    }
+    return 0;
+}
+
+func compiler_register_impl_method_func(name_ptr: u64, name_len: u64, fn: *AstFunc) -> u64 {
+    if (name_ptr == 0 || name_len == 0 || fn == 0) { return 0; }
+    if (g_impl_method_funcs == 0) { g_impl_method_funcs = new HashMap<u64, *AstFunc>(64); }
+    g_impl_method_funcs.put(name_ptr, name_len, fn);
+    return 0;
+}
+
+func compiler_register_impl_method(name_ptr: u64, name_len: u64) -> u64 {
+    return compiler_register_impl_method_ex(name_ptr, name_len, 0, 0, ACCESS_PUBLIC);
+}
+
+func compiler_get_impl_method_access(name_ptr: u64, name_len: u64) -> u64 {
+    if (g_impl_method_access == 0) { return ACCESS_PUBLIC; }
+    if (g_impl_method_access.has(name_ptr, name_len) == 0) { return ACCESS_PUBLIC; }
+    return g_impl_method_access.get(name_ptr, name_len);
+}
+
+func compiler_get_impl_method_owner(name_ptr: u64, name_len: u64) -> *NameInfo {
+    if (g_impl_method_owner == 0) { return 0; }
+    return g_impl_method_owner.get(name_ptr, name_len);
+}
+
+func compiler_get_impl_method_func(name_ptr: u64, name_len: u64) -> *AstFunc {
+    if (g_impl_method_funcs == 0) { return 0; }
+    return g_impl_method_funcs.get(name_ptr, name_len);
+}
+
+func compiler_abst_method_access_map_ensure(struct_ptr: u64, struct_len: u64) -> *HashMap<u64, u64> {
+    if (g_abst_methods_access == 0) {
+        g_abst_methods_access = new HashMap<u64, *HashMap<u64, u64>>(32);
+    }
+    var m: *HashMap<u64, u64> = g_abst_methods_access.get(struct_ptr, struct_len);
+    if (m != 0) { return m; }
+    var out: *HashMap<u64, u64> = new HashMap<u64, u64>(16);
+    g_abst_methods_access.put(struct_ptr, struct_len, out);
+    return out;
+}
+
+func compiler_abst_method_sigs_map_ensure(struct_ptr: u64, struct_len: u64) -> *HashMap<u64, *AstFunc> {
+    if (g_abst_methods_sigs == 0) {
+        g_abst_methods_sigs = new HashMap<u64, *HashMap<u64, *AstFunc>>(32);
+    }
+    var m: *HashMap<u64, *AstFunc> = g_abst_methods_sigs.get(struct_ptr, struct_len);
+    if (m != 0) { return m; }
+    var out: *HashMap<u64, *AstFunc> = new HashMap<u64, *AstFunc>(16);
+    g_abst_methods_sigs.put(struct_ptr, struct_len, out);
+    return out;
+}
+
+func compiler_register_abst_method_ex(struct_ptr: u64, struct_len: u64, method_ptr: u64, method_len: u64, sig: *AstFunc, access: u64) -> u64 {
     if (struct_ptr == 0 || struct_len == 0 || method_ptr == 0 || method_len == 0) { return 0; }
     if (g_abst_methods == 0) { g_abst_methods = new HashMap<u64, *Vec<*NameInfo>>(32); }
     var list: *Vec<*NameInfo> = g_abst_methods.get(struct_ptr, struct_len);
@@ -1860,12 +1968,39 @@ func compiler_register_abst_method(struct_ptr: u64, struct_len: u64, method_ptr:
     }
     var name_info: *NameInfo = new NameInfo{method_ptr, method_len};
     list.push(name_info);
+
+    var access_map: *HashMap<u64, u64> = compiler_abst_method_access_map_ensure(struct_ptr, struct_len);
+    access_map.put(method_ptr, method_len, access);
+
+    if (sig != 0) {
+        var sig_map: *HashMap<u64, *AstFunc> = compiler_abst_method_sigs_map_ensure(struct_ptr, struct_len);
+        sig_map.put(method_ptr, method_len, sig);
+    }
     return 0;
+}
+
+func compiler_register_abst_method(struct_ptr: u64, struct_len: u64, method_ptr: u64, method_len: u64) -> u64 {
+    return compiler_register_abst_method_ex(struct_ptr, struct_len, method_ptr, method_len, 0, ACCESS_PRIVATE);
 }
 
 func compiler_get_abst_methods(struct_ptr: u64, struct_len: u64) -> *Vec<*NameInfo> {
     if (g_abst_methods == 0) { return 0; }
     return g_abst_methods.get(struct_ptr, struct_len);
+}
+
+func compiler_get_abst_method_access(struct_ptr: u64, struct_len: u64, method_ptr: u64, method_len: u64) -> u64 {
+    if (g_abst_methods_access == 0) { return ACCESS_PRIVATE; }
+    var access_map: *HashMap<u64, u64> = g_abst_methods_access.get(struct_ptr, struct_len);
+    if (access_map == 0) { return ACCESS_PRIVATE; }
+    if (access_map.has(method_ptr, method_len) == 0) { return ACCESS_PRIVATE; }
+    return access_map.get(method_ptr, method_len);
+}
+
+func compiler_get_abst_method_sig(struct_ptr: u64, struct_len: u64, method_ptr: u64, method_len: u64) -> *AstFunc {
+    if (g_abst_methods_sigs == 0) { return 0; }
+    var sig_map: *HashMap<u64, *AstFunc> = g_abst_methods_sigs.get(struct_ptr, struct_len);
+    if (sig_map == 0) { return 0; }
+    return sig_map.get(method_ptr, method_len);
 }
 
 func compiler_is_abst_method(struct_ptr: u64, struct_len: u64, method_ptr: u64, method_len: u64) -> u64 {
@@ -1881,6 +2016,13 @@ func compiler_is_abst_method(struct_ptr: u64, struct_len: u64, method_ptr: u64, 
 
 func compiler_is_impl_method(name_ptr: u64, name_len: u64) -> u64 {
     return g_impl_methods.?has(name_ptr, name_len);
+}
+
+func compiler_can_access_private_member(owner_struct_ptr: u64, owner_struct_len: u64) -> u64 {
+    if (owner_struct_ptr == 0 || owner_struct_len == 0) { return false; }
+    if (g_current_access_struct_ptr == 0 || g_current_access_struct_len == 0) { return false; }
+    if (str_eq(owner_struct_ptr, owner_struct_len, g_current_access_struct_ptr, g_current_access_struct_len) != 0) { return true; }
+    return false;
 }
 
 func compiler_is_generic_func_ptr(fn: *AstFunc) -> u64 {
@@ -2282,6 +2424,205 @@ func _compiler_find_parent_def(struct_def: *AstStructDef, parent_ptr: u64, paren
         if (found != 0) { return found; }
     }
     return 0;
+}
+
+func compiler_virtual_dispatch_bucket_ensure(struct_ptr: u64, struct_len: u64) -> *HashMap<u64, *NameInfo> {
+    if (g_virtual_dispatch_traits == 0) {
+        g_virtual_dispatch_traits = new HashMap<u64, *HashMap<u64, *NameInfo>>(32);
+    }
+    var bucket: *HashMap<u64, *NameInfo> = g_virtual_dispatch_traits.get(struct_ptr, struct_len);
+    if (bucket != 0) { return bucket; }
+    var out: *HashMap<u64, *NameInfo> = new HashMap<u64, *NameInfo>(16);
+    g_virtual_dispatch_traits.put(struct_ptr, struct_len, out);
+    return out;
+}
+
+func compiler_register_virtual_dispatch_trait(struct_ptr: u64, struct_len: u64, method_ptr: u64, method_len: u64, trait_ptr: u64, trait_len: u64) -> u64 {
+    if (struct_ptr == 0 || struct_len == 0 || method_ptr == 0 || method_len == 0 || trait_ptr == 0 || trait_len == 0) { return 0; }
+    var bucket: *HashMap<u64, *NameInfo> = compiler_virtual_dispatch_bucket_ensure(struct_ptr, struct_len);
+    bucket.put(method_ptr, method_len, new NameInfo{trait_ptr, trait_len});
+    return 0;
+}
+
+func _compiler_find_virtual_dispatch_trait_in_struct(struct_def: *AstStructDef, method_ptr: u64, method_len: u64, depth: u64) -> *NameInfo {
+    if (struct_def == 0) { return 0; }
+    if (depth > 64) {
+        emit_stderr("[ERROR] Inheritance depth exceeded\n");
+        panic("Compiler error");
+    }
+
+    if (g_virtual_dispatch_traits != 0) {
+        var bucket: *HashMap<u64, *NameInfo> = g_virtual_dispatch_traits.get(struct_def.name_ptr, struct_def.name_len);
+        if (bucket != 0) {
+            var found: *NameInfo = bucket.get(method_ptr, method_len);
+            if (found != 0) { return found; }
+        }
+    }
+
+    if (struct_def.parents_vec == 0) { return 0; }
+    var parents: *Vec<*ParentDesc> = struct_def.parents_vec;
+    var pn: u64 = parents.len();
+    for (var i: u64 = 0; i < pn; i++) {
+        var parent_desc: *ParentDesc = parents.get(i);
+        var parent_def: *AstStructDef = compiler_resolve_parent_def(parent_desc, "Compiler error");
+        var found_parent: *NameInfo = _compiler_find_virtual_dispatch_trait_in_struct(parent_def, method_ptr, method_len, depth + 1);
+        if (found_parent != 0) { return found_parent; }
+    }
+    return 0;
+}
+
+func compiler_find_virtual_dispatch_trait(struct_ptr: u64, struct_len: u64, method_ptr: u64, method_len: u64) -> *NameInfo {
+    var sd: *AstStructDef = get_struct_def(struct_ptr, struct_len);
+    if (sd == 0) { return 0; }
+    return _compiler_find_virtual_dispatch_trait_in_struct(sd, method_ptr, method_len, 0);
+}
+
+func _compiler_find_method_func_in_hierarchy(struct_def: *AstStructDef, method_ptr: u64, method_len: u64, depth: u64) -> *AstFunc {
+    if (struct_def == 0) { return 0; }
+    if (depth > 64) {
+        emit_stderr("[ERROR] Inheritance depth exceeded\n");
+        panic("Compiler error");
+    }
+
+    var method_name: *NameInfo = compiler_build_method_name(struct_def.name_ptr, struct_def.name_len, method_ptr, method_len);
+    var fn: *AstFunc = compiler_get_impl_method_func(method_name.ptr, method_name.len);
+    if (fn == 0) {
+        fn = compiler_get_func(method_name.ptr, method_name.len);
+    }
+    if (fn != 0) { return fn; }
+
+    if (struct_def.parents_vec == 0) { return 0; }
+    var parents: *Vec<*ParentDesc> = struct_def.parents_vec;
+    var pn: u64 = parents.len();
+    var found_fn: *AstFunc = 0;
+    var found_count: u64 = 0;
+    for (var i: u64 = 0; i < pn; i++) {
+        var parent_desc: *ParentDesc = parents.get(i);
+        var parent_def: *AstStructDef = compiler_resolve_parent_def(parent_desc, "Compiler error");
+        var cand: *AstFunc = _compiler_find_method_func_in_hierarchy(parent_def, method_ptr, method_len, depth + 1);
+        if (cand != 0) {
+            found_count = found_count + 1;
+            if (found_count == 1) { found_fn = cand; }
+        }
+    }
+    if (found_count > 1) {
+        emit_stderr("[ERROR] Ambiguous method resolution in inheritance: ");
+        emit_stderr_len(struct_def.name_ptr, struct_def.name_len);
+        emit_stderr(".");
+        emit_stderr_len(method_ptr, method_len);
+        emit_stderr("\n");
+        panic("Compiler error");
+    }
+    return found_fn;
+}
+
+func compiler_find_method_func_in_hierarchy(struct_def: *AstStructDef, method_ptr: u64, method_len: u64) -> *AstFunc {
+    return _compiler_find_method_func_in_hierarchy(struct_def, method_ptr, method_len, 0);
+}
+
+func compiler_struct_is_same_or_descendant(child_ptr: u64, child_len: u64, ancestor_ptr: u64, ancestor_len: u64) -> u64 {
+    if (str_eq(child_ptr, child_len, ancestor_ptr, ancestor_len) != 0) { return true; }
+    var child_def: *AstStructDef = get_struct_def(child_ptr, child_len);
+    if (child_def == 0) { return false; }
+    var found: *AstStructDef = _compiler_find_parent_def(child_def, ancestor_ptr, ancestor_len, 0);
+    if (found != 0) { return true; }
+    return false;
+}
+
+func _compiler_find_method_decl_in_hierarchy(struct_def: *AstStructDef, method_ptr: u64, method_len: u64, depth: u64, owner_ptr_out: *u64, owner_len_out: *u64, access_out: *u64, sig_out: **AstFunc) -> u64 {
+    if (struct_def == 0) { return 0; }
+    if (depth > 64) {
+        emit_stderr("[ERROR] Inheritance depth exceeded\n");
+        panic("Compiler error");
+    }
+
+    var method_name: *NameInfo = compiler_build_method_name(struct_def.name_ptr, struct_def.name_len, method_ptr, method_len);
+    if (compiler_is_impl_method(method_name.ptr, method_name.len) != 0) {
+        *owner_ptr_out = struct_def.name_ptr;
+        *owner_len_out = struct_def.name_len;
+        *access_out = compiler_get_impl_method_access(method_name.ptr, method_name.len);
+        *sig_out = compiler_get_func(method_name.ptr, method_name.len);
+        return 1;
+    }
+
+    if (compiler_is_abst_method(struct_def.name_ptr, struct_def.name_len, method_ptr, method_len) != 0) {
+        *owner_ptr_out = struct_def.name_ptr;
+        *owner_len_out = struct_def.name_len;
+        *access_out = compiler_get_abst_method_access(struct_def.name_ptr, struct_def.name_len, method_ptr, method_len);
+        *sig_out = compiler_get_abst_method_sig(struct_def.name_ptr, struct_def.name_len, method_ptr, method_len);
+        return 1;
+    }
+
+    if (struct_def.parents_vec == 0) { return 0; }
+    var parents: *Vec<*ParentDesc> = struct_def.parents_vec;
+    var pn: u64 = parents.len();
+    var found: u64 = 0;
+    var owner_ptr_tmp: u64 = 0;
+    var owner_len_tmp: u64 = 0;
+    var access_tmp: u64 = ACCESS_PUBLIC;
+    var sig_tmp: *AstFunc = 0;
+    for (var i: u64 = 0; i < pn; i++) {
+        var parent_desc: *ParentDesc = parents.get(i);
+        var parent_def: *AstStructDef = compiler_resolve_parent_def(parent_desc, "Compiler error");
+        var owner_ptr_c: u64 = 0;
+        var owner_len_c: u64 = 0;
+        var access_c: u64 = ACCESS_PUBLIC;
+        var sig_c: *AstFunc = 0;
+        if (_compiler_find_method_decl_in_hierarchy(parent_def, method_ptr, method_len, depth + 1, &owner_ptr_c, &owner_len_c, &access_c, &sig_c) != 0) {
+            found = found + 1;
+            if (found == 1) {
+                owner_ptr_tmp = owner_ptr_c;
+                owner_len_tmp = owner_len_c;
+                access_tmp = access_c;
+                sig_tmp = sig_c;
+            }
+        }
+    }
+    if (found > 1) {
+        emit_stderr("[ERROR] Ambiguous method declaration in inheritance: ");
+        emit_stderr_len(struct_def.name_ptr, struct_def.name_len);
+        emit_stderr(".");
+        emit_stderr_len(method_ptr, method_len);
+        emit_stderr("\n");
+        panic("Compiler error");
+    }
+    if (found == 0) { return 0; }
+
+    *owner_ptr_out = owner_ptr_tmp;
+    *owner_len_out = owner_len_tmp;
+    *access_out = access_tmp;
+    *sig_out = sig_tmp;
+    return 1;
+}
+
+func compiler_find_method_decl_in_hierarchy(struct_ptr: u64, struct_len: u64, method_ptr: u64, method_len: u64, owner_ptr_out: *u64, owner_len_out: *u64, access_out: *u64, sig_out: **AstFunc) -> u64 {
+    var sd: *AstStructDef = get_struct_def(struct_ptr, struct_len);
+    if (sd == 0) { return 0; }
+    return _compiler_find_method_decl_in_hierarchy(sd, method_ptr, method_len, 0, owner_ptr_out, owner_len_out, access_out, sig_out);
+}
+
+func compiler_check_field_access(field_desc: *FieldDesc) -> u64 {
+    if (field_desc == 0) { return 0; }
+    if (field_desc.access != ACCESS_PRIVATE) { return 1; }
+    return compiler_can_access_private_member(field_desc.owner_struct_ptr, field_desc.owner_struct_len);
+}
+
+func compiler_check_method_access(struct_ptr: u64, struct_len: u64, method_ptr: u64, method_len: u64) -> u64 {
+    var owner_ptr: u64 = 0;
+    var owner_len: u64 = 0;
+    var access: u64 = ACCESS_PUBLIC;
+    var sig: *AstFunc = 0;
+    if (compiler_find_method_decl_in_hierarchy(struct_ptr, struct_len, method_ptr, method_len, &owner_ptr, &owner_len, &access, &sig) == 0) {
+        return 1;
+    }
+    if (access != ACCESS_PRIVATE) { return 1; }
+    return compiler_can_access_private_member(owner_ptr, owner_len);
+}
+
+func compiler_is_virtual_trait_name(name_ptr: u64, name_len: u64) -> u64 {
+    if (name_len < 7) { return false; }
+    if (str_eq(name_ptr, 7, "__Virt_", 7) != 0) { return true; }
+    return false;
 }
 
 func _compiler_find_field_desc_unscoped(struct_def: *AstStructDef, member_ptr: u64, member_len: u64, depth: u64) -> *FieldDesc {
@@ -2996,6 +3337,9 @@ func generic_clone_struct(template_def: *AstStructDef, bindings: *Vec<*GenericBi
         nf.elem_type_kind = ti.elem_type_kind;
         nf.elem_ptr_depth = ti.elem_ptr_depth;
         nf.array_len = ti.array_len;
+        nf.access = f.access;
+        nf.owner_struct_ptr = new_name_ptr;
+        nf.owner_struct_len = new_name_len;
         fields_out.push(nf);
     }
     var parents_out: *Vec<*ParentDesc> = 0;
@@ -3695,34 +4039,78 @@ func compiler_struct_size_internal(struct_info: *AstStructDef, depth: u64) -> u6
     return total_size;
 }
 
-func compiler_struct_find_field_offset(struct_def: *AstStructDef, field_ptr: u64, field_len: u64) -> u64 {
+func _compiler_struct_find_field_offset_hier(struct_def: *AstStructDef, field_ptr: u64, field_len: u64, depth: u64) -> u64 {
+    if (struct_def == 0) { return COMPILER_NOT_FOUND_U64; }
+    if (depth > 64) {
+        emit_stderr("[ERROR] Inheritance depth exceeded\n");
+        panic("TypeInfo error");
+    }
+
     var parent_total: u64 = 0;
     if (struct_def.parents_vec != 0) {
-        var parents: *Vec<*ParentDesc> = struct_def.parents_vec;
-        var pn: u64 = parents.len();
-        for (var pi: u64 = 0; pi < pn; pi++) {
-            var parent_desc: *ParentDesc = parents.get(pi);
-            var parent_def: *AstStructDef = compiler_resolve_parent_def(parent_desc, "TypeInfo error");
-            parent_total = parent_total + compiler_struct_size_internal(parent_def, 0);
+        var parents0: *Vec<*ParentDesc> = struct_def.parents_vec;
+        var pn0: u64 = parents0.len();
+        for (var p0: u64 = 0; p0 < pn0; p0++) {
+            var pd0: *ParentDesc = parents0.get(p0);
+            var pdef0: *AstStructDef = compiler_resolve_parent_def(pd0, "TypeInfo error");
+            parent_total = parent_total + compiler_struct_size_internal(pdef0, depth + 1);
         }
     }
+
     var fields: *Vec<*FieldDesc> = struct_def.fields_vec;
-    var num_fields: u64 = fields.len();
-    var offset: u64 = parent_total;
-    for (var i: u64 = 0; i < num_fields; i++) {
-        var field: *FieldDesc = fields.get(i);
-        if (str_eq(field.name_ptr, field.name_len, field_ptr, field_len)) { return offset; }
-        offset = offset + compiler_sizeof_field_desc(field);
+    var n: u64 = fields.len();
+    var local_off: u64 = parent_total;
+    for (var i: u64 = 0; i < n; i++) {
+        var f: *FieldDesc = fields.get(i);
+        if (str_eq(f.name_ptr, f.name_len, field_ptr, field_len)) {
+            return local_off;
+        }
+        local_off = local_off + compiler_sizeof_field_desc(f);
     }
-    return COMPILER_NOT_FOUND_U64;
+
+    if (struct_def.parents_vec == 0) { return COMPILER_NOT_FOUND_U64; }
+    var parents: *Vec<*ParentDesc> = struct_def.parents_vec;
+    var pn: u64 = parents.len();
+    var run_off: u64 = 0;
+    var found_count: u64 = 0;
+    var found_off: u64 = COMPILER_NOT_FOUND_U64;
+    for (var pi: u64 = 0; pi < pn; pi++) {
+        var pd: *ParentDesc = parents.get(pi);
+        var pdef: *AstStructDef = compiler_resolve_parent_def(pd, "TypeInfo error");
+        var cand_off: u64 = _compiler_struct_find_field_offset_hier(pdef, field_ptr, field_len, depth + 1);
+        if (compiler_is_not_found_u64(cand_off) == 0) {
+            found_count = found_count + 1;
+            if (found_count == 1) {
+                found_off = run_off + cand_off;
+            }
+        }
+        run_off = run_off + compiler_struct_size_internal(pdef, depth + 1);
+    }
+    if (found_count > 1) {
+        emit_stderr("[ERROR] Ambiguous field offset in inheritance: ");
+        emit_stderr_len(struct_def.name_ptr, struct_def.name_len);
+        emit_stderr(".");
+        emit_stderr_len(field_ptr, field_len);
+        emit_stderr("\n");
+        panic("TypeInfo error");
+    }
+    return found_off;
+}
+
+func compiler_struct_find_field_offset(struct_def: *AstStructDef, field_ptr: u64, field_len: u64) -> u64 {
+    return _compiler_struct_find_field_offset_hier(struct_def, field_ptr, field_len, 0);
 }
 
 func compiler_insert_vptr_field(struct_def: *AstStructDef, trait_ptr: u64, trait_len: u64, vtable_struct_ptr: u64, vtable_struct_len: u64) -> u64 {
     if (struct_def == 0) { return 0; }
+    var vptr_name: *NameInfo = compiler_build_vptr_field_name(trait_ptr, trait_len);
+    var existing_off: u64 = compiler_struct_find_field_offset(struct_def, vptr_name.ptr, vptr_name.len);
+    if (compiler_is_not_found_u64(existing_off) == 0) {
+        return 0;
+    }
     if (struct_def.fields_vec == 0) {
         struct_def.fields_vec = new Vec<*FieldDesc>(1);
     }
-    var vptr_name: *NameInfo = compiler_build_vptr_field_name(trait_ptr, trait_len);
     var fields: *Vec<*FieldDesc> = struct_def.fields_vec;
     var n: u64 = fields.len();
     for (var i: u64 = 0; i < n; i++) {
@@ -3743,6 +4131,9 @@ func compiler_insert_vptr_field(struct_def: *AstStructDef, trait_ptr: u64, trait
     new_field.elem_type_kind = 0;
     new_field.elem_ptr_depth = 0;
     new_field.array_len = 0;
+    new_field.access = ACCESS_PRIVATE;
+    new_field.owner_struct_ptr = struct_def.name_ptr;
+    new_field.owner_struct_len = struct_def.name_len;
 
     fields.push(new_field);
     return 0;
@@ -3781,7 +4172,16 @@ func compiler_build_trait_thunk_func(thunk_name_ptr: u64, thunk_name_len: u64, t
 
     var self_param: *Param = params_out.get(0);
     var self_ident: *AstNode = (*AstNode)ast_ident(self_param.name_ptr, self_param.name_len);
-    var casted: *AstNode = (*AstNode)ast_cast_ex(self_ident, TYPE_STRUCT, 1, 0, struct_ptr, struct_len, 0, 0);
+    var cast_struct_ptr: u64 = struct_ptr;
+    var cast_struct_len: u64 = struct_len;
+    if (impl_method != 0 && impl_method.func_def != 0 && impl_method.func_def.params_vec != 0 && impl_method.func_def.params_vec.len() != 0) {
+        var impl_self: *Param = impl_method.func_def.params_vec.get(0);
+        if (impl_self.type_kind == TYPE_STRUCT && impl_self.struct_name_ptr != 0 && impl_self.struct_name_len != 0) {
+            cast_struct_ptr = impl_self.struct_name_ptr;
+            cast_struct_len = impl_self.struct_name_len;
+        }
+    }
+    var casted: *AstNode = (*AstNode)ast_cast_ex(self_ident, TYPE_STRUCT, 1, 0, cast_struct_ptr, cast_struct_len, 0, 0);
 
     var call_args: *Vec<*AstNode> = new Vec<*AstNode>(param_count);
     call_args.push(casted);
@@ -3895,6 +4295,9 @@ func compiler_get_or_create_vtable_struct(trait_def: *TraitDef, trait_ptr: u64, 
         f.elem_type_kind = 0;
         f.elem_ptr_depth = 0;
         f.array_len = 0;
+        f.access = ACCESS_PRIVATE;
+        f.owner_struct_ptr = vtable_name.ptr;
+        f.owner_struct_len = vtable_name.len;
         vtable_fields.push(f);
     }
     vtable_struct_def = ast_struct_def(vtable_name.ptr, vtable_name.len, 0, vtable_fields, 0, 0);
@@ -3915,18 +4318,19 @@ func compiler_get_trait_impl_vptr_offset(impl_info: *TraitImpl, struct_def: *Ast
     return vptr_offset;
 }
 
-func compiler_validate_trait_signature_method(trait_method: *TraitMethod, trait_sig: *AstFunc) -> u64 {
+func compiler_validate_trait_signature_method(trait_ptr: u64, trait_len: u64, trait_method: *TraitMethod, trait_sig: *AstFunc) -> u64 {
     if (trait_sig.params_vec == 0 || trait_sig.params_vec.len() == 0) {
         compiler_trait_method_error("[ERROR] Trait method must have self parameter: ", trait_method.name_ptr, trait_method.name_len);
     }
     var self_param: *Param = trait_sig.params_vec.get(0);
+    var is_virtual_trait: u64 = compiler_is_virtual_trait_name(trait_ptr, trait_len);
     if (compiler_is_self_type(self_param.type_kind, self_param.struct_name_ptr, self_param.struct_name_len) == 0 || self_param.ptr_depth == 0) {
         compiler_trait_method_error("[ERROR] Trait method self must be *Self: ", trait_method.name_ptr, trait_method.name_len);
     }
-    if (trait_sig.ret_type == TYPE_STRUCT && trait_sig.ret_ptr_depth == 0) {
+    if (is_virtual_trait == 0 && trait_sig.ret_type == TYPE_STRUCT && trait_sig.ret_ptr_depth == 0) {
         compiler_trait_method_error("[ERROR] Trait method cannot return struct by value: ", trait_method.name_ptr, trait_method.name_len);
     }
-    if (compiler_is_self_type(trait_sig.ret_type, trait_sig.ret_struct_name_ptr, trait_sig.ret_struct_name_len) != 0) {
+    if (is_virtual_trait == 0 && compiler_is_self_type(trait_sig.ret_type, trait_sig.ret_struct_name_ptr, trait_sig.ret_struct_name_len) != 0) {
         compiler_trait_method_error("[ERROR] Trait method cannot return Self type: ", trait_method.name_ptr, trait_method.name_len);
     }
     return 0;
@@ -3941,14 +4345,27 @@ func compiler_validate_trait_impl_signature(trait_method: *TraitMethod, trait_si
     if (impl_self.ptr_depth == 0 || impl_self.type_kind != TYPE_STRUCT) {
         compiler_trait_method_error("[ERROR] Trait impl self must be struct pointer: ", trait_method.name_ptr, trait_method.name_len);
     }
-    if (!(str_eq(impl_self.struct_name_ptr, impl_self.struct_name_len, impl_info.struct_ptr, impl_info.struct_len) ||
-          compiler_is_self_type(impl_self.type_kind, impl_self.struct_name_ptr, impl_self.struct_name_len) != 0)) {
-        compiler_trait_method_error("[ERROR] Trait impl self type mismatch: ", trait_method.name_ptr, trait_method.name_len);
+    var is_virtual_trait: u64 = compiler_is_virtual_trait_name(impl_info.trait_ptr, impl_info.trait_len);
+    if (is_virtual_trait == 0) {
+        if (!(str_eq(impl_self.struct_name_ptr, impl_self.struct_name_len, impl_info.struct_ptr, impl_info.struct_len) ||
+              compiler_is_self_type(impl_self.type_kind, impl_self.struct_name_ptr, impl_self.struct_name_len) != 0)) {
+            compiler_trait_method_error("[ERROR] Trait impl self type mismatch: ", trait_method.name_ptr, trait_method.name_len);
+        }
+    } else {
+        var self_ok: u64 = 0;
+        if (str_eq(impl_self.struct_name_ptr, impl_self.struct_name_len, impl_info.struct_ptr, impl_info.struct_len) != 0) {
+            self_ok = 1;
+        } else if (compiler_struct_is_same_or_descendant(impl_info.struct_ptr, impl_info.struct_len, impl_self.struct_name_ptr, impl_self.struct_name_len) != 0) {
+            self_ok = 1;
+        }
+        if (self_ok == 0) {
+            compiler_trait_method_error("[ERROR] Virtual impl self type mismatch: ", trait_method.name_ptr, trait_method.name_len);
+        }
     }
 
     for (var pi: u64 = 1; pi < trait_sig.params_vec.len(); pi++) {
         var tp: *Param = trait_sig.params_vec.get(pi);
-        if (compiler_is_self_type(tp.type_kind, tp.struct_name_ptr, tp.struct_name_len) != 0) {
+        if (is_virtual_trait == 0 && compiler_is_self_type(tp.type_kind, tp.struct_name_ptr, tp.struct_name_len) != 0) {
             compiler_trait_method_error("[ERROR] Trait method params cannot use Self type: ", trait_method.name_ptr, trait_method.name_len);
         }
         var ip: *Param = impl_sig.params_vec.get(pi);
@@ -3978,6 +4395,8 @@ func compiler_register_trait_thunk(impl_info: *TraitImpl, trait_def: *TraitDef, 
     var thunk_fn: *AstFunc = compiler_build_trait_thunk_func(thunk_name.ptr, thunk_name.len, trait_def, trait_method, impl_method, impl_info.struct_ptr, impl_info.struct_len, vptr_offset);
     g_all_funcs.push(thunk_fn);
     g_all_func_sigs.push(thunk_fn);
+    compiler_register_impl_method_ex(thunk_name.ptr, thunk_name.len, impl_info.struct_ptr, impl_info.struct_len, ACCESS_PUBLIC);
+    compiler_register_impl_method_func(thunk_name.ptr, thunk_name.len, thunk_fn);
     compiler_invalidate_func_lookup();
     values.push((*AstNode)ast_ident(thunk_name.ptr, thunk_name.len));
     return 0;
@@ -4005,6 +4424,54 @@ func compiler_register_trait_vtable_global(impl_info: *TraitImpl, vtable_name_pt
     return 0;
 }
 
+func compiler_build_trait_default_impl_func(impl_info: *TraitImpl, trait_method: *TraitMethod, trait_sig: *AstFunc) -> *AstFunc {
+    if (impl_info == 0 || trait_method == 0 || trait_sig == 0 || trait_sig.body == 0) { return 0; }
+    if (trait_sig.params_vec == 0 || trait_sig.params_vec.len() == 0) { return 0; }
+
+    var fn_name: *NameInfo = compiler_build_method_name(impl_info.struct_ptr, impl_info.struct_len, trait_method.name_ptr, trait_method.name_len);
+    var params_out: *Vec<*Param> = new Vec<*Param>(trait_sig.params_vec.len());
+    var pn: u64 = trait_sig.params_vec.len();
+    for (var i: u64 = 0; i < pn; i++) {
+        var src: *Param = trait_sig.params_vec.get(i);
+        var dst: *Param = compiler_clone_param(src);
+        if (i == 0) {
+            dst.type_kind = TYPE_STRUCT;
+            dst.ptr_depth = 1;
+            dst.is_tagged = 0;
+            dst.struct_name_ptr = impl_info.struct_ptr;
+            dst.struct_name_len = impl_info.struct_len;
+            dst.tag_layout_ptr = 0;
+            dst.tag_layout_len = 0;
+        }
+        params_out.push(dst);
+    }
+
+    return ast_func_ex(fn_name.ptr, fn_name.len, params_out,
+                       trait_sig.ret_type, trait_sig.ret_ptr_depth, trait_sig.ret_is_tagged,
+                       trait_sig.ret_struct_name_ptr, trait_sig.ret_struct_name_len,
+                       trait_sig.ret_tag_layout_ptr, trait_sig.ret_tag_layout_len,
+                       trait_sig.body);
+}
+
+func compiler_register_trait_default_impl_method(impl_info: *TraitImpl, trait_method: *TraitMethod, trait_sig: *AstFunc) -> *TraitImplMethod {
+    var fn: *AstFunc = compiler_build_trait_default_impl_func(impl_info, trait_method, trait_sig);
+    if (fn == 0) { return 0; }
+    g_all_funcs.push(fn);
+    g_all_func_sigs.push(fn);
+    compiler_invalidate_func_lookup();
+    compiler_register_impl_method_ex(fn.name_ptr, fn.name_len, impl_info.struct_ptr, impl_info.struct_len, ACCESS_PUBLIC);
+    compiler_register_impl_method_func(fn.name_ptr, fn.name_len, fn);
+
+    var impl_method: *TraitImplMethod = new TraitImplMethod();
+    impl_method.name_ptr = trait_method.name_ptr;
+    impl_method.name_len = trait_method.name_len;
+    impl_method.func_def = fn;
+    if (impl_info.methods_vec != 0) {
+        impl_info.methods_vec.push(impl_method);
+    }
+    return impl_method;
+}
+
 func compiler_finalize_single_trait_impl(impl_info: *TraitImpl) -> u64 {
     var trait_def: *TraitDef = 0;
     var struct_def: *AstStructDef = 0;
@@ -4022,9 +4489,14 @@ func compiler_finalize_single_trait_impl(impl_info: *TraitImpl) -> u64 {
     for (var m: u64 = 0; m < method_count; m++) {
         var trait_method: *TraitMethod = trait_def.methods_vec.get(m);
         var trait_sig: *AstFunc = trait_method.sig;
-        compiler_validate_trait_signature_method(trait_method, trait_sig);
+        compiler_validate_trait_signature_method(impl_info.trait_ptr, impl_info.trait_len, trait_method, trait_sig);
 
         var impl_method: *TraitImplMethod = compiler_find_trait_impl_method(impl_info, trait_method.name_ptr, trait_method.name_len);
+        if (impl_method == 0) {
+            if (trait_sig.body != 0) {
+                impl_method = compiler_register_trait_default_impl_method(impl_info, trait_method, trait_sig);
+            }
+        }
         if (impl_method == 0) {
             compiler_trait_method_error("[ERROR] Trait method not implemented: ", trait_method.name_ptr, trait_method.name_len);
         }
@@ -4086,17 +4558,231 @@ func compiler_collect_abst_methods_recursive(struct_def: *AstStructDef, out: *Ve
     return 0;
 }
 
-func compiler_validate_child_implements_abst_method(sd: *AstStructDef, mi: *NameInfo) -> u64 {
-    if (compiler_is_abst_method(sd.name_ptr, sd.name_len, mi.ptr, mi.len) != 0) {
-        emit_stderr("[ERROR] Abstract method must be implemented in child: ");
-        emit_stderr_len(sd.name_ptr, sd.name_len);
+func compiler_collect_self_and_parent_abst_methods(struct_def: *AstStructDef, out: *Vec<*NameInfo>) -> u64 {
+    if (struct_def == 0 || out == 0) { return 0; }
+    compiler_collect_abst_methods_recursive(struct_def, out);
+    var own: *Vec<*NameInfo> = compiler_get_abst_methods(struct_def.name_ptr, struct_def.name_len);
+    if (own == 0) { return 0; }
+    var n: u64 = own.len();
+    for (var i: u64 = 0; i < n; i++) {
+        compiler_nameinfo_vec_push_unique(out, own.get(i));
+    }
+    return 0;
+}
+
+func _compiler_find_abst_decl_in_hierarchy(struct_def: *AstStructDef, method_ptr: u64, method_len: u64, depth: u64, owner_ptr_out: *u64, owner_len_out: *u64, access_out: *u64, sig_out: **AstFunc) -> u64 {
+    if (struct_def == 0) { return 0; }
+    if (depth > 64) {
+        emit_stderr("[ERROR] Inheritance depth exceeded\n");
+        panic("Compiler error");
+    }
+
+    if (compiler_is_abst_method(struct_def.name_ptr, struct_def.name_len, method_ptr, method_len) != 0) {
+        *owner_ptr_out = struct_def.name_ptr;
+        *owner_len_out = struct_def.name_len;
+        *access_out = compiler_get_abst_method_access(struct_def.name_ptr, struct_def.name_len, method_ptr, method_len);
+        *sig_out = compiler_get_abst_method_sig(struct_def.name_ptr, struct_def.name_len, method_ptr, method_len);
+        return 1;
+    }
+
+    if (struct_def.parents_vec == 0) { return 0; }
+    var parents: *Vec<*ParentDesc> = struct_def.parents_vec;
+    var pn: u64 = parents.len();
+    var found: u64 = 0;
+    var owner_ptr_tmp: u64 = 0;
+    var owner_len_tmp: u64 = 0;
+    var access_tmp: u64 = ACCESS_PRIVATE;
+    var sig_tmp: *AstFunc = 0;
+    for (var i: u64 = 0; i < pn; i++) {
+        var parent_desc: *ParentDesc = parents.get(i);
+        var parent_def: *AstStructDef = compiler_resolve_parent_def(parent_desc, "Compiler error");
+        var owner_ptr_c: u64 = 0;
+        var owner_len_c: u64 = 0;
+        var access_c: u64 = ACCESS_PRIVATE;
+        var sig_c: *AstFunc = 0;
+        if (_compiler_find_abst_decl_in_hierarchy(parent_def, method_ptr, method_len, depth + 1, &owner_ptr_c, &owner_len_c, &access_c, &sig_c) != 0) {
+            found = found + 1;
+            if (found == 1) {
+                owner_ptr_tmp = owner_ptr_c;
+                owner_len_tmp = owner_len_c;
+                access_tmp = access_c;
+                sig_tmp = sig_c;
+            }
+        }
+    }
+    if (found > 1) {
+        emit_stderr("[ERROR] Ambiguous abstract method declaration in inheritance: ");
+        emit_stderr_len(struct_def.name_ptr, struct_def.name_len);
         emit_stderr(".");
-        emit_stderr_len(mi.ptr, mi.len);
+        emit_stderr_len(method_ptr, method_len);
+        emit_stderr("\n");
+        panic("Compiler error");
+    }
+    if (found == 0) { return 0; }
+
+    *owner_ptr_out = owner_ptr_tmp;
+    *owner_len_out = owner_len_tmp;
+    *access_out = access_tmp;
+    *sig_out = sig_tmp;
+    return 1;
+}
+
+func compiler_find_abst_decl_in_hierarchy(struct_def: *AstStructDef, method_ptr: u64, method_len: u64, owner_ptr_out: *u64, owner_len_out: *u64, access_out: *u64, sig_out: **AstFunc) -> u64 {
+    return _compiler_find_abst_decl_in_hierarchy(struct_def, method_ptr, method_len, 0, owner_ptr_out, owner_len_out, access_out, sig_out);
+}
+
+func compiler_build_virtual_trait_name(base_ptr: u64, base_len: u64) -> *NameInfo {
+    return compiler_build_name_concat2("__Virt_", 7, base_ptr, base_len);
+}
+
+func compiler_build_virtual_trait_method_sig(abst_sig: *AstFunc, method_ptr: u64, method_len: u64) -> *AstFunc {
+    if (abst_sig == 0 || abst_sig.params_vec == 0 || abst_sig.params_vec.len() == 0) {
+        emit_stderr("[ERROR] abstract method requires self parameter for virtual dispatch: ");
+        emit_stderr_len(method_ptr, method_len);
         emit_stderr("\n");
         panic("Parse error");
     }
-    var method_name: *NameInfo = compiler_build_method_name(sd.name_ptr, sd.name_len, mi.ptr, mi.len);
-    if (compiler_is_impl_method(method_name.ptr, method_name.len) == 0) {
+
+    var params_out: *Vec<*Param> = new Vec<*Param>(abst_sig.params_vec.len());
+    var pn: u64 = abst_sig.params_vec.len();
+    for (var i: u64 = 0; i < pn; i++) {
+        var src: *Param = abst_sig.params_vec.get(i);
+        var dst: *Param = compiler_clone_param(src);
+        if (i == 0) {
+            dst.type_kind = TYPE_STRUCT;
+            dst.ptr_depth = 1;
+            dst.is_tagged = 0;
+            dst.struct_name_ptr = (u64)"Self";
+            dst.struct_name_len = 4;
+            dst.tag_layout_ptr = 0;
+            dst.tag_layout_len = 0;
+        }
+        params_out.push(dst);
+    }
+
+    return ast_func_ex(method_ptr, method_len, params_out,
+                       abst_sig.ret_type, abst_sig.ret_ptr_depth, abst_sig.ret_is_tagged,
+                       abst_sig.ret_struct_name_ptr, abst_sig.ret_struct_name_len,
+                       abst_sig.ret_tag_layout_ptr, abst_sig.ret_tag_layout_len, 0);
+}
+
+func compiler_setup_single_virtual_dispatch_trait(base_def: *AstStructDef) -> u64 {
+    if (base_def == 0) { return 0; }
+    var own_abst: *Vec<*NameInfo> = compiler_get_abst_methods(base_def.name_ptr, base_def.name_len);
+    if (own_abst == 0 || own_abst.len() == 0) { return 0; }
+
+    var required: *Vec<*NameInfo> = new Vec<*NameInfo>(8);
+    compiler_collect_self_and_parent_abst_methods(base_def, required);
+    if (required.len() == 0) { return 0; }
+
+    var trait_name: *NameInfo = compiler_build_virtual_trait_name(base_def.name_ptr, base_def.name_len);
+    var trait_def: *TraitDef = compiler_get_trait_def(trait_name.ptr, trait_name.len);
+    if (trait_def == 0) {
+        var methods: *Vec<*TraitMethod> = new Vec<*TraitMethod>(required.len());
+        var rn: u64 = required.len();
+        for (var ri: u64 = 0; ri < rn; ri++) {
+            var mi: *NameInfo = required.get(ri);
+            var owner_ptr: u64 = 0;
+            var owner_len: u64 = 0;
+            var access: u64 = ACCESS_PRIVATE;
+            var abst_sig: *AstFunc = 0;
+            if (compiler_find_abst_decl_in_hierarchy(base_def, mi.ptr, mi.len, &owner_ptr, &owner_len, &access, &abst_sig) == 0 || abst_sig == 0) {
+                emit_stderr("[ERROR] abstract signature missing for virtual dispatch: ");
+                emit_stderr_len(base_def.name_ptr, base_def.name_len);
+                emit_stderr(".");
+                emit_stderr_len(mi.ptr, mi.len);
+                emit_stderr("\n");
+                panic("Parse error");
+            }
+
+            var tm: *TraitMethod = new TraitMethod();
+            tm.name_ptr = mi.ptr;
+            tm.name_len = mi.len;
+            tm.sig = compiler_build_virtual_trait_method_sig(abst_sig, mi.ptr, mi.len);
+            tm.index = methods.len();
+            methods.push(tm);
+        }
+
+        trait_def = new TraitDef();
+        trait_def.name_ptr = trait_name.ptr;
+        trait_def.name_len = trait_name.len;
+        trait_def.methods_vec = methods;
+        compiler_register_trait_def(trait_def);
+    }
+
+    var vtable_name_ptr: u64 = 0;
+    var vtable_name_len: u64 = 0;
+    var vtable_struct_def: *AstStructDef = compiler_get_or_create_vtable_struct(trait_def, trait_name.ptr, trait_name.len, &vtable_name_ptr, &vtable_name_len);
+    if (vtable_struct_def == 0) {
+        emit_stderr("[ERROR] failed to build virtual vtable struct\n");
+        panic("Parse error");
+    }
+
+    var sn: u64 = g_all_structs_vec.len();
+    for (var si: u64 = 0; si < sn; si++) {
+        var sd: *AstStructDef = g_all_structs_vec.get(si);
+        if (sd == 0) { continue; }
+        if (compiler_struct_is_same_or_descendant(sd.name_ptr, sd.name_len, base_def.name_ptr, base_def.name_len) == 0) { continue; }
+
+        compiler_insert_vptr_field(sd, trait_name.ptr, trait_name.len, vtable_name_ptr, vtable_name_len);
+
+        var rn2: u64 = required.len();
+        for (var rj: u64 = 0; rj < rn2; rj++) {
+            var mref: *NameInfo = required.get(rj);
+            compiler_register_virtual_dispatch_trait(sd.name_ptr, sd.name_len, mref.ptr, mref.len, trait_name.ptr, trait_name.len);
+        }
+
+        if (compiler_find_trait_impl(trait_name.ptr, trait_name.len, sd.name_ptr, sd.name_len) != 0) { continue; }
+
+        var impl_methods: *Vec<*TraitImplMethod> = new Vec<*TraitImplMethod>(required.len());
+        var has_all_impls: u64 = 1;
+        for (var rk: u64 = 0; rk < required.len(); rk++) {
+            var mk: *NameInfo = required.get(rk);
+            var fn: *AstFunc = compiler_find_method_func_in_hierarchy(sd, mk.ptr, mk.len);
+            if (fn == 0) {
+                has_all_impls = 0;
+                break;
+            }
+            var tim: *TraitImplMethod = new TraitImplMethod();
+            tim.name_ptr = mk.ptr;
+            tim.name_len = mk.len;
+            tim.func_def = fn;
+            impl_methods.push(tim);
+        }
+        if (has_all_impls == 0) { continue; }
+
+        var impl_info: *TraitImpl = new TraitImpl();
+        impl_info.trait_ptr = trait_name.ptr;
+        impl_info.trait_len = trait_name.len;
+        impl_info.struct_ptr = sd.name_ptr;
+        impl_info.struct_len = sd.name_len;
+        impl_info.methods_vec = impl_methods;
+        impl_info.vtable_struct_def = 0;
+        impl_info.vtable_global_ptr = 0;
+        impl_info.vtable_global_len = 0;
+        compiler_register_trait_impl(impl_info);
+    }
+    return 0;
+}
+
+func compiler_setup_virtual_dispatch_traits() -> u64 {
+    if (g_all_structs_vec == 0) { return 0; }
+    var sn: u64 = g_all_structs_vec.len();
+    for (var si: u64 = 0; si < sn; si++) {
+        var sd: *AstStructDef = g_all_structs_vec.get(si);
+        if (sd == 0) { continue; }
+        compiler_setup_single_virtual_dispatch_trait(sd);
+    }
+    return 0;
+}
+
+func compiler_validate_child_implements_abst_method(sd: *AstStructDef, mi: *NameInfo) -> u64 {
+    if (compiler_is_abst_method(sd.name_ptr, sd.name_len, mi.ptr, mi.len) != 0) {
+        // Child remains abstract on this method; allowed.
+        return 0;
+    }
+    var found_impl: *AstFunc = compiler_find_method_func_in_hierarchy(sd, mi.ptr, mi.len);
+    if (found_impl == 0) {
         emit_stderr("[ERROR] Missing abstract method implementation in child: ");
         emit_stderr_len(sd.name_ptr, sd.name_len);
         emit_stderr(".");
@@ -4121,6 +4807,7 @@ func compiler_finalize_abst_methods() -> u64 {
             compiler_validate_child_implements_abst_method(sd, mi);
         }
     }
+    compiler_setup_virtual_dispatch_traits();
     return 0;
 }
 

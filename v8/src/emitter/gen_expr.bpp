@@ -856,6 +856,30 @@ func cg_expr_call(node: u64, symtab: *Symtab) -> u64 {
         resolved_ptr = resolved.ptr;
         resolved_len = resolved.len;
     }
+
+    var impl_check_ptr: u64 = name_ptr;
+    var impl_check_len: u64 = name_len;
+    if (compiler_is_impl_method(impl_check_ptr, impl_check_len) == 0 && resolved != 0 && compiler_is_impl_method(resolved_ptr, resolved_len) != 0) {
+        impl_check_ptr = resolved_ptr;
+        impl_check_len = resolved_len;
+    }
+    if (compiler_is_impl_method(impl_check_ptr, impl_check_len) != 0) {
+        var impl_access: u64 = compiler_get_impl_method_access(impl_check_ptr, impl_check_len);
+        if (impl_access == ACCESS_PRIVATE) {
+            var owner: *NameInfo = compiler_get_impl_method_owner(impl_check_ptr, impl_check_len);
+            var allow_private: u64 = 0;
+            if (owner != 0) {
+                allow_private = compiler_can_access_private_member(owner.ptr, owner.len);
+            }
+            if (allow_private == 0) {
+                emit_stderr("[ERROR] private method access denied: ");
+                emit_stderr_len(impl_check_ptr, impl_check_len);
+                emit_stderr("\n");
+                panic("Codegen error");
+            }
+        }
+    }
+
     var var_type: *TypeInfo = symtab_get_type(symtab, name_ptr, name_len);
     var is_global: u64 = is_global_var(resolved_ptr, resolved_len);
     if (var_type != 0 || is_global != 0) {
@@ -1683,6 +1707,14 @@ func cg_safe_member_access_expr(node: u64, symtab: *Symtab) -> u64 {
     var field_desc: *FieldDesc = 0;
     var found2: u64 = struct_find_field_desc_scoped(struct_def, parent_ptr, parent_len, member_ptr, member_len, &field_offset2, &field_desc);
     if (found2 == 0) { return 0; }
+    if (field_desc != 0 && compiler_check_field_access(field_desc) == 0) {
+        emit_stderr("[ERROR] private field access denied: ");
+        emit_stderr_len(struct_def.name_ptr, struct_def.name_len);
+        emit_stderr(".");
+        emit_stderr_len(member_ptr, member_len);
+        emit_stderr("\n");
+        return 0;
+    }
     if (field_offset2 > 0) {
         emit("    add rax, ");
         emit_u64(field_offset2);
@@ -1742,6 +1774,14 @@ func cg_member_emit_struct_field_at_rax(struct_def: *AstStructDef, parent_ptr: u
     var field_desc: *FieldDesc = 0;
     var found: u64 = struct_find_field_desc_scoped(struct_def, parent_ptr, parent_len, member_ptr, member_len, &field_offset, &field_desc);
     if (found == 0) { return 0; }
+    if (field_desc != 0 && compiler_check_field_access(field_desc) == 0) {
+        emit_stderr("[ERROR] private field access denied: ");
+        emit_stderr_len(struct_def.name_ptr, struct_def.name_len);
+        emit_stderr(".");
+        emit_stderr_len(member_ptr, member_len);
+        emit_stderr("\n");
+        panic("Codegen error");
+    }
     cg_member_add_offset_to_rax(field_offset);
     cg_member_emit_load_or_deref(field_desc, load_when_missing);
     return 1;
@@ -2297,6 +2337,14 @@ func cg_member_resolve_field_offset(struct_def: *AstStructDef, parent_ptr: u64, 
     var field_desc: *FieldDesc = 0;
     var found: u64 = struct_find_field_desc_scoped(struct_def, parent_ptr, parent_len, member_ptr, member_len, &field_offset, &field_desc);
     if (found == 0) { return 0; }
+    if (field_desc != 0 && compiler_check_field_access(field_desc) == 0) {
+        emit_stderr("[ERROR] private field access denied: ");
+        emit_stderr_len(struct_def.name_ptr, struct_def.name_len);
+        emit_stderr(".");
+        emit_stderr_len(member_ptr, member_len);
+        emit_stderr("\n");
+        panic("Codegen error");
+    }
     *offset_out = field_offset;
     return 1;
 }
@@ -2558,6 +2606,62 @@ func cg_method_push_receiver(receiver: u64, recv_ti: *TypeInfo, recv_is_ptr: u64
     return 1;
 }
 
+func cg_method_find_virtual_vptr_offset(recv_ti: *TypeInfo, trait_ptr: u64, trait_len: u64) -> u64 {
+    if (recv_ti == 0) { return COMPILER_NOT_FOUND_U64; }
+    var struct_def: *AstStructDef = recv_ti.struct_def;
+    if (struct_def == 0) {
+        struct_def = get_struct_def(recv_ti.struct_name_ptr, recv_ti.struct_name_len);
+    }
+    if (struct_def == 0) { return COMPILER_NOT_FOUND_U64; }
+    var vptr_name: *NameInfo = compiler_build_vptr_field_name(trait_ptr, trait_len);
+    var field_offset: u64 = 0;
+    var field_desc: *FieldDesc = 0;
+    var found: u64 = struct_find_field_desc_scoped(struct_def, 0, 0, vptr_name.ptr, vptr_name.len, &field_offset, &field_desc);
+    if (found == 0) { return COMPILER_NOT_FOUND_U64; }
+    return field_offset;
+}
+
+func cg_method_push_virtual_receiver(receiver: u64, recv_ti: *TypeInfo, trait_ptr: u64, trait_len: u64) -> u64 {
+    var off: u64 = cg_method_find_virtual_vptr_offset(recv_ti, trait_ptr, trait_len);
+    if (compiler_is_not_found_u64(off) != 0) {
+        emit_stderr("[ERROR] virtual dispatch vptr not found: ");
+        emit_stderr_len(recv_ti.struct_name_ptr, recv_ti.struct_name_len);
+        emit_stderr("\n");
+        panic("Codegen error");
+    }
+    cg_expr(receiver);
+    if (recv_ti != 0 && recv_ti.is_tagged == 1) {
+        emit_tagged_mask();
+    }
+    if (off != 0) {
+        emit("    add rax, ");
+        emit_u64(off);
+        emit_nl();
+    }
+    emit("    push rax\n");
+    return 1;
+}
+
+func cg_method_push_virtual_receiver_from_tmp(tmp_offset: u64, recv_ti: *TypeInfo, trait_ptr: u64, trait_len: u64) -> u64 {
+    var off: u64 = cg_method_find_virtual_vptr_offset(recv_ti, trait_ptr, trait_len);
+    if (compiler_is_not_found_u64(off) != 0) {
+        emit_stderr("[ERROR] virtual dispatch vptr not found: ");
+        emit_stderr_len(recv_ti.struct_name_ptr, recv_ti.struct_name_len);
+        emit_stderr("\n");
+        panic("Codegen error");
+    }
+    emit("    mov rax, [rbp");
+    emit_signed_disp(tmp_offset);
+    emit("]\n");
+    if (off != 0) {
+        emit("    add rax, ");
+        emit_u64(off);
+        emit_nl();
+    }
+    emit("    push rax\n");
+    return 1;
+}
+
 func cg_method_stack_cleanup(stack_words: u64) -> u64 {
     if (stack_words > 0) {
         emit("    add rsp, ");
@@ -2652,6 +2756,48 @@ func cg_safe_method_call_struct_ptr(method_call: *AstMethodCall, recv_ti: *TypeI
         return 0;
     }
 
+    if (compiler_check_method_access(recv_ti.struct_name_ptr, recv_ti.struct_name_len, method_ptr, method_len) == 0) {
+        emit_stderr("[ERROR] private method access denied: ");
+        emit_stderr_len(recv_ti.struct_name_ptr, recv_ti.struct_name_len);
+        emit_stderr(".");
+        emit_stderr_len(method_ptr, method_len);
+        emit_stderr("\n");
+        return 0;
+    }
+
+    var virt_trait: *NameInfo = 0;
+    if (recv_ti.ptr_depth > 0) {
+        virt_trait = compiler_find_virtual_dispatch_trait(recv_ti.struct_name_ptr, recv_ti.struct_name_len, method_ptr, method_len);
+    }
+    if (virt_trait != 0) {
+        var method_index_v: u64 = compiler_find_trait_method_index(virt_trait.ptr, virt_trait.len, method_ptr, method_len);
+        if (compiler_is_not_found_u64(method_index_v) != 0) {
+            emit_stderr("[ERROR] Virtual method not found: ");
+            emit_stderr_len(method_ptr, method_len);
+            emit_stderr("\n");
+            return 0;
+        }
+
+        var label_null_v: u64 = new_label();
+        var label_end_v: u64 = new_label();
+        var tmp_offset_v: u64 = 0;
+        cg_method_prepare_safe_receiver(receiver, recv_ti, label_null_v, symtab, &tmp_offset_v);
+
+        var total_arg_words_v: u64 = cg_method_push_user_args(args, nargs, symtab);
+        total_arg_words_v = total_arg_words_v + cg_method_push_virtual_receiver_from_tmp(tmp_offset_v, recv_ti, virt_trait.ptr, virt_trait.len);
+        var stack_words_v: u64 = _cg_sysv_pop_arg_regs(total_arg_words_v);
+        cg_method_emit_trait_vtable_call(method_index_v, stack_words_v);
+
+        emit("    jmp ");
+        emit_label(label_end_v);
+        emit_nl();
+
+        emit_label_def(label_null_v);
+        emit("    xor eax, eax\n");
+        emit_label_def(label_end_v);
+        return 0;
+    }
+
     var name_info: *NameInfo = compiler_build_method_name(recv_ti.struct_name_ptr, recv_ti.struct_name_len, method_ptr, method_len);
     var resolved_ptr: u64 = name_info.ptr;
     var resolved_len: u64 = name_info.len;
@@ -2662,6 +2808,13 @@ func cg_safe_method_call_struct_ptr(method_call: *AstMethodCall, recv_ti: *TypeI
     }
 
     var fn: *AstFunc = typeinfo_find_func(resolved_ptr, resolved_len);
+    if (fn == 0 && recv_ti.struct_def != 0) {
+        fn = compiler_find_method_func_in_hierarchy(recv_ti.struct_def, method_ptr, method_len);
+        if (fn != 0) {
+            resolved_ptr = fn.name_ptr;
+            resolved_len = fn.name_len;
+        }
+    }
     var ret_type: u64 = TYPE_I64;
     var ret_ptr_depth: u64 = 0;
     if (fn != 0) {
@@ -2746,6 +2899,35 @@ func cg_method_call(node: u64, symtab: *Symtab) -> u64 {
         cg_method_emit_trait_vtable_call(method_index, stack_words_t2);
         return 0;
     }
+
+    if (recv_ti != 0 && recv_ti.type_kind == TYPE_STRUCT) {
+        if (compiler_check_method_access(recv_ti.struct_name_ptr, recv_ti.struct_name_len, method_ptr, method_len) == 0) {
+            emit_stderr("[ERROR] private method access denied: ");
+            emit_stderr_len(recv_ti.struct_name_ptr, recv_ti.struct_name_len);
+            emit_stderr(".");
+            emit_stderr_len(method_ptr, method_len);
+            emit_stderr("\n");
+            panic("Codegen error");
+        }
+
+        if (recv_ti.ptr_depth > 0) {
+            var virt_trait: *NameInfo = compiler_find_virtual_dispatch_trait(recv_ti.struct_name_ptr, recv_ti.struct_name_len, method_ptr, method_len);
+            if (virt_trait != 0) {
+                var method_index_v: u64 = compiler_find_trait_method_index(virt_trait.ptr, virt_trait.len, method_ptr, method_len);
+                if (compiler_is_not_found_u64(method_index_v) != 0) {
+                    emit_stderr("[ERROR] Virtual method not found: ");
+                    emit_stderr_len(method_ptr, method_len);
+                    emit_stderr("\n");
+                    panic("Codegen error");
+                }
+                total_arg_words = cg_method_push_user_args(args, nargs, symtab);
+                total_arg_words = total_arg_words + cg_method_push_virtual_receiver(receiver, recv_ti, virt_trait.ptr, virt_trait.len);
+                var stack_words_v: u64 = _cg_sysv_pop_arg_regs(total_arg_words);
+                cg_method_emit_trait_vtable_call(method_index_v, stack_words_v);
+                return 0;
+            }
+        }
+    }
     
     // Push user args (in reverse order)
     total_arg_words = cg_method_push_user_args(args, nargs, symtab);
@@ -2777,6 +2959,13 @@ func cg_method_call(node: u64, symtab: *Symtab) -> u64 {
     if (resolved != 0) {
         resolved_ptr = resolved.ptr;
         resolved_len = resolved.len;
+    }
+    if (type_info.struct_def != 0) {
+        var fn_fallback: *AstFunc = compiler_find_method_func_in_hierarchy(type_info.struct_def, method_ptr, method_len);
+        if (fn_fallback != 0) {
+            resolved_ptr = fn_fallback.name_ptr;
+            resolved_len = fn_fallback.name_len;
+        }
     }
 
     var stack_words: u64 = _cg_sysv_pop_arg_regs(total_arg_words);
