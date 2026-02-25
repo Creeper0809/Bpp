@@ -1862,6 +1862,20 @@ func compiler_is_impl_context() -> u64 {
     return false;
 }
 
+func compiler_impl_has_generic_param(name_ptr: u64, name_len: u64) -> u64 {
+    if (compiler_is_impl_context() == 0) { return false; }
+    var tpl: *GenericStructTemplate = compiler_find_generic_struct_template_by_name(g_impl_prefix_ptr, g_impl_prefix_len);
+    if (tpl == 0 || tpl.params_vec == 0) { return false; }
+    var n: u64 = tpl.params_vec.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var gp: *GenericParam = tpl.params_vec.get(i);
+        if (str_eq(gp.name_ptr, gp.name_len, name_ptr, name_len) != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 func compiler_get_impl_prefix_ptr() -> u64 {
     return g_impl_prefix_ptr;
 }
@@ -2892,6 +2906,15 @@ func generic_infer_expr_type(expr: *AstNode, symtab: *HashMap<u64, *TypeInfo>) -
             var sc3: *AstStackCtor = (*AstStackCtor)expr;
             return generic_make_typeinfo_from_fields(sc3.type_kind, sc3.ptr_depth, sc3.is_tagged, sc3.struct_name_ptr, sc3.struct_name_len, sc3.tag_layout_ptr, sc3.tag_layout_len,
                                                      sc3.elem_type_kind, sc3.elem_ptr_depth, sc3.array_len, sc3.array_len_is_param, sc3.array_len_param_ptr, sc3.array_len_param_len);
+        case AST_GENERIC_STRUCT_LITERAL:
+            var gsl: *AstGenericStructLiteral = (*AstGenericStructLiteral)expr;
+            var tpl: *GenericStructTemplate = 0;
+            if (compiler_try_resolve_generic_struct_template(gsl.name_ptr, gsl.name_len, &tpl) == 0) {
+                return generic_type_u64();
+            }
+            var bindings_gsl: *Vec<*GenericBinding> = generic_build_bindings_for_struct(tpl, gsl.generic_args_vec);
+            var inst_name: *NameInfo = generic_struct_get_or_create_instance(tpl, bindings_gsl);
+            return generic_make_typeinfo_from_fields(TYPE_STRUCT, 0, 0, inst_name.ptr, inst_name.len, 0, 0, 0, 0, 0, 0, 0, 0);
         case AST_CALL:
             return generic_infer_call_return_type((*AstCall)expr);
         default:
@@ -3074,6 +3097,44 @@ func generic_clone_expr(node: *AstNode, bindings: *Vec<*GenericBinding>) -> *Ast
             return ast_call_with_origin(call.name_ptr, call.name_len, args, call.origin);
         case AST_GENERIC_CALL:
             return generic_clone_expr_generic_call((*AstGenericCall)node, bindings);
+        case AST_GENERIC_STRUCT_LITERAL:
+            var gsl: *AstGenericStructLiteral = (*AstGenericStructLiteral)node;
+            var gargs2: *Vec<*GenericArg> = new Vec<*GenericArg>(4);
+            var gn2: u64 = gsl.generic_args_vec.len();
+            for (var gi: u64 = 0; gi < gn2; gi++) {
+                var ga2: *GenericArg = gsl.generic_args_vec.get(gi);
+                var ng2: *GenericArg = new GenericArg();
+                ng2.kind = ga2.kind;
+                ng2.value = ga2.value;
+                if (ga2.kind == GENERIC_KIND_TYPE) {
+                    var ti3: *TypeInfo = ga2.type_ptr;
+                    ng2.type_ptr = generic_subst_typeinfo(ti3.type_kind, ti3.ptr_depth, ti3.is_tagged, ti3.struct_name_ptr, ti3.struct_name_len, ti3.tag_layout_ptr, ti3.tag_layout_len, ti3.elem_type_kind, ti3.elem_ptr_depth, ti3.array_len, ti3.array_len_is_param, ti3.array_len_param_ptr, ti3.array_len_param_len, bindings);
+                } else {
+                    ng2.type_ptr = 0;
+                }
+                gargs2.push(ng2);
+            }
+            var vals2: *Vec<*AstNode> = generic_clone_args_vec(gsl.values_vec, bindings);
+            return (*AstNode)ast_generic_struct_literal(gsl.name_ptr, gsl.name_len, gargs2, vals2);
+        case AST_STATIC_GENERIC_CALL:
+            var sgc: *AstStaticGenericCall = (*AstStaticGenericCall)node;
+            var sg_gargs: *Vec<*GenericArg> = new Vec<*GenericArg>(4);
+            var sg_n: u64 = sgc.generic_args_vec.len();
+            for (var sg_i: u64 = 0; sg_i < sg_n; sg_i++) {
+                var sg_ga: *GenericArg = sgc.generic_args_vec.get(sg_i);
+                var sg_ng: *GenericArg = new GenericArg();
+                sg_ng.kind = sg_ga.kind;
+                sg_ng.value = sg_ga.value;
+                if (sg_ga.kind == GENERIC_KIND_TYPE) {
+                    var sg_ti: *TypeInfo = sg_ga.type_ptr;
+                    sg_ng.type_ptr = generic_subst_typeinfo(sg_ti.type_kind, sg_ti.ptr_depth, sg_ti.is_tagged, sg_ti.struct_name_ptr, sg_ti.struct_name_len, sg_ti.tag_layout_ptr, sg_ti.tag_layout_len, sg_ti.elem_type_kind, sg_ti.elem_ptr_depth, sg_ti.array_len, sg_ti.array_len_is_param, sg_ti.array_len_param_ptr, sg_ti.array_len_param_len, bindings);
+                } else {
+                    sg_ng.type_ptr = 0;
+                }
+                sg_gargs.push(sg_ng);
+            }
+            var sg_args: *Vec<*AstNode> = generic_clone_args_vec(sgc.args_vec, bindings);
+            return (*AstNode)ast_static_generic_call(sgc.struct_name_ptr, sgc.struct_name_len, sgc.method_ptr, sgc.method_len, sg_gargs, sg_args);
         case AST_ADDR_OF:
             var ao: *AstAddrOf = (*AstAddrOf)node;
             return ast_addr_of(generic_clone_expr(ao.operand, bindings));
@@ -3691,6 +3752,14 @@ func generic_process_expr(expr: *AstNode, symtab: *HashMap<u64, *TypeInfo>) -> *
     switch (kind) {
         case AST_GENERIC_CALL:
             return generic_process_generic_call_expr((*AstGenericCall)expr, symtab);
+        case AST_STATIC_GENERIC_CALL:
+            var sgc: *AstStaticGenericCall = (*AstStaticGenericCall)expr;
+            sgc.args_vec = generic_process_args_vec(sgc.args_vec, symtab);
+            return generic_process_expr(compiler_lower_parse_sugar_static_generic_method_call(sgc), symtab);
+        case AST_GENERIC_STRUCT_LITERAL:
+            var gsl: *AstGenericStructLiteral = (*AstGenericStructLiteral)expr;
+            gsl.values_vec = generic_process_args_vec(gsl.values_vec, symtab);
+            return compiler_lower_parse_sugar_generic_struct_literal(gsl);
         case AST_CALL:
             return generic_process_call_expr((*AstCall)expr, symtab);
         case AST_BINARY:
@@ -3825,6 +3894,336 @@ func generic_process_stmt(stmt: *AstNode, symtab: *HashMap<u64, *TypeInfo>) -> u
     }
 }
 
+func compiler_try_resolve_struct_name(name_ptr: u64, name_len: u64, resolved_ptr_out: *u64, resolved_len_out: *u64, struct_def_out: **AstStructDef) -> u64 {
+    var resolved_ptr: u64 = name_ptr;
+    var resolved_len: u64 = name_len;
+    var struct_def: *AstStructDef = get_struct_def(resolved_ptr, resolved_len);
+    if (struct_def == 0) {
+        var resolved_name: *NameInfo = resolve_name(name_ptr, name_len);
+        if (resolved_name != 0) {
+            var resolved_def: *AstStructDef = get_struct_def(resolved_name.ptr, resolved_name.len);
+            if (resolved_def != 0) {
+                resolved_ptr = resolved_name.ptr;
+                resolved_len = resolved_name.len;
+                struct_def = resolved_def;
+            }
+        }
+    }
+    if (struct_def == 0) { return 0; }
+    *resolved_ptr_out = resolved_ptr;
+    *resolved_len_out = resolved_len;
+    *struct_def_out = struct_def;
+    return 1;
+}
+
+func compiler_try_resolve_generic_struct_template(name_ptr: u64, name_len: u64, tpl_out: **GenericStructTemplate) -> u64 {
+    var tpl: *GenericStructTemplate = compiler_find_generic_struct_template_by_name(name_ptr, name_len);
+    if (tpl == 0) {
+        var resolved_name: *NameInfo = resolve_name(name_ptr, name_len);
+        if (resolved_name != 0) {
+            tpl = compiler_find_generic_struct_template_by_name(resolved_name.ptr, resolved_name.len);
+        }
+    }
+    if (tpl == 0) { return 0; }
+    *tpl_out = tpl;
+    return 1;
+}
+
+func compiler_lower_parse_sugar_args(args: *Vec<*AstNode>) -> u64 {
+    if (args == 0) { return 0; }
+    var n: u64 = args.len();
+    for (var i: u64 = 0; i < n; i++) {
+        args.set(i, compiler_lower_parse_sugar_expr(args.get(i)));
+    }
+    return 0;
+}
+
+func compiler_lower_parse_sugar_ctor_call(call: *AstCall) -> *AstNode {
+    if (call == 0) { return 0; }
+    if (call.origin != AST_CALL_ORIGIN_DIRECT) { return (*AstNode)call; }
+
+    var struct_ptr: u64 = 0;
+    var struct_len: u64 = 0;
+    var struct_def: *AstStructDef = 0;
+    if (compiler_try_resolve_struct_name(call.name_ptr, call.name_len, &struct_ptr, &struct_len, &struct_def) == 0) {
+        return (*AstNode)call;
+    }
+
+    return (*AstNode)ast_stack_ctor(TYPE_STRUCT, 0, 0, struct_ptr, struct_len, 0, 0, 0, 0, 0, 0, 0, 0, call.args_vec);
+}
+
+func compiler_lower_parse_sugar_generic_ctor_call(gcall: *AstGenericCall) -> *AstNode {
+    if (gcall == 0) { return 0; }
+    if (gcall.origin != AST_CALL_ORIGIN_DIRECT) { return (*AstNode)gcall; }
+
+    var tpl: *GenericStructTemplate = 0;
+    if (compiler_try_resolve_generic_struct_template(gcall.name_ptr, gcall.name_len, &tpl) == 0) {
+        return (*AstNode)gcall;
+    }
+
+    var bindings: *Vec<*GenericBinding> = generic_build_bindings_for_struct(tpl, gcall.generic_args_vec);
+    var name_info: *NameInfo = generic_struct_get_or_create_instance(tpl, bindings);
+    return (*AstNode)ast_stack_ctor(TYPE_STRUCT, 0, 0, name_info.ptr, name_info.len, 0, 0, 0, 0, 0, 0, 0, 0, gcall.args_vec);
+}
+
+func compiler_lower_parse_sugar_generic_struct_literal(gsl: *AstGenericStructLiteral) -> *AstNode {
+    if (gsl == 0) { return 0; }
+
+    var tpl: *GenericStructTemplate = 0;
+    if (compiler_try_resolve_generic_struct_template(gsl.name_ptr, gsl.name_len, &tpl) == 0) {
+        emit_stderr("[ERROR] Generic struct template not found: ");
+        emit_stderr_len(gsl.name_ptr, gsl.name_len);
+        emit_stderr("\n");
+        panic("Compiler error");
+    }
+
+    var bindings: *Vec<*GenericBinding> = generic_build_bindings_for_struct(tpl, gsl.generic_args_vec);
+    var name_info: *NameInfo = generic_struct_get_or_create_instance(tpl, bindings);
+    var struct_def: *AstStructDef = get_struct_def(name_info.ptr, name_info.len);
+    if (struct_def == 0) {
+        emit_stderr("[ERROR] Generic struct def missing\n");
+        panic("Compiler error");
+    }
+    return (*AstNode)ast_struct_literal(struct_def, gsl.values_vec);
+}
+
+func compiler_lower_parse_sugar_static_generic_method_call(sgc: *AstStaticGenericCall) -> *AstNode {
+    if (sgc == 0) { return 0; }
+
+    var struct_ptr: u64 = 0;
+    var struct_len: u64 = 0;
+    var struct_def: *AstStructDef = 0;
+    if (compiler_try_resolve_struct_name(sgc.struct_name_ptr, sgc.struct_name_len, &struct_ptr, &struct_len, &struct_def) == 0) {
+        emit_stderr("[ERROR] static generic method owner type not found: ");
+        emit_stderr_len(sgc.struct_name_ptr, sgc.struct_name_len);
+        emit_stderr("\n");
+        panic("Compiler error");
+    }
+
+    var lowered_name: *NameInfo = compiler_build_method_name(struct_ptr, struct_len, sgc.method_ptr, sgc.method_len);
+    return (*AstNode)ast_generic_call_with_origin(lowered_name.ptr, lowered_name.len, sgc.generic_args_vec, sgc.args_vec, AST_CALL_ORIGIN_MEMBER_LOWERED);
+}
+
+func compiler_lower_parse_sugar_static_method_call(mc: *AstMethodCall, is_safe: u64) -> *AstNode {
+    if (mc == 0 || mc.receiver == 0) { return (*AstNode)mc; }
+    if (ast_kind(mc.receiver) != AST_IDENT) { return (*AstNode)mc; }
+
+    var recv_id: *AstIdent = (*AstIdent)mc.receiver;
+    var struct_ptr: u64 = 0;
+    var struct_len: u64 = 0;
+    var struct_def: *AstStructDef = 0;
+    if (compiler_try_resolve_struct_name(recv_id.name_ptr, recv_id.name_len, &struct_ptr, &struct_len, &struct_def) == 0) {
+        return (*AstNode)mc;
+    }
+
+    if (is_safe != 0) {
+        emit_stderr("[ERROR] safe navigation is not allowed for static method call\n");
+        panic("Compiler error");
+    }
+
+    var lowered_name: *NameInfo = compiler_build_method_name(struct_ptr, struct_len, mc.method_ptr, mc.method_len);
+    return (*AstNode)ast_call_with_origin(lowered_name.ptr, lowered_name.len, mc.args_vec, AST_CALL_ORIGIN_MEMBER_LOWERED);
+}
+
+func compiler_lower_parse_sugar_expr(expr: *AstNode) -> *AstNode {
+    if (expr == 0) { return 0; }
+    var kind: u64 = ast_kind(expr);
+    switch (kind) {
+        case AST_CALL:
+            var call: *AstCall = (*AstCall)expr;
+            compiler_lower_parse_sugar_args(call.args_vec);
+            return compiler_lower_parse_sugar_ctor_call(call);
+        case AST_GENERIC_CALL:
+            var gcall: *AstGenericCall = (*AstGenericCall)expr;
+            compiler_lower_parse_sugar_args(gcall.args_vec);
+            return compiler_lower_parse_sugar_generic_ctor_call(gcall);
+        case AST_GENERIC_STRUCT_LITERAL:
+            var gsl: *AstGenericStructLiteral = (*AstGenericStructLiteral)expr;
+            compiler_lower_parse_sugar_args(gsl.values_vec);
+            return compiler_lower_parse_sugar_generic_struct_literal(gsl);
+        case AST_STATIC_GENERIC_CALL:
+            var sgc: *AstStaticGenericCall = (*AstStaticGenericCall)expr;
+            compiler_lower_parse_sugar_args(sgc.args_vec);
+            return compiler_lower_parse_sugar_static_generic_method_call(sgc);
+        case AST_CALL_PTR:
+            var cp: *AstCallPtr = (*AstCallPtr)expr;
+            cp.callee = compiler_lower_parse_sugar_expr(cp.callee);
+            compiler_lower_parse_sugar_args(cp.args_vec);
+            return expr;
+        case AST_BINARY:
+            var bin: *AstBinary = (*AstBinary)expr;
+            bin.left = compiler_lower_parse_sugar_expr(bin.left);
+            bin.right = compiler_lower_parse_sugar_expr(bin.right);
+            return expr;
+        case AST_UNARY:
+            var un: *AstUnary = (*AstUnary)expr;
+            un.operand = compiler_lower_parse_sugar_expr(un.operand);
+            return expr;
+        case AST_ADDR_OF:
+            var ao: *AstAddrOf = (*AstAddrOf)expr;
+            ao.operand = compiler_lower_parse_sugar_expr(ao.operand);
+            return expr;
+        case AST_DEREF:
+            var dr: *AstDeref = (*AstDeref)expr;
+            dr.operand = compiler_lower_parse_sugar_expr(dr.operand);
+            return expr;
+        case AST_DEREF8:
+            var dr8: *AstDeref8 = (*AstDeref8)expr;
+            dr8.operand = compiler_lower_parse_sugar_expr(dr8.operand);
+            return expr;
+        case AST_CAST:
+            var cs: *AstCast = (*AstCast)expr;
+            cs.expr = compiler_lower_parse_sugar_expr(cs.expr);
+            return expr;
+        case AST_MEMBER_ACCESS:
+        case AST_SAFE_MEMBER_ACCESS:
+            var ma: *AstMemberAccess = (*AstMemberAccess)expr;
+            ma.object = compiler_lower_parse_sugar_expr(ma.object);
+            return expr;
+        case AST_METHOD_CALL:
+            var mc: *AstMethodCall = (*AstMethodCall)expr;
+            mc.receiver = compiler_lower_parse_sugar_expr(mc.receiver);
+            compiler_lower_parse_sugar_args(mc.args_vec);
+            return compiler_lower_parse_sugar_static_method_call(mc, 0);
+        case AST_SAFE_METHOD_CALL:
+            var smc: *AstMethodCall = (*AstMethodCall)expr;
+            smc.receiver = compiler_lower_parse_sugar_expr(smc.receiver);
+            compiler_lower_parse_sugar_args(smc.args_vec);
+            return compiler_lower_parse_sugar_static_method_call(smc, 1);
+        case AST_INDEX:
+            var ix: *AstIndex = (*AstIndex)expr;
+            ix.base = compiler_lower_parse_sugar_expr(ix.base);
+            ix.index = compiler_lower_parse_sugar_expr(ix.index);
+            return expr;
+        case AST_SLICE:
+            var sl: *AstSlice = (*AstSlice)expr;
+            sl.ptr_expr = compiler_lower_parse_sugar_expr(sl.ptr_expr);
+            sl.len_expr = compiler_lower_parse_sugar_expr(sl.len_expr);
+            return expr;
+        case AST_TRY:
+            var tr: *AstTry = (*AstTry)expr;
+            tr.operand = compiler_lower_parse_sugar_expr(tr.operand);
+            return expr;
+        case AST_SIZEOF_EXPR:
+            var se: *AstSizeofExpr = (*AstSizeofExpr)expr;
+            se.expr = compiler_lower_parse_sugar_expr(se.expr);
+            return expr;
+        case AST_STRUCT_LITERAL:
+            var lit: *AstStructLiteral = (*AstStructLiteral)expr;
+            compiler_lower_parse_sugar_args(lit.values_vec);
+            return expr;
+        case AST_NEW:
+            var nw: *AstNew = (*AstNew)expr;
+            nw.literal_expr = compiler_lower_parse_sugar_expr(nw.literal_expr);
+            compiler_lower_parse_sugar_args(nw.ctor_args_vec);
+            return expr;
+        case AST_STACK_CTOR:
+            var sc: *AstStackCtor = (*AstStackCtor)expr;
+            compiler_lower_parse_sugar_args(sc.ctor_args_vec);
+            return expr;
+        default:
+            return expr;
+    }
+}
+
+func compiler_lower_parse_sugar_stmt(stmt: *AstNode) -> u64 {
+    if (stmt == 0) { return 0; }
+    var kind: u64 = ast_kind(stmt);
+    switch (kind) {
+        case AST_RETURN:
+            var r: *AstReturn = (*AstReturn)stmt;
+            r.expr = compiler_lower_parse_sugar_expr(r.expr);
+            break;
+        case AST_VAR_DECL:
+            var vd: *AstVarDecl = (*AstVarDecl)stmt;
+            vd.init_expr = compiler_lower_parse_sugar_expr(vd.init_expr);
+            break;
+        case AST_ASSIGN:
+            var asn: *AstAssign = (*AstAssign)stmt;
+            asn.target = compiler_lower_parse_sugar_expr(asn.target);
+            asn.value = compiler_lower_parse_sugar_expr(asn.value);
+            break;
+        case AST_EXPR_STMT:
+            var es: *AstExprStmt = (*AstExprStmt)stmt;
+            es.expr = compiler_lower_parse_sugar_expr(es.expr);
+            break;
+        case AST_IF:
+            var ifs: *AstIf = (*AstIf)stmt;
+            ifs.cond = compiler_lower_parse_sugar_expr(ifs.cond);
+            compiler_lower_parse_sugar_stmt(ifs.then_block);
+            compiler_lower_parse_sugar_stmt(ifs.else_block);
+            break;
+        case AST_WHILE:
+            var wl: *AstWhile = (*AstWhile)stmt;
+            wl.cond = compiler_lower_parse_sugar_expr(wl.cond);
+            compiler_lower_parse_sugar_stmt(wl.body);
+            break;
+        case AST_FOR:
+            var fr: *AstFor = (*AstFor)stmt;
+            compiler_lower_parse_sugar_stmt(fr.init);
+            fr.cond = compiler_lower_parse_sugar_expr(fr.cond);
+            fr.update = compiler_lower_parse_sugar_expr(fr.update);
+            compiler_lower_parse_sugar_stmt(fr.body);
+            break;
+        case AST_SWITCH:
+            var sw: *AstSwitch = (*AstSwitch)stmt;
+            sw.expr = compiler_lower_parse_sugar_expr(sw.expr);
+            if (sw.cases_vec != 0) {
+                var cn: u64 = sw.cases_vec.len();
+                for (var ci: u64 = 0; ci < cn; ci++) {
+                    compiler_lower_parse_sugar_stmt(sw.cases_vec.get(ci));
+                }
+            }
+            break;
+        case AST_CASE:
+            var cs: *AstCase = (*AstCase)stmt;
+            cs.value = compiler_lower_parse_sugar_expr(cs.value);
+            compiler_lower_parse_sugar_stmt(cs.body);
+            break;
+        case AST_BLOCK:
+            var blk: *AstBlock = (*AstBlock)stmt;
+            if (blk.stmts_vec != 0) {
+                var n: u64 = blk.stmts_vec.len();
+                for (var i: u64 = 0; i < n; i++) {
+                    compiler_lower_parse_sugar_stmt(blk.stmts_vec.get(i));
+                }
+            }
+            break;
+        case AST_DEFER:
+            var df: *AstDefer = (*AstDefer)stmt;
+            compiler_lower_parse_sugar_stmt(df.stmt);
+            break;
+        case AST_DELETE:
+            var dl: *AstDelete = (*AstDelete)stmt;
+            dl.expr = compiler_lower_parse_sugar_expr(dl.expr);
+            break;
+        default:
+            break;
+    }
+    return 0;
+}
+
+func compiler_lower_parse_sugar() -> u64 {
+    if (g_all_funcs != 0) {
+        var fn_count: u64 = g_all_funcs.len();
+        for (var i: u64 = 0; i < fn_count; i++) {
+            var fn: *AstFunc = g_all_funcs.get(i);
+            if (fn == 0 || fn.body == 0) { continue; }
+            compiler_lower_parse_sugar_stmt(fn.body);
+        }
+    }
+
+    if (g_all_globals != 0) {
+        var gn: u64 = g_all_globals.len();
+        for (var gi: u64 = 0; gi < gn; gi++) {
+            var ginfo: *GlobalInfo = g_all_globals.get(gi);
+            if (ginfo == 0 || ginfo.init_expr == 0) { continue; }
+            ginfo.init_expr = (u64)compiler_lower_parse_sugar_expr((*AstNode)ginfo.init_expr);
+        }
+    }
+    return 0;
+}
+
 func compiler_validate_direct_impl_call_name(name_ptr: u64, name_len: u64, origin: u64, owner_ptr: u64, owner_len: u64) -> u64 {
     if (origin != AST_CALL_ORIGIN_DIRECT) { return 0; }
     if (compiler_is_impl_method(name_ptr, name_len) == 0) { return 0; }
@@ -3858,6 +4257,10 @@ func compiler_validate_direct_impl_calls_expr(expr: *AstNode, owner_ptr: u64, ow
             var gcall: *AstGenericCall = (*AstGenericCall)expr;
             compiler_validate_direct_impl_call_name(gcall.name_ptr, gcall.name_len, gcall.origin, owner_ptr, owner_len);
             compiler_validate_direct_impl_calls_args(gcall.args_vec, owner_ptr, owner_len);
+            break;
+        case AST_STATIC_GENERIC_CALL:
+            var sgc: *AstStaticGenericCall = (*AstStaticGenericCall)expr;
+            compiler_validate_direct_impl_calls_args(sgc.args_vec, owner_ptr, owner_len);
             break;
         case AST_CALL_PTR:
             var cp: *AstCallPtr = (*AstCallPtr)expr;
@@ -3921,6 +4324,10 @@ func compiler_validate_direct_impl_calls_expr(expr: *AstNode, owner_ptr: u64, ow
         case AST_STRUCT_LITERAL:
             var lit: *AstStructLiteral = (*AstStructLiteral)expr;
             compiler_validate_direct_impl_calls_args(lit.values_vec, owner_ptr, owner_len);
+            break;
+        case AST_GENERIC_STRUCT_LITERAL:
+            var gsl: *AstGenericStructLiteral = (*AstGenericStructLiteral)expr;
+            compiler_validate_direct_impl_calls_args(gsl.values_vec, owner_ptr, owner_len);
             break;
         case AST_NEW:
             var nw: *AstNew = (*AstNew)expr;
@@ -4272,6 +4679,10 @@ func compiler_lower_super_expr(expr: *AstNode, owner_ptr: u64, owner_len: u64) -
         case AST_STRUCT_LITERAL:
             var lit: *AstStructLiteral = (*AstStructLiteral)expr;
             compiler_lower_super_args(lit.values_vec, owner_ptr, owner_len);
+            return expr;
+        case AST_GENERIC_STRUCT_LITERAL:
+            var gsl: *AstGenericStructLiteral = (*AstGenericStructLiteral)expr;
+            compiler_lower_super_args(gsl.values_vec, owner_ptr, owner_len);
             return expr;
         case AST_NEW:
             var nw: *AstNew = (*AstNew)expr;

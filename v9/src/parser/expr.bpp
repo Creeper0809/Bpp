@@ -59,12 +59,6 @@ func parse_primary_identifier_generic_call(p: *Parser, tok4: *Token) -> *AstNode
     if (parse_is_generic_call(p) == 0) { return 0; }
     var generic_args: *Vec<*GenericArg> = parse_generic_args(p);
     var args_g: *Vec<*AstNode> = parse_expr_list_paren(p);
-    var struct_tpl: *GenericStructTemplate = compiler_find_generic_struct_template_by_name(tok4.ptr, tok4.len);
-    if (struct_tpl != 0) {
-        var bindings_struct: *Vec<*GenericBinding> = generic_build_bindings_for_struct(struct_tpl, generic_args);
-        var name_info_struct: *NameInfo = generic_struct_get_or_create_instance(struct_tpl, bindings_struct);
-        return (*AstNode)ast_stack_ctor(TYPE_STRUCT, 0, 0, name_info_struct.ptr, name_info_struct.len, 0, 0, 0, 0, 0, 0, 0, 0, args_g);
-    }
     return ast_generic_call(tok4.ptr, tok4.len, generic_args, args_g);
 }
 
@@ -72,22 +66,8 @@ func parse_primary_identifier_generic_struct_literal(p: *Parser, tok4: *Token) -
     if (parse_is_generic_struct_literal(p) == 0) { return 0; }
     var generic_args: *Vec<*GenericArg> = parse_generic_args_type(p);
     if (parse_peek_kind(p) != TOKEN_LBRACE) { return 0; }
-    var tpl: *GenericStructTemplate = compiler_find_generic_struct_template_by_name(tok4.ptr, tok4.len);
-    if (tpl == 0) {
-        emit_stderr("[ERROR] Generic struct template not found: ");
-        emit_stderr_len(tok4.ptr, tok4.len);
-        emit_stderr("\n");
-        parse_panic_here(p, "Parse error");
-    }
-    var bindings: *Vec<*GenericBinding> = generic_build_bindings_for_struct(tpl, generic_args);
-    var name_info: *NameInfo = generic_struct_get_or_create_instance(tpl, bindings);
-    var struct_def: *AstStructDef = get_struct_def(name_info.ptr, name_info.len);
-    if (struct_def == 0) {
-        emit_stderr("[ERROR] Generic struct def missing\n");
-        parse_panic_here(p, "Parse error");
-    }
     var values: *Vec<*AstNode> = parse_expr_list_brace(p);
-    return ast_struct_literal(struct_def, values);
+    return (*AstNode)ast_generic_struct_literal(tok4.ptr, tok4.len, generic_args, values);
 }
 
 func parse_primary_identifier_slice_literal(p: *Parser, tok4: *Token) -> *AstNode {
@@ -105,13 +85,18 @@ func parse_primary_identifier_slice_literal(p: *Parser, tok4: *Token) -> *AstNod
 func parse_primary_identifier_struct_literal(p: *Parser, tok4: *Token) -> *AstNode {
     if (parse_peek_kind(p) != TOKEN_LBRACE) { return 0; }
     var struct_def: *AstStructDef = parse_resolve_struct_def(tok4.ptr, tok4.len);
+    if (struct_def == 0) {
+        emit_stderr("[ERROR] Unknown struct type for literal: ");
+        emit_stderr_len(tok4.ptr, tok4.len);
+        emit_stderr("\n");
+        parse_panic_here(p, "Parse error");
+    }
     var values: *Vec<*AstNode> = parse_expr_list_brace(p);
     return ast_struct_literal(struct_def, values);
 }
 
 func parse_primary_identifier_static_method_call(p: *Parser, tok4: *Token) -> *AstNode {
     if (parse_peek_kind(p) != TOKEN_DOT) { return 0; }
-    if (is_struct_type(tok4.ptr, tok4.len) == 0) { return 0; }
 
     var saved_pos: u64 = parser_pos(p);
     parse_adv(p); // consume '.'
@@ -131,39 +116,26 @@ func parse_primary_identifier_static_method_call(p: *Parser, tok4: *Token) -> *A
         has_generic = 1;
     }
 
+    // Non-generic static calls (Type.method(...)) are parsed as normal method calls
+    // and lowered in compiler pass. Keep this parser fast path only for generic static calls
+    // because postfix parser doesn't represent method generic arguments yet.
+    if (has_generic == 0) {
+        parser_set_pos(p, saved_pos);
+        return 0;
+    }
+
     if (parse_peek_kind(p) != TOKEN_LPAREN) {
         parser_set_pos(p, saved_pos);
         return 0;
     }
 
-    var name_info: *NameInfo = compiler_build_method_name(tok4.ptr, tok4.len, method_tok.ptr, method_tok.len);
     var args: *Vec<*AstNode> = parse_expr_list_paren(p);
-    if (has_generic != 0) {
-        return ast_generic_call_with_origin(name_info.ptr, name_info.len, generic_args, args, AST_CALL_ORIGIN_MEMBER_LOWERED);
-    }
-    return ast_call_with_origin(name_info.ptr, name_info.len, args, AST_CALL_ORIGIN_MEMBER_LOWERED);
+    return (*AstNode)ast_static_generic_call(tok4.ptr, tok4.len, method_tok.ptr, method_tok.len, generic_args, args);
 }
 
 func parse_primary_identifier_call_or_ctor(p: *Parser, tok4: *Token) -> *AstNode {
     if (parse_peek_kind(p) != TOKEN_LPAREN) { return 0; }
     var args: *Vec<*AstNode> = parse_expr_list_paren(p);
-    var ctor_ptr: u64 = tok4.ptr;
-    var ctor_len: u64 = tok4.len;
-    var ctor_def: *AstStructDef = get_struct_def(ctor_ptr, ctor_len);
-    if (ctor_def == 0) {
-        var resolved_ctor: *NameInfo = resolve_name(ctor_ptr, ctor_len);
-        if (resolved_ctor != 0) {
-            var resolved_def: *AstStructDef = get_struct_def(resolved_ctor.ptr, resolved_ctor.len);
-            if (resolved_def != 0) {
-                ctor_ptr = resolved_ctor.ptr;
-                ctor_len = resolved_ctor.len;
-                ctor_def = resolved_def;
-            }
-        }
-    }
-    if (ctor_def != 0) {
-        return (*AstNode)ast_stack_ctor(TYPE_STRUCT, 0, 0, ctor_ptr, ctor_len, 0, 0, 0, 0, 0, 0, 0, 0, args);
-    }
     return ast_call(tok4.ptr, tok4.len, args);
 }
 
@@ -186,7 +158,8 @@ func parse_primary_identifier(p: *Parser, tok4: *Token) -> *AstNode {
 func parse_identifier_is_known_type(p: *Parser, name_ptr: u64, name_len: u64) -> u64 {
     if (compiler_is_trait_name(name_ptr, name_len) != 0) { return 1; }
     if (is_struct_type(name_ptr, name_len) != 0) { return 1; }
-    if (type_parser_find_generic_param(name_ptr, name_len) != 0) { return 1; }
+    if (type_parser_find_generic_param(p, name_ptr, name_len) != 0) { return 1; }
+    if (compiler_impl_has_generic_param(name_ptr, name_len) != 0) { return 1; }
 
     // Generic type lookahead: Name<...>
     var saved_pos: u64 = parser_pos(p);
@@ -209,13 +182,6 @@ func parse_primary_sizeof_is_type(p: *Parser) -> u64 {
     } else if (nk == TOKEN_IDENTIFIER) {
         var t: *Token = parse_peek(p);
         is_type = parse_identifier_is_known_type(p, t.ptr, t.len);
-        // Fallback for unresolved generic type params in impl context (e.g. sizeof(T) in impl Vec).
-        // Keep this narrow to avoid misclassifying normal identifiers in non-impl code.
-        if (is_type == 0 && compiler_is_impl_context() != 0 && t.ptr != 0 && t.len > 0) {
-            var name_u8: []u8 = slice(t.ptr, t.len);
-            var first_ch: u64 = name_u8[0];
-            if (first_ch >= 65 && first_ch <= 90) { is_type = 1; }
-        }
     }
     return is_type;
 }
