@@ -648,6 +648,160 @@ func cg_index_addr(node: u64, symtab: *Symtab) -> u64 {
     return;
 }
 
+func cg_try_expr(node: u64, symtab: *Symtab) -> u64 {
+    var tr: *AstTry = (*AstTry)node;
+    var operand: u64 = tr.operand;
+
+    var opt_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)operand, symtab);
+    if (opt_ti == 0) {
+        emit_stderr("[ERROR] try operand type not found\n");
+        panic("Codegen error");
+    }
+    var try_kind: u64 = compiler_try_kind_from_typeinfo(opt_ti);
+    if (try_kind == COMPILER_TRY_KIND_INVALID) {
+        if (opt_ti.type_kind != TYPE_STRUCT || opt_ti.ptr_depth != 0) {
+            emit_stderr("[ERROR] try operator requires Option/Result value\n");
+        } else {
+            emit_stderr("[ERROR] try operator requires Option or Result\n");
+        }
+        panic("Codegen error");
+    }
+
+    var ret_type: u64 = emitter_get_ret_type();
+    var ret_ptr_depth: u64 = emitter_get_ret_ptr_depth();
+    var ret_struct_name_ptr: u64 = emitter_get_ret_struct_name_ptr();
+    var ret_struct_name_len: u64 = emitter_get_ret_struct_name_len();
+    if (compiler_try_return_matches_type(opt_ti, ret_type, ret_ptr_depth, ret_struct_name_ptr, ret_struct_name_len) == 0) {
+        if (ret_type != TYPE_STRUCT || ret_ptr_depth != 0) {
+            emit_stderr("[ERROR] try operator requires Option/Result return type\n");
+        } else {
+            emit_stderr("[ERROR] try operand type must match function return type\n");
+        }
+        panic("Codegen error");
+    }
+
+    var struct_def: *AstStructDef = compiler_try_resolve_struct_def(opt_ti);
+    if (struct_def == 0) {
+        emit_stderr("[ERROR] try operand struct definition not found\n");
+        panic("Codegen error");
+    }
+
+    var check_ptr: u64 = 0;
+    var check_len: u64 = 0;
+    var value_ptr: u64 = 0;
+    var value_len: u64 = 0;
+    if (compiler_try_field_names(try_kind, &check_ptr, &check_len, &value_ptr, &value_len) == 0) {
+        emit_stderr("[ERROR] invalid try kind\n");
+        panic("Codegen error");
+    }
+
+    var value_desc: *FieldDesc = get_field_desc(struct_def, value_ptr, value_len);
+    if (value_desc == 0) {
+        emit_stderr("[ERROR] try value field not found\n");
+        panic("Codegen error");
+    }
+
+    var check_off: u64 = get_field_offset(struct_def, check_ptr, check_len);
+    var value_off: u64 = get_field_offset(struct_def, value_ptr, value_len);
+
+    var struct_size: u64 = sizeof_type(TYPE_STRUCT, 0, opt_ti.struct_name_ptr, opt_ti.struct_name_len);
+    var tmp_offset: u64 = cg_alloc_tmp_struct(symtab, struct_size);
+    var op_kind: u64 = ast_kind(operand);
+
+    if (struct_size > 16) {
+        if (op_kind == AST_CALL) {
+            cg_call_sret_to_offset(operand, tmp_offset, symtab);
+        } else if (op_kind == AST_METHOD_CALL) {
+            cg_method_call_sret_to_offset((*AstMethodCall)operand, tmp_offset, symtab);
+        } else {
+            cg_lvalue(operand);
+            emit("    mov rbx, rax\n");
+            emit("    lea r8, [rbp");
+            emit_signed_disp(tmp_offset);
+            emit("]\n");
+
+            emit_copy_bytes_with_regs("rbx", 3, "r8", 2, struct_size);
+        }
+    } else {
+        if (op_kind == AST_CALL || op_kind == AST_METHOD_CALL || op_kind == AST_CALL_PTR) {
+            cg_expr(operand);
+            emit("    lea rbx, [rbp");
+            emit_signed_disp(tmp_offset);
+            emit("]\n");
+            emit("    mov [rbx], rax\n");
+            if (struct_size > 8) {
+                emit("    mov [rbx+8], rdx\n");
+            }
+        } else {
+            cg_lvalue(operand);
+            emit("    mov rbx, rax\n");
+            emit("    lea r8, [rbp");
+            emit_signed_disp(tmp_offset);
+            emit("]\n");
+
+            emit_copy_bytes_with_regs("rbx", 3, "r8", 2, struct_size);
+        }
+    }
+
+    var label_ok: u64 = new_label();
+    emit("    lea rbx, [rbp");
+    emit_signed_disp(tmp_offset);
+    emit("]\n");
+    emit("    mov rax, [rbx");
+    if (check_off != 0) { emit("+"); emit_u64(check_off); }
+    emit("]\n");
+    emit("    test rax, rax\n");
+    emit("    jne ");
+    emit_label(label_ok);
+    emit_nl();
+
+    var ret_struct_size: u64 = sizeof_type(TYPE_STRUCT, 0, ret_struct_name_ptr, ret_struct_name_len);
+    if (ret_struct_size > 16) {
+        emit_copy_bytes_with_regs("rbx", 3, "rdi", 3, ret_struct_size);
+    } else if (ret_struct_size <= 8) {
+        emit("    mov rax, [rbx]\n");
+    } else {
+        emit("    mov rax, [rbx]\n");
+        emit("    mov rdx, [rbx+8]\n");
+    }
+    emit("    mov rsp, rbp\n");
+    emit("    pop rbp\n");
+    emit("    ret\n");
+
+    emit_label_def(label_ok);
+    var value_size: u64 = sizeof_field_desc(value_desc);
+    if (value_size <= 8) {
+        if (value_desc.ptr_depth == 0 && value_desc.type_kind == TYPE_U8) {
+            emit("    movzx rax, byte [rbx");
+            if (value_off != 0) { emit("+"); emit_u64(value_off); }
+            emit("]\n");
+        } else if (value_desc.ptr_depth == 0 && value_desc.type_kind == TYPE_U16) {
+            emit("    movzx rax, word [rbx");
+            if (value_off != 0) { emit("+"); emit_u64(value_off); }
+            emit("]\n");
+        } else if (value_desc.ptr_depth == 0 && value_desc.type_kind == TYPE_U32) {
+            emit("    mov eax, [rbx");
+            if (value_off != 0) { emit("+"); emit_u64(value_off); }
+            emit("]\n");
+        } else {
+            emit("    mov rax, [rbx");
+            if (value_off != 0) { emit("+"); emit_u64(value_off); }
+            emit("]\n");
+        }
+    } else if (value_size <= 16) {
+        emit("    mov rax, [rbx");
+        if (value_off != 0) { emit("+"); emit_u64(value_off); }
+        emit("]\n");
+        emit("    mov rdx, [rbx");
+        if (value_off + 8 != 0) { emit("+"); emit_u64(value_off + 8); }
+        emit("]\n");
+    } else {
+        emit_stderr("[ERROR] try value size too large for expression result\n");
+        panic("Codegen error");
+    }
+    return;
+}
+
 func cg_expr(node: u64) -> u64 {
     var kind: u64 = ast_kind(node);
     var symtab: *Symtab = emitter_get_symtab();
@@ -840,166 +994,7 @@ func cg_expr(node: u64) -> u64 {
     }
 
     if (kind == AST_TRY) {
-        var tr: *AstTry = (*AstTry)node;
-        var operand: u64 = tr.operand;
-
-        var opt_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)operand, symtab);
-        if (opt_ti == 0) {
-            emit_stderr("[ERROR] try operand type not found\n");
-            panic("Codegen error");
-        }
-        if (opt_ti.type_kind != TYPE_STRUCT || opt_ti.ptr_depth != 0) {
-            emit_stderr("[ERROR] try operator requires Option/Result value\n");
-            panic("Codegen error");
-        }
-
-        var base_len: u64 = compiler_find_generic_suffix_index(opt_ti.struct_name_ptr, opt_ti.struct_name_len);
-        var is_option: u64 = 0;
-        var is_result: u64 = 0;
-        if (str_eq(opt_ti.struct_name_ptr, base_len, "Option", 6)) { is_option = 1; }
-        else if (str_eq(opt_ti.struct_name_ptr, base_len, "Result", 6)) { is_result = 1; }
-        else {
-            emit_stderr("[ERROR] try operator requires Option or Result\n");
-            panic("Codegen error");
-        }
-
-        var ret_type: u64 = emitter_get_ret_type();
-        var ret_ptr_depth: u64 = emitter_get_ret_ptr_depth();
-        var ret_struct_name_ptr: u64 = emitter_get_ret_struct_name_ptr();
-        var ret_struct_name_len: u64 = emitter_get_ret_struct_name_len();
-        if (ret_type != TYPE_STRUCT || ret_ptr_depth != 0) {
-            emit_stderr("[ERROR] try operator requires Option/Result return type\n");
-            panic("Codegen error");
-        }
-        if (str_eq(ret_struct_name_ptr, ret_struct_name_len, opt_ti.struct_name_ptr, opt_ti.struct_name_len) == 0) {
-            emit_stderr("[ERROR] try operand type must match function return type\n");
-            panic("Codegen error");
-        }
-
-        var struct_def: *AstStructDef = opt_ti.struct_def;
-        if (struct_def == 0) {
-            struct_def = get_struct_def(opt_ti.struct_name_ptr, opt_ti.struct_name_len);
-        }
-        if (struct_def == 0) {
-            emit_stderr("[ERROR] try operand struct definition not found\n");
-            panic("Codegen error");
-        }
-
-        var check_ptr: u64 = (u64)"is_some";
-        var check_len: u64 = 7;
-        var value_ptr: u64 = (u64)"value";
-        var value_len: u64 = 5;
-        if (is_result != 0) {
-            check_ptr = (u64)"is_ok";
-            check_len = 5;
-            value_ptr = (u64)"ok";
-            value_len = 2;
-        }
-
-        var value_desc: *FieldDesc = get_field_desc(struct_def, value_ptr, value_len);
-        if (value_desc == 0) {
-            emit_stderr("[ERROR] try value field not found\n");
-            panic("Codegen error");
-        }
-
-        var check_off: u64 = get_field_offset(struct_def, check_ptr, check_len);
-        var value_off: u64 = get_field_offset(struct_def, value_ptr, value_len);
-
-        var struct_size: u64 = sizeof_type(TYPE_STRUCT, 0, opt_ti.struct_name_ptr, opt_ti.struct_name_len);
-        var tmp_offset: u64 = cg_alloc_tmp_struct(symtab, struct_size);
-        var op_kind: u64 = ast_kind(operand);
-
-        if (struct_size > 16) {
-            if (op_kind == AST_CALL) {
-                cg_call_sret_to_offset(operand, tmp_offset, symtab);
-            } else if (op_kind == AST_METHOD_CALL) {
-                cg_method_call_sret_to_offset((*AstMethodCall)operand, tmp_offset, symtab);
-            } else {
-                cg_lvalue(operand);
-                emit("    mov rbx, rax\n");
-                emit("    lea r8, [rbp");
-                emit_signed_disp(tmp_offset);
-                emit("]\n");
-
-                emit_copy_bytes_with_regs("rbx", 3, "r8", 2, struct_size);
-            }
-        } else {
-            if (op_kind == AST_CALL || op_kind == AST_METHOD_CALL || op_kind == AST_CALL_PTR) {
-                cg_expr(operand);
-                emit("    lea rbx, [rbp");
-                emit_signed_disp(tmp_offset);
-                emit("]\n");
-                emit("    mov [rbx], rax\n");
-                if (struct_size > 8) {
-                    emit("    mov [rbx+8], rdx\n");
-                }
-            } else {
-                cg_lvalue(operand);
-                emit("    mov rbx, rax\n");
-                emit("    lea r8, [rbp");
-                emit_signed_disp(tmp_offset);
-                emit("]\n");
-
-                emit_copy_bytes_with_regs("rbx", 3, "r8", 2, struct_size);
-            }
-        }
-
-        var label_ok: u64 = new_label();
-        emit("    lea rbx, [rbp");
-        emit_signed_disp(tmp_offset);
-        emit("]\n");
-        emit("    mov rax, [rbx");
-        if (check_off != 0) { emit("+"); emit_u64(check_off); }
-        emit("]\n");
-        emit("    test rax, rax\n");
-        emit("    jne ");
-        emit_label(label_ok);
-        emit_nl();
-
-        var ret_struct_size: u64 = sizeof_type(TYPE_STRUCT, 0, ret_struct_name_ptr, ret_struct_name_len);
-        if (ret_struct_size > 16) {
-            emit_copy_bytes_with_regs("rbx", 3, "rdi", 3, ret_struct_size);
-        } else if (ret_struct_size <= 8) {
-            emit("    mov rax, [rbx]\n");
-        } else {
-            emit("    mov rax, [rbx]\n");
-            emit("    mov rdx, [rbx+8]\n");
-        }
-        emit("    mov rsp, rbp\n");
-        emit("    pop rbp\n");
-        emit("    ret\n");
-
-        emit_label_def(label_ok);
-        var value_size: u64 = sizeof_field_desc(value_desc);
-        if (value_size <= 8) {
-            if (value_desc.ptr_depth == 0 && value_desc.type_kind == TYPE_U8) {
-                emit("    movzx rax, byte [rbx");
-                if (value_off != 0) { emit("+"); emit_u64(value_off); }
-                emit("]\n");
-            } else if (value_desc.ptr_depth == 0 && value_desc.type_kind == TYPE_U16) {
-                emit("    movzx rax, word [rbx");
-                if (value_off != 0) { emit("+"); emit_u64(value_off); }
-                emit("]\n");
-            } else if (value_desc.ptr_depth == 0 && value_desc.type_kind == TYPE_U32) {
-                emit("    mov eax, [rbx");
-                if (value_off != 0) { emit("+"); emit_u64(value_off); }
-                emit("]\n");
-            } else {
-                emit("    mov rax, [rbx");
-                if (value_off != 0) { emit("+"); emit_u64(value_off); }
-                emit("]\n");
-            }
-        } else if (value_size <= 16) {
-            emit("    mov rax, [rbx");
-            if (value_off != 0) { emit("+"); emit_u64(value_off); }
-            emit("]\n");
-            emit("    mov rdx, [rbx");
-            if (value_off + 8 != 0) { emit("+"); emit_u64(value_off + 8); }
-            emit("]\n");
-        } else {
-            emit_stderr("[ERROR] try value size too large for expression result\n");
-            panic("Codegen error");
-        }
+        cg_try_expr(node, symtab);
         return;
     }
     
@@ -2505,11 +2500,8 @@ func cg_safe_method_call(node: u64, symtab: *Symtab) -> u64 {
         emit_stderr("[ERROR] Safe method call receiver type not found\n");
         return 0;
     }
-    if (recv_ti.type_kind == TYPE_TRAIT || compiler_is_trait_name(recv_ti.struct_name_ptr, recv_ti.struct_name_len) != 0) {
-        if (recv_ti.ptr_depth == 0) {
-            emit_stderr("[ERROR] Safe trait method call requires pointer receiver\n");
-            return 0;
-        }
+    var recv_mode: u64 = compiler_safe_receiver_mode(recv_ti);
+    if (recv_mode == COMPILER_SAFE_RECV_TRAIT_PTR) {
         var method_index: u64 = compiler_find_trait_method_index(recv_ti.struct_name_ptr, recv_ti.struct_name_len, method_ptr, method_len);
         if (compiler_is_not_found_u64(method_index) != 0) {
             emit_stderr("[ERROR] Trait method not found: ");
@@ -2576,11 +2568,11 @@ func cg_safe_method_call(node: u64, symtab: *Symtab) -> u64 {
         emit_label_def(label_end_t);
         return 0;
     }
-    if (recv_ti.ptr_depth == 0) {
-        emit_stderr("[ERROR] Safe method call requires pointer receiver\n");
-        return 0;
-    }
-    if (recv_ti.type_kind != TYPE_STRUCT) {
+    if (recv_mode == COMPILER_SAFE_RECV_INVALID) {
+        if (recv_ti.ptr_depth == 0) {
+            emit_stderr("[ERROR] Safe method call requires pointer receiver\n");
+            return 0;
+        }
         emit_stderr("[ERROR] Safe method call requires struct pointer\n");
         return 0;
     }
