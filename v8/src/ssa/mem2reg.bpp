@@ -289,15 +289,54 @@ func _ssa_mem2reg_rewrite_opr(map_val: u64, map_set: u64, map_cap: u64, opr: u64
     return ssa_operand_reg(mapped);
 }
 
-func _ssa_mem2reg_rename_block(fn: *SSAFunction, block: *SSABlock, max_var: u64, stack_arr: u64, reg_map_val: u64, reg_map_set: u64, reg_map_cap: u64, child_arr: u64) -> u64 {
-    push_trace("_ssa_mem2reg_rename_block", "ssa_mem2reg.b", __LINE__);
-    defer pop_trace();
-    var pushed: *Vec<u64> = new Vec<u64>(8);
-    var stack_arr_u64: *u64 = (*u64)stack_arr;
-    var reg_map_val_u64: *u64 = (*u64)reg_map_val;
-    var reg_map_set_u64: *u64 = (*u64)reg_map_set;
-    var child_arr_u64: *u64 = (*u64)child_arr;
+func _ssa_mem2reg_rewrite_reg_in_place(reg_ptr: *u64, reg_map_val_u64: *u64, reg_map_set_u64: *u64, reg_map_cap: u64) -> u64 {
+    var reg: u64 = *reg_ptr;
+    if (reg >= reg_map_cap || reg_map_set_u64[reg] == 0) { return 0; }
+    var mapped: u64 = reg_map_val_u64[reg];
+    if (mapped != 0) { *reg_ptr = mapped; }
+    return 0;
+}
 
+func _ssa_mem2reg_rewrite_args_vec(args_vec: *Vec<u64>, nargs: u64, reg_map_val_u64: *u64, reg_map_set_u64: *u64, reg_map_cap: u64) -> u64 {
+    var n: u64 = nargs;
+    if (n == 0 && args_vec != 0) { n = args_vec.len(); }
+    for (var i: u64 = 0; i < n; i++) {
+        var reg: u64 = args_vec.get(i);
+        _ssa_mem2reg_rewrite_reg_in_place(&reg, reg_map_val_u64, reg_map_set_u64, reg_map_cap);
+        args_vec.set(i, reg);
+    }
+    return 0;
+}
+
+func _ssa_mem2reg_rewrite_call_operands(op: u64, info_ptr: u64, reg_map_val_u64: *u64, reg_map_set_u64: *u64, reg_map_cap: u64) -> u64 {
+    if (op == SSA_OP_CALL) {
+        var info: *SSACallInfo = (*SSACallInfo)info_ptr;
+        return _ssa_mem2reg_rewrite_args_vec(info.args_vec, info.nargs, reg_map_val_u64, reg_map_set_u64, reg_map_cap);
+    }
+    if (op == SSA_OP_CALL_PTR) {
+        var info_ptr_info: *SSACallPtrInfo = (*SSACallPtrInfo)info_ptr;
+        var callee_reg: u64 = info_ptr_info.callee_reg;
+        _ssa_mem2reg_rewrite_reg_in_place(&callee_reg, reg_map_val_u64, reg_map_set_u64, reg_map_cap);
+        info_ptr_info.callee_reg = callee_reg;
+        return _ssa_mem2reg_rewrite_args_vec(info_ptr_info.args_vec, info_ptr_info.nargs, reg_map_val_u64, reg_map_set_u64, reg_map_cap);
+    }
+    if (op == SSA_OP_CALL_SLICE_STORE) {
+        var info_s: *SSACallSliceStoreInfo = (*SSACallSliceStoreInfo)info_ptr;
+        if (info_s.is_ptr > 1) {
+            var info_call: *SSACallInfo = (*SSACallInfo)info_ptr;
+            return _ssa_mem2reg_rewrite_args_vec(info_call.args_vec, info_call.nargs, reg_map_val_u64, reg_map_set_u64, reg_map_cap);
+        }
+        if (info_s.is_ptr != 0) {
+            var callee_reg2: u64 = info_s.callee_reg;
+            _ssa_mem2reg_rewrite_reg_in_place(&callee_reg2, reg_map_val_u64, reg_map_set_u64, reg_map_cap);
+            info_s.callee_reg = callee_reg2;
+        }
+        return _ssa_mem2reg_rewrite_args_vec(info_s.args_vec, info_s.nargs, reg_map_val_u64, reg_map_set_u64, reg_map_cap);
+    }
+    return 0;
+}
+
+func _ssa_mem2reg_push_block_phi_defs(block: *SSABlock, max_var: u64, stack_arr_u64: *u64, pushed: *Vec<u64>) -> u64 {
     var phi: *SSAInstruction = block.phi_head;
     while (phi != 0) {
         var var_id: u64 = ssa_operand_value(phi.src2);
@@ -308,7 +347,10 @@ func _ssa_mem2reg_rename_block(fn: *SSAFunction, block: *SSABlock, max_var: u64,
         }
         phi = phi.next;
     }
+    return 0;
+}
 
+func _ssa_mem2reg_rename_block_insts(block: *SSABlock, max_var: u64, stack_arr_u64: *u64, reg_map_val: u64, reg_map_set: u64, reg_map_cap: u64, reg_map_val_u64: *u64, reg_map_set_u64: *u64, pushed: *Vec<u64>) -> u64 {
     var cur: *SSAInstruction = block.inst_head;
     while (cur != 0) {
         var op: u64 = ssa_inst_get_op(cur);
@@ -320,73 +362,8 @@ func _ssa_mem2reg_rename_block(fn: *SSAFunction, block: *SSABlock, max_var: u64,
             }
         }
 
-        if (op == SSA_OP_CALL) {
-            var info_ptr: u64 = ssa_operand_value(cur.src1);
-            var info: *SSACallInfo = (*SSACallInfo)info_ptr;
-            var args_vec: *Vec<u64> = info.args_vec;
-            var nargs: u64 = info.nargs;
-            if (nargs == 0 && args_vec != 0) { nargs = args_vec.len(); }
-            for (var ai: u64 = 0; ai < nargs; ai++) {
-                var r: u64 = args_vec.get(ai);
-                if (r < reg_map_cap && reg_map_set_u64[r] != 0) {
-                    var nr: u64 = reg_map_val_u64[r];
-                    if (nr != 0) { args_vec.set(ai, nr); }
-                }
-            }
-        }
-        if (op == SSA_OP_CALL_PTR) {
-            var info_ptrp: u64 = ssa_operand_value(cur.src1);
-            var info_ptr_info: *SSACallPtrInfo = (*SSACallPtrInfo)info_ptrp;
-            var callee_reg: u64 = info_ptr_info.callee_reg;
-            if (callee_reg < reg_map_cap && reg_map_set_u64[callee_reg] != 0) {
-                var ncallee: u64 = reg_map_val_u64[callee_reg];
-                if (ncallee != 0) { info_ptr_info.callee_reg = ncallee; }
-            }
-            var args_vecp: *Vec<u64> = info_ptr_info.args_vec;
-            var nargsp: u64 = info_ptr_info.nargs;
-            if (nargsp == 0 && args_vecp != 0) { nargsp = args_vecp.len(); }
-            for (var aip: u64 = 0; aip < nargsp; aip++) {
-                var r: u64 = args_vecp.get(aip);
-                if (r < reg_map_cap && reg_map_set_u64[r] != 0) {
-                    var nr: u64 = reg_map_val_u64[r];
-                    if (nr != 0) { args_vecp.set(aip, nr); }
-                }
-            }
-        }
-        if (op == SSA_OP_CALL_SLICE_STORE) {
-            var info_ptrs: u64 = ssa_operand_value(cur.src1);
-            var info_ptr_info2: *SSACallSliceStoreInfo = (*SSACallSliceStoreInfo)info_ptrs;
-            if (info_ptr_info2.is_ptr > 1) {
-                var info_call: *SSACallInfo = (*SSACallInfo)info_ptrs;
-                var args_vecs: *Vec<u64> = info_call.args_vec;
-                var nargss: u64 = info_call.nargs;
-                if (nargss == 0 && args_vecs != 0) { nargss = args_vecs.len(); }
-                for (var ais: u64 = 0; ais < nargss; ais++) {
-                    var r2: u64 = args_vecs.get(ais);
-                    if (r2 < reg_map_cap && reg_map_set_u64[r2] != 0) {
-                        var nr2: u64 = reg_map_val_u64[r2];
-                        if (nr2 != 0) { args_vecs.set(ais, nr2); }
-                    }
-                }
-            } else {
-                if (info_ptr_info2.is_ptr != 0) {
-                    var callee_reg2: u64 = info_ptr_info2.callee_reg;
-                    if (callee_reg2 < reg_map_cap && reg_map_set_u64[callee_reg2] != 0) {
-                        var ncallee2: u64 = reg_map_val_u64[callee_reg2];
-                        if (ncallee2 != 0) { info_ptr_info2.callee_reg = ncallee2; }
-                    }
-                }
-                var args_vecs2: *Vec<u64> = info_ptr_info2.args_vec;
-                var nargss2: u64 = info_ptr_info2.nargs;
-                if (nargss2 == 0 && args_vecs2 != 0) { nargss2 = args_vecs2.len(); }
-                for (var ais2: u64 = 0; ais2 < nargss2; ais2++) {
-                    var r2b: u64 = args_vecs2.get(ais2);
-                    if (r2b < reg_map_cap && reg_map_set_u64[r2b] != 0) {
-                        var nr2b: u64 = reg_map_val_u64[r2b];
-                        if (nr2b != 0) { args_vecs2.set(ais2, nr2b); }
-                    }
-                }
-            }
+        if (op == SSA_OP_CALL || op == SSA_OP_CALL_PTR || op == SSA_OP_CALL_SLICE_STORE) {
+            _ssa_mem2reg_rewrite_call_operands(op, ssa_operand_value(cur.src1), reg_map_val_u64, reg_map_set_u64, reg_map_cap);
         }
 
         if (op == SSA_OP_LOAD) {
@@ -416,12 +393,14 @@ func _ssa_mem2reg_rename_block(fn: *SSAFunction, block: *SSABlock, max_var: u64,
 
         cur = cur.next;
     }
+    return 0;
+}
 
+func _ssa_mem2reg_add_phi_args_to_succs(block: *SSABlock, max_var: u64, stack_arr_u64: *u64) -> u64 {
     var succs: []*SSABlock = block.succs;
     var slen: u64 = ssa_slice_len(succs);
     for (var si: u64 = 0; si < slen; si++) {
         var succ: *SSABlock = succs[si];
-
         var phi2: *SSAInstruction = succ.phi_head;
         while (phi2 != 0) {
             var var_id4: u64 = ssa_operand_value(phi2.src2);
@@ -434,22 +413,44 @@ func _ssa_mem2reg_rename_block(fn: *SSAFunction, block: *SSABlock, max_var: u64,
             phi2 = phi2.next;
         }
     }
+    return 0;
+}
 
+func _ssa_mem2reg_rename_block_children(fn: *SSAFunction, block: *SSABlock, max_var: u64, stack_arr: u64, reg_map_val: u64, reg_map_set: u64, reg_map_cap: u64, child_arr: u64, child_arr_u64: *u64) -> u64 {
     var child_vec: *Vec<*SSABlock> = (*Vec<*SSABlock>)child_arr_u64[block.id];
-    if (child_vec != 0) {
-        var ccount: u64 = child_vec.len();
-        for (var ci: u64 = 0; ci < ccount; ci++) {
-            var child: *SSABlock = child_vec.get(ci);
-            _ssa_mem2reg_rename_block(fn, child, max_var, stack_arr, reg_map_val, reg_map_set, reg_map_cap, child_arr);
-        }
+    if (child_vec == 0) { return 0; }
+    var ccount: u64 = child_vec.len();
+    for (var ci: u64 = 0; ci < ccount; ci++) {
+        var child: *SSABlock = child_vec.get(ci);
+        _ssa_mem2reg_rename_block(fn, child, max_var, stack_arr, reg_map_val, reg_map_set, reg_map_cap, child_arr);
     }
+    return 0;
+}
 
+func _ssa_mem2reg_pop_pushed(stack_arr_u64: *u64, pushed: *Vec<u64>) -> u64 {
     var pcount: u64 = pushed.len();
     for (var pi: u64 = 0; pi < pcount; pi++) {
         var var_id5: u64 = pushed.pop();
         var stack5: *Vec<u64> = (*Vec<u64>)stack_arr_u64[var_id5];
         stack5.pop();
     }
+    return 0;
+}
+
+func _ssa_mem2reg_rename_block(fn: *SSAFunction, block: *SSABlock, max_var: u64, stack_arr: u64, reg_map_val: u64, reg_map_set: u64, reg_map_cap: u64, child_arr: u64) -> u64 {
+    push_trace("_ssa_mem2reg_rename_block", "ssa_mem2reg.b", __LINE__);
+    defer pop_trace();
+    var pushed: *Vec<u64> = new Vec<u64>(8);
+    var stack_arr_u64: *u64 = (*u64)stack_arr;
+    var reg_map_val_u64: *u64 = (*u64)reg_map_val;
+    var reg_map_set_u64: *u64 = (*u64)reg_map_set;
+    var child_arr_u64: *u64 = (*u64)child_arr;
+
+    _ssa_mem2reg_push_block_phi_defs(block, max_var, stack_arr_u64, pushed);
+    _ssa_mem2reg_rename_block_insts(block, max_var, stack_arr_u64, reg_map_val, reg_map_set, reg_map_cap, reg_map_val_u64, reg_map_set_u64, pushed);
+    _ssa_mem2reg_add_phi_args_to_succs(block, max_var, stack_arr_u64);
+    _ssa_mem2reg_rename_block_children(fn, block, max_var, stack_arr, reg_map_val, reg_map_set, reg_map_cap, child_arr, child_arr_u64);
+    _ssa_mem2reg_pop_pushed(stack_arr_u64, pushed);
 
     return 0;
 }

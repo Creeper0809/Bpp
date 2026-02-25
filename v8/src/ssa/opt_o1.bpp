@@ -361,6 +361,144 @@ func _ssa_opt_remove_nops(block: *SSABlock) -> u64 {
     return 0;
 }
 
+func _ssa_opt_operand_const_value(reg_consts: *Vec<u64>, opr: u64, has_out: *u64, val_out: *u64) -> u64 {
+    *has_out = 0;
+    *val_out = 0;
+    if (ssa_operand_is_const(opr)) {
+        *val_out = ssa_operand_value(opr);
+        *has_out = 1;
+        return 0;
+    }
+    var idx: u64 = _ssa_opt_const_find(reg_consts, ssa_operand_value(opr));
+    if (idx != 0) {
+        *val_out = reg_consts.get(idx);
+        *has_out = 1;
+    }
+    return 0;
+}
+
+func _ssa_opt_run_block_handle_copy(cur: *SSAInstruction, reg_consts: *Vec<u64>) -> u64 {
+    if (ssa_inst_get_op(cur) != SSA_OP_COPY) { return 0; }
+    var v: u64 = 0;
+    var has: u64 = 0;
+    _ssa_opt_operand_const_value(reg_consts, cur.src1, &has, &v);
+    if (has != 0) {
+        ssa_inst_set_op(cur, SSA_OP_CONST);
+        cur.src1 = ssa_operand_const(v);
+        cur.src2 = 0;
+        _ssa_opt_const_set(reg_consts, cur.dest, v);
+    } else {
+        _ssa_opt_const_clear(reg_consts, cur.dest);
+    }
+    return 1;
+}
+
+func _ssa_opt_run_block_handle_store(cur: *SSAInstruction, reg_consts: *Vec<u64>, var_consts: *Vec<u64>) -> u64 {
+    if (ssa_inst_get_op(cur) != SSA_OP_STORE) { return 0; }
+    if (ssa_operand_is_const(cur.src1)) {
+        var var_id: u64 = ssa_operand_value(cur.src1);
+        var v: u64 = 0;
+        var has: u64 = 0;
+        _ssa_opt_operand_const_value(reg_consts, cur.src2, &has, &v);
+        if (has != 0) {
+            _ssa_opt_const_set(var_consts, var_id, v);
+        } else {
+            _ssa_opt_const_clear(var_consts, var_id);
+        }
+    }
+    return 1;
+}
+
+func _ssa_opt_run_block_handle_load(cur: *SSAInstruction, reg_consts: *Vec<u64>, var_consts: *Vec<u64>) -> u64 {
+    if (ssa_inst_get_op(cur) != SSA_OP_LOAD) { return 0; }
+    if (ssa_operand_is_const(cur.src1)) {
+        var var_id2: u64 = ssa_operand_value(cur.src1);
+        var idx_load: u64 = _ssa_opt_const_find(var_consts, var_id2);
+        if (idx_load != 0) {
+            var v3: u64 = var_consts.get(idx_load);
+            ssa_inst_set_op(cur, SSA_OP_CONST);
+            cur.src1 = ssa_operand_const(v3);
+            cur.src2 = 0;
+            _ssa_opt_const_set(reg_consts, cur.dest, v3);
+            return 1;
+        }
+    }
+    _ssa_opt_const_clear(reg_consts, cur.dest);
+    return 1;
+}
+
+func _ssa_opt_run_block_handle_foldable(cur: *SSAInstruction, reg_consts: *Vec<u64>) -> u64 {
+    var op: u64 = ssa_inst_get_op(cur);
+    if (_ssa_opt_is_foldable(op) == 0) { return 0; }
+
+    if (!ssa_operand_is_const(cur.src1)) {
+        var idx1: u64 = _ssa_opt_const_find(reg_consts, ssa_operand_value(cur.src1));
+        if (idx1 != 0) {
+            var c1: u64 = reg_consts.get(idx1);
+            cur.src1 = ssa_operand_const(c1);
+        }
+    }
+    if (!ssa_operand_is_const(cur.src2)) {
+        var idx2: u64 = _ssa_opt_const_find(reg_consts, ssa_operand_value(cur.src2));
+        if (idx2 != 0) {
+            var c2: u64 = reg_consts.get(idx2);
+            cur.src2 = ssa_operand_const(c2);
+        }
+    }
+
+    if (_ssa_opt_fold_inst(cur) != 0) {
+        _ssa_opt_const_set(reg_consts, cur.dest, ssa_operand_value(cur.src1));
+    } else if (cur.dest != 0) {
+        _ssa_opt_const_clear(reg_consts, cur.dest);
+    }
+    return 1;
+}
+
+func ssa_opt_o1_run_block(b: *SSABlock) -> u64 {
+    var reg_consts: *Vec<u64> = new Vec<u64>(32);
+    var var_consts: *Vec<u64> = new Vec<u64>(32);
+
+    var cur: *SSAInstruction = b.inst_head;
+    while (cur != 0) {
+        var op: u64 = ssa_inst_get_op(cur);
+
+        if (op == SSA_OP_CONST) {
+            _ssa_opt_const_set(reg_consts, cur.dest, ssa_operand_value(cur.src1));
+            cur = cur.next;
+            continue;
+        }
+
+        if (_ssa_opt_run_block_handle_copy(cur, reg_consts) != 0) {
+            cur = cur.next;
+            continue;
+        }
+
+        if (_ssa_opt_run_block_handle_store(cur, reg_consts, var_consts) != 0) {
+            cur = cur.next;
+            continue;
+        }
+
+        if (_ssa_opt_run_block_handle_load(cur, reg_consts, var_consts) != 0) {
+            cur = cur.next;
+            continue;
+        }
+
+        if (_ssa_opt_run_block_handle_foldable(cur, reg_consts) != 0) {
+            cur = cur.next;
+            continue;
+        }
+
+        if (cur.dest != 0) {
+            _ssa_opt_const_clear(reg_consts, cur.dest);
+        }
+
+        cur = cur.next;
+    }
+
+    _ssa_opt_remove_nops(b);
+    return 0;
+}
+
 func ssa_opt_o1_run(ctx: *SSAContext) -> u64 {
     push_trace("ssa_opt_o1_run", "ssa_opt_o1.b", __LINE__);
     defer pop_trace();
@@ -376,124 +514,7 @@ func ssa_opt_o1_run(ctx: *SSAContext) -> u64 {
         var bcount: u64 = ssa_slice_len(blocks);
         var bi: u64 = 0;
         for (bi = 0; bi < bcount; bi = bi + 1) {
-            var b: *SSABlock = blocks[bi];
-
-            var reg_consts: *Vec<u64> = new Vec<u64>(32);
-            var var_consts: *Vec<u64> = new Vec<u64>(32);
-
-            var cur: *SSAInstruction = b.inst_head;
-            while (cur != 0) {
-                var op: u64 = ssa_inst_get_op(cur);
-
-                if (op == SSA_OP_CONST) {
-                    _ssa_opt_const_set(reg_consts, cur.dest, ssa_operand_value(cur.src1));
-                    cur = cur.next;
-                    continue;
-                }
-
-                if (op == SSA_OP_COPY) {
-                    var v: u64 = 0;
-                    var has: u64 = 0;
-                    if (ssa_operand_is_const(cur.src1)) {
-                        v = ssa_operand_value(cur.src1);
-                        has = 1;
-                    } else {
-                        var idx_copy: u64 = _ssa_opt_const_find(reg_consts, ssa_operand_value(cur.src1));
-                        if (idx_copy != 0) {
-                            v = reg_consts.get(idx_copy);
-                            has = 1;
-                        }
-                    }
-                    if (has != 0) {
-                        ssa_inst_set_op(cur, SSA_OP_CONST);
-                        cur.src1 = ssa_operand_const(v);
-                        cur.src2 = 0;
-                        _ssa_opt_const_set(reg_consts, cur.dest, v);
-                    } else {
-                        _ssa_opt_const_clear(reg_consts, cur.dest);
-                    }
-                    cur = cur.next;
-                    continue;
-                }
-
-                if (op == SSA_OP_STORE) {
-                    if (ssa_operand_is_const(cur.src1)) {
-                        var var_id: u64 = ssa_operand_value(cur.src1);
-                        var v2: u64 = 0;
-                        var has: u64 = 0;
-                        if (ssa_operand_is_const(cur.src2)) {
-                            v2 = ssa_operand_value(cur.src2);
-                            has = 1;
-                        } else {
-                            var idx_store: u64 = _ssa_opt_const_find(reg_consts, ssa_operand_value(cur.src2));
-                            if (idx_store != 0) {
-                                v2 = reg_consts.get(idx_store);
-                                has = 1;
-                            }
-                        }
-                        if (has != 0) {
-                            _ssa_opt_const_set(var_consts, var_id, v2);
-                        } else {
-                            _ssa_opt_const_clear(var_consts, var_id);
-                        }
-                    }
-                    cur = cur.next;
-                    continue;
-                }
-
-                if (op == SSA_OP_LOAD) {
-                    if (ssa_operand_is_const(cur.src1)) {
-                        var var_id2: u64 = ssa_operand_value(cur.src1);
-                        var idx_load: u64 = _ssa_opt_const_find(var_consts, var_id2);
-                        if (idx_load != 0) {
-                            var v3: u64 = var_consts.get(idx_load);
-                            ssa_inst_set_op(cur, SSA_OP_CONST);
-                            cur.src1 = ssa_operand_const(v3);
-                            cur.src2 = 0;
-                            _ssa_opt_const_set(reg_consts, cur.dest, v3);
-                            cur = cur.next;
-                            continue;
-                        }
-                    }
-                    _ssa_opt_const_clear(reg_consts, cur.dest);
-                    cur = cur.next;
-                    continue;
-                }
-
-                if (_ssa_opt_is_foldable(op) != 0) {
-                    if (!ssa_operand_is_const(cur.src1)) {
-                        var idx1: u64 = _ssa_opt_const_find(reg_consts, ssa_operand_value(cur.src1));
-                        if (idx1 != 0) {
-                            var c1: u64 = reg_consts.get(idx1);
-                            cur.src1 = ssa_operand_const(c1);
-                        }
-                    }
-                    if (!ssa_operand_is_const(cur.src2)) {
-                        var idx2: u64 = _ssa_opt_const_find(reg_consts, ssa_operand_value(cur.src2));
-                        if (idx2 != 0) {
-                            var c2: u64 = reg_consts.get(idx2);
-                            cur.src2 = ssa_operand_const(c2);
-                        }
-                    }
-
-                    if (_ssa_opt_fold_inst(cur) != 0) {
-                        _ssa_opt_const_set(reg_consts, cur.dest, ssa_operand_value(cur.src1));
-                    } else if (cur.dest != 0) {
-                        _ssa_opt_const_clear(reg_consts, cur.dest);
-                    }
-
-                    cur = cur.next;
-                    continue;
-                }
-
-                if (cur.dest != 0) {
-                    _ssa_opt_const_clear((u64)reg_consts, cur.dest);
-                }
-
-                cur = cur.next;
-            }
-
-            _ssa_opt_remove_nops(b);
+            ssa_opt_o1_run_block(blocks[bi]);
         }
 
         _ssa_opt_dce_run(fn);
