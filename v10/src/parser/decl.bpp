@@ -972,7 +972,7 @@ func parse_destructor_decl(p: *Parser, struct_name_ptr: u64, struct_name_len: u6
     return ast_func_ex(name_tok.ptr, name_tok.len, params_out, TYPE_VOID, 0, 0, 0, 0, 0, 0, body);
 }
 
-func parser_mark_impl_method_metadata(struct_name_ptr: u64, struct_name_len: u64, func_node: *AstFunc, method_access: u64) -> u64 {
+func parser_mark_impl_method_metadata(struct_name_ptr: u64, struct_name_len: u64, func_node: *AstFunc, method_access: u64, method_is_override: u64) -> u64 {
     if (func_node == 0) { return 0; }
     func_node.impl_owner_ptr = struct_name_ptr;
     func_node.impl_owner_len = struct_name_len;
@@ -980,6 +980,7 @@ func parser_mark_impl_method_metadata(struct_name_ptr: u64, struct_name_len: u64
     func_node.impl_original_name_ptr = func_node.name_ptr;
     func_node.impl_original_name_len = func_node.name_len;
     func_node.impl_name_finalized = 0;
+    func_node.impl_is_override = method_is_override;
     return 0;
 }
 
@@ -993,18 +994,45 @@ func parse_impl_parse_func_by_mode(p: *Parser, sig_only: u64) -> *AstFunc {
 struct ParseImplModifiers {
     public is_static: u64;
     public is_abst: u64;
+    public is_override: u64;
     public access: u64;
+}
+
+func parse_impl_consume_override_annotation(p: *Parser, modifiers: *ParseImplModifiers) -> u64 {
+    if (parse_peek_kind(p) != TOKEN_AT) { return 0; }
+    parse_adv(p);
+    parse_consume(p, TOKEN_LBRACKET);
+    var anno_tok: *Token = parse_peek(p);
+    parse_consume(p, TOKEN_IDENTIFIER);
+    parse_consume(p, TOKEN_RBRACKET);
+    if (str_eq(anno_tok.ptr, anno_tok.len, "override", 8) == 0) {
+        emit_stderr("[ERROR] unknown impl annotation: @[");
+        emit_stderr_len(anno_tok.ptr, anno_tok.len);
+        emit_stderr("]\n");
+        parse_panic_here(p, "Parse error");
+    }
+    if (modifiers.is_override != 0) {
+        emit_stderr("[ERROR] duplicate @[override] annotation\n");
+        parse_panic_here(p, "Parse error");
+    }
+    modifiers.is_override = 1;
+    return 1;
 }
 
 func parse_impl_consume_modifiers(p: *Parser) -> ParseImplModifiers {
     var modifiers: ParseImplModifiers;
     modifiers.is_static = 0;
     modifiers.is_abst = 0;
+    modifiers.is_override = 0;
     modifiers.access = ACCESS_PRIVATE;
 
     var seen_access: u64 = 0;
     while (1) {
         var k: u64 = parse_peek_kind(p);
+        if (k == TOKEN_AT) {
+            parse_impl_consume_override_annotation(p, &modifiers);
+            continue;
+        }
         if (k == TOKEN_PUBLIC) {
             if (seen_access != 0) {
                 emit_stderr("[ERROR] duplicate access modifier\n");
@@ -1059,10 +1087,14 @@ func parse_impl_consume_modifiers(p: *Parser) -> ParseImplModifiers {
         emit_stderr("[ERROR] abstract method cannot be static\n");
         parse_panic_here(p, "Parse error");
     }
+    if (modifiers.is_abst != 0 && modifiers.is_override != 0) {
+        emit_stderr("[ERROR] abstract method cannot be @[override]\n");
+        parse_panic_here(p, "Parse error");
+    }
     return modifiers;
 }
 
-func parse_impl_try_special_method(p: *Parser, sig_only: u64, struct_name_ptr: u64, struct_name_len: u64, is_static: u64, is_abst: u64, method_access: u64, funcs: *Vec<*AstFunc>) -> u64 {
+func parse_impl_try_special_method(p: *Parser, sig_only: u64, struct_name_ptr: u64, struct_name_len: u64, is_static: u64, is_abst: u64, is_override: u64, method_access: u64, funcs: *Vec<*AstFunc>) -> u64 {
     var kind: u64 = parse_peek_kind(p);
     if (kind == TOKEN_CONSTRUCTOR) {
         if (is_static != 0) {
@@ -1073,8 +1105,12 @@ func parse_impl_try_special_method(p: *Parser, sig_only: u64, struct_name_ptr: u
             emit_stderr("[ERROR] constructor cannot be abstract\n");
             parse_panic_here(p, "Parse error");
         }
+        if (is_override != 0) {
+            emit_stderr("[ERROR] constructor cannot be @[override]\n");
+            parse_panic_here(p, "Parse error");
+        }
         var ctor_node: *AstFunc = parse_constructor_decl(p, struct_name_ptr, struct_name_len, sig_only);
-        parser_mark_impl_method_metadata(struct_name_ptr, struct_name_len, ctor_node, method_access);
+        parser_mark_impl_method_metadata(struct_name_ptr, struct_name_len, ctor_node, method_access, 0);
         funcs.push(ctor_node);
         return 1;
     }
@@ -1087,8 +1123,12 @@ func parse_impl_try_special_method(p: *Parser, sig_only: u64, struct_name_ptr: u
             emit_stderr("[ERROR] destructor cannot be abstract\n");
             parse_panic_here(p, "Parse error");
         }
+        if (is_override != 0) {
+            emit_stderr("[ERROR] destructor cannot be @[override]\n");
+            parse_panic_here(p, "Parse error");
+        }
         var dtor_node: *AstFunc = parse_destructor_decl(p, struct_name_ptr, struct_name_len, sig_only);
-        parser_mark_impl_method_metadata(struct_name_ptr, struct_name_len, dtor_node, method_access);
+        parser_mark_impl_method_metadata(struct_name_ptr, struct_name_len, dtor_node, method_access, 0);
         funcs.push(dtor_node);
         return 1;
     }
@@ -1114,8 +1154,9 @@ func parse_impl_block_impl(p: *Parser, sig_only: u64) -> *Vec<*AstFunc> {
         var modifiers: ParseImplModifiers = parse_impl_consume_modifiers(p);
         var is_static: u64 = modifiers.is_static;
         var is_abst: u64 = modifiers.is_abst;
+        var is_override: u64 = modifiers.is_override;
         var method_access: u64 = modifiers.access;
-        if (parse_impl_try_special_method(p, sig_only, struct_name_ptr, struct_name_len, is_static, is_abst, method_access, funcs) != 0) {
+        if (parse_impl_try_special_method(p, sig_only, struct_name_ptr, struct_name_len, is_static, is_abst, is_override, method_access, funcs) != 0) {
             continue;
         }
 
@@ -1129,7 +1170,7 @@ func parse_impl_block_impl(p: *Parser, sig_only: u64) -> *Vec<*AstFunc> {
             var func_node: *AstFunc = parse_impl_parse_func_by_mode(p, sig_only);
             if (func_node == 0) { continue; }
 
-            parser_mark_impl_method_metadata(struct_name_ptr, struct_name_len, func_node, method_access);
+            parser_mark_impl_method_metadata(struct_name_ptr, struct_name_len, func_node, method_access, is_override);
             funcs.push(func_node);
             continue;
         }
@@ -1179,35 +1220,20 @@ func parse_impl_trait_block_impl(p: *Parser, sig_only: u64, register_trait_impl:
     while (parse_peek_kind(p) != TOKEN_RBRACE) {
         if (parse_peek_kind(p) == TOKEN_EOF) { break; }
 
-        var method_access: u64 = ACCESS_PRIVATE;
-        var seen_access: u64 = 0;
-        if (parse_peek_kind(p) == TOKEN_PUBLIC) {
-            method_access = ACCESS_PUBLIC;
-            parse_adv(p);
-            seen_access = 1;
-        } else if (parse_peek_kind(p) == TOKEN_PRIVATE) {
-            method_access = ACCESS_PRIVATE;
-            parse_adv(p);
-            seen_access = 1;
-        } else if (parse_peek_kind(p) == TOKEN_PROTECTED) {
-            method_access = ACCESS_PROTECTED;
-            parse_adv(p);
-            seen_access = 1;
-        }
-        if (seen_access != 0) {
-            if (parse_peek_kind(p) == TOKEN_PUBLIC || parse_peek_kind(p) == TOKEN_PRIVATE || parse_peek_kind(p) == TOKEN_PROTECTED) {
-                emit_stderr("[ERROR] duplicate access modifier\n");
-                parse_panic_here(p, "Parse error");
-            }
-        }
+        var modifiers: ParseImplModifiers = parse_impl_consume_modifiers(p);
+        var method_access: u64 = modifiers.access;
 
-        if (parse_peek_kind(p) == TOKEN_STATIC) {
+        if (modifiers.is_static != 0) {
             emit_stderr("[ERROR] trait impl methods cannot be static\n");
             parse_panic_here(p, "Parse error");
         }
 
-        if (parse_peek_kind(p) == TOKEN_ABST) {
+        if (modifiers.is_abst != 0) {
             emit_stderr("[ERROR] trait impl methods cannot be abstract\n");
+            parse_panic_here(p, "Parse error");
+        }
+        if (modifiers.is_override != 0) {
+            emit_stderr("[ERROR] trait impl methods cannot use @[override]\n");
             parse_panic_here(p, "Parse error");
         }
 
@@ -1221,7 +1247,7 @@ func parse_impl_trait_block_impl(p: *Parser, sig_only: u64, register_trait_impl:
 
         var original_name_ptr: u64 = func_node.name_ptr;
         var original_name_len: u64 = func_node.name_len;
-        parser_mark_impl_method_metadata(struct_name_ptr, struct_name_len, func_node, method_access);
+        parser_mark_impl_method_metadata(struct_name_ptr, struct_name_len, func_node, method_access, 0);
 
         if (register_trait_impl != 0) {
             var impl_method: *TraitImplMethod = new TraitImplMethod();

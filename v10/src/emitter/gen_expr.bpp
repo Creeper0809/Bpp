@@ -322,8 +322,17 @@ func cg_method_call_ret_struct_size(mc: *AstMethodCall, symtab: *Symtab) -> u64 
     var struct_len: u64 = recv_ti.struct_name_len;
     if (struct_ptr == 0 || struct_len == 0) { return 0; }
 
-    var name_info: *NameInfo = compiler_build_method_name(struct_ptr, struct_len, mc.method_ptr, mc.method_len);
-    var fn: *AstFunc = typeinfo_find_func(name_info.ptr, name_info.len);
+    var args: *Vec<*AstNode> = mc.args_vec;
+    var nargs: u64 = 0;
+    if (args != 0) { nargs = args.len(); }
+    var arg_types: *Vec<*TypeInfo> = typeinfo_collect_arg_types(args, symtab);
+    var resolved: CompilerMethodResolveResult = compiler_resolve_method_overload(struct_ptr, struct_len, mc.method_ptr, mc.method_len, arg_types, nargs);
+    var fn: *AstFunc = 0;
+    if (resolved.found != 0) { fn = resolved.fn; }
+    if (fn == 0) {
+        var name_info: *NameInfo = compiler_build_method_name(struct_ptr, struct_len, mc.method_ptr, mc.method_len);
+        fn = typeinfo_find_func(name_info.ptr, name_info.len);
+    }
     if (fn == 0) { return 0; }
     if (fn.ret_type != TYPE_STRUCT || fn.ret_ptr_depth != 0) { return 0; }
     var struct_size: u64 = sizeof_type(TYPE_STRUCT, 0, fn.ret_struct_name_ptr, fn.ret_struct_name_len);
@@ -340,22 +349,33 @@ func cg_method_call_sret_to_offset(mc: *AstMethodCall, dest_offset: u64, symtab:
         struct_name_ptr = type_info.struct_name_ptr;
         struct_name_len = type_info.struct_name_len;
     }
-    var name_info: *NameInfo = compiler_build_method_name(struct_name_ptr, struct_name_len, mc.method_ptr, mc.method_len);
-    var resolved_ptr: u64 = name_info.ptr;
-    var resolved_len: u64 = name_info.len;
-    var resolved: *NameInfo = resolve_name(name_info.ptr, name_info.len);
-    if (resolved != 0) {
-        resolved_ptr = resolved.ptr;
-        resolved_len = resolved.len;
-    }
-    var fn_call: *AstFunc = typeinfo_find_func(resolved_ptr, resolved_len);
-    if (fn_call == 0) {
-        fn_call = typeinfo_find_func(name_info.ptr, name_info.len);
-    }
-
     var args: *Vec<*AstNode> = mc.args_vec;
     var nargs: u64 = 0;
     if (args != 0) { nargs = args.len(); }
+    var arg_types: *Vec<*TypeInfo> = typeinfo_collect_arg_types(args, symtab);
+    var resolved_ptr: u64 = 0;
+    var resolved_len: u64 = 0;
+    var fn_call: *AstFunc = 0;
+    var resolved_m: CompilerMethodResolveResult = compiler_resolve_method_overload(struct_name_ptr, struct_name_len, mc.method_ptr, mc.method_len, arg_types, nargs);
+    if (resolved_m.found != 0 && resolved_m.fn != 0) {
+        fn_call = resolved_m.fn;
+        resolved_ptr = fn_call.name_ptr;
+        resolved_len = fn_call.name_len;
+    }
+    if (fn_call == 0) {
+        var name_info: *NameInfo = compiler_build_method_name(struct_name_ptr, struct_name_len, mc.method_ptr, mc.method_len);
+        resolved_ptr = name_info.ptr;
+        resolved_len = name_info.len;
+        var resolved: *NameInfo = resolve_name(name_info.ptr, name_info.len);
+        if (resolved != 0) {
+            resolved_ptr = resolved.ptr;
+            resolved_len = resolved.len;
+        }
+        fn_call = typeinfo_find_func(resolved_ptr, resolved_len);
+        if (fn_call == 0) {
+            fn_call = typeinfo_find_func(name_info.ptr, name_info.len);
+        }
+    }
     var total_arg_words: u64 = 0;
 
     if (nargs != 0) {
@@ -1367,6 +1387,44 @@ func cg_emit_adjust_rax_sub(offset: u64) -> u64 {
     return 0;
 }
 
+func cg_emit_checked_trait_to_struct_guard(expected_vtable_ptr: u64, expected_vtable_len: u64) -> u64 {
+    if (expected_vtable_ptr == 0 || expected_vtable_len == 0) { return 0; }
+    var ok_label: u64 = new_label();
+    emit("    mov r11, [rax]\n");
+    emit("    lea r10, [rel _gvar_");
+    emit_len(expected_vtable_ptr, expected_vtable_len);
+    emit("]\n");
+    emit("    cmp r11, r10\n");
+    emit("    je ");
+    emit_label(ok_label);
+    emit_nl();
+    emit("    ud2\n");
+    emit_label_def(ok_label);
+    return 0;
+}
+
+func cg_emit_checked_struct_downcast_guard(check_info: CompilerDowncastCheckInfo) -> u64 {
+    if (check_info.found == 0) { return 0; }
+    var ok_label: u64 = new_label();
+    if (check_info.src_vptr_offset == 0) {
+        emit("    mov r11, [rax]\n");
+    } else {
+        emit("    mov r11, [rax + ");
+        emit_u64(check_info.src_vptr_offset);
+        emit("]\n");
+    }
+    emit("    lea r10, [rel _gvar_");
+    emit_len(check_info.expected_vtable_ptr, check_info.expected_vtable_len);
+    emit("]\n");
+    emit("    cmp r11, r10\n");
+    emit("    je ");
+    emit_label(ok_label);
+    emit_nl();
+    emit("    ud2\n");
+    emit_label_def(ok_label);
+    return 0;
+}
+
 func cg_try_adjust_struct_ptr_cast(src_ti: *TypeInfo, target_struct_ptr: u64, target_struct_len: u64) -> u64 {
     if (src_ti == 0) { return 0; }
     if (src_ti.type_kind != TYPE_STRUCT || src_ti.ptr_depth == 0) { return 0; }
@@ -1445,6 +1503,8 @@ func cg_expr_cast(node: u64, symtab: *Symtab) -> u64 {
                 panic("Codegen error");
             }
             cg_expr(expr);
+            if (src_ti2.is_tagged == 1) { emit_tagged_mask(); }
+            cg_emit_checked_trait_to_struct_guard(impl2.vtable_global_ptr, impl2.vtable_global_len);
             cg_emit_adjust_rax_sub(field_offset2);
             return;
         }
@@ -1452,6 +1512,11 @@ func cg_expr_cast(node: u64, symtab: *Symtab) -> u64 {
         if (cast.target_ptr_depth > 0 && src_ti2 != 0 && src_ti2.type_kind == TYPE_STRUCT && src_ti2.ptr_depth > 0) {
             cg_expr(expr);
             if (src_ti2.is_tagged == 1) { emit_tagged_mask(); }
+            if (str_eq(src_ti2.struct_name_ptr, src_ti2.struct_name_len, cast.struct_name_ptr, cast.struct_name_len) == 0 &&
+                compiler_struct_is_same_or_descendant(cast.struct_name_ptr, cast.struct_name_len, src_ti2.struct_name_ptr, src_ti2.struct_name_len) != 0) {
+                var check_info: CompilerDowncastCheckInfo = compiler_find_downcast_check_info(src_ti2.struct_name_ptr, src_ti2.struct_name_len, cast.struct_name_ptr, cast.struct_name_len);
+                cg_emit_checked_struct_downcast_guard(check_info);
+            }
             cg_try_adjust_struct_ptr_cast(src_ti2, cast.struct_name_ptr, cast.struct_name_len);
             return;
         }
@@ -2883,6 +2948,7 @@ func cg_safe_method_call_struct_ptr(method_call: *AstMethodCall, recv_ti: *TypeI
     var receiver: u64 = method_call.receiver;
     var method_ptr: u64 = method_call.method_ptr;
     var method_len: u64 = method_call.method_len;
+    var arg_types: *Vec<*TypeInfo> = typeinfo_collect_arg_types(args, symtab);
     if (recv_mode == COMPILER_SAFE_RECV_INVALID) {
         if (recv_ti.ptr_depth == 0) {
             emit_stderr("[ERROR] Safe method call requires pointer receiver\n");
@@ -2892,7 +2958,7 @@ func cg_safe_method_call_struct_ptr(method_call: *AstMethodCall, recv_ti: *TypeI
         return 0;
     }
 
-    if (compiler_check_method_access(recv_ti.struct_name_ptr, recv_ti.struct_name_len, method_ptr, method_len) == 0) {
+    if (compiler_check_method_access_overload(recv_ti.struct_name_ptr, recv_ti.struct_name_len, method_ptr, method_len, arg_types, nargs) == 0) {
         emit_stderr("[ERROR] private method access denied: ");
         emit_stderr_len(recv_ti.struct_name_ptr, recv_ti.struct_name_len);
         emit_stderr(".");
@@ -2934,24 +3000,34 @@ func cg_safe_method_call_struct_ptr(method_call: *AstMethodCall, recv_ti: *TypeI
         return 0;
     }
 
-    var name_info: *NameInfo = compiler_build_method_name(recv_ti.struct_name_ptr, recv_ti.struct_name_len, method_ptr, method_len);
-    var resolved_ptr: u64 = name_info.ptr;
-    var resolved_len: u64 = name_info.len;
-    var resolved: *NameInfo = resolve_name(name_info.ptr, name_info.len);
-    if (resolved != 0) {
-        resolved_ptr = resolved.ptr;
-        resolved_len = resolved.len;
-    }
-
-    var fn: *AstFunc = typeinfo_find_func(resolved_ptr, resolved_len);
-    if (fn == 0) {
-        fn = typeinfo_find_func(name_info.ptr, name_info.len);
+    var resolved_ptr: u64 = 0;
+    var resolved_len: u64 = 0;
+    var resolved_method: CompilerMethodResolveResult = compiler_resolve_method_overload(recv_ti.struct_name_ptr, recv_ti.struct_name_len, method_ptr, method_len, arg_types, nargs);
+    var fn: *AstFunc = 0;
+    if (resolved_method.found != 0 && resolved_method.fn != 0) {
+        fn = resolved_method.fn;
+        resolved_ptr = fn.name_ptr;
+        resolved_len = fn.name_len;
     }
     if (fn == 0 && recv_ti.struct_def != 0) {
         fn = compiler_find_method_func_in_hierarchy(recv_ti.struct_def, method_ptr, method_len);
         if (fn != 0) {
             resolved_ptr = fn.name_ptr;
             resolved_len = fn.name_len;
+        }
+    }
+    if (fn == 0) {
+        var name_info: *NameInfo = compiler_build_method_name(recv_ti.struct_name_ptr, recv_ti.struct_name_len, method_ptr, method_len);
+        resolved_ptr = name_info.ptr;
+        resolved_len = name_info.len;
+        var resolved: *NameInfo = resolve_name(name_info.ptr, name_info.len);
+        if (resolved != 0) {
+            resolved_ptr = resolved.ptr;
+            resolved_len = resolved.len;
+        }
+        fn = typeinfo_find_func(resolved_ptr, resolved_len);
+        if (fn == 0) {
+            fn = typeinfo_find_func(name_info.ptr, name_info.len);
         }
     }
     var ret_type: u64 = TYPE_I64;
@@ -3015,6 +3091,7 @@ func cg_method_call(node: u64, symtab: *Symtab) -> u64 {
     var args: *Vec<*AstNode> = method_call.args_vec;
     var nargs: u64 = 0;
     if (args != 0) { nargs = args.len(); }
+    var arg_types: *Vec<*TypeInfo> = typeinfo_collect_arg_types(args, symtab);
     var total_arg_words: u64 = 0;
 
     var recv_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)receiver, symtab);
@@ -3040,7 +3117,7 @@ func cg_method_call(node: u64, symtab: *Symtab) -> u64 {
     }
 
     if (recv_ti != 0 && recv_ti.type_kind == TYPE_STRUCT) {
-        if (compiler_check_method_access(recv_ti.struct_name_ptr, recv_ti.struct_name_len, method_ptr, method_len) == 0) {
+        if (compiler_check_method_access_overload(recv_ti.struct_name_ptr, recv_ti.struct_name_len, method_ptr, method_len, arg_types, nargs) == 0) {
             emit_stderr("[ERROR] private method access denied: ");
             emit_stderr_len(recv_ti.struct_name_ptr, recv_ti.struct_name_len);
             emit_stderr(".");
@@ -3083,27 +3160,38 @@ func cg_method_call(node: u64, symtab: *Symtab) -> u64 {
     }
     var struct_name_ptr: u64 = type_info.struct_name_ptr;
     var struct_name_len: u64 = type_info.struct_name_len;
-    
-    // Call StructName_method()
-    var name_info: *NameInfo = compiler_build_method_name(struct_name_ptr, struct_name_len, method_ptr, method_len);
-    var resolved_ptr: u64 = name_info.ptr;
-    var resolved_len: u64 = name_info.len;
-    var resolved: *NameInfo = resolve_name(name_info.ptr, name_info.len);
-    if (resolved != 0) {
-        resolved_ptr = resolved.ptr;
-        resolved_len = resolved.len;
+
+    var resolved_ptr: u64 = 0;
+    var resolved_len: u64 = 0;
+    var fn_direct: *AstFunc = 0;
+    var resolved_method2: CompilerMethodResolveResult = compiler_resolve_method_overload(struct_name_ptr, struct_name_len, method_ptr, method_len, arg_types, nargs);
+    if (resolved_method2.found != 0 && resolved_method2.fn != 0) {
+        fn_direct = resolved_method2.fn;
+        resolved_ptr = fn_direct.name_ptr;
+        resolved_len = fn_direct.name_len;
     }
-    if (type_info.struct_def != 0) {
+    if (fn_direct == 0 && type_info.struct_def != 0) {
         var fn_fallback: *AstFunc = compiler_find_method_func_in_hierarchy(type_info.struct_def, method_ptr, method_len);
         if (fn_fallback != 0) {
+            fn_direct = fn_fallback;
             resolved_ptr = fn_fallback.name_ptr;
             resolved_len = fn_fallback.name_len;
         }
     }
-
-    var fn_direct: *AstFunc = typeinfo_find_func(resolved_ptr, resolved_len);
     if (fn_direct == 0) {
-        fn_direct = typeinfo_find_func(name_info.ptr, name_info.len);
+        // Legacy fallback for non-overloaded/older names.
+        var name_info: *NameInfo = compiler_build_method_name(struct_name_ptr, struct_name_len, method_ptr, method_len);
+        resolved_ptr = name_info.ptr;
+        resolved_len = name_info.len;
+        var resolved: *NameInfo = resolve_name(name_info.ptr, name_info.len);
+        if (resolved != 0) {
+            resolved_ptr = resolved.ptr;
+            resolved_len = resolved.len;
+        }
+        fn_direct = typeinfo_find_func(resolved_ptr, resolved_len);
+        if (fn_direct == 0) {
+            fn_direct = typeinfo_find_func(name_info.ptr, name_info.len);
+        }
     }
     total_arg_words = cg_method_push_user_args(args, nargs, fn_direct, 1, symtab);
     total_arg_words = total_arg_words + cg_method_push_receiver(receiver, recv_ti, recv_is_ptr);

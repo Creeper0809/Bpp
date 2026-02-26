@@ -23,6 +23,7 @@ const COMPILER_TRY_KIND_RESULT = 2;
 const COMPILER_SAFE_RECV_INVALID = 0;
 const COMPILER_SAFE_RECV_STRUCT_PTR = 1;
 const COMPILER_SAFE_RECV_TRAIT_PTR = 2;
+const COMPILER_INHERIT_DIST_NOT_FOUND = 9223372036854775807;
 
 // ============================================
 // Global Module State
@@ -213,6 +214,23 @@ struct CompilerVtableStructInfo {
     public vtable_struct_def: *AstStructDef;
     public vtable_name_ptr: u64;
     public vtable_name_len: u64;
+}
+
+struct CompilerMethodResolveResult {
+    public found: u64;
+    public fn: *AstFunc;
+    public owner_ptr: u64;
+    public owner_len: u64;
+    public access: u64;
+}
+
+struct CompilerDowncastCheckInfo {
+    public found: u64;
+    public src_vptr_offset: u64;
+    public trait_ptr: u64;
+    public trait_len: u64;
+    public expected_vtable_ptr: u64;
+    public expected_vtable_len: u64;
 }
 
 func compiler_decl_lookup_none(default_access: u64) -> CompilerDeclLookup {
@@ -1403,8 +1421,6 @@ func compiler_pass1_register_func_sigs(prog_sig: *AstProgram) -> u64 {
     var num_sig_funcs: u64 = sig_funcs.len();
     for (var i: u64 = 0; i < num_sig_funcs; i++) {
         var sig_fn: *AstFunc = sig_funcs.get(i);
-        compiler_finalize_impl_method_name_if_needed(sig_fn);
-        compiler_register_finalized_impl_method(sig_fn);
         g_all_func_sigs.push(sig_fn);
     }
     return 0;
@@ -1963,6 +1979,341 @@ func compiler_register_impl_method_func(name_ptr: u64, name_len: u64, fn: *AstFu
     return 0;
 }
 
+func compiler_is_constructor_name(name_ptr: u64, name_len: u64) -> u64 {
+    if (str_eq(name_ptr, name_len, "constructor", 11) != 0) { return 1; }
+    return 0;
+}
+
+func compiler_is_destructor_name(name_ptr: u64, name_len: u64) -> u64 {
+    if (str_eq(name_ptr, name_len, "destructor", 10) != 0) { return 1; }
+    return 0;
+}
+
+func compiler_is_self_param(param: *Param) -> u64 {
+    if (param == 0) { return 0; }
+    if (param.type_kind != TYPE_STRUCT) { return 0; }
+    if (param.ptr_depth == 0) { return 0; }
+    if (param.name_ptr == 0 || param.name_len == 0) { return 0; }
+    if (str_eq(param.name_ptr, param.name_len, "self", 4) == 0) { return 0; }
+    return 1;
+}
+
+func compiler_method_param_start_index(fn: *AstFunc) -> u64 {
+    if (fn == 0 || fn.params_vec == 0 || fn.params_vec.len() == 0) { return 0; }
+    if (compiler_is_self_param(fn.params_vec.get(0)) != 0) { return 1; }
+    return 0;
+}
+
+func compiler_overload_hex_digit(v: u64) -> u64 {
+    if (v < 10) { return 48 + v; }
+    return 97 + (v - 10);
+}
+
+func compiler_overload_append_hex16(buf: u64, pos_ptr: *u64, value: u64) -> u64 {
+    var out: *u8 = (*u8)buf;
+    for (var i: u64 = 0; i < 16; i++) {
+        var shift: u64 = (15 - i) * 4;
+        var d: u64 = (value >> shift) & 15;
+        out[*pos_ptr] = compiler_overload_hex_digit(d);
+        *pos_ptr = *pos_ptr + 1;
+    }
+    return 0;
+}
+
+func compiler_method_overload_suffix_from_func(fn: *AstFunc) -> *NameInfo {
+    if (fn == 0 || fn.params_vec == 0) { return new NameInfo{0, 0}; }
+    var start_idx: u64 = compiler_method_param_start_index(fn);
+    var params_len: u64 = fn.params_vec.len();
+    if (start_idx > params_len) { start_idx = params_len; }
+
+    var total_len: u64 = 4; // "__OL"
+    for (var i: u64 = start_idx; i < params_len; i++) {
+        var p: *Param = fn.params_vec.get(i);
+        var sn_len: u64 = 0;
+        var arr_param_len: u64 = 0;
+        if (p != 0) {
+            sn_len = p.struct_name_len;
+            arr_param_len = p.array_len_param_len;
+        }
+        total_len = total_len + 1 + (16 * 9) + 2 + sn_len + arr_param_len;
+    }
+
+    var buf: u64 = heap_alloc((total_len + 1) * sizeof(u8));
+    var out: *u8 = (*u8)buf;
+    var pos: u64 = 0;
+    out[pos] = 95; pos = pos + 1; // _
+    out[pos] = 95; pos = pos + 1; // _
+    out[pos] = 79; pos = pos + 1; // O
+    out[pos] = 76; pos = pos + 1; // L
+
+    for (var j: u64 = start_idx; j < params_len; j++) {
+        var p2: *Param = fn.params_vec.get(j);
+        out[pos] = 95; pos = pos + 1; // _
+
+        compiler_overload_append_hex16(buf, &pos, p2.type_kind);
+        compiler_overload_append_hex16(buf, &pos, p2.ptr_depth);
+        compiler_overload_append_hex16(buf, &pos, p2.is_tagged);
+        compiler_overload_append_hex16(buf, &pos, p2.struct_name_len);
+        if (p2.struct_name_len > 0 && p2.struct_name_ptr != 0) {
+            str_copy(buf + pos, p2.struct_name_ptr, p2.struct_name_len);
+            pos = pos + p2.struct_name_len;
+        }
+        out[pos] = 95; pos = pos + 1; // _
+        compiler_overload_append_hex16(buf, &pos, p2.elem_type_kind);
+        compiler_overload_append_hex16(buf, &pos, p2.elem_ptr_depth);
+        compiler_overload_append_hex16(buf, &pos, p2.array_len);
+        compiler_overload_append_hex16(buf, &pos, p2.array_len_is_param);
+        compiler_overload_append_hex16(buf, &pos, p2.array_len_param_len);
+        if (p2.array_len_param_len > 0 && p2.array_len_param_ptr != 0) {
+            str_copy(buf + pos, p2.array_len_param_ptr, p2.array_len_param_len);
+            pos = pos + p2.array_len_param_len;
+        }
+        out[pos] = 95; pos = pos + 1; // _
+    }
+
+    out[pos] = 0;
+    return new NameInfo{buf, pos};
+}
+
+func compiler_method_overload_variant_count(owner_ptr: u64, owner_len: u64, method_ptr: u64, method_len: u64) -> u64 {
+    if (owner_ptr == 0 || owner_len == 0 || method_ptr == 0 || method_len == 0) { return 0; }
+    var src: *Vec<*AstFunc> = g_all_func_sigs;
+    if (src == 0 || src.len() == 0) { src = g_all_funcs; }
+    if (src == 0) { return 0; }
+
+    var seen: *HashMap<u64, u64> = new HashMap<u64, u64>(8);
+    var count: u64 = 0;
+    var n: u64 = src.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var fn: *AstFunc = src.get(i);
+        if (fn == 0) { continue; }
+        if (fn.impl_owner_ptr == 0 || fn.impl_owner_len == 0) { continue; }
+        if (str_eq(fn.impl_owner_ptr, fn.impl_owner_len, owner_ptr, owner_len) == 0) { continue; }
+
+        var cand_ptr: u64 = fn.impl_original_name_ptr;
+        var cand_len: u64 = fn.impl_original_name_len;
+        if (cand_ptr == 0 || cand_len == 0) {
+            cand_ptr = fn.name_ptr;
+            cand_len = fn.name_len;
+        }
+        if (str_eq(cand_ptr, cand_len, method_ptr, method_len) == 0) { continue; }
+
+        var sig: *NameInfo = compiler_method_overload_suffix_from_func(fn);
+        if (seen.has(sig.ptr, sig.len) == 0) {
+            seen.put(sig.ptr, sig.len, 1);
+            count = count + 1;
+        }
+    }
+    return count;
+}
+
+func compiler_method_is_overloadable(fn: *AstFunc, original_name_ptr: u64, original_name_len: u64) -> u64 {
+    if (fn == 0) { return 0; }
+    if (fn.impl_owner_ptr == 0 || fn.impl_owner_len == 0) { return 0; }
+    if (compiler_is_destructor_name(original_name_ptr, original_name_len) != 0) { return 0; }
+    if (fn.params_vec == 0 || fn.params_vec.len() == 0) { return 0; }
+    if (compiler_is_self_param(fn.params_vec.get(0)) == 0) { return 0; } // static methods are excluded
+    if (compiler_method_overload_variant_count(fn.impl_owner_ptr, fn.impl_owner_len, original_name_ptr, original_name_len) > 1) {
+        return 1;
+    }
+    return 0;
+}
+
+func compiler_build_method_name_with_overload_suffix(struct_name_ptr: u64, struct_name_len: u64, method_ptr: u64, method_len: u64, overload_ptr: u64, overload_len: u64) -> *NameInfo {
+    var base_name: *NameInfo = compiler_build_method_name(struct_name_ptr, struct_name_len, method_ptr, method_len);
+    if (overload_ptr == 0 || overload_len == 0) { return base_name; }
+    var full_ptr: u64 = str_concat(base_name.ptr, base_name.len, overload_ptr, overload_len);
+    return new NameInfo{full_ptr, base_name.len + overload_len};
+}
+
+func _compiler_struct_distance_to_ancestor(struct_def: *AstStructDef, ancestor_ptr: u64, ancestor_len: u64, depth: u64) -> u64 {
+    if (struct_def == 0) { return COMPILER_INHERIT_DIST_NOT_FOUND; }
+    if (depth > 64) {
+        emit_stderr("[ERROR] Inheritance depth exceeded\n");
+        panic("Compiler error");
+    }
+    if (str_eq(struct_def.name_ptr, struct_def.name_len, ancestor_ptr, ancestor_len) != 0) {
+        return 0;
+    }
+    if (struct_def.parents_vec == 0 || struct_def.parents_vec.len() == 0) {
+        return COMPILER_INHERIT_DIST_NOT_FOUND;
+    }
+    var best: u64 = COMPILER_INHERIT_DIST_NOT_FOUND;
+    var pn: u64 = struct_def.parents_vec.len();
+    for (var i: u64 = 0; i < pn; i++) {
+        var pd: *ParentDesc = struct_def.parents_vec.get(i);
+        var pdef: *AstStructDef = compiler_resolve_parent_def(pd, "Compiler error");
+        var d: u64 = _compiler_struct_distance_to_ancestor(pdef, ancestor_ptr, ancestor_len, depth + 1);
+        if (d == COMPILER_INHERIT_DIST_NOT_FOUND) { continue; }
+        var cand: u64 = d + 1;
+        if (best == COMPILER_INHERIT_DIST_NOT_FOUND || cand < best) {
+            best = cand;
+        }
+    }
+    return best;
+}
+
+func compiler_struct_distance_to_ancestor(child_ptr: u64, child_len: u64, ancestor_ptr: u64, ancestor_len: u64) -> u64 {
+    var child_def: *AstStructDef = get_struct_def(child_ptr, child_len);
+    if (child_def == 0) { return COMPILER_INHERIT_DIST_NOT_FOUND; }
+    return _compiler_struct_distance_to_ancestor(child_def, ancestor_ptr, ancestor_len, 0);
+}
+
+func compiler_method_param_match_score(expected: *Param, arg_ti: *TypeInfo) -> u64 {
+    if (expected == 0 || arg_ti == 0) { return 0; }
+
+    if (expected.type_kind == TYPE_STRUCT) {
+        if (arg_ti.type_kind != TYPE_STRUCT) { return 0; }
+        if (expected.ptr_depth != arg_ti.ptr_depth) { return 0; }
+        if (expected.struct_name_ptr == 0 || expected.struct_name_len == 0) { return 0; }
+        if (arg_ti.struct_name_ptr == 0 || arg_ti.struct_name_len == 0) { return 0; }
+        if (str_eq(expected.struct_name_ptr, expected.struct_name_len, arg_ti.struct_name_ptr, arg_ti.struct_name_len) != 0) {
+            return 6;
+        }
+        if (expected.ptr_depth > 0 &&
+            compiler_struct_is_same_or_descendant(arg_ti.struct_name_ptr, arg_ti.struct_name_len, expected.struct_name_ptr, expected.struct_name_len) != 0) {
+            return 3;
+        }
+        return 0;
+    }
+
+    if (expected.type_kind == TYPE_ARRAY || expected.type_kind == TYPE_SLICE) {
+        if (expected.type_kind != arg_ti.type_kind) { return 0; }
+        if (expected.ptr_depth != arg_ti.ptr_depth) { return 0; }
+        if (expected.elem_type_kind != arg_ti.elem_type_kind) { return 0; }
+        if (expected.elem_ptr_depth != arg_ti.elem_ptr_depth) { return 0; }
+        if (expected.type_kind == TYPE_ARRAY && expected.array_len != arg_ti.array_len) { return 0; }
+        if (expected.elem_type_kind == TYPE_STRUCT) {
+            if (str_eq(expected.struct_name_ptr, expected.struct_name_len, arg_ti.struct_name_ptr, arg_ti.struct_name_len) == 0) {
+                return 0;
+            }
+        }
+        return 4;
+    }
+
+    if (expected.type_kind == TYPE_TRAIT) {
+        if (arg_ti.type_kind != TYPE_TRAIT) { return 0; }
+        if (expected.ptr_depth != arg_ti.ptr_depth) { return 0; }
+        if (str_eq(expected.struct_name_ptr, expected.struct_name_len, arg_ti.struct_name_ptr, arg_ti.struct_name_len) == 0) {
+            return 0;
+        }
+        return 5;
+    }
+
+    if (expected.type_kind != arg_ti.type_kind) { return 0; }
+    if (expected.ptr_depth != arg_ti.ptr_depth) { return 0; }
+    return 5;
+}
+
+func compiler_method_match_score(fn: *AstFunc, arg_types: *Vec<*TypeInfo>, arg_count_hint: u64) -> u64 {
+    if (fn == 0 || fn.params_vec == 0) { return 0; }
+    var start_idx: u64 = compiler_method_param_start_index(fn);
+    var expected_arg_count: u64 = fn.params_vec.len() - start_idx;
+    if (arg_types == 0) {
+        if (expected_arg_count != arg_count_hint) { return 0; }
+        return 1;
+    }
+    if (arg_types.len() != expected_arg_count) { return 0; }
+    var total: u64 = 0;
+    for (var i: u64 = 0; i < expected_arg_count; i++) {
+        var expected: *Param = fn.params_vec.get(start_idx + i);
+        var actual: *TypeInfo = arg_types.get(i);
+        var score: u64 = compiler_method_param_match_score(expected, actual);
+        if (score == 0) { return 0; }
+        total = total + score;
+    }
+    return total;
+}
+
+func compiler_method_resolve_none() -> CompilerMethodResolveResult {
+    var result: CompilerMethodResolveResult;
+    result.found = 0;
+    result.fn = 0;
+    result.owner_ptr = 0;
+    result.owner_len = 0;
+    result.access = ACCESS_PUBLIC;
+    return result;
+}
+
+func compiler_resolve_method_overload(struct_ptr: u64, struct_len: u64, method_ptr: u64, method_len: u64, arg_types: *Vec<*TypeInfo>, arg_count_hint: u64) -> CompilerMethodResolveResult {
+    var result: CompilerMethodResolveResult = compiler_method_resolve_none();
+    if (struct_ptr == 0 || struct_len == 0 || method_ptr == 0 || method_len == 0) { return result; }
+    if (g_all_funcs == 0) { return result; }
+
+    var best_score: u64 = 0;
+    var best_fn: *AstFunc = 0;
+    var ambiguous: u64 = 0;
+    var n: u64 = g_all_funcs.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var fn: *AstFunc = g_all_funcs.get(i);
+        if (fn == 0) { continue; }
+        if (fn.impl_owner_ptr == 0 || fn.impl_owner_len == 0) { continue; }
+
+        var cand_ptr: u64 = fn.impl_original_name_ptr;
+        var cand_len: u64 = fn.impl_original_name_len;
+        if (cand_ptr == 0 || cand_len == 0) {
+            cand_ptr = fn.name_ptr;
+            cand_len = fn.name_len;
+        }
+        if (str_eq(cand_ptr, cand_len, method_ptr, method_len) == 0) { continue; }
+
+        var dist: u64 = compiler_struct_distance_to_ancestor(struct_ptr, struct_len, fn.impl_owner_ptr, fn.impl_owner_len);
+        if (dist == COMPILER_INHERIT_DIST_NOT_FOUND) { continue; }
+
+        var match_score: u64 = compiler_method_match_score(fn, arg_types, arg_count_hint);
+        if (match_score == 0) { continue; }
+
+        var depth_bonus: u64 = 0;
+        if (dist < 1024) { depth_bonus = 1024 - dist; }
+        var total_score: u64 = match_score * 2048 + depth_bonus;
+
+        if (best_fn == 0 || total_score > best_score) {
+            best_score = total_score;
+            best_fn = fn;
+            ambiguous = 0;
+            continue;
+        }
+        if (total_score == best_score && best_fn != fn) {
+            ambiguous = 1;
+        }
+    }
+
+    if (ambiguous != 0) {
+        emit_stderr("[ERROR] ambiguous overloaded method resolution: ");
+        emit_stderr_len(struct_ptr, struct_len);
+        emit_stderr(".");
+        emit_stderr_len(method_ptr, method_len);
+        emit_stderr("\n");
+        panic("Compiler error");
+    }
+    if (best_fn == 0) { return result; }
+
+    result.found = 1;
+    result.fn = best_fn;
+    result.owner_ptr = best_fn.impl_owner_ptr;
+    result.owner_len = best_fn.impl_owner_len;
+    result.access = best_fn.impl_method_access;
+    return result;
+}
+
+func compiler_method_arg_types_from_params(fn: *AstFunc) -> *Vec<*TypeInfo> {
+    if (fn == 0 || fn.params_vec == 0) { return 0; }
+    var start_idx: u64 = compiler_method_param_start_index(fn);
+    var n: u64 = fn.params_vec.len();
+    if (n < start_idx) { n = start_idx; }
+    var out: *Vec<*TypeInfo> = new Vec<*TypeInfo>(n - start_idx);
+    for (var i: u64 = start_idx; i < n; i++) {
+        var p: *Param = fn.params_vec.get(i);
+        var ti: *TypeInfo = new TypeInfo(p.type_kind, p.ptr_depth);
+        p.apply_to_typeinfo(ti);
+        if (ti.type_kind == TYPE_STRUCT && ti.struct_def == 0 && ti.struct_name_ptr != 0) {
+            ti.struct_def = get_struct_def(ti.struct_name_ptr, ti.struct_name_len);
+        }
+        out.push(ti);
+    }
+    return out;
+}
+
 func compiler_finalize_impl_method_name_if_needed(fn: *AstFunc) -> u64 {
     if (fn == 0) { return 0; }
     if (fn.impl_owner_ptr == 0 || fn.impl_owner_len == 0) { return 0; }
@@ -1977,7 +2328,13 @@ func compiler_finalize_impl_method_name_if_needed(fn: *AstFunc) -> u64 {
         fn.impl_original_name_len = original_name_len;
     }
 
-    var name_info: *NameInfo = compiler_build_method_name(fn.impl_owner_ptr, fn.impl_owner_len, original_name_ptr, original_name_len);
+    var name_info: *NameInfo = 0;
+    if (compiler_method_is_overloadable(fn, original_name_ptr, original_name_len) != 0) {
+        var overload_suffix: *NameInfo = compiler_method_overload_suffix_from_func(fn);
+        name_info = compiler_build_method_name_with_overload_suffix(fn.impl_owner_ptr, fn.impl_owner_len, original_name_ptr, original_name_len, overload_suffix.ptr, overload_suffix.len);
+    } else {
+        name_info = compiler_build_method_name(fn.impl_owner_ptr, fn.impl_owner_len, original_name_ptr, original_name_len);
+    }
     fn.name_ptr = name_info.ptr;
     fn.name_len = name_info.len;
     fn.impl_name_finalized = 1;
@@ -1987,6 +2344,60 @@ func compiler_finalize_impl_method_name_if_needed(fn: *AstFunc) -> u64 {
 func compiler_register_finalized_impl_method(fn: *AstFunc) -> u64 {
     if (fn == 0) { return 0; }
     if (fn.impl_owner_ptr == 0 || fn.impl_owner_len == 0) { return 0; }
+    var prev: *AstFunc = compiler_get_impl_method_func(fn.name_ptr, fn.name_len);
+    if (prev != 0 && prev != fn) {
+        var same_owner: u64 = str_eq(prev.impl_owner_ptr, prev.impl_owner_len, fn.impl_owner_ptr, fn.impl_owner_len);
+        var prev_method_ptr: u64 = prev.impl_original_name_ptr;
+        var prev_method_len: u64 = prev.impl_original_name_len;
+        if (prev_method_ptr == 0 || prev_method_len == 0) {
+            prev_method_ptr = prev.name_ptr;
+            prev_method_len = prev.name_len;
+        }
+        var fn_method_ptr: u64 = fn.impl_original_name_ptr;
+        var fn_method_len: u64 = fn.impl_original_name_len;
+        if (fn_method_ptr == 0 || fn_method_len == 0) {
+            fn_method_ptr = fn.name_ptr;
+            fn_method_len = fn.name_len;
+        }
+        var same_method: u64 = str_eq(prev_method_ptr, prev_method_len, fn_method_ptr, fn_method_len);
+        var same_signature: u64 = 0;
+        if (same_owner != 0 && same_method != 0) {
+            var prev_sig: *NameInfo = compiler_method_overload_suffix_from_func(prev);
+            var fn_sig: *NameInfo = compiler_method_overload_suffix_from_func(fn);
+            if (prev_sig.len == fn_sig.len) {
+                if (prev_sig.len == 0 || str_eq(prev_sig.ptr, prev_sig.len, fn_sig.ptr, fn_sig.len) != 0) {
+                    same_signature = 1;
+                }
+            }
+        }
+        if (same_signature != 0) {
+            var prev_has_body: u64 = 0;
+            var fn_has_body: u64 = 0;
+            if (prev.body != 0) { prev_has_body = 1; }
+            if (fn.body != 0) { fn_has_body = 1; }
+
+            if (prev_has_body != 0 && fn_has_body != 0) {
+                emit_stderr("[ERROR] duplicate method signature in impl: ");
+                emit_stderr_len(fn.impl_owner_ptr, fn.impl_owner_len);
+                emit_stderr(".");
+                emit_stderr_len(fn_method_ptr, fn_method_len);
+                emit_stderr("\n");
+                panic("Parse error");
+            }
+
+            // Prefer keeping the definition node over a signature-only placeholder.
+            if (prev_has_body != 0 && fn_has_body == 0) {
+                return 0;
+            }
+        } else {
+            emit_stderr("[ERROR] duplicate method signature in impl: ");
+            emit_stderr_len(fn.impl_owner_ptr, fn.impl_owner_len);
+            emit_stderr(".");
+            emit_stderr_len(fn_method_ptr, fn_method_len);
+            emit_stderr("\n");
+            panic("Parse error");
+        }
+    }
     compiler_register_impl_method_ex(fn.name_ptr, fn.name_len, fn.impl_owner_ptr, fn.impl_owner_len, fn.impl_method_access);
     compiler_register_impl_method_func(fn.name_ptr, fn.name_len, fn);
     compiler_alias_generic_template_by_func_ptr(fn, fn.name_ptr, fn.name_len);
@@ -2587,6 +2998,49 @@ func compiler_find_virtual_dispatch_trait(struct_ptr: u64, struct_len: u64, meth
     return _compiler_find_virtual_dispatch_trait_in_struct(sd, method_ptr, method_len, 0);
 }
 
+func compiler_find_unique_impl_method_in_struct(struct_ptr: u64, struct_len: u64, method_ptr: u64, method_len: u64) -> *AstFunc {
+    if (g_all_funcs == 0) { return 0; }
+    var found: *AstFunc = 0;
+    var found_count: u64 = 0;
+    var n: u64 = g_all_funcs.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var fn: *AstFunc = g_all_funcs.get(i);
+        if (fn == 0) { continue; }
+        if (fn.impl_owner_ptr == 0 || fn.impl_owner_len == 0) { continue; }
+        if (str_eq(fn.impl_owner_ptr, fn.impl_owner_len, struct_ptr, struct_len) == 0) { continue; }
+        var mptr: u64 = fn.impl_original_name_ptr;
+        var mlen: u64 = fn.impl_original_name_len;
+        if (mptr == 0 || mlen == 0) {
+            mptr = fn.name_ptr;
+            mlen = fn.name_len;
+        }
+        if (str_eq(mptr, mlen, method_ptr, method_len) == 0) { continue; }
+        found_count = found_count + 1;
+        if (found_count == 1) { found = fn; }
+    }
+    if (found_count > 1) {
+        emit_stderr("[ERROR] overloaded method requires argument type resolution: ");
+        emit_stderr_len(struct_ptr, struct_len);
+        emit_stderr(".");
+        emit_stderr_len(method_ptr, method_len);
+        emit_stderr("\n");
+        panic("Compiler error");
+    }
+    return found;
+}
+
+func compiler_find_unique_impl_method_decl_in_struct(struct_ptr: u64, struct_len: u64, method_ptr: u64, method_len: u64) -> CompilerDeclLookup {
+    var lookup: CompilerDeclLookup = compiler_decl_lookup_none(ACCESS_PUBLIC);
+    var fn: *AstFunc = compiler_find_unique_impl_method_in_struct(struct_ptr, struct_len, method_ptr, method_len);
+    if (fn == 0) { return lookup; }
+    lookup.found = 1;
+    lookup.owner_ptr = struct_ptr;
+    lookup.owner_len = struct_len;
+    lookup.access = fn.impl_method_access;
+    lookup.sig = fn;
+    return lookup;
+}
+
 func _compiler_find_method_func_in_hierarchy(struct_def: *AstStructDef, method_ptr: u64, method_len: u64, depth: u64) -> *AstFunc {
     if (struct_def == 0) { return 0; }
     if (depth > 64) {
@@ -2598,6 +3052,9 @@ func _compiler_find_method_func_in_hierarchy(struct_def: *AstStructDef, method_p
     var fn: *AstFunc = compiler_get_impl_method_func(method_name.ptr, method_name.len);
     if (fn == 0) {
         fn = compiler_get_func(method_name.ptr, method_name.len);
+    }
+    if (fn == 0) {
+        fn = compiler_find_unique_impl_method_in_struct(struct_def.name_ptr, struct_def.name_len, method_ptr, method_len);
     }
     if (fn != 0) { return fn; }
 
@@ -2657,6 +3114,9 @@ func _compiler_find_method_decl_in_hierarchy(struct_def: *AstStructDef, method_p
         return lookup;
     }
 
+    var overload_lookup: CompilerDeclLookup = compiler_find_unique_impl_method_decl_in_struct(struct_def.name_ptr, struct_def.name_len, method_ptr, method_len);
+    if (overload_lookup.found != 0) { return overload_lookup; }
+
     if (compiler_is_abst_method(struct_def.name_ptr, struct_def.name_len, method_ptr, method_len) != 0) {
         lookup.found = 1;
         lookup.owner_ptr = struct_def.name_ptr;
@@ -2699,6 +3159,20 @@ func compiler_find_method_decl_in_hierarchy(struct_ptr: u64, struct_len: u64, me
     return _compiler_find_method_decl_in_hierarchy(sd, method_ptr, method_len, 0);
 }
 
+func compiler_find_method_decl_in_hierarchy_overload(struct_ptr: u64, struct_len: u64, method_ptr: u64, method_len: u64, arg_types: *Vec<*TypeInfo>, arg_count_hint: u64) -> CompilerDeclLookup {
+    var resolved: CompilerMethodResolveResult = compiler_resolve_method_overload(struct_ptr, struct_len, method_ptr, method_len, arg_types, arg_count_hint);
+    if (resolved.found != 0 && resolved.fn != 0) {
+        var hit: CompilerDeclLookup = compiler_decl_lookup_none(ACCESS_PUBLIC);
+        hit.found = 1;
+        hit.owner_ptr = resolved.owner_ptr;
+        hit.owner_len = resolved.owner_len;
+        hit.access = resolved.access;
+        hit.sig = resolved.fn;
+        return hit;
+    }
+    return compiler_find_method_decl_in_hierarchy(struct_ptr, struct_len, method_ptr, method_len);
+}
+
 func compiler_check_field_access(field_desc: *FieldDesc) -> u64 {
     if (field_desc == 0) { return 0; }
     return compiler_can_access_member(field_desc.owner_struct_ptr, field_desc.owner_struct_len, field_desc.access);
@@ -2709,6 +3183,12 @@ func compiler_check_method_access(struct_ptr: u64, struct_len: u64, method_ptr: 
     if (lookup.found == 0) {
         return 1;
     }
+    return compiler_can_access_member(lookup.owner_ptr, lookup.owner_len, lookup.access);
+}
+
+func compiler_check_method_access_overload(struct_ptr: u64, struct_len: u64, method_ptr: u64, method_len: u64, arg_types: *Vec<*TypeInfo>, arg_count_hint: u64) -> u64 {
+    var lookup: CompilerDeclLookup = compiler_find_method_decl_in_hierarchy_overload(struct_ptr, struct_len, method_ptr, method_len, arg_types, arg_count_hint);
+    if (lookup.found == 0) { return 1; }
     return compiler_can_access_member(lookup.owner_ptr, lookup.owner_len, lookup.access);
 }
 
@@ -4756,7 +5236,19 @@ func compiler_lower_super_method_call_expr(mc: *AstMethodCall, owner_ptr: u64, o
     var parent_len: u64 = resolved_parent2.parent_len;
     var parent_def: *AstStructDef = resolved_parent2.parent_def;
 
-    var member_lookup: CompilerDeclLookup = compiler_find_method_decl_in_hierarchy(parent_ptr, parent_len, mc.method_ptr, mc.method_len);
+    var arg_count_hint: u64 = 0;
+    if (mc.args_vec != 0) { arg_count_hint = mc.args_vec.len(); }
+    var resolved_call: CompilerMethodResolveResult = compiler_resolve_method_overload(parent_ptr, parent_len, mc.method_ptr, mc.method_len, 0, arg_count_hint);
+    var member_lookup: CompilerDeclLookup = compiler_decl_lookup_none(ACCESS_PUBLIC);
+    if (resolved_call.found != 0 && resolved_call.fn != 0) {
+        member_lookup.found = 1;
+        member_lookup.owner_ptr = resolved_call.owner_ptr;
+        member_lookup.owner_len = resolved_call.owner_len;
+        member_lookup.access = resolved_call.access;
+        member_lookup.sig = resolved_call.fn;
+    } else {
+        member_lookup = compiler_find_method_decl_in_hierarchy(parent_ptr, parent_len, mc.method_ptr, mc.method_len);
+    }
     if (member_lookup.found == 0) {
         emit_stderr("[ERROR] super method not found: ");
         emit_stderr_len(parent_ptr, parent_len);
@@ -4774,7 +5266,12 @@ func compiler_lower_super_method_call_expr(mc: *AstMethodCall, owner_ptr: u64, o
         member_owner_len = parent_len;
     }
 
-    var lowered_name: *NameInfo = compiler_build_method_name(member_owner_ptr, member_owner_len, mc.method_ptr, mc.method_len);
+    var lowered_name: *NameInfo = 0;
+    if (resolved_call.found != 0 && resolved_call.fn != 0) {
+        lowered_name = new NameInfo{resolved_call.fn.name_ptr, resolved_call.fn.name_len};
+    } else {
+        lowered_name = compiler_build_method_name(member_owner_ptr, member_owner_len, mc.method_ptr, mc.method_len);
+    }
     var lowered_args: *Vec<*AstNode> = new Vec<*AstNode>(mc.args_vec.?len() + 1);
     lowered_args.push((*AstNode)ast_ident("self", 4));
     var arg_count: u64 = mc.args_vec.?len();
@@ -5101,6 +5598,54 @@ func compiler_is_vptr_field_name(name_ptr: u64, name_len: u64) -> u64 {
 
 func compiler_build_vptr_field_name(trait_ptr: u64, trait_len: u64) -> *NameInfo {
     return module_util_name_concat2("__vptr_", 7, trait_ptr, trait_len);
+}
+
+func compiler_downcast_check_info_none() -> CompilerDowncastCheckInfo {
+    var info: CompilerDowncastCheckInfo;
+    info.found = 0;
+    info.src_vptr_offset = 0;
+    info.trait_ptr = 0;
+    info.trait_len = 0;
+    info.expected_vtable_ptr = 0;
+    info.expected_vtable_len = 0;
+    return info;
+}
+
+func compiler_find_downcast_check_info(src_struct_ptr: u64, src_struct_len: u64, target_struct_ptr: u64, target_struct_len: u64) -> CompilerDowncastCheckInfo {
+    var info: CompilerDowncastCheckInfo = compiler_downcast_check_info_none();
+    if (src_struct_ptr == 0 || src_struct_len == 0 || target_struct_ptr == 0 || target_struct_len == 0) { return info; }
+    if (compiler_struct_is_same_or_descendant(target_struct_ptr, target_struct_len, src_struct_ptr, src_struct_len) == 0) { return info; }
+
+    var src_def: *AstStructDef = get_struct_def(src_struct_ptr, src_struct_len);
+    if (src_def == 0 || src_def.fields_vec == 0) { return info; }
+
+    var fields: *Vec<*FieldDesc> = src_def.fields_vec;
+    var n: u64 = fields.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var fd: *FieldDesc = fields.get(i);
+        if (fd == 0) { continue; }
+        if (compiler_is_vptr_field_name(fd.name_ptr, fd.name_len) == 0) { continue; }
+        if (fd.name_len <= 7) { continue; }
+
+        var trait_ptr: u64 = fd.name_ptr + 7;
+        var trait_len: u64 = fd.name_len - 7;
+        var target_impl: *TraitImpl = compiler_find_trait_impl(trait_ptr, trait_len, target_struct_ptr, target_struct_len);
+        if (target_impl == 0) { continue; }
+        if (target_impl.vtable_global_ptr == 0 || target_impl.vtable_global_len == 0) { continue; }
+
+        var vptr_name: *NameInfo = compiler_build_vptr_field_name(trait_ptr, trait_len);
+        var off: u64 = compiler_struct_find_field_offset(src_def, vptr_name.ptr, vptr_name.len);
+        if (compiler_is_not_found_u64(off) != 0) { continue; }
+
+        info.found = 1;
+        info.src_vptr_offset = off;
+        info.trait_ptr = trait_ptr;
+        info.trait_len = trait_len;
+        info.expected_vtable_ptr = target_impl.vtable_global_ptr;
+        info.expected_vtable_len = target_impl.vtable_global_len;
+        return info;
+    }
+    return info;
 }
 
 func compiler_build_vtable_struct_name(trait_ptr: u64, trait_len: u64) -> *NameInfo {
@@ -6007,6 +6552,127 @@ func compiler_setup_virtual_dispatch_traits() -> u64 {
     return 0;
 }
 
+func compiler_find_parent_method_decl_for_override(struct_def: *AstStructDef, method_ptr: u64, method_len: u64, arg_types: *Vec<*TypeInfo>, arg_count_hint: u64) -> CompilerDeclLookup {
+    var lookup: CompilerDeclLookup = compiler_decl_lookup_none(ACCESS_PUBLIC);
+    if (struct_def == 0 || struct_def.parents_vec == 0) { return lookup; }
+    var parents: *Vec<*ParentDesc> = struct_def.parents_vec;
+    var pn: u64 = parents.len();
+    var found: u64 = 0;
+    var first_hit: CompilerDeclLookup = compiler_decl_lookup_none(ACCESS_PUBLIC);
+    for (var i: u64 = 0; i < pn; i++) {
+        var parent_desc: *ParentDesc = parents.get(i);
+        var parent_def: *AstStructDef = compiler_resolve_parent_def(parent_desc, "Compiler error");
+        var child_lookup: CompilerDeclLookup = compiler_find_method_decl_in_hierarchy_overload(parent_def.name_ptr, parent_def.name_len, method_ptr, method_len, arg_types, arg_count_hint);
+        if (child_lookup.found != 0) {
+            found = found + 1;
+            if (found == 1) { first_hit = child_lookup; }
+        }
+    }
+    if (found > 1) {
+        emit_stderr("[ERROR] Ambiguous override target in inheritance: ");
+        emit_stderr_len(struct_def.name_ptr, struct_def.name_len);
+        emit_stderr(".");
+        emit_stderr_len(method_ptr, method_len);
+        emit_stderr("\n");
+        panic("Compiler error");
+    }
+    if (found == 0) { return lookup; }
+    return first_hit;
+}
+
+func compiler_is_trait_impl_func(fn: *AstFunc) -> u64 {
+    if (fn == 0 || g_all_trait_impls_vec == 0) { return 0; }
+    var inum: u64 = g_all_trait_impls_vec.len();
+    for (var ii: u64 = 0; ii < inum; ii++) {
+        var impl_info: *TraitImpl = g_all_trait_impls_vec.get(ii);
+        if (impl_info == 0 || impl_info.methods_vec == 0) { continue; }
+        var mn: u64 = impl_info.methods_vec.len();
+        for (var mi: u64 = 0; mi < mn; mi++) {
+            var method: *TraitImplMethod = impl_info.methods_vec.get(mi);
+            if (method != 0 && method.func_def == fn) { return 1; }
+        }
+    }
+    return 0;
+}
+
+func compiler_validate_single_impl_override(fn: *AstFunc) -> u64 {
+    if (fn == 0) { return 0; }
+    if (fn.impl_owner_ptr == 0 || fn.impl_owner_len == 0) { return 0; }
+    if (compiler_is_trait_impl_func(fn) != 0) { return 0; }
+
+    var owner_def: *AstStructDef = get_struct_def(fn.impl_owner_ptr, fn.impl_owner_len);
+    if (owner_def == 0 || owner_def.parents_vec == 0) { return 0; }
+
+    var method_ptr: u64 = fn.impl_original_name_ptr;
+    var method_len: u64 = fn.impl_original_name_len;
+    if (method_ptr == 0 || method_len == 0) {
+        method_ptr = fn.name_ptr;
+        method_len = fn.name_len;
+    }
+
+    var method_arg_types: *Vec<*TypeInfo> = compiler_method_arg_types_from_params(fn);
+    var arg_count_hint: u64 = 0;
+    if (method_arg_types != 0) { arg_count_hint = method_arg_types.len(); }
+    var base_lookup: CompilerDeclLookup = compiler_find_parent_method_decl_for_override(owner_def, method_ptr, method_len, method_arg_types, arg_count_hint);
+    var require_override: u64 = 0;
+
+    if (base_lookup.found == 0) {
+        if (fn.impl_is_override != 0) {
+            emit_stderr("[ERROR] @[override] has no base method: ");
+            emit_stderr_len(fn.impl_owner_ptr, fn.impl_owner_len);
+            emit_stderr(".");
+            emit_stderr_len(method_ptr, method_len);
+            emit_stderr("\n");
+            panic("Parse error");
+        }
+        return 0;
+    }
+    if (base_lookup.sig != 0 && base_lookup.sig.body == 0) {
+        require_override = 1;
+    } else if (base_lookup.owner_ptr != 0 && base_lookup.owner_len != 0 &&
+               compiler_is_abst_method(base_lookup.owner_ptr, base_lookup.owner_len, method_ptr, method_len) != 0) {
+        require_override = 1;
+    }
+
+    var base_access: u64 = base_lookup.access;
+    if (base_lookup.sig != 0 && base_lookup.sig.impl_method_access == ACCESS_PRIVATE) {
+        base_access = ACCESS_PRIVATE;
+    }
+    if (base_lookup.sig != 0 && base_lookup.sig.impl_method_access == ACCESS_PRIVATE) {
+        base_access = ACCESS_PRIVATE;
+    }
+    if (base_access == ACCESS_PRIVATE) {
+        if (fn.impl_is_override != 0) {
+            emit_stderr("[ERROR] cannot override private base method: ");
+            emit_stderr_len(fn.impl_owner_ptr, fn.impl_owner_len);
+            emit_stderr(".");
+            emit_stderr_len(method_ptr, method_len);
+            emit_stderr("\n");
+            panic("Parse error");
+        }
+        return 0;
+    }
+
+    if (require_override != 0 && fn.impl_is_override == 0) {
+        emit_stderr("[ERROR] missing @[override] on overriding method: ");
+        emit_stderr_len(fn.impl_owner_ptr, fn.impl_owner_len);
+        emit_stderr(".");
+        emit_stderr_len(method_ptr, method_len);
+        emit_stderr("\n");
+        panic("Parse error");
+    }
+    return 0;
+}
+
+func compiler_validate_impl_overrides() -> u64 {
+    if (g_all_func_sigs == 0) { return 0; }
+    var n: u64 = g_all_func_sigs.len();
+    for (var i: u64 = 0; i < n; i++) {
+        compiler_validate_single_impl_override(g_all_func_sigs.get(i));
+    }
+    return 0;
+}
+
 func compiler_validate_child_implements_abst_method(sd: *AstStructDef, mi: *NameInfo) -> u64 {
     if (compiler_is_abst_method(sd.name_ptr, sd.name_len, mi.ptr, mi.len) != 0) {
         // Child remains abstract on this method; allowed.
@@ -6066,6 +6732,246 @@ func compiler_insert_default_constructors() -> u64 {
         if (def == 0) { continue; }
         if (compiler_is_generic_struct_def(def) != 0) { continue; }
         compiler_insert_default_constructor(def.name_ptr, def.name_len);
+    }
+    return 0;
+}
+
+func compiler_expr_has_super_constructor_call(expr: *AstNode) -> u64 {
+    if (expr == 0) { return 0; }
+    var kind: u64 = ast_kind(expr);
+    switch (kind) {
+        case AST_METHOD_CALL:
+        case AST_SAFE_METHOD_CALL:
+            var mc: *AstMethodCall = (*AstMethodCall)expr;
+            if (compiler_is_super_expr(mc.receiver) != 0 &&
+                compiler_is_constructor_name(mc.method_ptr, mc.method_len) != 0) {
+                return 1;
+            }
+            if (compiler_expr_has_super_constructor_call(mc.receiver) != 0) { return 1; }
+            if (mc.args_vec != 0) {
+                var an: u64 = mc.args_vec.len();
+                for (var ai: u64 = 0; ai < an; ai++) {
+                    if (compiler_expr_has_super_constructor_call(mc.args_vec.get(ai)) != 0) { return 1; }
+                }
+            }
+            return 0;
+        case AST_CALL:
+            var call: *AstCall = (*AstCall)expr;
+            if (call.args_vec != 0) {
+                var an2: u64 = call.args_vec.len();
+                for (var ai2: u64 = 0; ai2 < an2; ai2++) {
+                    if (compiler_expr_has_super_constructor_call(call.args_vec.get(ai2)) != 0) { return 1; }
+                }
+            }
+            return 0;
+        case AST_CALL_PTR:
+            var cp: *AstCallPtr = (*AstCallPtr)expr;
+            if (compiler_expr_has_super_constructor_call(cp.callee) != 0) { return 1; }
+            if (cp.args_vec != 0) {
+                var an3: u64 = cp.args_vec.len();
+                for (var ai3: u64 = 0; ai3 < an3; ai3++) {
+                    if (compiler_expr_has_super_constructor_call(cp.args_vec.get(ai3)) != 0) { return 1; }
+                }
+            }
+            return 0;
+        case AST_BINARY:
+            var bin: *AstBinary = (*AstBinary)expr;
+            if (compiler_expr_has_super_constructor_call(bin.left) != 0) { return 1; }
+            if (compiler_expr_has_super_constructor_call(bin.right) != 0) { return 1; }
+            return 0;
+        case AST_UNARY:
+            return compiler_expr_has_super_constructor_call(((*AstUnary)expr).operand);
+        case AST_ADDR_OF:
+            return compiler_expr_has_super_constructor_call(((*AstAddrOf)expr).operand);
+        case AST_DEREF:
+            return compiler_expr_has_super_constructor_call(((*AstDeref)expr).operand);
+        case AST_DEREF8:
+            return compiler_expr_has_super_constructor_call(((*AstDeref8)expr).operand);
+        case AST_CAST:
+            return compiler_expr_has_super_constructor_call(((*AstCast)expr).expr);
+        case AST_INDEX:
+            var ix: *AstIndex = (*AstIndex)expr;
+            if (compiler_expr_has_super_constructor_call(ix.base) != 0) { return 1; }
+            return compiler_expr_has_super_constructor_call(ix.index);
+        case AST_MEMBER_ACCESS:
+        case AST_SAFE_MEMBER_ACCESS:
+            return compiler_expr_has_super_constructor_call(((*AstMemberAccess)expr).object);
+        case AST_TRY:
+            return compiler_expr_has_super_constructor_call(((*AstTry)expr).operand);
+        case AST_SLICE:
+            var sl: *AstSlice = (*AstSlice)expr;
+            if (compiler_expr_has_super_constructor_call(sl.ptr_expr) != 0) { return 1; }
+            return compiler_expr_has_super_constructor_call(sl.len_expr);
+        case AST_SIZEOF_EXPR:
+            return compiler_expr_has_super_constructor_call(((*AstSizeofExpr)expr).expr);
+        case AST_STRUCT_LITERAL:
+            var lit: *AstStructLiteral = (*AstStructLiteral)expr;
+            if (lit.values_vec != 0) {
+                var ln: u64 = lit.values_vec.len();
+                for (var li: u64 = 0; li < ln; li++) {
+                    if (compiler_expr_has_super_constructor_call(lit.values_vec.get(li)) != 0) { return 1; }
+                }
+            }
+            return 0;
+        case AST_GENERIC_STRUCT_LITERAL:
+            var glit: *AstGenericStructLiteral = (*AstGenericStructLiteral)expr;
+            if (glit.values_vec != 0) {
+                var gln: u64 = glit.values_vec.len();
+                for (var gli: u64 = 0; gli < gln; gli++) {
+                    if (compiler_expr_has_super_constructor_call(glit.values_vec.get(gli)) != 0) { return 1; }
+                }
+            }
+            return 0;
+        case AST_NEW:
+            var nw: *AstNew = (*AstNew)expr;
+            if (compiler_expr_has_super_constructor_call(nw.literal_expr) != 0) { return 1; }
+            if (nw.ctor_args_vec != 0) {
+                var nn: u64 = nw.ctor_args_vec.len();
+                for (var ni: u64 = 0; ni < nn; ni++) {
+                    if (compiler_expr_has_super_constructor_call(nw.ctor_args_vec.get(ni)) != 0) { return 1; }
+                }
+            }
+            return 0;
+        case AST_STACK_CTOR:
+            var sc: *AstStackCtor = (*AstStackCtor)expr;
+            if (sc.ctor_args_vec != 0) {
+                var sn2: u64 = sc.ctor_args_vec.len();
+                for (var si2: u64 = 0; si2 < sn2; si2++) {
+                    if (compiler_expr_has_super_constructor_call(sc.ctor_args_vec.get(si2)) != 0) { return 1; }
+                }
+            }
+            return 0;
+    }
+    return 0;
+}
+
+func compiler_stmt_has_super_constructor_call(stmt: *AstNode) -> u64 {
+    if (stmt == 0) { return 0; }
+    var kind: u64 = ast_kind(stmt);
+    switch (kind) {
+        case AST_EXPR_STMT:
+            return compiler_expr_has_super_constructor_call(((*AstExprStmt)stmt).expr);
+        case AST_VAR_DECL:
+            return compiler_expr_has_super_constructor_call(((*AstVarDecl)stmt).init_expr);
+        case AST_ASSIGN:
+            var asn: *AstAssign = (*AstAssign)stmt;
+            if (compiler_expr_has_super_constructor_call(asn.target) != 0) { return 1; }
+            return compiler_expr_has_super_constructor_call(asn.value);
+        case AST_RETURN:
+            return compiler_expr_has_super_constructor_call(((*AstReturn)stmt).expr);
+        case AST_IF:
+            var ifs: *AstIf = (*AstIf)stmt;
+            if (compiler_expr_has_super_constructor_call(ifs.cond) != 0) { return 1; }
+            if (compiler_stmt_has_super_constructor_call(ifs.then_block) != 0) { return 1; }
+            return compiler_stmt_has_super_constructor_call(ifs.else_block);
+        case AST_WHILE:
+            var wl: *AstWhile = (*AstWhile)stmt;
+            if (compiler_expr_has_super_constructor_call(wl.cond) != 0) { return 1; }
+            return compiler_stmt_has_super_constructor_call(wl.body);
+        case AST_FOR:
+            var fr: *AstFor = (*AstFor)stmt;
+            if (compiler_stmt_has_super_constructor_call(fr.init) != 0) { return 1; }
+            if (compiler_expr_has_super_constructor_call(fr.cond) != 0) { return 1; }
+            if (compiler_expr_has_super_constructor_call(fr.update) != 0) { return 1; }
+            return compiler_stmt_has_super_constructor_call(fr.body);
+        case AST_SWITCH:
+            var sw: *AstSwitch = (*AstSwitch)stmt;
+            if (compiler_expr_has_super_constructor_call(sw.expr) != 0) { return 1; }
+            if (sw.cases_vec != 0) {
+                var cn: u64 = sw.cases_vec.len();
+                for (var ci: u64 = 0; ci < cn; ci++) {
+                    if (compiler_stmt_has_super_constructor_call(sw.cases_vec.get(ci)) != 0) { return 1; }
+                }
+            }
+            return 0;
+        case AST_CASE:
+            var cs: *AstCase = (*AstCase)stmt;
+            if (compiler_expr_has_super_constructor_call(cs.value) != 0) { return 1; }
+            return compiler_stmt_has_super_constructor_call(cs.body);
+        case AST_BLOCK:
+            var blk: *AstBlock = (*AstBlock)stmt;
+            if (blk.stmts_vec == 0) { return 0; }
+            var n: u64 = blk.stmts_vec.len();
+            for (var i: u64 = 0; i < n; i++) {
+                if (compiler_stmt_has_super_constructor_call(blk.stmts_vec.get(i)) != 0) { return 1; }
+            }
+            return 0;
+    }
+    return 0;
+}
+
+func compiler_insert_auto_super_constructor_chain_for_fn(fn: *AstFunc) -> u64 {
+    if (fn == 0) { return 0; }
+    if (fn.impl_owner_ptr == 0 || fn.impl_owner_len == 0) { return 0; }
+
+    var method_ptr: u64 = fn.impl_original_name_ptr;
+    var method_len: u64 = fn.impl_original_name_len;
+    if (method_ptr == 0 || method_len == 0) {
+        method_ptr = fn.name_ptr;
+        method_len = fn.name_len;
+    }
+    if (compiler_is_constructor_name(method_ptr, method_len) == 0) { return 0; }
+
+    var owner_def: *AstStructDef = get_struct_def(fn.impl_owner_ptr, fn.impl_owner_len);
+    if (owner_def == 0 || owner_def.parents_vec == 0 || owner_def.parents_vec.len() == 0) { return 0; }
+    if (compiler_stmt_has_super_constructor_call(fn.body) != 0) { return 0; }
+
+    if (owner_def.parents_vec.len() != 1) {
+        emit_stderr("[ERROR] automatic super constructor chaining is ambiguous with multiple parents: ");
+        emit_stderr_len(owner_def.name_ptr, owner_def.name_len);
+        emit_stderr("\n");
+        panic("Compiler error");
+    }
+
+    var parent_desc: *ParentDesc = owner_def.parents_vec.get(0);
+    var parent_def: *AstStructDef = compiler_resolve_parent_def(parent_desc, "Compiler error");
+    var parent_ctor: CompilerMethodResolveResult = compiler_resolve_method_overload(parent_def.name_ptr, parent_def.name_len, "constructor", 11, 0, 0);
+    if (parent_ctor.found == 0) {
+        emit_stderr("[ERROR] parent constructor() is required for automatic super chaining: ");
+        emit_stderr_len(parent_def.name_ptr, parent_def.name_len);
+        emit_stderr("\n");
+        panic("Compiler error");
+    }
+
+    var injected_args: *Vec<*AstNode> = new Vec<*AstNode>(0);
+    var injected_call: *AstMethodCall = ast_method_call((*AstNode)ast_super(), "constructor", 11, injected_args);
+    var injected_stmt: *AstNode = (*AstNode)ast_expr_stmt((*AstNode)injected_call);
+
+    if (fn.body == 0) {
+        var only_stmts: *Vec<*AstNode> = new Vec<*AstNode>(1);
+        only_stmts.push(injected_stmt);
+        fn.body = (*AstNode)ast_block(only_stmts);
+        return 0;
+    }
+
+    if (ast_kind(fn.body) != AST_BLOCK) {
+        var wrapped_stmts: *Vec<*AstNode> = new Vec<*AstNode>(2);
+        wrapped_stmts.push(injected_stmt);
+        wrapped_stmts.push(fn.body);
+        fn.body = (*AstNode)ast_block(wrapped_stmts);
+        return 0;
+    }
+
+    var body_block: *AstBlock = (*AstBlock)fn.body;
+    var old_stmts: *Vec<*AstNode> = body_block.stmts_vec;
+    if (old_stmts == 0) {
+        old_stmts = new Vec<*AstNode>(1);
+    }
+    var old_len: u64 = old_stmts.len();
+    var new_stmts: *Vec<*AstNode> = new Vec<*AstNode>(old_len + 1);
+    new_stmts.push(injected_stmt);
+    for (var i2: u64 = 0; i2 < old_len; i2++) {
+        new_stmts.push(old_stmts.get(i2));
+    }
+    body_block.stmts_vec = new_stmts;
+    return 0;
+}
+
+func compiler_insert_auto_super_constructor_chains() -> u64 {
+    if (g_all_funcs == 0) { return 0; }
+    var n: u64 = g_all_funcs.len();
+    for (var i: u64 = 0; i < n; i++) {
+        compiler_insert_auto_super_constructor_chain_for_fn(g_all_funcs.get(i));
     }
     return 0;
 }
