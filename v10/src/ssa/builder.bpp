@@ -3562,6 +3562,46 @@ func builder_cast_adjust_sub(ctx: *BuilderCtx, base_reg: u64, offset: u64) -> u6
     return out_reg;
 }
 
+func builder_emit_trap_ud2(ctx: *BuilderCtx) -> u64 {
+    var text_vec: *Vec<u64> = new Vec<u64>(4);
+    text_vec.push(117); // 'u'
+    text_vec.push(100); // 'd'
+    text_vec.push(50);  // '2'
+    text_vec.push(10);  // '\n'
+    var inst_ptr: *SSAInstruction = ssa_new_inst(ctx.ssa_ctx, SSA_OP_ASM, 0, ssa_operand_const((u64)text_vec), 0);
+    ssa_inst_append(ctx.cur_block, inst_ptr);
+    return 0;
+}
+
+func builder_load_vtable_ptr(ctx: *BuilderCtx, base_reg: u64, vptr_offset: u64) -> u64 {
+    var vptr_addr: u64 = builder_cast_adjust_add(ctx, base_reg, vptr_offset);
+    return builder_load_by_size(ctx, vptr_addr, 8);
+}
+
+func builder_emit_checked_vtable_guard(ctx: *BuilderCtx, loaded_vtable_reg: u64, expected_vtable_ptr: u64, expected_vtable_len: u64) -> u64 {
+    if (expected_vtable_ptr == 0 || expected_vtable_len == 0) { return 0; }
+    var expected_reg: u64 = builder_new_lea_global(ctx, expected_vtable_ptr, expected_vtable_len);
+    var cond_reg: u64 = builder_new_reg(ctx);
+    var cmp_ptr: *SSAInstruction = ssa_new_inst(ctx.ssa_ctx, SSA_OP_EQ, cond_reg, ssa_operand_reg(loaded_vtable_reg), ssa_operand_reg(expected_reg));
+    ssa_inst_append(ctx.cur_block, cmp_ptr);
+
+    var ok_bb: *SSABlock = ssa_new_block(ctx.ssa_ctx, ctx.cur_func);
+    var fail_bb: *SSABlock = ssa_new_block(ctx.ssa_ctx, ctx.cur_func);
+    var br_ptr: *SSAInstruction = ssa_new_inst(ctx.ssa_ctx, SSA_OP_BR, ssa_operand_const(fail_bb.id), ssa_operand_reg(cond_reg), ssa_operand_const(ok_bb.id));
+    ssa_inst_append(ctx.cur_block, br_ptr);
+    ssa_add_edge(ctx.cur_block, ok_bb);
+    ssa_add_edge(ctx.cur_block, fail_bb);
+
+    ctx.cur_block = fail_bb;
+    builder_emit_trap_ud2(ctx);
+    var jmp_ptr: *SSAInstruction = ssa_new_inst(ctx.ssa_ctx, SSA_OP_JMP, 0, ssa_operand_const(ok_bb.id), 0);
+    ssa_inst_append(ctx.cur_block, jmp_ptr);
+    ssa_add_edge(ctx.cur_block, ok_bb);
+
+    ctx.cur_block = ok_bb;
+    return 0;
+}
+
 func builder_cast_try_adjust_struct_ptr(ctx: *BuilderCtx, src_ti: *TypeInfo, target_struct_ptr: u64, target_struct_len: u64, src_reg: u64) -> u64 {
     if (src_ti == 0) { return src_reg; }
     if (src_ti.type_kind != TYPE_STRUCT || src_ti.ptr_depth == 0) { return src_reg; }
@@ -3638,10 +3678,12 @@ func builder_expr_cast(ctx: *BuilderCtx, node: u64) -> u64 {
                 emit_stderr("[ERROR] vptr field not found for trait cast\n");
                 panic("SSA build error");
             }
-            // Checked trait->struct cast guard is currently emitted only in classic backend.
-            // Mark this function unsupported for SSA so codegen falls back safely.
-            ctx.build_failed = 1;
-            return src_reg;
+            if (src_ti.is_tagged == 1) {
+                src_reg = builder_mask_tagged_ptr(ctx, src_reg);
+            }
+            var loaded_vtable_reg: u64 = builder_load_vtable_ptr(ctx, src_reg, 0);
+            builder_emit_checked_vtable_guard(ctx, loaded_vtable_reg, impl2.vtable_global_ptr, impl2.vtable_global_len);
+            return builder_cast_adjust_sub(ctx, src_reg, field_offset2);
         }
 
         if (cast.target_ptr_depth > 0 && src_ti != 0 && src_ti.type_kind == TYPE_STRUCT && src_ti.ptr_depth > 0) {
@@ -3651,10 +3693,8 @@ func builder_expr_cast(ctx: *BuilderCtx, node: u64) -> u64 {
             if (compiler_is_strict_downcast(src_ti.struct_name_ptr, src_ti.struct_name_len, cast.struct_name_ptr, cast.struct_name_len) != 0) {
                 var check_info: CompilerDowncastCheckInfo = compiler_require_checked_struct_downcast_info(src_ti.struct_name_ptr, src_ti.struct_name_len, cast.struct_name_ptr, cast.struct_name_len);
                 if (check_info.found != 0) {
-                    // Runtime checked struct downcast guard is emitted only in classic backend.
-                    // Mark this function unsupported for SSA so codegen falls back safely.
-                    ctx.build_failed = 1;
-                    return src_reg;
+                    var loaded_vtable_reg2: u64 = builder_load_vtable_ptr(ctx, src_reg, check_info.src_vptr_offset);
+                    builder_emit_checked_vtable_guard(ctx, loaded_vtable_reg2, check_info.expected_vtable_ptr, check_info.expected_vtable_len);
                 }
             }
             return builder_cast_try_adjust_struct_ptr(ctx, src_ti, cast.struct_name_ptr, cast.struct_name_len, src_reg);
