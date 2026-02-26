@@ -339,30 +339,59 @@ func builder_emit_return_struct_from_addr_reg(ctx: *BuilderCtx, addr_reg: u64, s
     return 0;
 }
 
-func builder_resolve_constructor_name(struct_ptr: u64, struct_len: u64) -> *PtrLen {
+func builder_resolve_constructor_call(struct_ptr: u64, struct_len: u64, args: *Vec<*AstNode>, symtab: *Symtab, site_ptr: u64, site_len: u64) -> CompilerMethodResolveResult {
+    var resolved: CompilerMethodResolveResult = compiler_method_resolve_none();
     var method_ptr: u64 = (u64)"constructor";
     var method_len: u64 = 11;
     var base_len: u64 = compiler_find_generic_suffix_index(struct_ptr, struct_len);
     var suffix_len: u64 = struct_len - base_len;
     var name_info: *NameInfo = compiler_build_method_name_base(struct_ptr, base_len, method_ptr, method_len, suffix_len);
+    var alt_info: *NameInfo = compiler_build_method_name_base(struct_ptr, base_len, method_ptr, method_len, 0);
     if (compiler_func_exists(name_info.ptr, name_info.len) == 0) {
-        var alt_info: *NameInfo = compiler_build_method_name_base(struct_ptr, base_len, method_ptr, method_len, 0);
-        if (compiler_func_exists(alt_info.ptr, alt_info.len) == 0) {
-            emit_stderr("[ERROR] constructor not found for stack/new\n");
-            emit_stderr_len(struct_ptr, struct_len);
-            emit_stderr("\n");
-            return 0;
-        }
         name_info = alt_info;
     }
-    var resolved_ptr: u64 = name_info.ptr;
-    var resolved_len: u64 = name_info.len;
-    var resolved: *NameInfo = resolve_name(name_info.ptr, name_info.len);
-    if (resolved != 0) {
-        resolved_ptr = resolved.ptr;
-        resolved_len = resolved.len;
+    if (compiler_func_exists(name_info.ptr, name_info.len) != 0) {
+        var fn_ctor: *AstFunc = typeinfo_find_func(name_info.ptr, name_info.len);
+        if (fn_ctor == 0) {
+            var resolved_name: *NameInfo = resolve_name(name_info.ptr, name_info.len);
+            if (resolved_name != 0) {
+                fn_ctor = typeinfo_find_func(resolved_name.ptr, resolved_name.len);
+            }
+        }
+        if (fn_ctor != 0) {
+            resolved.found = 1;
+            resolved.fn = fn_ctor;
+            var owner_map: *NameInfo = compiler_get_impl_method_owner(name_info.ptr, name_info.len);
+            if (owner_map != 0) {
+                resolved.owner_ptr = owner_map.ptr;
+                resolved.owner_len = owner_map.len;
+            } else {
+                resolved.owner_ptr = fn_ctor.impl_owner_ptr;
+                resolved.owner_len = fn_ctor.impl_owner_len;
+            }
+            resolved.access = compiler_get_impl_method_access(name_info.ptr, name_info.len);
+        }
     }
-    return new PtrLen{resolved_ptr, resolved_len};
+    if (resolved.found == 0 || resolved.fn == 0) {
+        emit_stderr("[ERROR] constructor not found for ");
+        emit_stderr_len(site_ptr, site_len);
+        emit_stderr(": ");
+        emit_stderr_len(struct_ptr, struct_len);
+        emit_stderr("\n");
+        panic("SSA build error");
+    }
+    if (resolved.owner_ptr == 0 || resolved.owner_len == 0) {
+        resolved.owner_ptr = struct_ptr;
+        resolved.owner_len = struct_len;
+    }
+    if (resolved.access == 0) { resolved.access = ACCESS_PUBLIC; }
+    if (compiler_can_access_member(resolved.owner_ptr, resolved.owner_len, resolved.access) == 0) {
+        emit_stderr("[ERROR] constructor access denied: ");
+        emit_stderr_len(resolved.owner_ptr, resolved.owner_len);
+        emit_stderr(".constructor\n");
+        panic("SSA build error");
+    }
+    return resolved;
 }
 
 func builder_stack_ctor_init_at_addr(ctx: *BuilderCtx, sc: *AstStackCtor, base_addr: u64) -> u64 {
@@ -390,10 +419,9 @@ func builder_stack_ctor_init_at_addr(ctx: *BuilderCtx, sc: *AstStackCtor, base_a
 
     var args: *Vec<*AstNode> = sc.ctor_args_vec;
     if (args != 0) {
-        var name_info: *PtrLen = builder_resolve_constructor_name(sc.struct_name_ptr, sc.struct_name_len);
-        if (name_info == 0) { return 0; }
+        var ctor_resolved: CompilerMethodResolveResult = builder_resolve_constructor_call(sc.struct_name_ptr, sc.struct_name_len, args, ctx.symtab, "stack ctor", 10);
         var arg_regs: *Vec<u64> = builder_make_call_arg_regs_nodes(ctx, args, builder_call_prefix_one(base_addr));
-        builder_emit_call_name_raw(ctx, name_info.ptr, name_info.len, arg_regs, 0, 0, TYPE_VOID, 0, 0);
+        builder_emit_call_name_raw(ctx, ctor_resolved.fn.name_ptr, ctor_resolved.fn.name_len, arg_regs, 0, 0, TYPE_VOID, 0, 0);
     }
     return 0;
 }
@@ -2631,11 +2659,10 @@ func builder_expr_new(ctx: *BuilderCtx, node: u64) -> u64 {
             emit_stderr("[ERROR] new constructor call requires struct type\n");
             panic("SSA build error");
         }
-        var name_info: *PtrLen = builder_resolve_constructor_name(nw.struct_name_ptr, nw.struct_name_len);
-        if (name_info == 0) { return heap_reg; }
         var args: *Vec<*AstNode> = nw.ctor_args_vec;
+        var ctor_resolved: CompilerMethodResolveResult = builder_resolve_constructor_call(nw.struct_name_ptr, nw.struct_name_len, args, ctx.symtab, "new", 3);
         var arg_regs: *Vec<u64> = builder_make_call_arg_regs_nodes(ctx, args, builder_call_prefix_one(heap_reg));
-        builder_emit_call_name_raw(ctx, name_info.ptr, name_info.len, arg_regs, 0, 0, TYPE_VOID, 0, 0);
+        builder_emit_call_name_raw(ctx, ctor_resolved.fn.name_ptr, ctor_resolved.fn.name_len, arg_regs, 0, 0, TYPE_VOID, 0, 0);
     }
 
     return heap_reg;
@@ -3611,12 +3638,24 @@ func builder_expr_cast(ctx: *BuilderCtx, node: u64) -> u64 {
                 emit_stderr("[ERROR] vptr field not found for trait cast\n");
                 panic("SSA build error");
             }
-            return builder_cast_adjust_sub(ctx, src_reg, field_offset2);
+            // Checked trait->struct cast guard is currently emitted only in classic backend.
+            // Mark this function unsupported for SSA so codegen falls back safely.
+            ctx.build_failed = 1;
+            return src_reg;
         }
 
         if (cast.target_ptr_depth > 0 && src_ti != 0 && src_ti.type_kind == TYPE_STRUCT && src_ti.ptr_depth > 0) {
             if (src_ti.is_tagged == 1) {
                 src_reg = builder_mask_tagged_ptr(ctx, src_reg);
+            }
+            if (compiler_is_strict_downcast(src_ti.struct_name_ptr, src_ti.struct_name_len, cast.struct_name_ptr, cast.struct_name_len) != 0) {
+                var check_info: CompilerDowncastCheckInfo = compiler_require_checked_struct_downcast_info(src_ti.struct_name_ptr, src_ti.struct_name_len, cast.struct_name_ptr, cast.struct_name_len);
+                if (check_info.found != 0) {
+                    // Runtime checked struct downcast guard is emitted only in classic backend.
+                    // Mark this function unsupported for SSA so codegen falls back safely.
+                    ctx.build_failed = 1;
+                    return src_reg;
+                }
             }
             return builder_cast_try_adjust_struct_ptr(ctx, src_ti, cast.struct_name_ptr, cast.struct_name_len, src_reg);
         }

@@ -131,49 +131,62 @@ func cg_stack_ctor_emit_memzero(size: u64) -> u64 {
     return 0;
 }
 
-func cg_stack_ctor_resolve_constructor(sc: *AstStackCtor) -> *NameInfo {
-    var result: *NameInfo = new NameInfo();
-    result.ptr = 0;
-    result.len = 0;
+func cg_resolve_constructor_call(struct_ptr: u64, struct_len: u64, args: *Vec<*AstNode>, symtab: *Symtab, site_ptr: u64, site_len: u64) -> CompilerMethodResolveResult {
+    var resolved: CompilerMethodResolveResult = compiler_method_resolve_none();
     var method_ptr: u64 = (u64)"constructor";
     var method_len: u64 = 11;
-    var base_len: u64 = compiler_find_generic_suffix_index(sc.struct_name_ptr, sc.struct_name_len);
-    var suffix_len: u64 = sc.struct_name_len - base_len;
-    var name_info: *NameInfo = compiler_build_method_name_base(sc.struct_name_ptr, base_len, method_ptr, method_len, suffix_len);
-    var call_ptr: u64 = name_info.ptr;
-    var call_len: u64 = name_info.len;
-    var resolved: *NameInfo = resolve_name(name_info.ptr, name_info.len);
-    if (resolved != 0) {
-        call_ptr = resolved.ptr;
-        call_len = resolved.len;
-    }
-
+    var base_len: u64 = compiler_find_generic_suffix_index(struct_ptr, struct_len);
+    var suffix_len: u64 = struct_len - base_len;
+    var name_info: *NameInfo = compiler_build_method_name_base(struct_ptr, base_len, method_ptr, method_len, suffix_len);
+    var alt_info: *NameInfo = compiler_build_method_name_base(struct_ptr, base_len, method_ptr, method_len, 0);
     if (compiler_func_exists(name_info.ptr, name_info.len) == 0) {
-        var alt_info: *NameInfo = compiler_build_method_name_base(sc.struct_name_ptr, base_len, method_ptr, method_len, 0);
-        var alt_call_ptr: u64 = alt_info.ptr;
-        var alt_call_len: u64 = alt_info.len;
-        var alt_res: *NameInfo = resolve_name(alt_info.ptr, alt_info.len);
-        if (alt_res != 0) {
-            alt_call_ptr = alt_res.ptr;
-            alt_call_len = alt_res.len;
-        }
-        if (compiler_func_exists(alt_info.ptr, alt_info.len) == 0) {
-            emit_stderr("[ERROR] constructor not found for stack ctor\n");
-            emit_stderr_len(sc.struct_name_ptr, sc.struct_name_len);
-            emit_stderr("\n");
-            panic("Codegen error");
-        }
-        call_ptr = alt_call_ptr;
-        call_len = alt_call_len;
+        name_info = alt_info;
     }
-
-    result.ptr = call_ptr;
-    result.len = call_len;
-    return result;
+    if (compiler_func_exists(name_info.ptr, name_info.len) != 0) {
+        var fn_ctor: *AstFunc = typeinfo_find_func(name_info.ptr, name_info.len);
+        if (fn_ctor == 0) {
+            var resolved_name: *NameInfo = resolve_name(name_info.ptr, name_info.len);
+            if (resolved_name != 0) {
+                fn_ctor = typeinfo_find_func(resolved_name.ptr, resolved_name.len);
+            }
+        }
+        if (fn_ctor != 0) {
+            resolved.found = 1;
+            resolved.fn = fn_ctor;
+            var owner_map: *NameInfo = compiler_get_impl_method_owner(name_info.ptr, name_info.len);
+            if (owner_map != 0) {
+                resolved.owner_ptr = owner_map.ptr;
+                resolved.owner_len = owner_map.len;
+            } else {
+                resolved.owner_ptr = fn_ctor.impl_owner_ptr;
+                resolved.owner_len = fn_ctor.impl_owner_len;
+            }
+            resolved.access = compiler_get_impl_method_access(name_info.ptr, name_info.len);
+        }
+    }
+    if (resolved.found == 0 || resolved.fn == 0) {
+        emit_stderr("[ERROR] constructor not found for ");
+        emit_stderr_len(site_ptr, site_len);
+        emit_stderr(": ");
+        emit_stderr_len(struct_ptr, struct_len);
+        emit_stderr("\n");
+        panic("Codegen error");
+    }
+    if (resolved.owner_ptr == 0 || resolved.owner_len == 0) {
+        resolved.owner_ptr = struct_ptr;
+        resolved.owner_len = struct_len;
+    }
+    if (resolved.access == 0) { resolved.access = ACCESS_PUBLIC; }
+    if (compiler_can_access_member(resolved.owner_ptr, resolved.owner_len, resolved.access) == 0) {
+        emit_stderr("[ERROR] constructor access denied: ");
+        emit_stderr_len(resolved.owner_ptr, resolved.owner_len);
+        emit_stderr(".constructor\n");
+        panic("Codegen error");
+    }
+    return resolved;
 }
 
-func cg_stack_ctor_emit_constructor_call(sc: *AstStackCtor, symtab: *Symtab, call_ptr: u64, call_len: u64) -> u64 {
-    var fn_ctor: *AstFunc = typeinfo_find_func(call_ptr, call_len);
+func cg_stack_ctor_emit_constructor_call(sc: *AstStackCtor, symtab: *Symtab, fn_ctor: *AstFunc, call_ptr: u64, call_len: u64) -> u64 {
     var args: *Vec<*AstNode> = sc.ctor_args_vec;
     var nargs: u64 = 0;
     if (args != 0) { nargs = args.len(); }
@@ -211,8 +224,15 @@ func cg_stack_ctor_call_at_r12(sc: *AstStackCtor, symtab: *Symtab) -> u64 {
     cg_stack_ctor_emit_memzero(size);
 
     cg_emit_trait_vptr_init_at_r12(sc.struct_name_ptr, sc.struct_name_len);
-    var ctor_name: *NameInfo = cg_stack_ctor_resolve_constructor(sc);
-    return cg_stack_ctor_emit_constructor_call(sc, symtab, ctor_name.ptr, ctor_name.len);
+    var resolved_ctor: CompilerMethodResolveResult = cg_resolve_constructor_call(sc.struct_name_ptr, sc.struct_name_len, sc.ctor_args_vec, symtab, "stack ctor", 10);
+    var call_ptr: u64 = resolved_ctor.fn.name_ptr;
+    var call_len: u64 = resolved_ctor.fn.name_len;
+    var alias_name: *NameInfo = resolve_name(call_ptr, call_len);
+    if (alias_name != 0) {
+        call_ptr = alias_name.ptr;
+        call_len = alias_name.len;
+    }
+    return cg_stack_ctor_emit_constructor_call(sc, symtab, resolved_ctor.fn, call_ptr, call_len);
 }
 
 func cg_stack_ctor_init_to_offset(sc: *AstStackCtor, dest_offset: u64, symtab: *Symtab) -> u64 {
@@ -1514,7 +1534,7 @@ func cg_expr_cast(node: u64, symtab: *Symtab) -> u64 {
             if (src_ti2.is_tagged == 1) { emit_tagged_mask(); }
             if (str_eq(src_ti2.struct_name_ptr, src_ti2.struct_name_len, cast.struct_name_ptr, cast.struct_name_len) == 0 &&
                 compiler_struct_is_same_or_descendant(cast.struct_name_ptr, cast.struct_name_len, src_ti2.struct_name_ptr, src_ti2.struct_name_len) != 0) {
-                var check_info: CompilerDowncastCheckInfo = compiler_find_downcast_check_info(src_ti2.struct_name_ptr, src_ti2.struct_name_len, cast.struct_name_ptr, cast.struct_name_len);
+                var check_info: CompilerDowncastCheckInfo = compiler_require_checked_struct_downcast_info(src_ti2.struct_name_ptr, src_ti2.struct_name_len, cast.struct_name_ptr, cast.struct_name_len);
                 cg_emit_checked_struct_downcast_guard(check_info);
             }
             cg_try_adjust_struct_ptr_cast(src_ti2, cast.struct_name_ptr, cast.struct_name_len);
@@ -1614,42 +1634,16 @@ func cg_new_invoke_constructor(nw: *AstNew, symtab: *Symtab) -> u64 {
         panic("Codegen error");
     }
 
-    var method_ptr: u64 = (u64)"constructor";
-    var method_len: u64 = 11;
-    var base_len: u64 = compiler_find_generic_suffix_index(nw.struct_name_ptr, nw.struct_name_len);
-    var suffix_len: u64 = nw.struct_name_len - base_len;
-    var name_info: *NameInfo = compiler_build_method_name_base(nw.struct_name_ptr, base_len, method_ptr, method_len, suffix_len);
-    var call_ptr: u64 = name_info.ptr;
-    var call_len: u64 = name_info.len;
-    var resolved: *NameInfo = resolve_name(name_info.ptr, name_info.len);
-    if (resolved != 0) {
-        call_ptr = resolved.ptr;
-        call_len = resolved.len;
-    }
-
-    if (compiler_func_exists(name_info.ptr, name_info.len) == 0) {
-        var alt_info: *NameInfo = compiler_build_method_name_base(nw.struct_name_ptr, base_len, method_ptr, method_len, 0);
-        var alt_call_ptr: u64 = alt_info.ptr;
-        var alt_call_len: u64 = alt_info.len;
-        var alt_res: *NameInfo = resolve_name(alt_info.ptr, alt_info.len);
-        if (alt_res != 0) {
-            alt_call_ptr = alt_res.ptr;
-            alt_call_len = alt_res.len;
-        }
-
-        if (compiler_func_exists(alt_info.ptr, alt_info.len) == 0) {
-            emit_stderr("[ERROR] constructor not found for new\n");
-            emit_stderr_len(nw.struct_name_ptr, nw.struct_name_len);
-            emit_stderr("\n");
-            panic("Codegen error");
-        }
-
-        call_ptr = alt_call_ptr;
-        call_len = alt_call_len;
-    }
-
-    var fn_ctor: *AstFunc = typeinfo_find_func(call_ptr, call_len);
     var args: *Vec<*AstNode> = nw.ctor_args_vec;
+    var resolved_ctor: CompilerMethodResolveResult = cg_resolve_constructor_call(nw.struct_name_ptr, nw.struct_name_len, args, symtab, "new", 3);
+    var fn_ctor: *AstFunc = resolved_ctor.fn;
+    var call_ptr: u64 = fn_ctor.name_ptr;
+    var call_len: u64 = fn_ctor.name_len;
+    var resolved_name: *NameInfo = resolve_name(call_ptr, call_len);
+    if (resolved_name != 0) {
+        call_ptr = resolved_name.ptr;
+        call_len = resolved_name.len;
+    }
     var nargs: u64 = args.len();
     var total_arg_words: u64 = 0;
     if (nargs != 0) {

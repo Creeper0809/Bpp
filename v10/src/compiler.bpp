@@ -93,6 +93,7 @@ var g_abst_methods_sigs: *HashMap<u64, *HashMap<u64, *AstFunc>> = 0; // HashMap:
 var g_virtual_dispatch_traits: *HashMap<u64, *HashMap<u64, *NameInfo>> = 0; // HashMap: struct -> (method -> virtual trait)
 var g_current_access_struct_ptr: u64 = 0;
 var g_current_access_struct_len: u64 = 0;
+var g_super_instance_method_ctx: u64 = 0;
 var g_resolve_name_hits: *HashMap<u64, *HashMap<u64, *NameInfo>> = 0;     // HashMap: module_id -> (name -> resolved)
 var g_resolve_name_misses: *HashMap<u64, *HashMap<u64, u64>> = 0;          // HashMap: module_id -> (name -> miss=1)
 var g_reg_aliases: *HashMap<u64, *NameInfo> = new HashMap<u64, *NameInfo>(64);   // HashMap: alias name -> register name
@@ -2293,6 +2294,19 @@ func compiler_resolve_method_overload(struct_ptr: u64, struct_len: u64, method_p
     result.owner_ptr = best_fn.impl_owner_ptr;
     result.owner_len = best_fn.impl_owner_len;
     result.access = best_fn.impl_method_access;
+    return result;
+}
+
+func compiler_resolve_method_overload_with_count_fallback(struct_ptr: u64, struct_len: u64, method_ptr: u64, method_len: u64, arg_types: *Vec<*TypeInfo>, arg_count_hint: u64) -> CompilerMethodResolveResult {
+    var result: CompilerMethodResolveResult = compiler_resolve_method_overload(struct_ptr, struct_len, method_ptr, method_len, arg_types, arg_count_hint);
+    if (result.found == 0 && arg_types != 0) {
+        result = compiler_resolve_method_overload(struct_ptr, struct_len, method_ptr, method_len, 0, arg_count_hint);
+    }
+    return result;
+}
+
+func compiler_resolve_constructor_overload(struct_ptr: u64, struct_len: u64, arg_types: *Vec<*TypeInfo>, arg_count_hint: u64) -> CompilerMethodResolveResult {
+    var result: CompilerMethodResolveResult = compiler_resolve_method_overload_with_count_fallback(struct_ptr, struct_len, "constructor", 11, arg_types, arg_count_hint);
     return result;
 }
 
@@ -5136,6 +5150,10 @@ func compiler_super_resolve_parent(owner_ptr: u64, owner_len: u64) -> CompilerRe
         emit_stderr("[ERROR] 'super' is only allowed inside impl methods\n");
         panic("Compiler error");
     }
+    if (g_super_instance_method_ctx == 0) {
+        emit_stderr("[ERROR] 'super' is not allowed in static methods\n");
+        panic("Compiler error");
+    }
 
     var owner_def: *AstStructDef = get_struct_def(owner_ptr, owner_len);
     if (owner_def == 0) {
@@ -5460,6 +5478,7 @@ func compiler_resolve_super_references() -> u64 {
         for (var i: u64 = 0; i < fn_count; i++) {
             var fn: *AstFunc = g_all_funcs.get(i);
             if (fn == 0 || fn.body == 0) { continue; }
+            g_super_instance_method_ctx = compiler_method_param_start_index(fn);
             var owner_info: *NameInfo = compiler_get_impl_method_owner(fn.name_ptr, fn.name_len);
             var owner_ptr: u64 = 0;
             var owner_len: u64 = 0;
@@ -5472,6 +5491,7 @@ func compiler_resolve_super_references() -> u64 {
     }
 
     if (g_all_globals != 0) {
+        g_super_instance_method_ctx = 0;
         var gn: u64 = g_all_globals.len();
         for (var gi: u64 = 0; gi < gn; gi++) {
             var ginfo: *GlobalInfo = g_all_globals.get(gi);
@@ -5479,6 +5499,7 @@ func compiler_resolve_super_references() -> u64 {
             ginfo.init_expr = (u64)compiler_lower_super_expr((*AstNode)ginfo.init_expr, 0, 0);
         }
     }
+    g_super_instance_method_ctx = 0;
     return 0;
 }
 
@@ -5611,6 +5632,13 @@ func compiler_downcast_check_info_none() -> CompilerDowncastCheckInfo {
     return info;
 }
 
+func compiler_is_strict_downcast(src_struct_ptr: u64, src_struct_len: u64, target_struct_ptr: u64, target_struct_len: u64) -> u64 {
+    if (src_struct_ptr == 0 || src_struct_len == 0 || target_struct_ptr == 0 || target_struct_len == 0) { return 0; }
+    if (str_eq(src_struct_ptr, src_struct_len, target_struct_ptr, target_struct_len) != 0) { return 0; }
+    if (compiler_struct_is_same_or_descendant(target_struct_ptr, target_struct_len, src_struct_ptr, src_struct_len) == 0) { return 0; }
+    return 1;
+}
+
 func compiler_find_downcast_check_info(src_struct_ptr: u64, src_struct_len: u64, target_struct_ptr: u64, target_struct_len: u64) -> CompilerDowncastCheckInfo {
     var info: CompilerDowncastCheckInfo = compiler_downcast_check_info_none();
     if (src_struct_ptr == 0 || src_struct_len == 0 || target_struct_ptr == 0 || target_struct_len == 0) { return info; }
@@ -5645,6 +5673,21 @@ func compiler_find_downcast_check_info(src_struct_ptr: u64, src_struct_len: u64,
         info.expected_vtable_len = target_impl.vtable_global_len;
         return info;
     }
+    return info;
+}
+
+func compiler_require_checked_struct_downcast_info(src_struct_ptr: u64, src_struct_len: u64, target_struct_ptr: u64, target_struct_len: u64) -> CompilerDowncastCheckInfo {
+    var info: CompilerDowncastCheckInfo = compiler_find_downcast_check_info(src_struct_ptr, src_struct_len, target_struct_ptr, target_struct_len);
+    if (compiler_is_strict_downcast(src_struct_ptr, src_struct_len, target_struct_ptr, target_struct_len) == 0) {
+        return info;
+    }
+    if (info.found != 0) { return info; }
+    emit_stderr("[ERROR] unchecked downcast is forbidden without virtual dispatch metadata: ");
+    emit_stderr_len(src_struct_ptr, src_struct_len);
+    emit_stderr(" -> ");
+    emit_stderr_len(target_struct_ptr, target_struct_len);
+    emit_stderr("\n");
+    panic("Compiler error");
     return info;
 }
 
