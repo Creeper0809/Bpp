@@ -69,6 +69,15 @@ fi
 
 echo "   (ASM work dir: ${ASM_WORK_DIR})"
 
+if [ ! -x "${BASE_BIN}" ]; then
+    chmod +x "${BASE_BIN}" 2>/dev/null || true
+fi
+if [ ! -x "${BASE_BIN}" ]; then
+    echo "Error: Base compiler is not executable: ${BASE_BIN}"
+    echo "   Run: chmod +x ${BASE_BIN}"
+    exit 1
+fi
+
 "${BASE_BIN}" -asm "${SRC_FILE}" > "${STAGE0_ASM}"
 nasm ${NASM_FLAGS} "${STAGE0_ASM}" -o "build/${VERSION}_stage0.o"
 ld build/${VERSION}_stage0.o -o bin/${VERSION}_stage0

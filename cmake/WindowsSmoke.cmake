@@ -36,7 +36,7 @@ if(NOT _nasm_code EQUAL 0)
 endif()
 
 execute_process(
-    COMMAND "${BPP_LINKER_EXECUTABLE}" /nologo /subsystem:console /entry:mainCRTStartup /out:"${_exe_file}" "${_obj_file}" kernel32.lib
+    COMMAND "${BPP_LINKER_EXECUTABLE}" /nologo /subsystem:console /entry:mainCRTStartup /out:${_exe_file} "${_obj_file}" kernel32.lib
     RESULT_VARIABLE _link_code
     ERROR_VARIABLE _link_error
 )
