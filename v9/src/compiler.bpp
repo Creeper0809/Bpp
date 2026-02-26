@@ -2724,6 +2724,15 @@ func _compiler_find_field_desc_unscoped(struct_def: *AstStructDef, member_ptr: u
         emit_stderr("[ERROR] Inheritance depth exceeded\n");
         panic("Compiler error");
     }
+    if (struct_def.is_union == 1) {
+        var ufields: *Vec<*FieldDesc> = struct_def.fields_vec;
+        var un: u64 = ufields.len();
+        for (var ui: u64 = 0; ui < un; ui++) {
+            var uf: *FieldDesc = ufields.get(ui);
+            if (str_eq(uf.name_ptr, uf.name_len, member_ptr, member_len)) { return uf; }
+        }
+        return 0;
+    }
     var fields: *Vec<*FieldDesc> = struct_def.fields_vec;
     var n: u64 = fields.len();
     for (var i: u64 = 0; i < n; i++) {
@@ -2757,6 +2766,13 @@ func _compiler_find_field_desc_unscoped(struct_def: *AstStructDef, member_ptr: u
 
 func compiler_find_struct_field_desc_scoped(struct_def: *AstStructDef, parent_ptr: u64, parent_len: u64, member_ptr: u64, member_len: u64) -> *FieldDesc {
     if (struct_def == 0) { return 0; }
+    if (struct_def.is_union == 1) {
+        if (parent_ptr != 0) {
+            emit_stderr("[ERROR] union cannot use parent scope\n");
+            panic("Compiler error");
+        }
+        return _compiler_find_field_desc_unscoped(struct_def, member_ptr, member_len, 0);
+    }
     if (parent_ptr != 0) {
         var parent_def: *AstStructDef = _compiler_find_parent_def(struct_def, parent_ptr, parent_len, 0);
         if (parent_def == 0) {
@@ -3508,7 +3524,7 @@ func generic_clone_struct(template_def: *AstStructDef, bindings: *Vec<*GenericBi
             traits_out.push(t_out);
         }
     }
-    return ast_struct_def(new_name_ptr, new_name_len, parents_out, fields_out, sd.is_packed, traits_out);
+    return ast_struct_def(new_name_ptr, new_name_len, parents_out, fields_out, sd.is_packed, traits_out, sd.is_union);
 }
 
 func generic_struct_get_or_create_instance(tpl_ptr: *GenericStructTemplate, bindings: *Vec<*GenericBinding>) -> *NameInfo {
@@ -4004,6 +4020,10 @@ func compiler_lower_parse_sugar_generic_struct_literal(gsl: *AstGenericStructLit
     var struct_def: *AstStructDef = get_struct_def(name_info.ptr, name_info.len);
     if (struct_def == 0) {
         emit_stderr("[ERROR] Generic struct def missing\n");
+        panic("Compiler error");
+    }
+    if (struct_def.is_union == 1 && gsl.values_vec != 0 && gsl.values_vec.len() > 1) {
+        emit_stderr("[ERROR] union literal accepts at most one initializer\n");
         panic("Compiler error");
     }
     return (*AstNode)ast_struct_literal(struct_def, gsl.values_vec);
@@ -4734,11 +4754,12 @@ func compiler_lower_super_expr(expr: *AstNode, owner_ptr: u64, owner_len: u64) -
         case AST_IDENT:
             var id: *AstIdent = (*AstIdent)expr;
             if (str_eq(id.name_ptr, id.name_len, "super", 5) != 0) {
-                compiler_super_require_member_form();
+                // Keep bare/surviving 'super' node as-is here.
+                // Member/method forms are validated and lowered in their dedicated cases.
+                return expr;
             }
             return expr;
         case AST_SUPER:
-            compiler_super_require_member_form();
             return expr;
         case AST_BINARY:
             var bin: *AstBinary = (*AstBinary)expr;
@@ -5160,6 +5181,26 @@ func compiler_struct_size_internal(struct_info: *AstStructDef, depth: u64) -> u6
         emit_stderr("[ERROR] Inheritance depth exceeded\n");
         panic("TypeInfo error");
     }
+    if (struct_info.is_union == 1) {
+        if (struct_info.is_packed == 1) {
+            emit_stderr("[ERROR] packed union is not supported\n");
+            panic("TypeInfo error");
+        }
+        if ((struct_info.parents_vec != 0 && struct_info.parents_vec.len() > 0) ||
+            (struct_info.traits_vec != 0 && struct_info.traits_vec.len() > 0)) {
+            emit_stderr("[ERROR] union cannot use inheritance or traits\n");
+            panic("TypeInfo error");
+        }
+        var max_size: u64 = 0;
+        var fields_u: *Vec<*FieldDesc> = struct_info.fields_vec;
+        var num_fields_u: u64 = fields_u.len();
+        for (var ui: u64 = 0; ui < num_fields_u; ui++) {
+            var field_u: *FieldDesc = fields_u.get(ui);
+            var size_u: u64 = compiler_sizeof_field_desc(field_u);
+            if (size_u > max_size) { max_size = size_u; }
+        }
+        return max_size;
+    }
     if (struct_info.is_packed == 1) {
         emit_stderr("[ERROR] packed struct cannot use trait vptr layout\n");
         panic("TypeInfo error");
@@ -5188,6 +5229,17 @@ func _compiler_struct_find_field_offset_hier(struct_def: *AstStructDef, field_pt
     if (depth > 64) {
         emit_stderr("[ERROR] Inheritance depth exceeded\n");
         panic("TypeInfo error");
+    }
+    if (struct_def.is_union == 1) {
+        var ufields: *Vec<*FieldDesc> = struct_def.fields_vec;
+        var un: u64 = ufields.len();
+        for (var ui: u64 = 0; ui < un; ui++) {
+            var uf: *FieldDesc = ufields.get(ui);
+            if (str_eq(uf.name_ptr, uf.name_len, field_ptr, field_len)) {
+                return 0;
+            }
+        }
+        return COMPILER_NOT_FOUND_U64;
     }
 
     var parent_total: u64 = 0;
@@ -5247,6 +5299,12 @@ func compiler_struct_find_field_offset(struct_def: *AstStructDef, field_ptr: u64
 
 func compiler_insert_vptr_field(struct_def: *AstStructDef, trait_ptr: u64, trait_len: u64, vtable_struct_ptr: u64, vtable_struct_len: u64) -> u64 {
     if (struct_def == 0) { return 0; }
+    if (struct_def.is_union == 1) {
+        emit_stderr("[ERROR] union cannot contain vptr field: ");
+        emit_stderr_len(struct_def.name_ptr, struct_def.name_len);
+        emit_stderr("\n");
+        panic("Parse error");
+    }
     var vptr_name: *NameInfo = compiler_build_vptr_field_name(trait_ptr, trait_len);
     var existing_off: u64 = compiler_struct_find_field_offset(struct_def, vptr_name.ptr, vptr_name.len);
     if (compiler_is_not_found_u64(existing_off) == 0) {
@@ -5342,6 +5400,12 @@ func compiler_build_trait_thunk_func(thunk_name_ptr: u64, thunk_name_len: u64, t
 
 func compiler_validate_struct_trait_inheritance(sd: *AstStructDef) -> u64 {
     if (sd == 0 || sd.traits_vec == 0) { return 0; }
+    if (sd.is_union == 1) {
+        emit_stderr("[ERROR] union cannot use trait inheritance: ");
+        emit_stderr_len(sd.name_ptr, sd.name_len);
+        emit_stderr("\n");
+        panic("Parse error");
+    }
     var tn: u64 = sd.traits_vec.len();
     for (var ti: u64 = 0; ti < tn; ti++) {
         var tref: *TraitRef = sd.traits_vec.get(ti);
@@ -5395,6 +5459,10 @@ func compiler_get_impl_trait_and_struct(impl_info: *TraitImpl) -> CompilerImplTr
         emit_stderr("\n");
         panic("Parse error");
     }
+    if (struct_def.is_union == 1) {
+        emit_stderr("[ERROR] union cannot implement traits\n");
+        panic("Parse error");
+    }
     if (struct_def.is_packed == 1) {
         emit_stderr("[ERROR] packed struct cannot implement traits\n");
         panic("Parse error");
@@ -5444,7 +5512,7 @@ func compiler_get_or_create_vtable_struct(trait_def: *TraitDef, trait_ptr: u64, 
         f.owner_struct_len = vtable_name.len;
         vtable_fields.push(f);
     }
-    vtable_struct_def = ast_struct_def(vtable_name.ptr, vtable_name.len, 0, vtable_fields, 0, 0);
+    vtable_struct_def = ast_struct_def(vtable_name.ptr, vtable_name.len, 0, vtable_fields, 0, 0, 0);
     register_struct_type(vtable_struct_def);
     info.vtable_struct_def = vtable_struct_def;
     return info;
