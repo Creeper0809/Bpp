@@ -9,11 +9,11 @@ B로 작성되었으며 부트스트래핑하여 메이저 B를 제작합니다.
 ## Platform Support
 
 - ✅ **Linux** (x86-64, fully supported)
-- 🚧 **Windows** (x86-64, Phase 0 in progress)
-  - CMake build system ✅
-  - OS abstraction layer ✅
-  - PE32+ file format ✅
-  - Full Windows API integration ⏳
+- 🚧 **Windows** (x86-64, hosted pipeline in progress)
+  - CMake toolchain bootstrap (`nasm`) ✅
+  - Linker detection with install guidance (`link.exe` / `lld-link`) ✅
+  - Windows runner scripts and CI smoke execution ✅
+  - Full self-host/runtime parity with Linux ⏳
 
 See [Windows Support Guide](docs/windows_support.md) for details.
 
@@ -86,47 +86,47 @@ if (rax > 5) {
 
 ## Build & Run
 
-### Linux
+### Linux (v10)
 ```bash
 # Install dependencies
-sudo apt-get install nasm cmake build-essential
+sudo apt-get install nasm binutils
 
-# Build
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build
-
-# Run
-./bin/v3c input.b
+# Build + self-host + tests
+cd v10
+bash build_and_test.sh
 ```
 
-### Windows
+### Windows (toolchain + smoke)
 ```powershell
-# Install dependencies (using Chocolatey)
-choco install nasm mingw cmake -y
+# Configure (auto-download NASM when missing)
+cmake -S . -B build-win -DBPP_BOOTSTRAP_NASM=ON
 
-# Build
-cmake -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
-cmake --build build
+# Verify toolchain and run Windows executable smoke test
+cmake --build build-win --target toolchain-check windows-smoke
 
-# Run
-.\bin\v3c.exe input.b
+# Optional: run hosted Windows test pipeline when a Windows stage compiler exists
+.\v10\build_and_test.ps1
 ```
+
+If `link.exe` is missing, install Visual Studio Build Tools:
+https://aka.ms/vs/17/release/vs_BuildTools.exe
 
 ### Tests
 ```bash
 # Linux
-bash test/v3_hosted/run_lexer_golden.sh
-bash test/v3_hosted/run_codegen_golden.sh
+cd v10
+bash test/run_tests.sh
+```
 
-# Windows (coming soon)
-# .\test\v3_hosted\run_lexer_golden.ps1
+```powershell
+# Windows
+.\v10\test\run_tests.ps1 -CompilerPath .\bin\v10_stage1.exe
 ```
 
 ## CI/CD
 
-GitHub Actions automatically builds and tests on:
+GitHub Actions automatically runs:
 - Ubuntu (latest)
 - Windows Server 2022
 
 See `.github/workflows/ci.yml` for configuration.
-
