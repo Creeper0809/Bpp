@@ -5203,6 +5203,54 @@ func compiler_lower_super_args(args: *Vec<*AstNode>, owner_ptr: u64, owner_len: 
     return 0;
 }
 
+func compiler_quick_infer_super_arg_type(expr: *AstNode) -> *TypeInfo {
+    if (expr == 0) { return generic_type_unknown(); }
+    var kind: u64 = ast_kind(expr);
+    switch (kind) {
+        case AST_LITERAL:
+            // Integer literal defaults are context-sensitive in overload resolution.
+            // Keep this unknown in super-lowering and rely on arity fallback unless
+            // caller provides an explicit cast.
+            return generic_type_unknown();
+        case AST_FLOAT:
+            return generic_type_f64();
+        case AST_STRING:
+            return generic_type_u8_ptr();
+        case AST_CAST:
+            var c: *AstCast = (*AstCast)expr;
+            return generic_make_typeinfo_from_fields(c.target_type, c.target_ptr_depth, c.target_is_tagged, c.struct_name_ptr, c.struct_name_len, c.tag_layout_ptr, c.tag_layout_len, 0, 0, 0, 0, 0, 0);
+        case AST_STACK_CTOR:
+            var sc: *AstStackCtor = (*AstStackCtor)expr;
+            return generic_make_typeinfo_from_fields(sc.type_kind, sc.ptr_depth, sc.is_tagged, sc.struct_name_ptr, sc.struct_name_len, sc.tag_layout_ptr, sc.tag_layout_len, sc.elem_type_kind, sc.elem_ptr_depth, sc.array_len, sc.array_len_is_param, sc.array_len_param_ptr, sc.array_len_param_len);
+        case AST_NEW:
+            var nw: *AstNew = (*AstNew)expr;
+            return generic_make_typeinfo_from_fields(TYPE_STRUCT, 1, 0, nw.struct_name_ptr, nw.struct_name_len, 0, 0, 0, 0, 0, 0, 0, 0);
+        default:
+            return generic_type_unknown();
+    }
+}
+
+func compiler_collect_super_arg_types(args: *Vec<*AstNode>) -> *Vec<*TypeInfo> {
+    if (args == 0) { return new Vec<*TypeInfo>(0); }
+    var n: u64 = args.len();
+    var out: *Vec<*TypeInfo> = new Vec<*TypeInfo>(n);
+    for (var i: u64 = 0; i < n; i++) {
+        out.push(compiler_quick_infer_super_arg_type(args.get(i)));
+    }
+    return out;
+}
+
+func compiler_super_has_specific_arg_types(arg_types: *Vec<*TypeInfo>) -> u64 {
+    if (arg_types == 0) { return 0; }
+    var n: u64 = arg_types.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var ti: *TypeInfo = arg_types.get(i);
+        if (ti == 0) { continue; }
+        if (ti.type_kind != TYPE_VOID) { return 1; }
+    }
+    return 0;
+}
+
 func compiler_lower_super_member_access_expr(ma: *AstMemberAccess, owner_ptr: u64, owner_len: u64, is_safe: u64) -> *AstNode {
     if (compiler_is_super_expr(ma.object) == 0) {
         ma.object = compiler_lower_super_expr(ma.object, owner_ptr, owner_len);
@@ -5256,7 +5304,12 @@ func compiler_lower_super_method_call_expr(mc: *AstMethodCall, owner_ptr: u64, o
 
     var arg_count_hint: u64 = 0;
     if (mc.args_vec != 0) { arg_count_hint = mc.args_vec.len(); }
-    var resolved_call: CompilerMethodResolveResult = compiler_resolve_method_overload(parent_ptr, parent_len, mc.method_ptr, mc.method_len, 0, arg_count_hint);
+    var arg_types: *Vec<*TypeInfo> = compiler_collect_super_arg_types(mc.args_vec);
+    var typed_arg_types: *Vec<*TypeInfo> = 0;
+    if (compiler_super_has_specific_arg_types(arg_types) != 0) {
+        typed_arg_types = arg_types;
+    }
+    var resolved_call: CompilerMethodResolveResult = compiler_resolve_method_overload_with_count_fallback(parent_ptr, parent_len, mc.method_ptr, mc.method_len, typed_arg_types, arg_count_hint);
     var member_lookup: CompilerDeclLookup = compiler_decl_lookup_none(ACCESS_PUBLIC);
     if (resolved_call.found != 0 && resolved_call.fn != 0) {
         member_lookup.found = 1;
@@ -6678,9 +6731,6 @@ func compiler_validate_single_impl_override(fn: *AstFunc) -> u64 {
     }
 
     var base_access: u64 = base_lookup.access;
-    if (base_lookup.sig != 0 && base_lookup.sig.impl_method_access == ACCESS_PRIVATE) {
-        base_access = ACCESS_PRIVATE;
-    }
     if (base_lookup.sig != 0 && base_lookup.sig.impl_method_access == ACCESS_PRIVATE) {
         base_access = ACCESS_PRIVATE;
     }
