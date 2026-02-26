@@ -49,6 +49,7 @@ echo ""
 # Step 1: 베이스 컴파일러로 빌드 (또는 이전 버전 사용)
 echo "[1/6] Compiling ${VERSION}..."
 cd "$ROOT_DIR"
+mkdir -p "$BUILD_DIR" "$BIN_DIR"
 
 # {VERSION}_base가 있으면 사용, 없으면 이전 버전 사용
 BASE_BIN=""
