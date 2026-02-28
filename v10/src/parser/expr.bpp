@@ -21,6 +21,72 @@ import parser.type;
 // Primary Expression
 // ============================================
 
+struct ParseCallArgs {
+    public args: *Vec<*AstNode>;
+    public arg_names: *Vec<*NameInfo>;
+}
+
+func parse_call_named_arg_peek(p: *Parser) -> *Token {
+    if (parse_peek_kind(p) != TOKEN_IDENTIFIER) { return 0; }
+    var saved_pos: u64 = parser_pos(p);
+    var name_tok: *Token = parse_peek(p);
+    parse_adv(p);
+    var is_named: u64 = 0;
+    if (parse_peek_kind(p) == TOKEN_COLON) {
+        is_named = 1;
+    }
+    parser_set_pos(p, saved_pos);
+    if (is_named == 0) { return 0; }
+    return name_tok;
+}
+
+func parse_call_args_paren(p: *Parser, allow_named: u64) -> *ParseCallArgs {
+    parse_consume(p, TOKEN_LPAREN);
+
+    var args: *Vec<*AstNode> = new Vec<*AstNode>(8);
+    var arg_names: *Vec<*NameInfo> = 0;
+    var seen_named: u64 = 0;
+
+    if (parse_peek_kind(p) != TOKEN_RPAREN) {
+        while (1) {
+            var arg_name: *NameInfo = 0;
+            var named_tok: *Token = parse_call_named_arg_peek(p);
+            if (named_tok != 0) {
+                if (allow_named == 0) {
+                    emit_stderr("[ERROR] named arguments are not allowed for this call target\n");
+                    parse_panic_here(p, "Syntax error");
+                }
+                parse_consume(p, TOKEN_IDENTIFIER);
+                parse_consume(p, TOKEN_COLON);
+                arg_name = new NameInfo{named_tok.ptr, named_tok.len};
+                seen_named = 1;
+            } else if (seen_named != 0) {
+                emit_stderr("[ERROR] positional argument cannot follow named arguments\n");
+                parse_panic_here(p, "Syntax error");
+            }
+
+            args.push(parse_expr(p));
+            if (arg_names != 0) {
+                arg_names.push(arg_name);
+            } else if (arg_name != 0) {
+                arg_names = new Vec<*NameInfo>(args.len());
+                for (var ai: u64 = 0; ai + 1 < args.len(); ai++) {
+                    arg_names.push(0);
+                }
+                arg_names.push(arg_name);
+            }
+
+            if (parse_match(p, TOKEN_COMMA) == 0) { break; }
+        }
+    }
+
+    parse_consume(p, TOKEN_RPAREN);
+    var out: *ParseCallArgs = new ParseCallArgs();
+    out.args = args;
+    out.arg_names = arg_names;
+    return out;
+}
+
 func parse_expr_list_paren(p: *Parser) -> *Vec<*AstNode> {
     parse_consume(p, TOKEN_LPAREN);
     var args: *Vec<*AstNode> = new Vec<*AstNode>(8);
@@ -47,6 +113,301 @@ func parse_expr_list_brace(p: *Parser) -> *Vec<*AstNode> {
     return values;
 }
 
+func parse_lambda_param_set_default(param: *Param) -> u64 {
+    param.type_kind = TYPE_U64;
+    param.ptr_depth = 0;
+    param.is_tagged = 0;
+    param.struct_name_ptr = 0;
+    param.struct_name_len = 0;
+    param.tag_layout_ptr = 0;
+    param.tag_layout_len = 0;
+    param.elem_type_kind = 0;
+    param.elem_ptr_depth = 0;
+    param.array_len = 0;
+    param.array_len_is_param = 0;
+    param.array_len_param_ptr = 0;
+    param.array_len_param_len = 0;
+    param.elem_typeinfo = 0;
+    return 0;
+}
+
+func parse_lambda_param(p: *Parser) -> *Param {
+    var name_tok: *Token = parse_peek(p);
+    parse_consume(p, TOKEN_IDENTIFIER);
+
+    var param: *Param = new Param();
+    param.name_ptr = name_tok.ptr;
+    param.name_len = name_tok.len;
+
+    if (parse_match(p, TOKEN_COLON)) {
+        var ty: *TypeInfo = parse_type_ex(p);
+        param.fill_from_typeinfo(ty);
+        param.decay_array_to_ptr();
+        return param;
+    }
+
+    parse_lambda_param_set_default(param);
+    return param;
+}
+
+func parse_lambda_param_exists(params: *Vec<*Param>, name_ptr: u64, name_len: u64) -> u64 {
+    if (params == 0) { return 0; }
+    var n: u64 = params.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var p2: *Param = params.get(i);
+        if (str_eq(p2.name_ptr, p2.name_len, name_ptr, name_len) != 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+func parse_lambda_symbol_is_global(name_ptr: u64, name_len: u64) -> u64 {
+    if (compiler_func_exists(name_ptr, name_len) != 0) { return 1; }
+    if (compiler_global_exists(name_ptr, name_len) != 0) { return 1; }
+    var cres: *ConstResult = (*ConstResult)compiler_find_const(name_ptr, name_len);
+    if (cres != 0 && cres.found != 0) { return 1; }
+
+    var resolved: *NameInfo = resolve_name(name_ptr, name_len);
+    if (resolved != 0) {
+        if (compiler_func_exists(resolved.ptr, resolved.len) != 0) { return 1; }
+        if (compiler_global_exists(resolved.ptr, resolved.len) != 0) { return 1; }
+        var cres2: *ConstResult = (*ConstResult)compiler_find_const(resolved.ptr, resolved.len);
+        if (cres2 != 0 && cres2.found != 0) { return 1; }
+    }
+    return 0;
+}
+
+func parse_lambda_report_capture_error(p: *Parser, name_ptr: u64, name_len: u64) -> u64 {
+    emit_stderr("[ERROR] lambda captures are not supported yet (identifier: ");
+    emit_stderr_len(name_ptr, name_len);
+    emit_stderr(")\n");
+    parse_panic_here(p, "Syntax error");
+    return 0;
+}
+
+func parse_lambda_validate_expr_no_capture(p: *Parser, node: *AstNode, params: *Vec<*Param>) -> u64 {
+    if (node == 0) { return 1; }
+    var kind: u64 = ast_kind(node);
+    switch (kind) {
+        case AST_IDENT:
+            var id: *AstIdent = (*AstIdent)node;
+            if (parse_lambda_param_exists(params, id.name_ptr, id.name_len) != 0) { return 1; }
+            if (parse_lambda_symbol_is_global(id.name_ptr, id.name_len) != 0) { return 1; }
+            parse_lambda_report_capture_error(p, id.name_ptr, id.name_len);
+            return 0;
+        case AST_BINARY:
+            var bin: *AstBinary = (*AstBinary)node;
+            parse_lambda_validate_expr_no_capture(p, bin.left, params);
+            parse_lambda_validate_expr_no_capture(p, bin.right, params);
+            return 1;
+        case AST_UNARY:
+            return parse_lambda_validate_expr_no_capture(p, ((*AstUnary)node).operand, params);
+        case AST_ADDR_OF:
+            return parse_lambda_validate_expr_no_capture(p, ((*AstAddrOf)node).operand, params);
+        case AST_DEREF:
+            return parse_lambda_validate_expr_no_capture(p, ((*AstDeref)node).operand, params);
+        case AST_DEREF8:
+            return parse_lambda_validate_expr_no_capture(p, ((*AstDeref8)node).operand, params);
+        case AST_CAST:
+            return parse_lambda_validate_expr_no_capture(p, ((*AstCast)node).expr, params);
+        case AST_TRY:
+            return parse_lambda_validate_expr_no_capture(p, ((*AstTry)node).operand, params);
+        case AST_SIZEOF_EXPR:
+            return parse_lambda_validate_expr_no_capture(p, ((*AstSizeofExpr)node).expr, params);
+        case AST_INDEX:
+            var idx: *AstIndex = (*AstIndex)node;
+            parse_lambda_validate_expr_no_capture(p, idx.base, params);
+            parse_lambda_validate_expr_no_capture(p, idx.index, params);
+            return 1;
+        case AST_MEMBER_ACCESS:
+        case AST_SAFE_MEMBER_ACCESS:
+            return parse_lambda_validate_expr_no_capture(p, ((*AstMemberAccess)node).object, params);
+        case AST_METHOD_CALL:
+        case AST_SAFE_METHOD_CALL:
+            var mc: *AstMethodCall = (*AstMethodCall)node;
+            parse_lambda_validate_expr_no_capture(p, mc.receiver, params);
+            if (mc.args_vec != 0) {
+                var an: u64 = mc.args_vec.len();
+                for (var ai: u64 = 0; ai < an; ai++) {
+                    parse_lambda_validate_expr_no_capture(p, mc.args_vec.get(ai), params);
+                }
+            }
+            return 1;
+        case AST_CALL:
+            var call: *AstCall = (*AstCall)node;
+            if (parse_lambda_symbol_is_global(call.name_ptr, call.name_len) == 0) {
+                parse_lambda_report_capture_error(p, call.name_ptr, call.name_len);
+            }
+            if (call.args_vec != 0) {
+                var cn: u64 = call.args_vec.len();
+                for (var ci: u64 = 0; ci < cn; ci++) {
+                    parse_lambda_validate_expr_no_capture(p, call.args_vec.get(ci), params);
+                }
+            }
+            return 1;
+        case AST_CALL_PTR:
+            var cp: *AstCallPtr = (*AstCallPtr)node;
+            parse_lambda_validate_expr_no_capture(p, cp.callee, params);
+            if (cp.args_vec != 0) {
+                var cpn: u64 = cp.args_vec.len();
+                for (var cpi: u64 = 0; cpi < cpn; cpi++) {
+                    parse_lambda_validate_expr_no_capture(p, cp.args_vec.get(cpi), params);
+                }
+            }
+            return 1;
+        case AST_GENERIC_CALL:
+            var gc: *AstGenericCall = (*AstGenericCall)node;
+            if (parse_lambda_symbol_is_global(gc.name_ptr, gc.name_len) == 0) {
+                parse_lambda_report_capture_error(p, gc.name_ptr, gc.name_len);
+            }
+            if (gc.args_vec != 0) {
+                var gcn: u64 = gc.args_vec.len();
+                for (var gci: u64 = 0; gci < gcn; gci++) {
+                    parse_lambda_validate_expr_no_capture(p, gc.args_vec.get(gci), params);
+                }
+            }
+            return 1;
+        case AST_STATIC_GENERIC_CALL:
+            var sgc: *AstStaticGenericCall = (*AstStaticGenericCall)node;
+            if (parse_lambda_symbol_is_global(sgc.struct_name_ptr, sgc.struct_name_len) == 0) {
+                parse_lambda_report_capture_error(p, sgc.struct_name_ptr, sgc.struct_name_len);
+            }
+            if (sgc.args_vec != 0) {
+                var sgn: u64 = sgc.args_vec.len();
+                for (var sgi: u64 = 0; sgi < sgn; sgi++) {
+                    parse_lambda_validate_expr_no_capture(p, sgc.args_vec.get(sgi), params);
+                }
+            }
+            return 1;
+        case AST_STRUCT_LITERAL:
+            var sl: *AstStructLiteral = (*AstStructLiteral)node;
+            if (sl.values_vec != 0) {
+                var sn: u64 = sl.values_vec.len();
+                for (var si: u64 = 0; si < sn; si++) {
+                    parse_lambda_validate_expr_no_capture(p, sl.values_vec.get(si), params);
+                }
+            }
+            return 1;
+        case AST_GENERIC_STRUCT_LITERAL:
+            var gsl: *AstGenericStructLiteral = (*AstGenericStructLiteral)node;
+            if (gsl.values_vec != 0) {
+                var gsn: u64 = gsl.values_vec.len();
+                for (var gsi: u64 = 0; gsi < gsn; gsi++) {
+                    parse_lambda_validate_expr_no_capture(p, gsl.values_vec.get(gsi), params);
+                }
+            }
+            return 1;
+        case AST_SLICE:
+            var slice_node: *AstSlice = (*AstSlice)node;
+            parse_lambda_validate_expr_no_capture(p, slice_node.ptr_expr, params);
+            parse_lambda_validate_expr_no_capture(p, slice_node.len_expr, params);
+            return 1;
+        case AST_NEW:
+            var nw: *AstNew = (*AstNew)node;
+            if (nw.literal_expr != 0) {
+                parse_lambda_validate_expr_no_capture(p, nw.literal_expr, params);
+            }
+            if (nw.ctor_args_vec != 0) {
+                var nn: u64 = nw.ctor_args_vec.len();
+                for (var ni: u64 = 0; ni < nn; ni++) {
+                    parse_lambda_validate_expr_no_capture(p, nw.ctor_args_vec.get(ni), params);
+                }
+            }
+            return 1;
+        case AST_STACK_CTOR:
+            var sc: *AstStackCtor = (*AstStackCtor)node;
+            if (sc.ctor_args_vec != 0) {
+                var sn2: u64 = sc.ctor_args_vec.len();
+                for (var si2: u64 = 0; si2 < sn2; si2++) {
+                    parse_lambda_validate_expr_no_capture(p, sc.ctor_args_vec.get(si2), params);
+                }
+            }
+            return 1;
+    }
+    return 1;
+}
+
+func parse_lambda_build_name(lambda_id: u64) -> *NameInfo {
+    var prefix_ptr: u64 = (u64)"__lambda_";
+    var prefix_len: u64 = 9;
+    var id_buf: u64 = heap_alloc(32 * sizeof(u8));
+    var id_len: u64 = io_u64_to_ascii(id_buf, lambda_id);
+    var total_len: u64 = prefix_len + id_len;
+    var name_ptr: u64 = heap_alloc((total_len + 1) * sizeof(u8));
+    var name_u8: []u8 = slice(name_ptr, total_len + 1);
+    str_copy(name_ptr, prefix_ptr, prefix_len);
+    str_copy(name_ptr + prefix_len, id_buf, id_len);
+    name_u8[total_len] = 0;
+    return new NameInfo{name_ptr, total_len};
+}
+
+func parse_primary_lambda_expr(p: *Parser) -> *AstNode {
+    parse_consume(p, TOKEN_FUNC);
+    parse_consume(p, TOKEN_LPAREN);
+
+    var params: *Vec<*Param> = new Vec<*Param>(4);
+    if (parse_peek_kind(p) != TOKEN_RPAREN) {
+        params.push(parse_lambda_param(p));
+        while (parse_match(p, TOKEN_COMMA)) {
+            params.push(parse_lambda_param(p));
+        }
+    }
+    parse_consume(p, TOKEN_RPAREN);
+
+    var ret_type: u64 = TYPE_I64;
+    var ret_ptr_depth: u64 = 0;
+    var ret_is_tagged: u64 = 0;
+    var ret_struct_name_ptr: u64 = 0;
+    var ret_struct_name_len: u64 = 0;
+    var ret_tag_layout_ptr: u64 = 0;
+    var ret_tag_layout_len: u64 = 0;
+    if (parse_match(p, TOKEN_ARROW)) {
+        var ret_ti: *TypeInfo = parse_type_ex(p);
+        ret_type = ret_ti.type_kind;
+        ret_ptr_depth = ret_ti.ptr_depth;
+        ret_is_tagged = ret_ti.is_tagged;
+        ret_struct_name_ptr = ret_ti.struct_name_ptr;
+        ret_struct_name_len = ret_ti.struct_name_len;
+        ret_tag_layout_ptr = ret_ti.tag_layout_ptr;
+        ret_tag_layout_len = ret_ti.tag_layout_len;
+        if (ret_type == TYPE_ARRAY) {
+            ret_type = ret_ti.elem_type_kind;
+            ret_ptr_depth = ret_ti.elem_ptr_depth + 1;
+            ret_is_tagged = 0;
+            ret_struct_name_ptr = ret_ti.struct_name_ptr;
+            ret_struct_name_len = ret_ti.struct_name_len;
+            ret_tag_layout_ptr = 0;
+            ret_tag_layout_len = 0;
+        }
+    }
+
+    parse_consume(p, TOKEN_LBRACE);
+    if (parse_peek_kind(p) == TOKEN_RBRACE) {
+        emit_stderr("[ERROR] lambda body expression is required\n");
+        parse_panic_here(p, "Syntax error");
+    }
+    var body_expr: *AstNode = parse_expr(p);
+    parse_match(p, TOKEN_SEMICOLON);
+    parse_consume(p, TOKEN_RBRACE);
+    parse_lambda_validate_expr_no_capture(p, body_expr, params);
+
+    var body_stmts: *Vec<*AstNode> = new Vec<*AstNode>(1);
+    body_stmts.push((*AstNode)ast_return(body_expr));
+    var body: *AstNode = (*AstNode)ast_block(body_stmts);
+
+    var lambda_id: u64 = parse_next_generated_id();
+    var lambda_name: *NameInfo = parse_lambda_build_name(lambda_id);
+    var lambda_fn: *AstFunc = ast_func_ex(lambda_name.ptr, lambda_name.len, params,
+                                          ret_type, ret_ptr_depth, ret_is_tagged,
+                                          ret_struct_name_ptr, ret_struct_name_len,
+                                          ret_tag_layout_ptr, ret_tag_layout_len, body);
+    parse_generated_funcs_push((u64)lambda_fn);
+
+    var fn_ident: *AstNode = (*AstNode)ast_ident(lambda_name.ptr, lambda_name.len);
+    return (*AstNode)ast_addr_of(fn_ident);
+}
+
 func parse_resolve_struct_def(name_ptr: u64, name_len: u64) -> *AstStructDef {
     var struct_def: *AstStructDef = get_struct_def(name_ptr, name_len);
     if (struct_def != 0) { return struct_def; }
@@ -58,8 +419,8 @@ func parse_resolve_struct_def(name_ptr: u64, name_len: u64) -> *AstStructDef {
 func parse_primary_identifier_generic_call(p: *Parser, tok4: *Token) -> *AstNode {
     if (parse_is_generic_call(p) == 0) { return 0; }
     var generic_args: *Vec<*GenericArg> = parse_generic_args(p);
-    var args_g: *Vec<*AstNode> = parse_expr_list_paren(p);
-    return ast_generic_call(tok4.ptr, tok4.len, generic_args, args_g);
+    var parsed_args: *ParseCallArgs = parse_call_args_paren(p, 1);
+    return (*AstNode)ast_generic_call_with_origin_named(tok4.ptr, tok4.len, generic_args, parsed_args.args, parsed_args.arg_names, AST_CALL_ORIGIN_DIRECT);
 }
 
 func parse_primary_identifier_generic_struct_literal(p: *Parser, tok4: *Token) -> *AstNode {
@@ -133,14 +494,14 @@ func parse_primary_identifier_static_method_call(p: *Parser, tok4: *Token) -> *A
         return 0;
     }
 
-    var args: *Vec<*AstNode> = parse_expr_list_paren(p);
-    return (*AstNode)ast_static_generic_call(tok4.ptr, tok4.len, method_tok.ptr, method_tok.len, generic_args, args);
+    var args: *ParseCallArgs = parse_call_args_paren(p, 1);
+    return (*AstNode)ast_static_generic_call_named(tok4.ptr, tok4.len, method_tok.ptr, method_tok.len, generic_args, args.args, args.arg_names);
 }
 
 func parse_primary_identifier_call_or_ctor(p: *Parser, tok4: *Token) -> *AstNode {
     if (parse_peek_kind(p) != TOKEN_LPAREN) { return 0; }
-    var args: *Vec<*AstNode> = parse_expr_list_paren(p);
-    return ast_call(tok4.ptr, tok4.len, args);
+    var args: *ParseCallArgs = parse_call_args_paren(p, 1);
+    return (*AstNode)ast_call_with_origin_named(tok4.ptr, tok4.len, args.args, args.arg_names, AST_CALL_ORIGIN_DIRECT);
 }
 
 func parse_primary_identifier(p: *Parser, tok4: *Token) -> *AstNode {
@@ -182,7 +543,7 @@ func parse_identifier_is_known_type(p: *Parser, name_ptr: u64, name_len: u64) ->
 func parse_primary_sizeof_is_type(p: *Parser) -> u64 {
     var nk: u64 = parse_peek_kind(p);
     var is_type: u64 = 0;
-    if (nk == TOKEN_STAR || nk == TOKEN_U8 || nk == TOKEN_U16 || nk == TOKEN_U32 || nk == TOKEN_U64 || nk == TOKEN_I64 || nk == TOKEN_F64 || nk == TOKEN_LBRACKET) {
+    if (nk == TOKEN_STAR || nk == TOKEN_BOOL || nk == TOKEN_U8 || nk == TOKEN_U16 || nk == TOKEN_U32 || nk == TOKEN_U64 || nk == TOKEN_I8 || nk == TOKEN_I16 || nk == TOKEN_I32 || nk == TOKEN_I64 || nk == TOKEN_F64 || nk == TOKEN_LBRACKET) {
         is_type = 1;
     } else if (nk == TOKEN_IDENTIFIER) {
         var t: *Token = parse_peek(p);
@@ -259,8 +620,8 @@ func parse_primary_new_expr(p: *Parser) -> *AstNode {
 func parse_primary_paren_or_cast(p: *Parser) -> *AstNode {
     parse_adv(p);
     var next_k: u64 = parse_peek_kind(p);
-    if (next_k == TOKEN_STAR || next_k == TOKEN_U8 || next_k == TOKEN_U16 ||
-        next_k == TOKEN_U32 || next_k == TOKEN_U64 || next_k == TOKEN_I64 ||
+    if (next_k == TOKEN_STAR || next_k == TOKEN_BOOL || next_k == TOKEN_U8 || next_k == TOKEN_U16 ||
+        next_k == TOKEN_U32 || next_k == TOKEN_U64 || next_k == TOKEN_I8 || next_k == TOKEN_I16 || next_k == TOKEN_I32 || next_k == TOKEN_I64 ||
         next_k == TOKEN_F64 || next_k == TOKEN_CHAR || next_k == TOKEN_LBRACKET) {
         var ty2: *TypeInfo = parse_type_ex(p);
         var type_kind2: u64 = ty2.type_kind;
@@ -328,10 +689,12 @@ func parse_primary(p: *Parser) -> *AstNode {
                 return ast_literal(line);
         case TOKEN_TRUE:
             parse_adv(p);
-                return ast_literal(1);
+            var true_lit: *AstNode = (*AstNode)ast_literal(1);
+                return (*AstNode)ast_cast_ex(true_lit, TYPE_BOOL, 0, 0, 0, 0, 0, 0);
         case TOKEN_FALSE:
             parse_adv(p);
-                return ast_literal(0);
+            var false_lit: *AstNode = (*AstNode)ast_literal(0);
+                return (*AstNode)ast_cast_ex(false_lit, TYPE_BOOL, 0, 0, 0, 0, 0, 0);
         case TOKEN_NULL:
             parse_adv(p);
                 return ast_literal(0);
@@ -351,6 +714,8 @@ func parse_primary(p: *Parser) -> *AstNode {
             return parse_primary_sizeof(p);
         case TOKEN_NEW:
             return parse_primary_new_expr(p);
+        case TOKEN_FUNC:
+            return parse_primary_lambda_expr(p);
         case TOKEN_AMPERSAND:
             parse_adv(p);
             var operand: *AstNode = parse_unary(p);
@@ -402,19 +767,6 @@ func parse_generic_args(p: *Parser) -> *Vec<*GenericArg> {
 // Postfix Expression
 // ============================================
 
-func parse_postfix_args(p: *Parser) -> *Vec<*AstNode> {
-    var args: *Vec<*AstNode> = new Vec<*AstNode>(4);
-    if (parse_peek_kind(p) != TOKEN_RPAREN) {
-        args.push(parse_expr(p));
-        while (parse_peek_kind(p) == TOKEN_COMMA) {
-            parse_adv(p);
-            args.push(parse_expr(p));
-        }
-    }
-    parse_consume(p, TOKEN_RPAREN);
-    return args;
-}
-
 func parse_postfix_after_dot(p: *Parser, left: *AstNode, is_safe: u64) -> *AstNode {
     if (parse_peek_kind(p) == TOKEN_LT) {
         parse_adv(p);
@@ -454,12 +806,11 @@ func parse_postfix_after_dot(p: *Parser, left: *AstNode, is_safe: u64) -> *AstNo
     parse_adv(p);
 
     if (parse_peek_kind(p) == TOKEN_LPAREN) {
-        parse_adv(p);
-        var call_args: *Vec<*AstNode> = parse_postfix_args(p);
+        var call_args: *ParseCallArgs = parse_call_args_paren(p, 1);
         if (is_safe != 0) {
-            return ast_safe_method_call(left, field_tok.ptr, field_tok.len, call_args);
+            return (*AstNode)ast_safe_method_call_named(left, field_tok.ptr, field_tok.len, call_args.args, call_args.arg_names);
         }
-        return ast_method_call(left, field_tok.ptr, field_tok.len, call_args);
+        return (*AstNode)ast_method_call_named(left, field_tok.ptr, field_tok.len, call_args.args, call_args.arg_names);
     }
 
     if (is_safe != 0) {
@@ -480,8 +831,8 @@ func parse_postfix_from(p: *Parser, left: *AstNode) -> *AstNode {
                 left = ast_index(left, idx);
                 break;
             case TOKEN_LPAREN:
-                parse_adv(p);
-                left = ast_call_ptr(left, parse_postfix_args(p));
+                var ptr_call_args: *ParseCallArgs = parse_call_args_paren(p, 0);
+                left = ast_call_ptr(left, ptr_call_args.args);
                 break;
             case TOKEN_DOT:
                 parse_adv(p);

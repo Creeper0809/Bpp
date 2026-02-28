@@ -48,6 +48,9 @@ func parse_const_eval_expr(p: *Parser, node: *AstNode, ok: *u64) -> u64 {
             emit_stderr("\n");
             *ok = 0;
             return 0;
+        case AST_CAST:
+            var cast_node: *AstCast = (*AstCast)node;
+            return parse_const_eval_expr(p, cast_node.expr, ok);
         case AST_UNARY:
             var un: *AstUnary = (*AstUnary)node;
             var sub_ok: u64 = 1;
@@ -359,6 +362,13 @@ func parse_generic_params_any(p: *Parser) -> *Vec<*GenericParam> {
 }
 
 func parse_param(p: *Parser) -> *Param {
+    var is_variadic: u64 = 0;
+    if (parse_match(p, TOKEN_DOT)) {
+        parse_consume(p, TOKEN_DOT);
+        parse_consume(p, TOKEN_DOT);
+        is_variadic = 1;
+    }
+
     var name_tok: *Token = parse_peek(p);
     parse_consume(p, TOKEN_IDENTIFIER);
 
@@ -370,31 +380,84 @@ func parse_param(p: *Parser) -> *Param {
     var param: *Param = new Param();
     param.name_ptr = name_tok.ptr;
     param.name_len = name_tok.len;
+    param.is_variadic = is_variadic;
+    param.has_default = 0;
+    param.default_expr = 0;
 
     if (parse_match(p, TOKEN_COLON)) {
         var ty: *TypeInfo = parse_type_ex(p);
         param.fill_from_typeinfo(ty);
         param.decay_array_to_ptr();
-        return param;
+    } else {
+        // Backward-compatible shorthand: untyped parameters default to u64.
+        param.type_kind = TYPE_U64;
+        param.ptr_depth = 0;
+        param.is_tagged = 0;
+        param.struct_name_ptr = 0;
+        param.struct_name_len = 0;
+        param.tag_layout_ptr = 0;
+        param.tag_layout_len = 0;
+        param.elem_type_kind = 0;
+        param.elem_ptr_depth = 0;
+        param.array_len = 0;
+        param.array_len_is_param = 0;
+        param.array_len_param_ptr = 0;
+        param.array_len_param_len = 0;
+        param.elem_typeinfo = 0;
     }
 
-    // Backward-compatible shorthand: untyped parameters default to u64.
-    param.type_kind = TYPE_U64;
-    param.ptr_depth = 0;
-    param.is_tagged = 0;
-    param.struct_name_ptr = 0;
-    param.struct_name_len = 0;
-    param.tag_layout_ptr = 0;
-    param.tag_layout_len = 0;
-    param.elem_type_kind = 0;
-    param.elem_ptr_depth = 0;
-    param.array_len = 0;
-    param.array_len_is_param = 0;
-    param.array_len_param_ptr = 0;
-    param.array_len_param_len = 0;
-    param.elem_typeinfo = 0;
+    if (parse_match(p, TOKEN_EQ)) {
+        param.default_expr = (u64)parse_expr(p);
+        param.has_default = 1;
+    }
 
     return param;
+}
+
+func parse_validate_params(p: *Parser, params: *Vec<*Param>) -> u64 {
+    if (params == 0) { return 0; }
+    var n: u64 = params.len();
+    var seen_default: u64 = 0;
+    var seen_variadic: u64 = 0;
+    for (var i: u64 = 0; i < n; i++) {
+        var param: *Param = params.get(i);
+        if (param == 0) { continue; }
+
+        for (var j: u64 = 0; j < i; j++) {
+            var prev: *Param = params.get(j);
+            if (prev == 0) { continue; }
+            if (str_eq(prev.name_ptr, prev.name_len, param.name_ptr, param.name_len) != 0) {
+                emit_stderr("[ERROR] duplicate parameter name: ");
+                emit_stderr_len(param.name_ptr, param.name_len);
+                emit_stderr("\n");
+                parse_panic_here(p, "Syntax error");
+            }
+        }
+
+        if (param.is_variadic != 0) {
+            if (seen_variadic != 0) {
+                emit_stderr("[ERROR] only one variadic parameter is allowed\n");
+                parse_panic_here(p, "Syntax error");
+            }
+            seen_variadic = 1;
+            if (i + 1 != n) {
+                emit_stderr("[ERROR] variadic parameter must be the last parameter\n");
+                parse_panic_here(p, "Syntax error");
+            }
+            if (param.has_default != 0) {
+                emit_stderr("[ERROR] variadic parameter cannot have default value\n");
+                parse_panic_here(p, "Syntax error");
+            }
+            continue;
+        }
+        if (param.has_default != 0) {
+            seen_default = 1;
+        } else if (seen_default != 0) {
+            emit_stderr("[ERROR] non-default parameter cannot follow default parameter\n");
+            parse_panic_here(p, "Syntax error");
+        }
+    }
+    return 0;
 }
 
 struct ParsedFuncHeader {
@@ -452,6 +515,7 @@ func parse_func_header(p: *Parser) -> *ParsedFuncHeader {
         }
     }
     parse_consume(p, TOKEN_RPAREN);
+    parse_validate_params(p, params);
 
     var ret_type: u64 = TYPE_VOID;
     var ret_ptr_depth: u64 = 0;
@@ -686,6 +750,11 @@ func parse_struct_parse_packed_field_type(p: *Parser) -> ParsePackedFieldType {
     packed_type.bit_width = 0;
     var k: u64 = parse_peek_kind(p);
     switch (k) {
+        case TOKEN_BOOL:
+            parse_adv(p);
+            packed_type.type_kind = TYPE_BOOL;
+            packed_type.bit_width = 8;
+            break;
         case TOKEN_U8:
             parse_adv(p);
             packed_type.type_kind = TYPE_U8;
@@ -706,6 +775,26 @@ func parse_struct_parse_packed_field_type(p: *Parser) -> ParsePackedFieldType {
             packed_type.type_kind = TYPE_U64;
             packed_type.bit_width = 64;
             break;
+        case TOKEN_I8:
+            parse_adv(p);
+            packed_type.type_kind = TYPE_I8;
+            packed_type.bit_width = 8;
+            break;
+        case TOKEN_I16:
+            parse_adv(p);
+            packed_type.type_kind = TYPE_I16;
+            packed_type.bit_width = 16;
+            break;
+        case TOKEN_I32:
+            parse_adv(p);
+            packed_type.type_kind = TYPE_I32;
+            packed_type.bit_width = 32;
+            break;
+        case TOKEN_I64:
+            parse_adv(p);
+            packed_type.type_kind = TYPE_I64;
+            packed_type.bit_width = 64;
+            break;
         case TOKEN_IDENTIFIER:
             var bw_tok: *Token = parse_peek(p);
             var bw_ptr: u64 = bw_tok.ptr;
@@ -713,14 +802,14 @@ func parse_struct_parse_packed_field_type(p: *Parser) -> ParsePackedFieldType {
             parse_adv(p);
             var bw: u64 = parse_uwidth_from_ident(bw_ptr, bw_len);
             if (bw == 0 || bw > 64) {
-                emit_stderr("[ERROR] packed field must be u1..u64\n");
+                emit_stderr("[ERROR] packed field must be integer width type\n");
                 parse_panic_here(p, "Syntax error");
             }
             packed_type.type_kind = TYPE_U64;
             packed_type.bit_width = bw;
             break;
         default:
-            emit_stderr("[ERROR] packed field must be u1..u64\n");
+            emit_stderr("[ERROR] packed field must be integer width type\n");
             parse_panic_here(p, "Syntax error");
     }
     return packed_type;
@@ -943,6 +1032,7 @@ func parse_trait_method_signature(p: *Parser, mode: u64) -> *AstFunc {
         }
     }
     parse_consume(p, TOKEN_RPAREN);
+    parse_validate_params(p, params);
 
     var ret_type: u64 = TYPE_VOID;
     var ret_ptr_depth: u64 = 0;
@@ -1046,6 +1136,7 @@ func parse_constructor_decl(p: *Parser, struct_name_ptr: u64, struct_name_len: u
         }
     }
     parse_consume(p, TOKEN_RPAREN);
+    parse_validate_params(p, params);
 
     if (parse_peek_kind(p) == TOKEN_ARROW) {
         emit_stderr("[ERROR] constructor cannot specify return type\n");
@@ -1491,6 +1582,16 @@ func parse_append_impl_funcs(dst: *Vec<*AstFunc>, src: *Vec<*AstFunc>, mode: u64
     return 0;
 }
 
+func parse_append_generated_funcs(funcs: *Vec<*AstFunc>) -> u64 {
+    var generated: *Vec<u64> = parse_generated_funcs_take();
+    if (generated == 0) { return 0; }
+    var n: u64 = generated.len();
+    for (var i: u64 = 0; i < n; i++) {
+        funcs.push((*AstFunc)generated.get(i));
+    }
+    return 0;
+}
+
 func parse_global_var_decl_full(p: *Parser, globals: *Vec<*GlobalInfo>) -> u64 {
     parse_consume(p, TOKEN_VAR);
     var tok: *Token = parse_peek(p);
@@ -1618,6 +1719,7 @@ func parse_program_impl(p: *Parser, mode: u64) -> *AstProgram {
         structs = new Vec<*AstStructDef>(16);
     }
 
+    parse_generated_funcs_begin();
     clear_parsing_context();
     while (parse_peek_kind(p) != TOKEN_EOF) {
         // Prevent stale "last parsed function" from polluting top-level diagnostics.
@@ -1661,6 +1763,7 @@ func parse_program_impl(p: *Parser, mode: u64) -> *AstProgram {
         }
     }
 
+    parse_append_generated_funcs(funcs);
     clear_parsing_context();
     var prog: *AstProgram = ast_program(funcs, consts, imports);
     if (mode == PARSE_PROGRAM_MODE_FULL) {
