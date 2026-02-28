@@ -178,6 +178,13 @@ Notes:
 - Multiple annotation groups can be stacked
 - In statement scope, annotation targets are restricted to `var` declarations
 - At top-level, annotation targets are restricted to `func` and `var` declarations
+- `@[entry]` marks the process entry function (default remains `main` when absent)
+  - Current restriction: entry function must be top-level and parameterless
+- If a function annotation name resolves to another function symbol, it is treated as a decorator:
+  - Decorator signature must be `(next: u64, <target params...>) -> <target return>`
+  - The target function is lowered to a generated wrapper that calls the decorator
+  - Multiple decorators are applied from bottom to top (Python-style stacking)
+  - Current restriction: decorator lowering is supported for top-level non-generic functions
 
 ### 3.4. `enum` Declarations
 

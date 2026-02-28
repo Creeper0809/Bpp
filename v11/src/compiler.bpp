@@ -59,6 +59,8 @@ struct CompilerCtx {
     public lib_dir_len: u64;
     public tool_nasm_path: u64;
     public tool_ld_path: u64;
+    public entry_func_ptr: u64;
+    public entry_func_len: u64;
 
     // Generic templates and instantiations
     public generic_funcs: *HashMap<u64, *GenericFuncTemplate>;
@@ -141,6 +143,8 @@ impl CompilerCtx {
         self.lib_dir_len = 0;
         self.tool_nasm_path = 0;
         self.tool_ld_path = 0;
+        self.entry_func_ptr = 0;
+        self.entry_func_len = 0;
         self.generic_funcs = 0;
         self.generic_funcs_mangled = 0;
         self.generic_func_ptrs = 0;
@@ -220,6 +224,8 @@ func compiler_ctx_reset_state() -> u64 {
     g_compiler_ctx.lib_dir_len = 0;
     g_compiler_ctx.tool_nasm_path = 0;
     g_compiler_ctx.tool_ld_path = 0;
+    g_compiler_ctx.entry_func_ptr = 0;
+    g_compiler_ctx.entry_func_len = 0;
 
     // Generic templates and instantiations
     g_compiler_ctx.generic_funcs = new HashMap<u64, *GenericFuncTemplate>(64);
@@ -7371,6 +7377,377 @@ func compiler_validate_impl_overrides() -> u64 {
     return 0;
 }
 
+func compiler_annotation_is_builtin_name(name_ptr: u64, name_len: u64) -> u64 {
+    if (str_eq(name_ptr, name_len, "override", 8) != 0) { return 1; }
+    if (str_eq(name_ptr, name_len, "entry", 5) != 0) { return 1; }
+    if (str_eq(name_ptr, name_len, "used", 4) != 0) { return 1; }
+    if (str_eq(name_ptr, name_len, "hot", 3) != 0) { return 1; }
+    if (str_eq(name_ptr, name_len, "cold", 4) != 0) { return 1; }
+    if (str_eq(name_ptr, name_len, "trace", 5) != 0) { return 1; }
+    if (str_eq(name_ptr, name_len, "config", 6) != 0) { return 1; }
+    return 0;
+}
+
+func compiler_annotation_count_name(annotations: *Vec<*NameInfo>, name_ptr: u64, name_len: u64) -> u64 {
+    if (annotations == 0) { return 0; }
+    var n: u64 = annotations.len();
+    var count: u64 = 0;
+    for (var i: u64 = 0; i < n; i++) {
+        var ann: *NameInfo = annotations.get(i);
+        if (str_eq(ann.ptr, ann.len, name_ptr, name_len) != 0) {
+            count = count + 1;
+        }
+    }
+    return count;
+}
+
+func compiler_annotation_param_shape_equal(a: *Param, b: *Param) -> u64 {
+    if (a == 0 || b == 0) { return 0; }
+    if (a.type_kind != b.type_kind) { return 0; }
+    if (a.ptr_depth != b.ptr_depth) { return 0; }
+    if (a.is_tagged != b.is_tagged) { return 0; }
+    if (a.elem_type_kind != b.elem_type_kind) { return 0; }
+    if (a.elem_ptr_depth != b.elem_ptr_depth) { return 0; }
+    if (a.array_len != b.array_len) { return 0; }
+    if (a.array_len_is_param != b.array_len_is_param) { return 0; }
+    if (a.array_len_is_param != 0) {
+        if (str_eq(a.array_len_param_ptr, a.array_len_param_len, b.array_len_param_ptr, b.array_len_param_len) == 0) {
+            return 0;
+        }
+    }
+    if (a.type_kind == TYPE_STRUCT || a.type_kind == TYPE_GENERIC || a.type_kind == TYPE_TRAIT || a.type_kind == TYPE_ARRAY || a.type_kind == TYPE_SLICE) {
+        if (str_eq(a.struct_name_ptr, a.struct_name_len, b.struct_name_ptr, b.struct_name_len) == 0) {
+            return 0;
+        }
+    }
+    if (a.is_tagged != 0) {
+        if (str_eq(a.tag_layout_ptr, a.tag_layout_len, b.tag_layout_ptr, b.tag_layout_len) == 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+func compiler_annotation_return_shape_equal(lhs: *AstFunc, rhs: *AstFunc) -> u64 {
+    if (lhs == 0 || rhs == 0) { return 0; }
+    if (lhs.ret_type != rhs.ret_type) { return 0; }
+    if (lhs.ret_ptr_depth != rhs.ret_ptr_depth) { return 0; }
+    if (lhs.ret_is_tagged != rhs.ret_is_tagged) { return 0; }
+    if (lhs.ret_type == TYPE_STRUCT || lhs.ret_type == TYPE_GENERIC || lhs.ret_type == TYPE_TRAIT || lhs.ret_type == TYPE_ARRAY || lhs.ret_type == TYPE_SLICE) {
+        if (str_eq(lhs.ret_struct_name_ptr, lhs.ret_struct_name_len, rhs.ret_struct_name_ptr, rhs.ret_struct_name_len) == 0) {
+            return 0;
+        }
+    }
+    if (lhs.ret_is_tagged != 0) {
+        if (str_eq(lhs.ret_tag_layout_ptr, lhs.ret_tag_layout_len, rhs.ret_tag_layout_ptr, rhs.ret_tag_layout_len) == 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+func compiler_annotation_clone_params(params: *Vec<*Param>) -> *Vec<*Param> {
+    if (params == 0) { return new Vec<*Param>(1); }
+    var n: u64 = params.len();
+    var out: *Vec<*Param> = new Vec<*Param>(n + 1);
+    for (var i: u64 = 0; i < n; i++) {
+        out.push(module_util_clone_param(params.get(i)));
+    }
+    return out;
+}
+
+func compiler_annotation_clone_sig(template: *AstFunc, new_name_ptr: u64, new_name_len: u64) -> *AstFunc {
+    var params_out: *Vec<*Param> = compiler_annotation_clone_params(template.params_vec);
+    var sig_out: *AstFunc = ast_func_ex(new_name_ptr, new_name_len, params_out,
+                                        template.ret_type, template.ret_ptr_depth, template.ret_is_tagged,
+                                        template.ret_struct_name_ptr, template.ret_struct_name_len,
+                                        template.ret_tag_layout_ptr, template.ret_tag_layout_len, 0);
+    sig_out.annotations_vec = 0;
+    return sig_out;
+}
+
+func compiler_annotation_build_generated_name(prefix_ptr: u64, prefix_len: u64, base_ptr: u64, base_len: u64, id: u64) -> *NameInfo {
+    var id_buf: u64 = heap_alloc(32 * sizeof(u8));
+    var id_len: u64 = io_u64_to_ascii(id_buf, id);
+    var sep_len: u64 = 2;
+    var total_len: u64 = prefix_len + base_len + sep_len + id_len;
+    var out_ptr: u64 = heap_alloc((total_len + 1) * sizeof(u8));
+    var out_u8: []u8 = slice(out_ptr, total_len + 1);
+    str_copy(out_ptr, prefix_ptr, prefix_len);
+    str_copy(out_ptr + prefix_len, base_ptr, base_len);
+    out_u8[prefix_len + base_len] = 95;
+    out_u8[prefix_len + base_len + 1] = 95;
+    str_copy(out_ptr + prefix_len + base_len + sep_len, id_buf, id_len);
+    out_u8[total_len] = 0;
+    return new NameInfo{out_ptr, total_len};
+}
+
+func compiler_annotation_collect_decorators(fn: *AstFunc) -> *Vec<*NameInfo> {
+    if (fn == 0 || fn.annotations_vec == 0) { return 0; }
+
+    var annotations: *Vec<*NameInfo> = fn.annotations_vec;
+    var n: u64 = annotations.len();
+    var out: *Vec<*NameInfo> = 0;
+    for (var i: u64 = 0; i < n; i++) {
+        var ann: *NameInfo = annotations.get(i);
+        if (compiler_annotation_is_builtin_name(ann.ptr, ann.len) != 0) { continue; }
+
+        var deco_sig: *AstFunc = compiler_find_func_signature_for_call(ann.ptr, ann.len);
+        if (deco_sig == 0) { continue; }
+        if (compiler_name_matches_tail(fn.name_ptr, fn.name_len, ann.ptr, ann.len) != 0) {
+            emit_stderr("[ERROR] function cannot decorate itself: ");
+            emit_stderr_len(fn.name_ptr, fn.name_len);
+            emit_stderr("\n");
+            compiler_panic("Compilation failed");
+        }
+
+        if (out == 0) {
+            out = new Vec<*NameInfo>(2);
+        } else {
+            var dup: u64 = 0;
+            var on: u64 = out.len();
+            for (var j: u64 = 0; j < on; j++) {
+                var prev: *NameInfo = out.get(j);
+                if (str_eq(prev.ptr, prev.len, ann.ptr, ann.len) != 0) {
+                    dup = 1;
+                    break;
+                }
+            }
+            if (dup != 0) { continue; }
+        }
+        out.push(ann);
+    }
+    return out;
+}
+
+func compiler_annotation_validate_decorator_signature(deco_sig: *AstFunc, target: *AstFunc, deco_ptr: u64, deco_len: u64) -> u64 {
+    if (deco_sig == 0 || target == 0) {
+        emit_stderr("[ERROR] internal: decorator signature validation received null function\n");
+        compiler_panic("Compilation failed");
+    }
+
+    if (compiler_annotation_return_shape_equal(deco_sig, target) == 0) {
+        emit_stderr("[ERROR] decorator return type must match target function: ");
+        emit_stderr_len(deco_ptr, deco_len);
+        emit_stderr("\n");
+        compiler_panic("Compilation failed");
+    }
+
+    var target_params: *Vec<*Param> = target.params_vec;
+    var target_n: u64 = 0;
+    if (target_params != 0) { target_n = target_params.len(); }
+
+    var deco_params: *Vec<*Param> = deco_sig.params_vec;
+    if (deco_params == 0 || deco_params.len() != target_n + 1) {
+        emit_stderr("[ERROR] decorator must have signature: (next: u64, <target params...>) -> <target return>: ");
+        emit_stderr_len(deco_ptr, deco_len);
+        emit_stderr("\n");
+        compiler_panic("Compilation failed");
+    }
+
+    var next_param: *Param = deco_params.get(0);
+    if (next_param.type_kind != TYPE_U64 || next_param.ptr_depth != 0 || next_param.is_variadic != 0 || next_param.has_default != 0) {
+        emit_stderr("[ERROR] decorator first parameter must be plain u64 function pointer: ");
+        emit_stderr_len(deco_ptr, deco_len);
+        emit_stderr("\n");
+        compiler_panic("Compilation failed");
+    }
+
+    for (var i: u64 = 0; i < target_n; i++) {
+        var tp: *Param = target_params.get(i);
+        var dp: *Param = deco_params.get(i + 1);
+        if (tp.is_variadic != 0 || tp.has_default != 0) {
+            emit_stderr("[ERROR] decorated target cannot use variadic/default parameters: ");
+            emit_stderr_len(target.name_ptr, target.name_len);
+            emit_stderr("\n");
+            compiler_panic("Compilation failed");
+        }
+        if (dp.is_variadic != 0 || dp.has_default != 0) {
+            emit_stderr("[ERROR] decorator cannot use variadic/default parameters: ");
+            emit_stderr_len(deco_ptr, deco_len);
+            emit_stderr("\n");
+            compiler_panic("Compilation failed");
+        }
+        if (compiler_annotation_param_shape_equal(tp, dp) == 0) {
+            emit_stderr("[ERROR] decorator parameter list must match target function after the first parameter: ");
+            emit_stderr_len(deco_ptr, deco_len);
+            emit_stderr("\n");
+            compiler_panic("Compilation failed");
+        }
+    }
+    return 0;
+}
+
+func compiler_annotation_build_wrapper_body(template: *AstFunc, decorator_ptr: u64, decorator_len: u64, callee_ptr: u64, callee_len: u64, wrapper_params: *Vec<*Param>) -> *AstNode {
+    var n_params: u64 = 0;
+    if (wrapper_params != 0) { n_params = wrapper_params.len(); }
+
+    var args: *Vec<*AstNode> = new Vec<*AstNode>(n_params + 1);
+    args.push((*AstNode)ast_addr_of((*AstNode)ast_ident(callee_ptr, callee_len)));
+    for (var i: u64 = 0; i < n_params; i++) {
+        var p: *Param = wrapper_params.get(i);
+        args.push((*AstNode)ast_ident(p.name_ptr, p.name_len));
+    }
+
+    var call_node: *AstNode = (*AstNode)ast_call_with_origin_named(decorator_ptr, decorator_len, args, 0, AST_CALL_ORIGIN_DIRECT);
+    var stmts: *Vec<*AstNode> = new Vec<*AstNode>(1);
+    if (template.ret_type == TYPE_VOID && template.ret_ptr_depth == 0) {
+        stmts.push((*AstNode)ast_expr_stmt(call_node));
+    } else {
+        stmts.push((*AstNode)ast_return(call_node));
+    }
+    return (*AstNode)ast_block(stmts);
+}
+
+func compiler_annotation_build_wrapper_func(template: *AstFunc, wrapper_name_ptr: u64, wrapper_name_len: u64, decorator_ptr: u64, decorator_len: u64, callee_ptr: u64, callee_len: u64) -> *AstFunc {
+    var params_out: *Vec<*Param> = compiler_annotation_clone_params(template.params_vec);
+    var body_out: *AstNode = compiler_annotation_build_wrapper_body(template, decorator_ptr, decorator_len, callee_ptr, callee_len, params_out);
+    var fn_out: *AstFunc = ast_func_ex(wrapper_name_ptr, wrapper_name_len, params_out,
+                                       template.ret_type, template.ret_ptr_depth, template.ret_is_tagged,
+                                       template.ret_struct_name_ptr, template.ret_struct_name_len,
+                                       template.ret_tag_layout_ptr, template.ret_tag_layout_len, body_out);
+    fn_out.annotations_vec = 0;
+    return fn_out;
+}
+
+func compiler_annotation_rename_first_signature(old_ptr: u64, old_len: u64, new_ptr: u64, new_len: u64) -> u64 {
+    if (g_compiler_ctx.all_func_sigs == 0) { return 0; }
+    var n: u64 = g_compiler_ctx.all_func_sigs.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var sig: *AstFunc = g_compiler_ctx.all_func_sigs.get(i);
+        if (sig == 0) { continue; }
+        if (str_eq(sig.name_ptr, sig.name_len, old_ptr, old_len) == 0) { continue; }
+        sig.name_ptr = new_ptr;
+        sig.name_len = new_len;
+        return 1;
+    }
+    return 0;
+}
+
+func compiler_apply_annotations() -> u64 {
+    if (g_compiler_ctx.all_funcs == 0) { return 0; }
+
+    var original_count: u64 = g_compiler_ctx.all_funcs.len();
+    var generated_id: u64 = 0;
+    var entry_ptr: u64 = 0;
+    var entry_len: u64 = 0;
+
+    for (var i: u64 = 0; i < original_count; i++) {
+        var fn: *AstFunc = g_compiler_ctx.all_funcs.get(i);
+        if (fn == 0) { continue; }
+
+        var entry_count: u64 = compiler_annotation_count_name(fn.annotations_vec, "entry", 5);
+        if (entry_count > 0) {
+            if (fn.impl_owner_ptr != 0 && fn.impl_owner_len != 0) {
+                emit_stderr("[ERROR] @[entry] is only allowed on top-level functions\n");
+                compiler_panic("Compilation failed");
+            }
+            var entry_param_n: u64 = 0;
+            if (fn.params_vec != 0) { entry_param_n = fn.params_vec.len(); }
+            if (entry_param_n != 0) {
+                emit_stderr("[ERROR] @[entry] function must not declare parameters: ");
+                emit_stderr_len(fn.name_ptr, fn.name_len);
+                emit_stderr("\n");
+                compiler_panic("Compilation failed");
+            }
+            if (entry_count > 1) {
+                emit_stderr("[ERROR] duplicate @[entry] annotation on function: ");
+                emit_stderr_len(fn.name_ptr, fn.name_len);
+                emit_stderr("\n");
+                compiler_panic("Compilation failed");
+            }
+            if (entry_ptr != 0 && str_eq(entry_ptr, entry_len, fn.name_ptr, fn.name_len) == 0) {
+                emit_stderr("[ERROR] multiple @[entry] functions are not allowed: ");
+                emit_stderr_len(entry_ptr, entry_len);
+                emit_stderr(" and ");
+                emit_stderr_len(fn.name_ptr, fn.name_len);
+                emit_stderr("\n");
+                compiler_panic("Compilation failed");
+            }
+            entry_ptr = fn.name_ptr;
+            entry_len = fn.name_len;
+        }
+
+        var decorators: *Vec<*NameInfo> = compiler_annotation_collect_decorators(fn);
+        if (decorators == 0 || decorators.len() == 0) { continue; }
+
+        if (fn.impl_owner_ptr != 0 && fn.impl_owner_len != 0) {
+            emit_stderr("[ERROR] function decorators are currently supported only on top-level functions: ");
+            emit_stderr_len(fn.name_ptr, fn.name_len);
+            emit_stderr("\n");
+            compiler_panic("Compilation failed");
+        }
+        if (fn.body == 0) {
+            emit_stderr("[ERROR] function decorator requires a function body: ");
+            emit_stderr_len(fn.name_ptr, fn.name_len);
+            emit_stderr("\n");
+            compiler_panic("Compilation failed");
+        }
+        if (compiler_is_generic_func_ptr(fn) != 0 || fn.ret_type == TYPE_GENERIC) {
+            emit_stderr("[ERROR] function decorators are not supported on generic functions yet: ");
+            emit_stderr_len(fn.name_ptr, fn.name_len);
+            emit_stderr("\n");
+            compiler_panic("Compilation failed");
+        }
+
+        var public_name_ptr: u64 = fn.name_ptr;
+        var public_name_len: u64 = fn.name_len;
+
+        generated_id = generated_id + 1;
+        var hidden_name: *NameInfo = compiler_annotation_build_generated_name("__ann_orig__", 11, public_name_ptr, public_name_len, generated_id);
+        fn.name_ptr = hidden_name.ptr;
+        fn.name_len = hidden_name.len;
+        fn.annotations_vec = 0;
+
+        if (compiler_annotation_rename_first_signature(public_name_ptr, public_name_len, hidden_name.ptr, hidden_name.len) == 0) {
+            if (g_compiler_ctx.all_func_sigs != 0) {
+                g_compiler_ctx.all_func_sigs.push(compiler_annotation_clone_sig(fn, hidden_name.ptr, hidden_name.len));
+            }
+        }
+
+        var callee_ptr: u64 = hidden_name.ptr;
+        var callee_len: u64 = hidden_name.len;
+        var deco_n: u64 = decorators.len();
+        for (var rev: u64 = 0; rev < deco_n; rev++) {
+            var di: u64 = deco_n - rev - 1;
+            var deco: *NameInfo = decorators.get(di);
+            var deco_sig: *AstFunc = compiler_find_func_signature_for_call(deco.ptr, deco.len);
+            if (deco_sig == 0) {
+                emit_stderr("[ERROR] unresolved decorator function: ");
+                emit_stderr_len(deco.ptr, deco.len);
+                emit_stderr("\n");
+                compiler_panic("Compilation failed");
+            }
+            compiler_annotation_validate_decorator_signature(deco_sig, fn, deco.ptr, deco.len);
+
+            var wrapper_name_ptr: u64 = 0;
+            var wrapper_name_len: u64 = 0;
+            if (di == 0) {
+                wrapper_name_ptr = public_name_ptr;
+                wrapper_name_len = public_name_len;
+            } else {
+                generated_id = generated_id + 1;
+                var wrap_name: *NameInfo = compiler_annotation_build_generated_name("__ann_wrap__", 11, public_name_ptr, public_name_len, generated_id);
+                wrapper_name_ptr = wrap_name.ptr;
+                wrapper_name_len = wrap_name.len;
+            }
+
+            var wrapper_fn: *AstFunc = compiler_annotation_build_wrapper_func(fn, wrapper_name_ptr, wrapper_name_len, deco.ptr, deco.len, callee_ptr, callee_len);
+            g_compiler_ctx.all_funcs.push(wrapper_fn);
+            if (g_compiler_ctx.all_func_sigs != 0) {
+                g_compiler_ctx.all_func_sigs.push(compiler_annotation_clone_sig(wrapper_fn, wrapper_name_ptr, wrapper_name_len));
+            }
+            callee_ptr = wrapper_name_ptr;
+            callee_len = wrapper_name_len;
+        }
+    }
+
+    g_compiler_ctx.entry_func_ptr = entry_ptr;
+    g_compiler_ctx.entry_func_len = entry_len;
+    compiler_invalidate_func_lookup();
+    return 0;
+}
+
 func compiler_validate_child_implements_abst_method(sd: *AstStructDef, mi: *NameInfo) -> u64 {
     if (compiler_is_abst_method(sd.name_ptr, sd.name_len, mi.ptr, mi.len) != 0) {
         // Child remains abstract on this method; allowed.
@@ -7662,6 +8039,20 @@ func compiler_get_nasm_path() -> u64 {
 
 func compiler_get_ld_path() -> u64 {
     return g_compiler_ctx.tool_ld_path;
+}
+
+func compiler_get_entry_func_ptr() -> u64 {
+    if (g_compiler_ctx.entry_func_ptr != 0 && g_compiler_ctx.entry_func_len != 0) {
+        return g_compiler_ctx.entry_func_ptr;
+    }
+    return (u64)"main";
+}
+
+func compiler_get_entry_func_len() -> u64 {
+    if (g_compiler_ctx.entry_func_ptr != 0 && g_compiler_ctx.entry_func_len != 0) {
+        return g_compiler_ctx.entry_func_len;
+    }
+    return 4;
 }
 
 func build_merged_program() -> *AstProgram {
