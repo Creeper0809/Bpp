@@ -40,6 +40,7 @@ TEST_PROFILE=${TEST_PROFILE:-full}
 TEST_MODE_FILTER=${TEST_MODE_FILTER:-}
 TEST_OPT_FILTER=${TEST_OPT_FILTER:-}
 COMPILE_FAIL_SINGLE_VARIANT=${COMPILE_FAIL_SINGLE_VARIANT:-}
+TEST_SUITE_CASE_LIMIT=${TEST_SUITE_CASE_LIMIT:-}
 FAST_IO_ACTIVE=0
 
 BUILD_DIR="$BUILD_DIR_BASE"
@@ -193,6 +194,13 @@ if [ -z "$COMPILE_FAIL_SINGLE_VARIANT" ]; then
         COMPILE_FAIL_SINGLE_VARIANT=0
     fi
 fi
+if [ -z "$TEST_SUITE_CASE_LIMIT" ]; then
+    TEST_SUITE_CASE_LIMIT=0
+fi
+if ! [[ "$TEST_SUITE_CASE_LIMIT" =~ ^[0-9]+$ ]]; then
+    echo "Error: TEST_SUITE_CASE_LIMIT must be a non-negative integer"
+    exit 1
+fi
 
 GLOBAL_MODES_CSV="$(normalize_modes_csv "$TEST_MODE_FILTER")"
 GLOBAL_OPTS_CSV="$(normalize_opts_csv "$TEST_OPT_FILTER")"
@@ -237,6 +245,7 @@ if [ "$TEST_QUIET" -eq 0 ]; then
     echo "[INFO] Mode filter: $GLOBAL_MODES_CSV"
     echo "[INFO] Opt filter: $GLOBAL_OPTS_CSV"
     echo "[INFO] Compile-fail single variant: $COMPILE_FAIL_SINGLE_VARIANT"
+    echo "[INFO] Suite case limit: $TEST_SUITE_CASE_LIMIT (0=all)"
     echo "[INFO] Stress runs: $STRESS_RUNS"
     echo "[INFO] Stability runs: $STABILITY_RUNS"
     echo ""
@@ -531,8 +540,13 @@ for TEST_FILE in "${SOURCE_FILES[@]}"; do
             echo "Error: Failed to expand suite file $TEST_FILE"
             exit 1
         fi
+        SUITE_CASE_IDX=0
         while IFS=$'\t' read -r EXPANDED_FILE DISPLAY_NAME; do
             [ -z "$EXPANDED_FILE" ] && continue
+            SUITE_CASE_IDX=$((SUITE_CASE_IDX + 1))
+            if [ "$TEST_SUITE_CASE_LIMIT" -gt 0 ] && [ "$SUITE_CASE_IDX" -gt "$TEST_SUITE_CASE_LIMIT" ]; then
+                continue
+            fi
             TEST_FILES+=("$EXPANDED_FILE")
             TEST_DISPLAY_NAME["$EXPANDED_FILE"]="$DISPLAY_NAME"
         done <<< "$SUITE_CASES"
