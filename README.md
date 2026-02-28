@@ -112,6 +112,22 @@ sudo cmake --install build-linux
 bpp hello.bpp
 ```
 
+### Package Manifest (`bpp.toml`)
+`bpp` now supports a simple project manifest discovered from the source directory upward:
+
+```toml
+version=v10
+module_root=src
+std_root=/abs/path/to/Bpp/v10/src
+nasm_path=/usr/bin/nasm
+ld_path=/usr/bin/ld
+```
+
+- `module_root`: package import root (for non-std modules)
+- `std_root`: std library root that contains `std/*.bpp`
+- `nasm_path`, `ld_path`: optional tool overrides for default compile+run mode
+- `version`: used when deriving defaults
+
 ### Windows (toolchain + smoke)
 ```powershell
 # Configure (auto-download NASM when missing)
@@ -132,6 +148,7 @@ https://aka.ms/vs/17/release/vs_BuildTools.exe
 # Linux
 cd v10
 bash test/run_tests.sh
+bash test/run_regression.sh ../bin/v10_stage1
 ```
 
 ```powershell

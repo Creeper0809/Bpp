@@ -54,8 +54,12 @@ var g_all_trait_impls_vec: *Vec<*TraitImpl> = new Vec<*TraitImpl>(32);   // Vec 
 var g_abst_methods: *HashMap<u64, *Vec<*NameInfo>> = 0;                 // HashMap: struct name -> abstract methods
 var g_base_dir = 0;          // Base directory for imports
 var g_base_dir_len = 0;
+var g_project_dir = 0;       // Optional package module root (from bpp.toml)
+var g_project_dir_len = 0;
 var g_lib_dir = 0;           // Library root directory for compiler/runtime modules
 var g_lib_dir_len = 0;
+var g_tool_nasm_path = 0;    // Optional tool overrides (from bpp.toml)
+var g_tool_ld_path = 0;
 
 // Generic templates and instantiations
 var g_generic_funcs: *HashMap<u64, *GenericFuncTemplate> = new HashMap<u64, *GenericFuncTemplate>(64);          // HashMap: base name -> GenericFuncTemplate
@@ -348,6 +352,59 @@ func compiler_get_cached_module_tokens(file_path: u64, file_path_len: u64) -> *V
 // Config File Parsing
 // ============================================
 
+func compiler_trim_ascii_space(raw: u64) -> u64 {
+    if (raw == 0) { return 0; }
+    var raw_len: u64 = str_len(raw);
+    if (raw_len == 0) { return raw; }
+
+    var s_u8: []u8 = slice(raw, raw_len);
+    var start: u64 = 0;
+    var end: u64 = raw_len;
+
+    while (start < end) {
+        var c0: u64 = s_u8[start];
+        if (c0 != 32 && c0 != 9 && c0 != 10 && c0 != 13) { break; }
+        start = start + 1;
+    }
+    while (end > start) {
+        var c1: u64 = s_u8[end - 1];
+        if (c1 != 32 && c1 != 9 && c1 != 10 && c1 != 13) { break; }
+        end = end - 1;
+    }
+
+    var out_len: u64 = end - start;
+    var out: u64 = heap_alloc((out_len + 1) * sizeof(u8));
+    var out_u8: []u8 = slice(out, out_len + 1);
+    for (var i: u64 = 0; i < out_len; i++) {
+        out_u8[i] = s_u8[start + i];
+    }
+    out_u8[out_len] = 0;
+    return out;
+}
+
+func compiler_strip_wrapped_quotes(raw: u64) -> u64 {
+    if (raw == 0) { return 0; }
+    var raw_len: u64 = str_len(raw);
+    if (raw_len < 2) { return raw; }
+    var s_u8: []u8 = slice(raw, raw_len);
+    if (s_u8[0] != 34 || s_u8[raw_len - 1] != 34) { return raw; }
+
+    var out_len: u64 = raw_len - 2;
+    var out: u64 = heap_alloc((out_len + 1) * sizeof(u8));
+    var out_u8: []u8 = slice(out, out_len + 1);
+    for (var i: u64 = 0; i < out_len; i++) {
+        out_u8[i] = s_u8[i + 1];
+    }
+    out_u8[out_len] = 0;
+    return out;
+}
+
+func compiler_clean_manifest_value(raw: u64) -> u64 {
+    if (raw == 0) { return 0; }
+    var trimmed: u64 = compiler_trim_ascii_space(raw);
+    return compiler_strip_wrapped_quotes(trimmed);
+}
+
 // Read config.ini and extract VERSION value
 func read_version_from_config(config_path: u64) -> u64 {
     var content: u64 = read_entire_file(config_path);
@@ -356,6 +413,43 @@ func read_version_from_config(config_path: u64) -> u64 {
     }
 
     return module_util_find_line_starting_with(content, g_file_len, "VERSION=", 8);
+}
+
+func read_manifest_value(manifest_path: u64, key_prefix: u64, key_prefix_len: u64) -> u64 {
+    var content: u64 = read_entire_file(manifest_path);
+    if (content == 0) { return 0; }
+    var raw: u64 = module_util_find_line_starting_with(content, g_file_len, key_prefix, key_prefix_len);
+    return compiler_clean_manifest_value(raw);
+}
+
+func compiler_manifest_resolve_path(manifest_dir: u64, manifest_dir_len: u64, value_path: u64) -> u64 {
+    if (value_path == 0) { return 0; }
+    var val_len: u64 = str_len(value_path);
+    if (val_len == 0) { return 0; }
+    var val_u8: []u8 = slice(value_path, val_len);
+    if (val_u8[0] == 47) { return value_path; }
+    return str_concat3(manifest_dir, manifest_dir_len, "/", 1, value_path, val_len);
+}
+
+func compiler_find_manifest_path(start_dir: u64, start_dir_len: u64) -> u64 {
+    var cur: u64 = start_dir;
+    var cur_len: u64 = start_dir_len;
+
+    for (var depth: u64 = 0; depth < 64; depth++) {
+        var candidate: u64 = str_concat3(cur, cur_len, "/", 1, "bpp.toml", 8);
+        if (module_util_file_exists(candidate) != 0) { return candidate; }
+
+        if (cur_len == 0) { break; }
+        var parent: u64 = path_dirname(cur, cur_len);
+        var parent_len: u64 = str_len(parent);
+        if (parent_len == cur_len) {
+            if (str_eq(parent, parent_len, cur, cur_len) != 0) { break; }
+        }
+        cur = parent;
+        cur_len = parent_len;
+    }
+
+    return 0;
 }
 
 // ============================================
@@ -475,20 +569,37 @@ func resolve_module_path(module_path: u64, module_len: u64) -> u64 {
         if (full != 0) { return full; }
         full = resolve_module_path_try_cache(module_path, module_len, resolve_module_path_join_root(g_base_dir, g_base_dir_len, with_ext_bpp, with_ext_bpp_len));
         if (full != 0) { return full; }
+        if (g_project_dir != 0 && g_project_dir_len != 0) {
+            full = resolve_module_path_try_cache(module_path, module_len, resolve_module_path_join_root(g_project_dir, g_project_dir_len, with_ext_bpp, with_ext_bpp_len));
+            if (full != 0) { return full; }
+        }
         full = resolve_module_path_try_cache(module_path, module_len, resolve_module_path_join_root(g_lib_dir, g_lib_dir_len, with_ext, with_ext_len));
         if (full != 0) { return full; }
         fallback = resolve_module_path_join_root(g_base_dir, g_base_dir_len, with_ext, with_ext_len);
         full = resolve_module_path_try_cache(module_path, module_len, fallback);
         if (full != 0) { return full; }
+        if (g_project_dir != 0 && g_project_dir_len != 0) {
+            fallback = resolve_module_path_join_root(g_project_dir, g_project_dir_len, with_ext, with_ext_len);
+            full = resolve_module_path_try_cache(module_path, module_len, fallback);
+            if (full != 0) { return full; }
+        }
         return resolve_module_path_panic_not_found(module_path, module_len, fallback);
     }
 
     full = resolve_module_path_try_cache(module_path, module_len, resolve_module_path_join_root(g_base_dir, g_base_dir_len, with_ext_bpp, with_ext_bpp_len));
     if (full != 0) { return full; }
+    if (g_project_dir != 0 && g_project_dir_len != 0) {
+        full = resolve_module_path_try_cache(module_path, module_len, resolve_module_path_join_root(g_project_dir, g_project_dir_len, with_ext_bpp, with_ext_bpp_len));
+        if (full != 0) { return full; }
+    }
     full = resolve_module_path_try_cache(module_path, module_len, resolve_module_path_join_root(g_lib_dir, g_lib_dir_len, with_ext_bpp, with_ext_bpp_len));
     if (full != 0) { return full; }
     full = resolve_module_path_try_cache(module_path, module_len, resolve_module_path_join_root(g_base_dir, g_base_dir_len, with_ext, with_ext_len));
     if (full != 0) { return full; }
+    if (g_project_dir != 0 && g_project_dir_len != 0) {
+        full = resolve_module_path_try_cache(module_path, module_len, resolve_module_path_join_root(g_project_dir, g_project_dir_len, with_ext, with_ext_len));
+        if (full != 0) { return full; }
+    }
     fallback = resolve_module_path_join_root(g_lib_dir, g_lib_dir_len, with_ext, with_ext_len);
     full = resolve_module_path_try_cache(module_path, module_len, fallback);
     if (full != 0) { return full; }
@@ -7125,8 +7236,55 @@ func compiler_insert_global_init_func() -> u64 {
 func setup_paths_with_compiler(filename: u64, filename_len: u64) -> u64 {
     g_base_dir = path_dirname(filename, filename_len);
     g_base_dir_len = str_len(g_base_dir);
+    g_project_dir = g_base_dir;
+    g_project_dir_len = g_base_dir_len;
+    g_lib_dir = 0;
+    g_lib_dir_len = 0;
+    g_tool_nasm_path = 0;
+    g_tool_ld_path = 0;
 
-    // Find version directory by going up from base_dir
+    // Optional package manifest (`bpp.toml`) discovered upward from source dir.
+    // Supported keys (simple key=value):
+    // - module_root=...
+    // - std_root=...
+    // - version=...
+    // - nasm_path=...
+    // - ld_path=...
+    var manifest_path: u64 = compiler_find_manifest_path(g_base_dir, g_base_dir_len);
+    if (manifest_path != 0) {
+        var manifest_len: u64 = str_len(manifest_path);
+        var manifest_dir: u64 = path_dirname(manifest_path, manifest_len);
+        var manifest_dir_len: u64 = str_len(manifest_dir);
+
+        var module_root_val: u64 = read_manifest_value(manifest_path, "module_root=", 12);
+        if (module_root_val != 0) {
+            g_project_dir = compiler_manifest_resolve_path(manifest_dir, manifest_dir_len, module_root_val);
+            g_project_dir_len = str_len(g_project_dir);
+        }
+
+        var std_root_val: u64 = read_manifest_value(manifest_path, "std_root=", 9);
+        if (std_root_val != 0) {
+            g_lib_dir = compiler_manifest_resolve_path(manifest_dir, manifest_dir_len, std_root_val);
+            g_lib_dir_len = str_len(g_lib_dir);
+        } else {
+            var version_val: u64 = read_manifest_value(manifest_path, "version=", 8);
+            if (version_val != 0) {
+                var v_len: u64 = str_len(version_val);
+                var version_src_rel: u64 = str_concat3(version_val, v_len, "/", 1, "src", 3);
+                g_lib_dir = compiler_manifest_resolve_path(manifest_dir, manifest_dir_len, version_src_rel);
+                g_lib_dir_len = str_len(g_lib_dir);
+            }
+        }
+
+        g_tool_nasm_path = read_manifest_value(manifest_path, "nasm_path=", 10);
+        g_tool_ld_path = read_manifest_value(manifest_path, "ld_path=", 8);
+    }
+
+    if (g_lib_dir != 0 && g_lib_dir_len != 0) {
+        return 0;
+    }
+
+    // Legacy fallback: infer version root from neighboring config.ini.
     // src: B/v3_XX/src -> up 1 = B/v3_XX
     // test: B/v3_XX/test/b -> up 2 = B/v3_XX
     var up_one: u64 = path_dirname(g_base_dir, g_base_dir_len);
@@ -7143,7 +7301,7 @@ func setup_paths_with_compiler(filename: u64, filename_len: u64) -> u64 {
     }
 
     if (version2 == 0) {
-        emit_stderr("[ERROR] Could not determine compiler version from config.ini\n");
+        emit_stderr("[ERROR] Could not determine compiler version from config.ini or bpp.toml\n");
         emit_stderr("[ERROR] Checked: ");
         emit_stderr(config_path1);
         emit_stderr(" and ");
@@ -7176,6 +7334,14 @@ func setup_paths_with_compiler(filename: u64, filename_len: u64) -> u64 {
     g_lib_dir = str_concat(lib_root, lib_root_len, src_suffix2, 4);
     g_lib_dir_len = str_len(g_lib_dir);
     return 0;
+}
+
+func compiler_get_nasm_path() -> u64 {
+    return g_tool_nasm_path;
+}
+
+func compiler_get_ld_path() -> u64 {
+    return g_tool_ld_path;
 }
 
 func build_merged_program() -> *AstProgram {
