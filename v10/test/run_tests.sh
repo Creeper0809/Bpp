@@ -36,6 +36,10 @@ TEST_FAST_IO=${TEST_FAST_IO:-0}
 TEST_QUIET=${TEST_QUIET:-0}
 KEEP_TEST_ARTIFACTS=${KEEP_TEST_ARTIFACTS:-1}
 TEST_JOBS=${TEST_JOBS:-0}
+TEST_PROFILE=${TEST_PROFILE:-full}
+TEST_MODE_FILTER=${TEST_MODE_FILTER:-}
+TEST_OPT_FILTER=${TEST_OPT_FILTER:-}
+COMPILE_FAIL_SINGLE_VARIANT=${COMPILE_FAIL_SINGLE_VARIANT:-}
 FAST_IO_ACTIVE=0
 
 BUILD_DIR="$BUILD_DIR_BASE"
@@ -71,6 +75,86 @@ detect_test_jobs() {
     TEST_JOBS="$detected"
 }
 
+normalize_modes_csv() {
+    local raw
+    raw="$(echo "$1" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+    case "$raw" in
+        ""|"both"|"all")
+            echo "nossa,ssa"
+            ;;
+        "nossa"|"ssa")
+            echo "$raw"
+            ;;
+        "nossa,ssa"|"ssa,nossa")
+            echo "nossa,ssa"
+            ;;
+        *)
+            local out=""
+            IFS=',' read -r -a parts <<< "$raw"
+            for p in "${parts[@]}"; do
+                if [ "$p" != "nossa" ] && [ "$p" != "ssa" ]; then
+                    continue
+                fi
+                if [[ ",$out," != *",$p,"* ]]; then
+                    if [ -z "$out" ]; then
+                        out="$p"
+                    else
+                        out="$out,$p"
+                    fi
+                fi
+            done
+            if [ -n "$out" ]; then
+                echo "$out"
+            else
+                echo "nossa,ssa"
+            fi
+            ;;
+    esac
+}
+
+normalize_opts_csv() {
+    local raw
+    raw="$(echo "$1" | tr '[:lower:]' '[:upper:]' | tr -d '[:space:]')"
+    case "$raw" in
+        ""|"BOTH"|"ALL")
+            echo "O0,O1"
+            ;;
+        "O0"|"O1")
+            echo "$raw"
+            ;;
+        "O0,O1"|"O1,O0")
+            echo "O0,O1"
+            ;;
+        *)
+            local out=""
+            IFS=',' read -r -a parts <<< "$raw"
+            for p in "${parts[@]}"; do
+                if [ "$p" != "O0" ] && [ "$p" != "O1" ]; then
+                    continue
+                fi
+                if [[ ",$out," != *",$p,"* ]]; then
+                    if [ -z "$out" ]; then
+                        out="$p"
+                    else
+                        out="$out,$p"
+                    fi
+                fi
+            done
+            if [ -n "$out" ]; then
+                echo "$out"
+            else
+                echo "O0,O1"
+            fi
+            ;;
+    esac
+}
+
+csv_has() {
+    local csv="$1"
+    local needle="$2"
+    [[ ",$csv," == *",$needle,"* ]]
+}
+
 # Colors
 GREEN='\033[0;32m'
 RED='\033[0;31m'
@@ -87,9 +171,47 @@ TOTAL=0
 PASSED=0
 FAILED=0
 
-# Stress/Stability settings (override via env)
-STRESS_RUNS=${STRESS_RUNS:-20}
-STABILITY_RUNS=${STABILITY_RUNS:-5}
+# Resolve profile defaults first, then normalize filters.
+if [ -z "$TEST_MODE_FILTER" ]; then
+    if [ "$TEST_PROFILE" = "quick" ]; then
+        TEST_MODE_FILTER="nossa"
+    else
+        TEST_MODE_FILTER="nossa,ssa"
+    fi
+fi
+if [ -z "$TEST_OPT_FILTER" ]; then
+    if [ "$TEST_PROFILE" = "quick" ]; then
+        TEST_OPT_FILTER="O1"
+    else
+        TEST_OPT_FILTER="O0,O1"
+    fi
+fi
+if [ -z "$COMPILE_FAIL_SINGLE_VARIANT" ]; then
+    if [ "$TEST_PROFILE" = "quick" ]; then
+        COMPILE_FAIL_SINGLE_VARIANT=1
+    else
+        COMPILE_FAIL_SINGLE_VARIANT=0
+    fi
+fi
+
+GLOBAL_MODES_CSV="$(normalize_modes_csv "$TEST_MODE_FILTER")"
+GLOBAL_OPTS_CSV="$(normalize_opts_csv "$TEST_OPT_FILTER")"
+
+# Stress/Stability settings (override via env; quick profile disables by default)
+if [ -z "${STRESS_RUNS+x}" ]; then
+    if [ "$TEST_PROFILE" = "quick" ]; then
+        STRESS_RUNS=0
+    else
+        STRESS_RUNS=20
+    fi
+fi
+if [ -z "${STABILITY_RUNS+x}" ]; then
+    if [ "$TEST_PROFILE" = "quick" ]; then
+        STABILITY_RUNS=0
+    else
+        STABILITY_RUNS=5
+    fi
+fi
 STRESS_PASSED=0
 STRESS_FAILED=0
 STABILITY_PASSED=0
@@ -97,6 +219,7 @@ STABILITY_FAILED=0
 
 # De-dup by content (ignore directive headers)
 declare -A SEEN_HASH
+declare -A TEST_DISPLAY_NAME
 
 echo "========================================"
 echo "${VERSION} Compiler Test Suite"
@@ -110,6 +233,12 @@ fi
 detect_test_jobs
 if [ "$TEST_QUIET" -eq 0 ]; then
     echo "[INFO] Parallel jobs: $TEST_JOBS"
+    echo "[INFO] Profile: $TEST_PROFILE"
+    echo "[INFO] Mode filter: $GLOBAL_MODES_CSV"
+    echo "[INFO] Opt filter: $GLOBAL_OPTS_CSV"
+    echo "[INFO] Compile-fail single variant: $COMPILE_FAIL_SINGLE_VARIANT"
+    echo "[INFO] Stress runs: $STRESS_RUNS"
+    echo "[INFO] Stability runs: $STABILITY_RUNS"
     echo ""
 fi
 
@@ -119,6 +248,8 @@ rm -f "$JOBS_DIR"/*.result 2>/dev/null || true
 RUN_TAG="run_$$"
 CASE_RESULT_FILES=()
 IR_RESULT_FILES=()
+SUITE_CASES_DIR="$ROOT_DIR/build/${VERSION}_suite_cases/$RUN_TAG"
+mkdir -p "$SUITE_CASES_DIR"
 
 launch_job_with_limit() {
     while [ "$(jobs -rp | wc -l)" -ge "$TEST_JOBS" ]; do
@@ -131,13 +262,16 @@ run_matrix_case() {
     set +e
     local case_num="$1"
     local test_file="$2"
-    local test_name="$3"
-    local mode="$4"
-    local opt="$5"
-    local expected="$6"
-    local result_file="$7"
+    local test_id="$3"
+    local test_label="$4"
+    local mode="$5"
+    local opt="$6"
+    local expected="$7"
+    local expect_compile_fail="$8"
+    local expect_error_contains="$9"
+    local result_file="${10}"
 
-    local case_tag="[$case_num] Testing $test_name ($mode $opt)"
+    local case_tag="[$case_num] Testing $test_label ($mode $opt)"
     local case_pass=0
     local case_fail=0
     local case_stress_pass=0
@@ -146,22 +280,13 @@ run_matrix_case() {
     local case_stability_fail=0
     local case_status="PASS"
 
-    local asm_file="$BUILD_DIR/${test_name}.${mode}.${opt}.asm"
-    local obj_file="$BUILD_DIR/${test_name}.${mode}.${opt}.o"
-    local bin_file="$BUILD_DIR/${test_name}.${mode}.${opt}"
-    local out_file="$RESULTS_DIR/${test_name}.${mode}.${opt}.out"
-    local err_file="$RESULTS_DIR/${test_name}.${mode}.${opt}.err"
-    local out_file_persist="$RESULTS_DIR_BASE/${test_name}.${mode}.${opt}.out"
-    local err_file_persist="$RESULTS_DIR_BASE/${test_name}.${mode}.${opt}.err"
-
-    local expect_compile_fail_raw
-    expect_compile_fail_raw=$(grep -m1 -E '^// Expect compile fail:' "$test_file" | awk -F': ' '{print $2}' | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
-    local expect_compile_fail=0
-    if [ "$expect_compile_fail_raw" = "1" ] || [ "$expect_compile_fail_raw" = "true" ] || [ "$expect_compile_fail_raw" = "yes" ]; then
-        expect_compile_fail=1
-    fi
-    local expect_error_contains
-    expect_error_contains=$(grep -m1 -E '^// Expect error contains:' "$test_file" | sed -E 's|^// Expect error contains:[[:space:]]*||')
+    local asm_file="$BUILD_DIR/${test_id}.${mode}.${opt}.asm"
+    local obj_file="$BUILD_DIR/${test_id}.${mode}.${opt}.o"
+    local bin_file="$BUILD_DIR/${test_id}.${mode}.${opt}"
+    local out_file="$RESULTS_DIR/${test_id}.${mode}.${opt}.out"
+    local err_file="$RESULTS_DIR/${test_id}.${mode}.${opt}.err"
+    local out_file_persist="$RESULTS_DIR_BASE/${test_id}.${mode}.${opt}.out"
+    local err_file_persist="$RESULTS_DIR_BASE/${test_id}.${mode}.${opt}.err"
 
     rm -f "$out_file" "$err_file"
 
@@ -272,6 +397,77 @@ run_matrix_case() {
     return 0
 }
 
+expand_suite_file() {
+    local suite_file="$1"
+    local suite_base
+    suite_base="$(basename "$suite_file" .bpp)"
+    local suite_out_dir="$SUITE_CASES_DIR/$suite_base"
+    local manifest="$suite_out_dir/cases.tsv"
+
+    mkdir -p "$suite_out_dir"
+    rm -f "$suite_out_dir"/*.bpp "$manifest" 2>/dev/null || true
+
+    awk \
+        -v suite_base="$suite_base" \
+        -v out_dir="$suite_out_dir" \
+        -v manifest="$manifest" \
+        '
+function sanitize(raw, out) {
+    out = raw
+    gsub(/[^A-Za-z0-9_.-]+/, "_", out)
+    sub(/^_+/, "", out)
+    sub(/_+$/, "", out)
+    if (out == "") out = "case"
+    return out
+}
+BEGIN {
+    in_case = 0
+    case_idx = 0
+}
+/^\/\/=== CASE[[:space:]]+/ {
+    if (in_case) {
+        print "Suite parse error: nested //=== CASE in " FILENAME > "/dev/stderr"
+        exit 1
+    }
+    raw_name = $0
+    sub(/^\/\/=== CASE[[:space:]]+/, "", raw_name)
+    case_idx++
+    safe_name = sanitize(raw_name)
+    out_file = sprintf("%s/%s__%03d_%s.bpp", out_dir, suite_base, case_idx, safe_name)
+    display_name = sprintf("%s::%s", suite_base, raw_name)
+    print out_file "\t" display_name >> manifest
+    in_case = 1
+    next
+}
+/^\/\/=== END[[:space:]]*$/ {
+    if (!in_case) {
+        print "Suite parse error: orphan //=== END in " FILENAME > "/dev/stderr"
+        exit 1
+    }
+    close(out_file)
+    in_case = 0
+    next
+}
+{
+    if (in_case) {
+        print $0 >> out_file
+    }
+}
+END {
+    if (in_case) {
+        print "Suite parse error: missing //=== END in " FILENAME > "/dev/stderr"
+        exit 1
+    }
+    if (case_idx == 0) {
+        print "Suite parse error: no //=== CASE blocks in " FILENAME > "/dev/stderr"
+        exit 1
+    }
+}
+' "$suite_file" || return 1
+
+    cat "$manifest"
+}
+
 run_ir_case() {
     set +e
     local case_num="$1"
@@ -321,37 +517,113 @@ run_ir_case() {
     return 0
 }
 
-# Find all test files (exclude module files)
-TEST_FILES=$(ls $TEST_DIR/*.bpp 2>/dev/null | grep -E '/[0-9]+_' | sort -V)
-if [ -z "$TEST_FILES" ]; then
+# Find all top-level test files (exclude module files).
+mapfile -t SOURCE_FILES < <(find "$TEST_DIR" -maxdepth 1 -type f -name '*.bpp' | sort -V)
+TEST_FILES=()
+for TEST_FILE in "${SOURCE_FILES[@]}"; do
+    TEST_BASE_NAME=$(basename "$TEST_FILE")
+    if [[ ! "$TEST_BASE_NAME" =~ ^[0-9]+_ ]]; then
+        continue
+    fi
+
+    if grep -qE '^//=== CASE[[:space:]]+' "$TEST_FILE"; then
+        if ! SUITE_CASES="$(expand_suite_file "$TEST_FILE")"; then
+            echo "Error: Failed to expand suite file $TEST_FILE"
+            exit 1
+        fi
+        while IFS=$'\t' read -r EXPANDED_FILE DISPLAY_NAME; do
+            [ -z "$EXPANDED_FILE" ] && continue
+            TEST_FILES+=("$EXPANDED_FILE")
+            TEST_DISPLAY_NAME["$EXPANDED_FILE"]="$DISPLAY_NAME"
+        done <<< "$SUITE_CASES"
+    else
+        TEST_FILES+=("$TEST_FILE")
+        TEST_DISPLAY_NAME["$TEST_FILE"]="$(basename "$TEST_FILE" .bpp)"
+    fi
+done
+
+if [ "${#TEST_FILES[@]}" -eq 0 ]; then
     echo "No test files found in $TEST_DIR"
     exit 1
 fi
 
-for TEST_FILE in $TEST_FILES; do
+for TEST_FILE in "${TEST_FILES[@]}"; do
     TEST_NAME=$(basename "$TEST_FILE" .bpp)
+    TEST_LABEL="${TEST_DISPLAY_NAME[$TEST_FILE]:-$TEST_NAME}"
     CONTENT_HASH=$(awk '{if ($0 !~ /^\/\/ (Covers:|Mode:|Opt:|Expect exit code:|Expect compile fail:|Expect error contains:)/) print}' "$TEST_FILE" | md5sum | awk '{print $1}')
     if [ -n "${SEEN_HASH[$CONTENT_HASH]}" ]; then
         if [ "$TEST_QUIET" -eq 0 ]; then
-            echo "[SKIP] Duplicate content: $TEST_NAME (same as ${SEEN_HASH[$CONTENT_HASH]})"
+            echo "[SKIP] Duplicate content: $TEST_LABEL (same as ${SEEN_HASH[$CONTENT_HASH]})"
         fi
         continue
     fi
-    SEEN_HASH[$CONTENT_HASH]="$TEST_NAME"
+    SEEN_HASH[$CONTENT_HASH]="$TEST_LABEL"
 
     EXPECTED=$(grep -m1 -E '^// Expect exit code:' "$TEST_FILE" | awk -F': ' '{print $2}' | tr -d ' ' || echo "0")
     if [ -z "$EXPECTED" ]; then
         EXPECTED=0
     fi
 
+    EXPECT_COMPILE_FAIL_RAW=$(grep -m1 -E '^// Expect compile fail:' "$TEST_FILE" | awk -F': ' '{print $2}' | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]' || true)
+    EXPECT_COMPILE_FAIL=0
+    if [ "$EXPECT_COMPILE_FAIL_RAW" = "1" ] || [ "$EXPECT_COMPILE_FAIL_RAW" = "true" ] || [ "$EXPECT_COMPILE_FAIL_RAW" = "yes" ]; then
+        EXPECT_COMPILE_FAIL=1
+    fi
+    EXPECT_ERROR_CONTAINS=$(grep -m1 -E '^// Expect error contains:' "$TEST_FILE" | sed -E 's|^// Expect error contains:[[:space:]]*||' || true)
+
+    TEST_MODE_DIRECTIVE=$(grep -m1 -E '^// Mode:' "$TEST_FILE" | sed -E 's|^// Mode:[[:space:]]*||' || true)
+    TEST_OPT_DIRECTIVE=$(grep -m1 -E '^// Opt:' "$TEST_FILE" | sed -E 's|^// Opt:[[:space:]]*||' || true)
+    TEST_MODES_CSV="$(normalize_modes_csv "$TEST_MODE_DIRECTIVE")"
+    TEST_OPTS_CSV="$(normalize_opts_csv "$TEST_OPT_DIRECTIVE")"
+
+    # Compile-fail tests do not need full codegen matrix unless explicitly requested.
+    if [ "$EXPECT_COMPILE_FAIL" -eq 1 ] && [ "$COMPILE_FAIL_SINGLE_VARIANT" -eq 1 ] && [ -z "$TEST_MODE_DIRECTIVE" ] && [ -z "$TEST_OPT_DIRECTIVE" ]; then
+        TEST_MODES_CSV="nossa"
+        TEST_OPTS_CSV="O0"
+    fi
+
+    VARIANT_COUNT=0
     for MODE in nossa ssa; do
+        if ! csv_has "$GLOBAL_MODES_CSV" "$MODE" || ! csv_has "$TEST_MODES_CSV" "$MODE"; then
+            continue
+        fi
         for OPT in O0 O1; do
+            if ! csv_has "$GLOBAL_OPTS_CSV" "$OPT" || ! csv_has "$TEST_OPTS_CSV" "$OPT"; then
+                continue
+            fi
+            VARIANT_COUNT=$((VARIANT_COUNT + 1))
             TOTAL=$((TOTAL + 1))
             RESULT_FILE="$JOBS_DIR/${RUN_TAG}_case_${TOTAL}.result"
             CASE_RESULT_FILES+=("$RESULT_FILE")
-            launch_job_with_limit run_matrix_case "$TOTAL" "$TEST_FILE" "$TEST_NAME" "$MODE" "$OPT" "$EXPECTED" "$RESULT_FILE"
+            launch_job_with_limit run_matrix_case "$TOTAL" "$TEST_FILE" "$TEST_NAME" "$TEST_LABEL" "$MODE" "$OPT" "$EXPECTED" "$EXPECT_COMPILE_FAIL" "$EXPECT_ERROR_CONTAINS" "$RESULT_FILE"
         done
     done
+
+    # If global quick filters eliminate all variants, honor per-test directives.
+    if [ "$VARIANT_COUNT" -eq 0 ]; then
+        for MODE in nossa ssa; do
+            if ! csv_has "$TEST_MODES_CSV" "$MODE"; then
+                continue
+            fi
+            for OPT in O0 O1; do
+                if ! csv_has "$TEST_OPTS_CSV" "$OPT"; then
+                    continue
+                fi
+                VARIANT_COUNT=$((VARIANT_COUNT + 1))
+                TOTAL=$((TOTAL + 1))
+                RESULT_FILE="$JOBS_DIR/${RUN_TAG}_case_${TOTAL}.result"
+                CASE_RESULT_FILES+=("$RESULT_FILE")
+                launch_job_with_limit run_matrix_case "$TOTAL" "$TEST_FILE" "$TEST_NAME" "$TEST_LABEL" "$MODE" "$OPT" "$EXPECTED" "$EXPECT_COMPILE_FAIL" "$EXPECT_ERROR_CONTAINS" "$RESULT_FILE"
+            done
+        done
+    fi
+
+    if [ "$VARIANT_COUNT" -eq 0 ]; then
+        echo "Error: No test variants selected for $TEST_LABEL"
+        echo "       Global mode/opt: $GLOBAL_MODES_CSV / $GLOBAL_OPTS_CSV"
+        echo "       Test mode/opt:   $TEST_MODES_CSV / $TEST_OPTS_CSV"
+        exit 1
+    fi
 done
 
 wait || true
@@ -440,9 +712,15 @@ echo -e "Stability: ${GREEN}$STABILITY_PASSED${NC} passed, ${RED}$STABILITY_FAIL
 echo ""
 
 if [ $FAILED -eq 0 ]; then
+    if [ "$KEEP_TEST_ARTIFACTS" -eq 0 ]; then
+        rm -rf "$SUITE_CASES_DIR"
+    fi
     echo -e "${GREEN}All tests passed!${NC}"
     exit 0
 else
+    if [ "$KEEP_TEST_ARTIFACTS" -eq 0 ]; then
+        rm -rf "$SUITE_CASES_DIR"
+    fi
     echo -e "${RED}Some tests failed.${NC}"
     exit 1
 fi
