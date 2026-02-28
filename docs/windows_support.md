@@ -1,6 +1,6 @@
 # Windows Support Guide
 
-## Current Scope (v10)
+## Current Scope (v11)
 
 Windows support is split into two layers:
 
@@ -10,7 +10,7 @@ Windows support is split into two layers:
 - Executable smoke test in CI on `windows-latest`
 
 2. Full hosted compiler/runtime layer (in progress)
-- A Windows-hosted stage compiler binary (`bin/v10_stage1.exe`)
+- A Windows-hosted stage compiler binary (`bin/v11_stage1.exe`)
 - Full runtime parity with Linux for process/file/memory primitives
 
 ## Quick Start
@@ -47,13 +47,13 @@ Install sources:
 When a Windows compiler binary is available:
 
 ```powershell
-.\v10\build_and_test.ps1
+.\build_and_test.ps1
 ```
 
 or directly:
 
 ```powershell
-.\v10\test\run_tests.ps1 -CompilerPath .\bin\v10_stage1.exe
+.\test\run_tests.ps1 -CompilerPath .\bin\v11_stage1.exe
 ```
 
-If `bin/v10_stage1.exe` is missing, the script exits with an explicit bootstrap requirement message.
+If `bin/v11_stage1.exe` is missing, the script exits with an explicit bootstrap requirement message.

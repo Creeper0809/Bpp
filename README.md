@@ -75,7 +75,7 @@ if (rax > 5) {
 
 현재 Stage1에서 실제로 지원되는 문법/제약은 아래 문서에 정리되어 있습니다.
 
-- [docs/syntax.md](docs/syntax.md)
+- [syntax.md](syntax.md)
 
 ## Roadmap
 
@@ -86,25 +86,22 @@ if (rax > 5) {
 
 ## Build & Run
 
-### Linux (v10)
+### Linux
 ```bash
 # Install dependencies
 sudo apt-get install nasm binutils
 
 # Build + self-host + tests
-cd v10
 bash build_and_test.sh
 ```
 
 ### Linux (CMake install + bpp command)
 ```bash
 # Build stage compiler first (required once)
-cd v10
 bash build_and_test.sh
-cd ..
 
 # Install bpp launcher + compiler + std library
-cmake -S . -B build-linux -DBPP_ACTIVE_VERSION=v10
+cmake -S . -B build-linux
 cmake --build build-linux --target toolchain-check
 sudo cmake --install build-linux
 
@@ -116,9 +113,9 @@ bpp hello.bpp
 `bpp` now supports a simple project manifest discovered from the source directory upward:
 
 ```toml
-version=v10
+version=v11
 module_root=src
-std_root=/abs/path/to/Bpp/v10/src
+std_root=/abs/path/to/Bpp/src
 nasm_path=/usr/bin/nasm
 ld_path=/usr/bin/ld
 ```
@@ -137,7 +134,7 @@ cmake -S . -B build-win -DBPP_BOOTSTRAP_NASM=ON
 cmake --build build-win --target toolchain-check windows-smoke
 
 # Optional: run hosted Windows test pipeline when a Windows stage compiler exists
-.\v10\build_and_test.ps1
+.\build_and_test.ps1
 ```
 
 If `link.exe` is missing, install Visual Studio Build Tools:
@@ -146,14 +143,14 @@ https://aka.ms/vs/17/release/vs_BuildTools.exe
 ### Tests
 ```bash
 # Linux
-cd v10
 bash test/run_tests.sh
-bash test/run_regression.sh ../bin/v10_stage1
+VERSION="$(grep -E '^VERSION=' config.ini | head -n1 | cut -d'=' -f2 | tr -d '[:space:]')"
+bash test/run_regression.sh "./bin/${VERSION}_stage1"
 ```
 
 ```powershell
 # Windows
-.\v10\test\run_tests.ps1 -CompilerPath .\bin\v10_stage1.exe
+.\test\run_tests.ps1 -CompilerPath .\bin\v11_stage1.exe
 ```
 
 ## CI/CD

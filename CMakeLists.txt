@@ -3,7 +3,16 @@ project(Bpp LANGUAGES NONE)
 
 option(BPP_BOOTSTRAP_NASM "Automatically download NASM on Windows when not found" ON)
 set(BPP_NASM_VERSION "2.16.03" CACHE STRING "NASM version used for Windows bootstrap")
-set(BPP_ACTIVE_VERSION "v10" CACHE STRING "Active compiler version directory")
+set(BPP_DEFAULT_VERSION "v11")
+set(BPP_CONFIG_FILE "${CMAKE_CURRENT_SOURCE_DIR}/config.ini")
+if(EXISTS "${BPP_CONFIG_FILE}")
+    file(STRINGS "${BPP_CONFIG_FILE}" _bpp_version_line REGEX "^VERSION=" LIMIT_COUNT 1)
+    if(_bpp_version_line)
+        string(REPLACE "VERSION=" "" BPP_DEFAULT_VERSION "${_bpp_version_line}")
+        string(STRIP "${BPP_DEFAULT_VERSION}" BPP_DEFAULT_VERSION)
+    endif()
+endif()
+set(BPP_ACTIVE_VERSION "${BPP_DEFAULT_VERSION}" CACHE STRING "Active compiler version identifier")
 set(BPP_INSTALL_BINDIR "bin" CACHE STRING "Install directory for bpp launcher")
 set(BPP_INSTALL_LIBEXECDIR "libexec" CACHE STRING "Install directory for bpp compiler binaries")
 set(BPP_INSTALL_DATADIR "share" CACHE STRING "Install directory for bpp shared data")
@@ -14,7 +23,7 @@ include(BppToolchain)
 bpp_resolve_nasm(BPP_NASM_EXECUTABLE)
 bpp_resolve_linker(BPP_LINKER_EXECUTABLE)
 
-message(STATUS "BPP active version : ${BPP_ACTIVE_VERSION}")
+message(STATUS "BPP active version id : ${BPP_ACTIVE_VERSION}")
 message(STATUS "BPP NASM          : ${BPP_NASM_EXECUTABLE}")
 message(STATUS "BPP linker        : ${BPP_LINKER_EXECUTABLE}")
 
@@ -33,7 +42,7 @@ if(UNIX AND NOT WIN32)
     if(NOT EXISTS "${BPP_STAGE1_SOURCE}")
         message(WARNING
             "Linux stage1 compiler binary not found at ${BPP_STAGE1_SOURCE}. "
-            "Install step will fail unless you build it first (e.g. run v10/build_and_test.sh)."
+            "Install step will fail unless you build it first (e.g. run ./build_and_test.sh)."
         )
     endif()
 
@@ -47,8 +56,8 @@ if(UNIX AND NOT WIN32)
     install(PROGRAMS "${CMAKE_CURRENT_BINARY_DIR}/bpp" DESTINATION "${BPP_INSTALL_BINDIR}")
     install(PROGRAMS "${BPP_STAGE1_SOURCE}" DESTINATION "${BPP_INSTALL_LIBEXECDIR}/bpp")
     install(
-        DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/${BPP_ACTIVE_VERSION}/src/std"
-        DESTINATION "${BPP_INSTALL_DATADIR}/bpp/${BPP_ACTIVE_VERSION}/src"
+        DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/src/std"
+        DESTINATION "${BPP_INSTALL_DATADIR}/bpp/src"
     )
 endif()
 

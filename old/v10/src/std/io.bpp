@@ -1,0 +1,273 @@
+// io.b - I/O helpers and memory allocation
+// Low-level I/O + heap helpers
+import std.str;
+import std.os;
+
+var heap_inited;
+var heap_brk;
+var heap_reserved_end;
+var heap_base;
+var heap_free_head;
+var g_out_fd;
+var g_print_u64_buf;
+
+const HEAP_ALIGN = 8;
+const HEAP_ALLOC_HEADER_SIZE = 16;
+const HEAP_ALLOC_MIN_SPLIT = 8;
+
+func sys_brk(addr) { return os_sys_brk(addr); }
+func sys_write(fd, buf, count) { return os_sys_write(fd, buf, count); }
+func sys_read(fd, buf, count) { return os_sys_read(fd, buf, count); }
+func sys_open(path, flags, mode) { return os_sys_open(path, flags, mode); }
+func sys_close(fd) { return os_sys_close(fd); }
+func sys_fstat(fd, statbuf) { return os_sys_fstat(fd, statbuf); }
+func sys_exit(code) { return os_sys_exit(code); }
+
+func io_set_output_fd(fd: u64) -> u64 {
+    g_out_fd = fd;
+    return 0;
+}
+
+func io_get_output_fd() -> u64 {
+    if (g_out_fd == 0) { return 1; }
+    return g_out_fd;
+}
+
+func io_write_out(buf: u64, len: u64) -> u64 {
+    var out_fd: u64 = io_get_output_fd();
+    return os_sys_write(out_fd, buf, len);
+}
+
+func heap_align8(size: u64) -> u64 {
+    var align_mask: u64 = 0;
+    align_mask = align_mask - HEAP_ALIGN; // ~(HEAP_ALIGN - 1)
+    var aligned_size: u64 = size + (HEAP_ALIGN - 1);
+    aligned_size = aligned_size & align_mask;
+    return aligned_size;
+}
+
+func heap_block_get_size(block: u64) -> u64 {
+    var p: *u64 = (*u64)block;
+    return p[0];
+}
+
+func heap_block_set_size(block: u64, size: u64) -> u64 {
+    var p: *u64 = (*u64)block;
+    p[0] = size;
+    return 0;
+}
+
+func heap_block_get_next(block: u64) -> u64 {
+    var p: *u64 = (*u64)block;
+    return p[1];
+}
+
+func heap_block_set_next(block: u64, next: u64) -> u64 {
+    var p: *u64 = (*u64)block;
+    p[1] = next;
+    return 0;
+}
+
+func heap_free_list_contains(block: u64) -> u64 {
+    var cur: u64 = heap_free_head;
+    while (cur != 0) {
+        if (cur == block) { return 1; }
+        cur = heap_block_get_next(cur);
+    }
+    return 0;
+}
+
+func heap_free_list_coalesce_adjacent() -> u64 {
+    var cur: u64 = heap_free_head;
+    while (cur != 0) {
+        var next: u64 = heap_block_get_next(cur);
+        if (next == 0) { break; }
+        var cur_end: u64 = cur + HEAP_ALLOC_HEADER_SIZE + heap_block_get_size(cur);
+        if (cur_end == next) {
+            var merged_size: u64 = heap_block_get_size(cur) + HEAP_ALLOC_HEADER_SIZE + heap_block_get_size(next);
+            heap_block_set_size(cur, merged_size);
+            heap_block_set_next(cur, heap_block_get_next(next));
+            continue;
+        }
+        cur = next;
+    }
+    return 0;
+}
+
+func heap_free_list_insert(block: u64) -> u64 {
+    if (block == 0) { return 0; }
+    if (heap_free_head == 0 || block < heap_free_head) {
+        heap_block_set_next(block, heap_free_head);
+        heap_free_head = block;
+        heap_free_list_coalesce_adjacent();
+        return 0;
+    }
+
+    var prev: u64 = heap_free_head;
+    var cur: u64 = heap_block_get_next(prev);
+    while (cur != 0 && cur < block) {
+        prev = cur;
+        cur = heap_block_get_next(cur);
+    }
+
+    heap_block_set_next(block, cur);
+    heap_block_set_next(prev, block);
+    heap_free_list_coalesce_adjacent();
+    return 0;
+}
+
+func heap_try_alloc_from_free_list(aligned_size: u64) -> u64 {
+    var prev: u64 = 0;
+    var cur: u64 = heap_free_head;
+    while (cur != 0) {
+        var cur_size: u64 = heap_block_get_size(cur);
+        if (cur_size >= aligned_size) {
+            var next: u64 = heap_block_get_next(cur);
+            var remaining: u64 = cur_size - aligned_size;
+            if (remaining >= HEAP_ALLOC_HEADER_SIZE + HEAP_ALLOC_MIN_SPLIT) {
+                var split_block: u64 = cur + HEAP_ALLOC_HEADER_SIZE + aligned_size;
+                var split_size: u64 = cur_size - aligned_size - HEAP_ALLOC_HEADER_SIZE;
+                heap_block_set_size(split_block, split_size);
+                heap_block_set_next(split_block, next);
+                if (prev == 0) { heap_free_head = split_block; }
+                else { heap_block_set_next(prev, split_block); }
+                heap_block_set_size(cur, aligned_size);
+            } else {
+                if (prev == 0) { heap_free_head = next; }
+                else { heap_block_set_next(prev, next); }
+            }
+            heap_block_set_next(cur, 0);
+            return cur + HEAP_ALLOC_HEADER_SIZE;
+        }
+        prev = cur;
+        cur = heap_block_get_next(cur);
+    }
+    return 0;
+}
+
+func heap_alloc(size) {
+    if (size == 0) {
+        return 0;
+    }
+
+    var aligned_size: u64 = heap_align8(size);
+    var reused: u64 = heap_try_alloc_from_free_list(aligned_size);
+    if (reused != 0) { return reused; }
+
+    if (heap_inited == 0) {
+        var cur_brk: u64 = os_sys_brk(0);
+        heap_base = cur_brk;
+        heap_brk = cur_brk;
+        heap_reserved_end = cur_brk;
+        heap_inited = 1;
+    }
+
+    var aligned_brk: u64 = heap_align8(heap_brk);
+    var total_size: u64 = aligned_size + HEAP_ALLOC_HEADER_SIZE;
+
+    var p: u64 = aligned_brk;
+    var new_brk: u64 = p + total_size;
+    if (new_brk > heap_reserved_end) {
+        var grow: u64 = total_size;
+        if (grow < 1048576) { grow = 1048576; } // Reserve 1 MiB chunks.
+        var target_end: u64 = new_brk + grow;
+        var res: u64 = os_sys_brk(target_end);
+        if (res < target_end) {
+            return 0;
+        }
+        heap_reserved_end = target_end;
+    }
+
+    heap_brk = new_brk;
+    heap_block_set_size(p, aligned_size);
+    heap_block_set_next(p, 0);
+    return p + HEAP_ALLOC_HEADER_SIZE;
+}
+
+func heap_free(ptr: u64) -> u64 {
+    if (ptr == 0) { return 0; }
+    if (heap_inited == 0) { return 0; }
+    if (ptr < HEAP_ALLOC_HEADER_SIZE) { return 0; }
+
+    var block: u64 = ptr - HEAP_ALLOC_HEADER_SIZE;
+    if (block < heap_base || block >= heap_brk) { return 0; }
+    if (heap_free_list_contains(block) != 0) { return 0; }
+
+    var size: u64 = heap_block_get_size(block);
+    if (size == 0) { return 0; }
+
+    heap_free_list_insert(block);
+    return 0;
+}
+
+func emitln(s: u64) {
+    var len: u64 = str_len(s);
+    io_write_out(s, len);
+    io_write_out("\n", 1);
+}
+
+func emit(s: u64) {
+    if (s == 0) { return; }
+    emit_len(s, str_len(s));
+}
+
+func emit_len(s: u64, len: u64) {
+    if (s == 0) { return; }
+    io_write_out(s, len);
+}
+
+func print(s, len) {
+    emit_len(s, len);
+}
+
+func print_nl() {
+    io_write_out("\n", 1);
+}
+
+func println(s, len) {
+    io_write_out(s, len);
+    io_write_out("\n", 1);
+}
+
+func io_u64_to_ascii(buf: u64, n: u64) -> u64 {
+    var buf_u8: *u8 = (*u8)buf;
+    if (n == 0) {
+        buf_u8[0] = 48;
+        return 1;
+    }
+
+    var i: u64 = 0;
+    var value: u64 = n;
+    for (; value > 0; ) {
+        var digit: u64 = value % 10;
+        buf_u8[i] = digit + 48;
+        value = value / 10;
+        i = i + 1;
+    }
+    var half: u64 = i / 2;
+    for (var k: u64 = 0; k < half; k++) {
+        var rk: u64 = i - 1 - k;
+        var tmp: u8 = buf_u8[k];
+        buf_u8[k] = buf_u8[rk];
+        buf_u8[rk] = tmp;
+    }
+    return i;
+}
+
+func print_u64(n: u64) {
+    if (g_print_u64_buf == 0) {
+        g_print_u64_buf = heap_alloc(32 * sizeof(u8));
+    }
+    var buf = g_print_u64_buf;
+    var i: u64 = io_u64_to_ascii(buf, n);
+    io_write_out(buf, i);
+}
+
+func print_i64(n: i64) {
+    if (n < 0) {
+        io_write_out("-", 1);
+        print_u64((u64)(0 - n));
+    } else {
+        print_u64((u64)n);
+    }
+}

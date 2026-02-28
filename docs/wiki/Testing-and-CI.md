@@ -13,18 +13,18 @@
 전체:
 
 ```bash
-v11/test/run_tests.sh
+test/run_tests.sh
 ```
 
 빠른 프로필:
 
 ```bash
-TEST_PROFILE=quick TEST_FAST_IO=1 TEST_JOBS=4 v11/test/run_tests.sh
+TEST_PROFILE=quick TEST_FAST_IO=1 TEST_JOBS=4 test/run_tests.sh
 ```
 
 ## 3. 테스트 파일 구성
 
-- `v11/test/source/*.bpp`
+- `test/source/*.bpp`
 - suite 파일은 `//=== CASE ...` 기준으로 케이스를 분리
 - 성공/실패 케이스를 카테고리별로 묶어 관리
 

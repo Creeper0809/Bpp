@@ -26,7 +26,7 @@
 
 ### Compile-fail Test
 
-- `v11/test/source/*_fail*.bpp` 케이스는 의도적으로 실패해야 정상입니다.
+- `test/source/*_fail*.bpp` 케이스는 의도적으로 실패해야 정상입니다.
 - 진단 메시지 포함 여부까지 CI에서 검증합니다.
 
 ## Constraints (v11)
