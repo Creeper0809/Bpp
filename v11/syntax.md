@@ -153,7 +153,33 @@ func my_func() {
 }
 ```
 
-### 3.3. `enum` Declarations
+### 3.3. Declaration Annotations (`@[...]`)
+
+Annotations can be attached to declaration targets:
+
+- Function declarations (`func`)
+- Variable declarations (`var`) at global scope and local statement scope
+
+```b
+@[entry]
+func run() -> u64 {
+    @[hot]
+    var x: u64 = 1;
+    return x;
+}
+
+@[config]
+var GLOBAL_COUNT: u64 = 42;
+```
+
+Notes:
+
+- Multiple annotation names can be grouped: `@[a, b, c]`
+- Multiple annotation groups can be stacked
+- In statement scope, annotation targets are restricted to `var` declarations
+- At top-level, annotation targets are restricted to `func` and `var` declarations
+
+### 3.4. `enum` Declarations
 
 Enums define a set of named integer constants. The value automatically increments from the previous member.
 
@@ -172,7 +198,7 @@ enum Flags {
 ```
 The members are accessed as `EnumName_MemberName` (e.g., `Color_RED`).
 
-### 3.4. `import` Declarations
+### 3.5. `import` Declarations
 
 Imports a module. The path is specified using dot notation. 선택적으로 심볼을 가져오거나 별칭을 부여할 수 있습니다.
 

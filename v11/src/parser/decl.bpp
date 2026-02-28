@@ -461,6 +461,7 @@ func parse_validate_params(p: *Parser, params: *Vec<*Param>) -> u64 {
 }
 
 struct ParsedFuncHeader {
+    public annotations: *Vec<*NameInfo>;
     public name_tok: *Token;
     public generic_params: *Vec<*GenericParam>;
     public params: *Vec<*Param>;
@@ -475,6 +476,7 @@ struct ParsedFuncHeader {
 
 impl ParsedFuncHeader {
     public constructor() {
+        self.annotations = 0;
         self.name_tok = 0;
         self.generic_params = 0;
         self.params = 0;
@@ -489,6 +491,7 @@ impl ParsedFuncHeader {
 }
 
 func parse_func_header(p: *Parser) -> *ParsedFuncHeader {
+    var annotations: *Vec<*NameInfo> = parse_take_leading_annotations(p);
     parse_consume(p, TOKEN_FUNC);
 
     var name_tok: *Token = parse_peek(p);
@@ -546,6 +549,7 @@ func parse_func_header(p: *Parser) -> *ParsedFuncHeader {
     }
 
     var parsed: *ParsedFuncHeader = new ParsedFuncHeader();
+    parsed.annotations = annotations;
     parsed.name_tok = name_tok;
     parsed.generic_params = generic_params;
     parsed.params = params;
@@ -561,10 +565,12 @@ func parse_func_header(p: *Parser) -> *ParsedFuncHeader {
 
 func parse_func_from_header(parsed: *ParsedFuncHeader, body: *AstNode) -> *AstFunc {
     var name_tok: *Token = parsed.name_tok;
-    return ast_func_ex(name_tok.ptr, name_tok.len, parsed.params,
-                       parsed.ret_type, parsed.ret_ptr_depth, parsed.ret_is_tagged,
-                       parsed.ret_struct_name_ptr, parsed.ret_struct_name_len,
-                       parsed.ret_tag_layout_ptr, parsed.ret_tag_layout_len, body);
+    var func_node: *AstFunc = ast_func_ex(name_tok.ptr, name_tok.len, parsed.params,
+                                          parsed.ret_type, parsed.ret_ptr_depth, parsed.ret_is_tagged,
+                                          parsed.ret_struct_name_ptr, parsed.ret_struct_name_len,
+                                          parsed.ret_tag_layout_ptr, parsed.ret_tag_layout_len, body);
+    func_node.annotations_vec = parsed.annotations;
+    return func_node;
 }
 
 func parse_register_generic_func(p: *Parser, name_tok: *Token, generic_params: *Vec<*GenericParam>, func_node: *AstFunc, is_definition: u64) -> u64 {
@@ -1213,26 +1219,42 @@ struct ParseImplModifiers {
     public is_abst: u64;
     public is_override: u64;
     public access: u64;
+    public annotations: *Vec<*NameInfo>;
 }
 
 func parse_impl_consume_override_annotation(p: *Parser, modifiers: *ParseImplModifiers) -> u64 {
     if (parse_peek_kind(p) != TOKEN_AT) { return 0; }
-    parse_adv(p);
-    parse_consume(p, TOKEN_LBRACKET);
-    var anno_tok: *Token = parse_peek(p);
-    parse_consume(p, TOKEN_IDENTIFIER);
-    parse_consume(p, TOKEN_RBRACKET);
-    if (str_eq(anno_tok.ptr, anno_tok.len, "override", 8) == 0) {
-        emit_stderr("[ERROR] unknown impl annotation: @[");
-        emit_stderr_len(anno_tok.ptr, anno_tok.len);
-        emit_stderr("]\n");
+
+    var group: *Vec<*NameInfo> = parse_consume_annotation_group(p);
+    if (group == 0 || group.len() == 0) { return 0; }
+
+    var has_override: u64 = 0;
+    var has_other: u64 = 0;
+    var n: u64 = group.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var info: *NameInfo = group.get(i);
+        if (str_eq(info.ptr, info.len, "override", 8) != 0) {
+            has_override = 1;
+        } else {
+            has_other = 1;
+        }
+    }
+
+    if (has_override != 0 && has_other != 0) {
+        emit_stderr("[ERROR] @[override] cannot be combined with other annotations in the same group\n");
         parse_panic_here(p, "Syntax error");
     }
-    if (modifiers.is_override != 0) {
-        emit_stderr("[ERROR] duplicate @[override] annotation\n");
-        parse_panic_here(p, "Syntax error");
+
+    if (has_override != 0) {
+        if (modifiers.is_override != 0 || n > 1) {
+            emit_stderr("[ERROR] duplicate @[override] annotation\n");
+            parse_panic_here(p, "Syntax error");
+        }
+        modifiers.is_override = 1;
+        return 1;
     }
-    modifiers.is_override = 1;
+
+    modifiers.annotations = parse_annotations_append(modifiers.annotations, group);
     return 1;
 }
 
@@ -1242,6 +1264,7 @@ func parse_impl_consume_modifiers(p: *Parser) -> ParseImplModifiers {
     modifiers.is_abst = 0;
     modifiers.is_override = 0;
     modifiers.access = ACCESS_PRIVATE;
+    modifiers.annotations = 0;
 
     var seen_access: u64 = 0;
     while (1) {
@@ -1311,7 +1334,17 @@ func parse_impl_consume_modifiers(p: *Parser) -> ParseImplModifiers {
     return modifiers;
 }
 
-func parse_impl_try_special_method(p: *Parser, sig_only: u64, struct_name_ptr: u64, struct_name_len: u64, is_static: u64, is_abst: u64, is_override: u64, method_access: u64, funcs: *Vec<*AstFunc>) -> u64 {
+func parse_merge_func_annotations(func_node: *AstFunc, extra: *Vec<*NameInfo>) -> u64 {
+    if (func_node == 0 || extra == 0) { return 0; }
+    if (func_node.annotations_vec == 0) {
+        func_node.annotations_vec = extra;
+        return 0;
+    }
+    func_node.annotations_vec = parse_annotations_append(func_node.annotations_vec, extra);
+    return 0;
+}
+
+func parse_impl_try_special_method(p: *Parser, sig_only: u64, struct_name_ptr: u64, struct_name_len: u64, is_static: u64, is_abst: u64, is_override: u64, method_access: u64, method_annotations: *Vec<*NameInfo>, funcs: *Vec<*AstFunc>) -> u64 {
     var kind: u64 = parse_peek_kind(p);
     if (kind == TOKEN_CONSTRUCTOR) {
         if (is_static != 0) {
@@ -1327,6 +1360,7 @@ func parse_impl_try_special_method(p: *Parser, sig_only: u64, struct_name_ptr: u
             parse_panic_here(p, "Syntax error");
         }
         var ctor_node: *AstFunc = parse_constructor_decl(p, struct_name_ptr, struct_name_len, sig_only);
+        parse_merge_func_annotations(ctor_node, method_annotations);
         parser_mark_impl_method_metadata(struct_name_ptr, struct_name_len, ctor_node, method_access, 0);
         funcs.push(ctor_node);
         return 1;
@@ -1345,6 +1379,7 @@ func parse_impl_try_special_method(p: *Parser, sig_only: u64, struct_name_ptr: u
             parse_panic_here(p, "Syntax error");
         }
         var dtor_node: *AstFunc = parse_destructor_decl(p, struct_name_ptr, struct_name_len, sig_only);
+        parse_merge_func_annotations(dtor_node, method_annotations);
         parser_mark_impl_method_metadata(struct_name_ptr, struct_name_len, dtor_node, method_access, 0);
         funcs.push(dtor_node);
         return 1;
@@ -1373,19 +1408,21 @@ func parse_impl_block_impl(p: *Parser, sig_only: u64) -> *Vec<*AstFunc> {
         var is_abst: u64 = modifiers.is_abst;
         var is_override: u64 = modifiers.is_override;
         var method_access: u64 = modifiers.access;
-        if (parse_impl_try_special_method(p, sig_only, struct_name_ptr, struct_name_len, is_static, is_abst, is_override, method_access, funcs) != 0) {
+        if (parse_impl_try_special_method(p, sig_only, struct_name_ptr, struct_name_len, is_static, is_abst, is_override, method_access, modifiers.annotations, funcs) != 0) {
             continue;
         }
 
         if (parse_peek_kind(p) == TOKEN_FUNC) {
             if (is_abst != 0) {
                 var abst_sig: *AstFunc = parse_func_decl_abst_signature(p);
+                parse_merge_func_annotations(abst_sig, modifiers.annotations);
                 compiler_register_abst_method_ex(struct_name_ptr, struct_name_len, abst_sig.name_ptr, abst_sig.name_len, abst_sig, method_access);
                 continue;
             }
 
             var func_node: *AstFunc = parse_impl_parse_func_by_mode(p, sig_only);
             if (func_node == 0) { continue; }
+            parse_merge_func_annotations(func_node, modifiers.annotations);
 
             parser_mark_impl_method_metadata(struct_name_ptr, struct_name_len, func_node, method_access, is_override);
             funcs.push(func_node);
@@ -1461,6 +1498,7 @@ func parse_impl_trait_block_impl(p: *Parser, sig_only: u64, register_trait_impl:
 
         var func_node: *AstFunc = parse_impl_parse_func_by_mode(p, sig_only);
         if (func_node == 0) { continue; }
+        parse_merge_func_annotations(func_node, modifiers.annotations);
 
         var original_name_ptr: u64 = func_node.name_ptr;
         var original_name_len: u64 = func_node.name_len;
@@ -1559,6 +1597,7 @@ func parse_skip_const_decl_signature(p: *Parser) -> u64 {
 }
 
 func parse_skip_global_var_decl_signature(p: *Parser) -> u64 {
+    parse_take_leading_annotations(p);
     parse_consume(p, TOKEN_VAR);
     parse_consume(p, TOKEN_IDENTIFIER);
     if (parse_match(p, TOKEN_COLON)) {
@@ -1593,6 +1632,7 @@ func parse_append_generated_funcs(p: *Parser, funcs: *Vec<*AstFunc>) -> u64 {
 }
 
 func parse_global_var_decl_full(p: *Parser, globals: *Vec<*GlobalInfo>) -> u64 {
+    var annotations: *Vec<*NameInfo> = parse_take_leading_annotations(p);
     parse_consume(p, TOKEN_VAR);
     var tok: *Token = parse_peek(p);
 
@@ -1627,6 +1667,7 @@ func parse_global_var_decl_full(p: *Parser, globals: *Vec<*GlobalInfo>) -> u64 {
     ginfo.init_name_ptr = 0;
     ginfo.init_name_len = 0;
     ginfo.init_expr = (u64)init_expr;
+    ginfo.annotations_vec = annotations;
     globals.push(ginfo);
     return 0;
 }
@@ -1748,6 +1789,19 @@ func parse_program_impl(p: *Parser, mode: u64) -> *AstProgram {
                 break;
             case TOKEN_VAR:
                 parse_program_handle_global(p, mode, globals);
+                break;
+            case TOKEN_AT:
+                var next_k: u64 = parse_peek_kind_after_annotations(p);
+                if (next_k == TOKEN_FUNC) {
+                    parse_program_handle_func(p, mode, funcs);
+                    break;
+                }
+                if (next_k == TOKEN_VAR) {
+                    parse_program_handle_global(p, mode, globals);
+                    break;
+                }
+                emit_stderr("[ERROR] annotation target must be function or variable declaration\n");
+                parse_panic_here(p, "Syntax error");
                 break;
             case TOKEN_IMPORT:
                 imports.push(parse_import_decl(p));
