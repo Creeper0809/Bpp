@@ -15,8 +15,6 @@ B로 작성되었으며 부트스트래핑하여 메이저 B를 제작합니다.
   - Windows runner scripts and CI smoke execution ✅
   - Full self-host/runtime parity with Linux ⏳
 
-See [Windows Support Guide](docs/windows_support.md) for details.
-
 ## Why?
 
 이 세상에는 없어져야 더 행복해질 수 있는 것들이 잔뜩있습니다.
@@ -71,11 +69,9 @@ if (rax > 5) {
 }
 ```
 
-## 문법 문서
+## 문법 기준
 
-현재 Stage1에서 실제로 지원되는 문법/제약은 아래 문서에 정리되어 있습니다.
-
-- [syntax.md](syntax.md)
+현재 구현 기준 문법/제약은 `src/` 파서 구현과 `test/source` 케이스를 기준으로 관리합니다.
 
 ## Roadmap
 
