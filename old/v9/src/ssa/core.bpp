@@ -1,0 +1,492 @@
+// ssa_core.b - SSA core helpers and constructors
+// 자료구조를 조립하기 위한 핵심 유틸/생성자/리스트 조작 함수 모음
+
+import std.io;
+import std.util;
+import std.vec;
+import std.mem;
+import ssa.datastruct;
+
+// ============================================
+// Pointer List Helpers
+// ============================================
+
+// _ssa_slice_push - 슬라이스 필드와 cap 필드를 직접 참조로 받아 동적 확장/삽입합니다.
+// 기존 오프셋 기반 구현(unsafe pointer arithmetic)을 제네릭 기반으로 대체했습니다.
+func _ssa_slice_push<T>(slice_ref: *[]T, cap_ref: *u64, item: T, initial_cap: u64) -> u64 {
+    push_trace("_ssa_slice_push<T>", "ssa_core.b", __LINE__);
+    defer pop_trace();
+    var slice_u64: *u64 = (*u64)slice_ref;
+
+    var len: u64 = slice_u64[1];
+    var cap: u64 = *cap_ref;
+    var data: u64 = slice_u64[0];
+
+    if (len >= cap) {
+        var new_cap: u64 = cap * 2;
+        if (new_cap == 0) { new_cap = initial_cap; }
+
+        var elem_size: u64 = sizeof(T);
+        var new_data: u64 = heap_alloc(new_cap * elem_size);
+        if (len > 0) {
+            var old_u64: *T = (*T)data;
+            var new_u64: *T = (*T)new_data;
+            for (var i: u64 = 0; i < len; i++) {
+                new_u64[i] = old_u64[i];
+            }
+        }
+        if (data != 0) {
+            // Currently a no-op in bump allocator mode, but keep explicit release path.
+            free(data);
+        }
+        data = new_data;
+        cap = new_cap;
+    }
+
+    var data_u64: *T = (*T)data;
+    data_u64[len] = item;
+    len = len + 1;
+
+    slice_u64[0] = data;
+    slice_u64[1] = len;
+    *cap_ref = cap;
+    return 0;
+}
+
+func ssa_block_list_push(fn: *SSAFunction, block: *SSABlock) -> u64 {
+    push_trace("ssa_block_list_push", "ssa_core.b", __LINE__);
+    defer pop_trace();
+    return _ssa_slice_push<*SSABlock>(&fn.blocks, &fn.blocks_cap, block, 8);
+}
+
+func ssa_func_list_push(ctx: *SSAContext, fn: *SSAFunction) -> u64 {
+    push_trace("ssa_func_list_push", "ssa_core.b", __LINE__);
+    defer pop_trace();
+    return _ssa_slice_push<*SSAFunction>(&ctx.funcs, &ctx.funcs_cap, fn, 8);
+}
+
+func ssa_slice_len<T>(s: []T) -> u64 {
+    var s_u64: *u64 = (*u64)&s;
+    return s_u64[1];
+}
+
+// ============================================
+// SSA Constructors
+// ============================================
+
+func ssa_context_new() -> *SSAContext {
+    push_trace("ssa_context_new", "ssa_core.b", __LINE__);
+    defer pop_trace();
+    var ctx: *SSAContext = new SSAContext();
+    return ctx;
+}
+
+func ssa_new_block(ctx: *SSAContext, fn: *SSAFunction) -> *SSABlock {
+    push_trace("ssa_new_block", "ssa_core.b", __LINE__);
+    defer pop_trace();
+    var b: *SSABlock = new SSABlock();
+    b.id = fn.next_local_block_id;
+    fn.next_local_block_id = fn.next_local_block_id + 1;
+    ssa_block_list_push(fn, b);
+    return b;
+}
+
+func ssa_new_inst(ctx: *SSAContext, op: u64, dest: u64, src1: u64, src2: u64) -> *SSAInstruction {
+    push_trace("ssa_new_inst", "ssa_core.b", __LINE__);
+    defer pop_trace();
+    var inst: *SSAInstruction = new SSAInstruction();
+    var p: *tagged(InstMeta) u8 = (*tagged(InstMeta) u8)0;
+    p.op = (u16)op;
+    inst.prev = p;
+    inst.id = ctx.next_inst_id;
+    ctx.next_inst_id = ctx.next_inst_id + 1;
+    inst.dest = dest;
+    inst.src1 = src1;
+    inst.src2 = src2;
+    return inst;
+}
+
+func ssa_inst_append(block: *SSABlock, inst: *SSAInstruction) -> u64 {
+    push_trace("ssa_inst_append", "ssa_core.b", __LINE__);
+    defer pop_trace();
+    var p: *tagged(InstMeta) u8 = inst.prev;
+    var current_op: u16 = p.op;
+    p = (*tagged(InstMeta) u8)block.inst_tail;
+    p.op = current_op;
+    inst.prev = p;
+    inst.next = 0;
+    if (block.inst_head == 0) {
+        block.inst_head = inst;
+        block.inst_tail = inst;
+        return 0;
+    }
+    block.inst_tail.next = inst;
+    block.inst_tail = inst;
+    return 0;
+}
+
+func ssa_inst_insert_before_terminator(block: *SSABlock, inst: *SSAInstruction) -> u64 {
+    push_trace("ssa_inst_insert_before_terminator", "ssa_core.b", __LINE__);
+    defer pop_trace();
+    if (block == 0 || inst == 0) { return 0; }
+
+    var tail: *SSAInstruction = block.inst_tail;
+    if (tail == 0) { return ssa_inst_append(block, inst); }
+
+    var op: u64 = ssa_inst_get_op(tail);
+    if (op != SSA_OP_JMP && op != SSA_OP_BR && op != SSA_OP_RET && op != SSA_OP_RET_SLICE_HEAP) {
+        return ssa_inst_append(block, inst);
+    }
+
+    var prev: *SSAInstruction = 0;
+    var cur: *SSAInstruction = block.inst_head;
+    while (cur != 0 && cur != tail) {
+        prev = cur;
+        cur = cur.next;
+    }
+    if (cur == 0) { return ssa_inst_append(block, inst); }
+
+    inst.next = tail;
+    ssa_inst_set_prev(inst, prev);
+    if (prev != 0) {
+        prev.next = inst;
+    } else {
+        block.inst_head = inst;
+    }
+    ssa_inst_set_prev(tail, inst);
+    return 0;
+}
+
+func ssa_phi_append(block: *SSABlock, phi: *SSAInstruction) -> u64 {
+    push_trace("ssa_phi_append", "ssa_core.b", __LINE__);
+    defer pop_trace();
+    var next_phi: *SSAInstruction = block.phi_head;
+    phi.next = next_phi;
+
+    if (next_phi != 0) {
+        var next_p: *tagged(InstMeta) u8 = next_phi.prev;
+        var next_op: u16 = next_p.op;
+        next_p = (*tagged(InstMeta) u8)phi;
+        next_p.op = next_op;
+        next_phi.prev = next_p;
+    }
+
+    var p: *tagged(InstMeta) u8 = phi.prev;
+    var op: u16 = p.op;
+    p = (*tagged(InstMeta) u8)0;
+    p.op = op;
+    phi.prev = p;
+
+    block.phi_head = phi;
+    return 0;
+}
+
+func ssa_inst_get_op(inst: *SSAInstruction) -> u64 {
+    push_trace("ssa_inst_get_op", "ssa_core.b", __LINE__);
+    defer pop_trace();
+    var p: *tagged(InstMeta) u8 = inst.prev;
+    return (u64)p.op;
+}
+
+func ssa_inst_set_op(inst: *SSAInstruction, op: u64) -> u64 {
+    push_trace("ssa_inst_set_op", "ssa_core.b", __LINE__);
+    defer pop_trace();
+    var p: *tagged(InstMeta) u8 = inst.prev;
+    p.op = (u16)op;
+    inst.prev = p;
+    return 0;
+}
+
+func ssa_inst_set_prev(inst: *SSAInstruction, prev: *SSAInstruction) -> u64 {
+    push_trace("ssa_inst_set_prev", "ssa_core.b", __LINE__);
+    defer pop_trace();
+    var p: *tagged(InstMeta) u8 = inst.prev;
+    var op: u16 = p.op;
+    p = (*tagged(InstMeta) u8)prev;
+    p.op = op;
+    inst.prev = p;
+    return 0;
+}
+
+func ssa_phi_arg_new(val: u64, block_id: u64) -> *SSAPhiArg {
+    push_trace("ssa_phi_arg_new", "ssa_core.b", __LINE__);
+    defer pop_trace();
+    var a: *SSAPhiArg = new SSAPhiArg();
+    a.val = val;
+    a.block_id = block_id;
+    return a;
+}
+
+func ssa_phi_arg_append(head: *SSAPhiArg, val: u64, block_id: u64) -> *SSAPhiArg {
+    push_trace("ssa_phi_arg_append", "ssa_core.b", __LINE__);
+    defer pop_trace();
+    var node_ptr: *SSAPhiArg = ssa_phi_arg_new(val, block_id);
+    if (head == 0) { return node_ptr; }
+
+    var cur: *SSAPhiArg = head;
+    while (cur.next != 0) {
+        cur = cur.next;
+    }
+    cur.next = node_ptr;
+    return head;
+}
+
+func ssa_phi_new(ctx: *SSAContext, dest: u64, args_head: *SSAPhiArg) -> *SSAInstruction {
+    push_trace("ssa_phi_new", "ssa_core.b", __LINE__);
+    defer pop_trace();
+    var inst_ptr: *SSAInstruction = ssa_new_inst(ctx, SSA_OP_PHI, dest, (u64)args_head, 0);
+    return inst_ptr;
+}
+
+func ssa_phi_add_arg(inst: *SSAInstruction, val: u64, block_id: u64) -> u64 {
+    push_trace("ssa_phi_add_arg", "ssa_core.b", __LINE__);
+    defer pop_trace();
+    if (ssa_inst_get_op(inst) != SSA_OP_PHI) { return 0; }
+    var head: *SSAPhiArg = (*SSAPhiArg)inst.src1;
+    var new_head_ptr: *SSAPhiArg = ssa_phi_arg_append(head, val, block_id);
+    inst.src1 = (u64)new_head_ptr;
+    return 0;
+}
+
+func ssa_operand_const(val: u64) -> u64 {
+    push_trace("ssa_operand_const", "ssa_core.b", __LINE__);
+    defer pop_trace();
+    var mask: u64 = 1;
+    mask = mask << 63;
+    return val | mask;
+}
+
+func ssa_operand_reg(id: u64) -> u64 {
+    push_trace("ssa_operand_reg", "ssa_core.b", __LINE__);
+    defer pop_trace();
+    return id & SSA_OPR_VALUE_MASK;
+}
+
+func ssa_operand_is_const(opr: u64) -> u64 {
+    push_trace("ssa_operand_is_const", "ssa_core.b", __LINE__);
+    defer pop_trace();
+    var mask: u64 = 1;
+    mask = mask << 63;
+    return (opr & mask) != 0;
+}
+
+func ssa_operand_value(opr: u64) -> u64 {
+    push_trace("ssa_operand_value", "ssa_core.b", __LINE__);
+    defer pop_trace();
+    return opr & SSA_OPR_VALUE_MASK;
+}
+
+struct SSARetSliceHeapInfo {
+    public inst_ptr: u64;
+    public elem_size: u64;
+}
+
+impl SSARetSliceHeapInfo {
+    public constructor() {
+        self.inst_ptr = 0;
+        self.elem_size = 0;
+    }
+}
+
+struct SSARetSliceHeapInfoEx {
+    public inst_ptr: u64;
+    public elem_size: u64;
+    public ptr_val: u64;
+    public len_val: u64;
+    public ptr_is_reg: u64;
+    public len_is_reg: u64;
+}
+
+struct SSARetSliceHeapQueryEx {
+    public found: u64;
+    public elem_size: u64;
+    public ptr_val: u64;
+    public len_val: u64;
+    public ptr_is_reg: u64;
+    public len_is_reg: u64;
+}
+
+impl SSARetSliceHeapInfoEx {
+    public constructor() {
+        self.inst_ptr = 0;
+        self.elem_size = 0;
+        self.ptr_val = 0;
+        self.len_val = 0;
+        self.ptr_is_reg = 0;
+        self.len_is_reg = 0;
+    }
+}
+
+var g_ret_slice_heap_map: *Vec<*SSARetSliceHeapInfo>;
+var g_ret_slice_heap_map_ex: *Vec<*SSARetSliceHeapInfoEx>;
+
+func ssa_ret_slice_heap_clear() -> u64 {
+    g_ret_slice_heap_map = 0;
+    g_ret_slice_heap_map_ex = 0;
+    return 0;
+}
+
+func ssa_ret_slice_heap_set(inst_ptr: u64, elem_size: u64) -> u64 {
+    if (g_ret_slice_heap_map == 0) { g_ret_slice_heap_map = new Vec<*SSARetSliceHeapInfo>(16); }
+    var info: *SSARetSliceHeapInfo = new SSARetSliceHeapInfo();
+    info.inst_ptr = inst_ptr;
+    info.elem_size = elem_size;
+    g_ret_slice_heap_map.push(info);
+    return 0;
+}
+
+func ssa_ret_slice_heap_set_ex(inst_ptr: u64, elem_size: u64, ptr_val: u64, len_val: u64, ptr_is_reg: u64, len_is_reg: u64) -> u64 {
+    if (g_ret_slice_heap_map_ex == 0) { g_ret_slice_heap_map_ex = new Vec<*SSARetSliceHeapInfoEx>(24); }
+    var info_ex: *SSARetSliceHeapInfoEx = new SSARetSliceHeapInfoEx();
+    info_ex.inst_ptr = inst_ptr;
+    info_ex.elem_size = elem_size;
+    info_ex.ptr_val = ptr_val;
+    info_ex.len_val = len_val;
+    info_ex.ptr_is_reg = ptr_is_reg;
+    info_ex.len_is_reg = len_is_reg;
+    g_ret_slice_heap_map_ex.push(info_ex);
+    return 0;
+}
+
+func ssa_ret_slice_heap_get(inst_ptr: u64) -> u64 {
+    if (g_ret_slice_heap_map == 0) { return 0; }
+    var n: u64 = g_ret_slice_heap_map.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var info: *SSARetSliceHeapInfo = g_ret_slice_heap_map.get(i);
+        if (info.inst_ptr == inst_ptr) { return info.elem_size; }
+    }
+    return 0;
+}
+
+func ssa_ret_slice_heap_get_ex(inst_ptr: u64) -> SSARetSliceHeapQueryEx {
+    var result: SSARetSliceHeapQueryEx;
+    result.found = 0;
+    result.elem_size = 0;
+    result.ptr_val = 0;
+    result.len_val = 0;
+    result.ptr_is_reg = 0;
+    result.len_is_reg = 0;
+
+    if (g_ret_slice_heap_map_ex == 0) { return result; }
+    var n: u64 = g_ret_slice_heap_map_ex.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var info_ex: *SSARetSliceHeapInfoEx = g_ret_slice_heap_map_ex.get(i);
+        if (info_ex.inst_ptr == inst_ptr) {
+            result.found = 1;
+            result.elem_size = info_ex.elem_size;
+            result.ptr_val = info_ex.ptr_val;
+            result.len_val = info_ex.len_val;
+            result.ptr_is_reg = info_ex.ptr_is_reg;
+            result.len_is_reg = info_ex.len_is_reg;
+            return result;
+        }
+    }
+    return result;
+}
+
+func ssa_ret_slice_heap_remap_ex(inst_ptr: u64, map: u64, map_len: u64) -> u64 {
+    if (g_ret_slice_heap_map_ex == 0) { return false; }
+    var n: u64 = g_ret_slice_heap_map_ex.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var info_ex: *SSARetSliceHeapInfoEx = g_ret_slice_heap_map_ex.get(i);
+        if (info_ex.inst_ptr == inst_ptr) {
+            var ptr_val: u64 = info_ex.ptr_val;
+            var len_val: u64 = info_ex.len_val;
+            var ptr_is_reg: u64 = info_ex.ptr_is_reg;
+            var len_is_reg: u64 = info_ex.len_is_reg;
+            var map_u64: *u64 = (*u64)map;
+            if (ptr_is_reg != 0 && ptr_val < map_len) {
+                var pptr: u64 = map_u64[ptr_val];
+                if (pptr != 0) { info_ex.ptr_val = pptr; }
+            }
+            if (len_is_reg != 0 && len_val < map_len) {
+                var plen: u64 = map_u64[len_val];
+                if (plen != 0) { info_ex.len_val = plen; }
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+func ssa_block_add_pred(block: *SSABlock, pred: *SSABlock) -> u64 {
+    push_trace("ssa_block_add_pred", "ssa_core.b", __LINE__);
+    defer pop_trace();
+    return _ssa_slice_push<*SSABlock>(&block.preds, &block.preds_cap, pred, 4);
+}
+
+func ssa_block_add_succ(block: *SSABlock, succ: *SSABlock) -> u64 {
+    push_trace("ssa_block_add_succ", "ssa_core.b", __LINE__);
+    defer pop_trace();
+    return _ssa_slice_push<*SSABlock>(&block.succs, &block.succs_cap, succ, 4);
+}
+
+func ssa_block_add_df(block: *SSABlock, target: *SSABlock) -> u64 {
+    push_trace("ssa_block_add_df", "ssa_core.b", __LINE__);
+    defer pop_trace();
+    var data: []*SSABlock = block.df;
+    var len: u64 = ssa_slice_len(data);
+    for (var i: u64 = 0; i < len; i++) {
+        var cur: *SSABlock = data[i];
+        if (cur == target) { return 0; }
+    }
+
+    return _ssa_slice_push<*SSABlock>(&block.df, &block.df_cap, target, 4);
+}
+
+func ssa_block_replace_succ(block: *SSABlock, old_succ: *SSABlock, new_succ: *SSABlock) -> u64 {
+    push_trace("ssa_block_replace_succ", "ssa_core.b", __LINE__);
+    defer pop_trace();
+    var data: []*SSABlock = block.succs;
+    var len: u64 = ssa_slice_len(data);
+    for (var i: u64 = 0; i < len; i++) {
+        var cur: *SSABlock = data[i];
+        if (cur == old_succ) {
+            data[i] = new_succ;
+            return true;
+        }
+    }
+    return false;
+}
+
+func ssa_block_replace_pred(block: *SSABlock, old_pred: *SSABlock, new_pred: *SSABlock) -> u64 {
+    push_trace("ssa_block_replace_pred", "ssa_core.b", __LINE__);
+    defer pop_trace();
+    var data: []*SSABlock = block.preds;
+    var len: u64 = ssa_slice_len(data);
+    for (var i: u64 = 0; i < len; i++) {
+        var cur: *SSABlock = data[i];
+        if (cur == old_pred) {
+            data[i] = new_pred;
+            return true;
+        }
+    }
+    return false;
+}
+
+func ssa_add_edge(src: *SSABlock, dst: *SSABlock) -> u64 {
+    push_trace("ssa_add_edge", "ssa_core.b", __LINE__);
+    defer pop_trace();
+    ssa_block_add_succ(src, dst);
+    ssa_block_add_pred(dst, src);
+    return 0;
+}
+
+func ssa_new_function(ctx: *SSAContext, name_ptr: u64, name_len: u64) -> *SSAFunction {
+    push_trace("ssa_new_function", "ssa_core.b", __LINE__);
+    defer pop_trace();
+    var f: *SSAFunction = new SSAFunction();
+    f.id = ssa_slice_len(ctx.funcs);
+    f.name_ptr = name_ptr;
+    f.name_len = name_len;
+    f.blocks = slice(0, 0);
+    f.blocks_cap = 0;
+    f.next_local_block_id = 0;
+    f.entry = ssa_new_block(ctx, f);
+    f.reg_map_data = 0;
+    f.reg_map_len = 0;
+    f.regalloc_failed = 0;
+    f.regalloc_done = 0;
+    ssa_func_list_push(ctx, f);
+    return f;
+}

@@ -13,10 +13,10 @@
 
 ## 2. 주요 컴포넌트
 
-- `v11/src/compiler.bpp`: 컴파일러 컨텍스트, 패스, 의미 분석
-- `v11/src/parser/*`: 파서 구현
-- `v11/src/codegen.bpp`, `v11/src/emitter/*`: 코드 생성
-- `v11/src/ssa/*`: SSA/IR 경로
+- `src/compiler.bpp`: 컴파일러 컨텍스트, 패스, 의미 분석
+- `src/parser/*`: 파서 구현
+- `src/codegen.bpp`, `src/emitter/*`: 코드 생성
+- `src/ssa/*`: SSA/IR 경로
 
 ## 3. 최근 핵심 변화(v11)
 

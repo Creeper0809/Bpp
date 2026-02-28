@@ -1,0 +1,557 @@
+// ssa_opt_o1.b - SSA O1 optimizations (v3_17)
+
+import std.io;
+import std.util;
+import std.vec;
+import ssa.datastruct;
+import ssa.core;
+
+const SSA_O1_DEBUG = 0;
+
+struct SSAOptKV {
+    public key: u64;
+    public val: u64;
+    public active: u64;
+}
+
+impl SSAOptKV {
+    public constructor() {
+        self.key = 0;
+        self.val = 0;
+        self.active = 0;
+    }
+}
+
+// ============================================
+// Const Propagation Helpers
+// ============================================
+
+func _ssa_opt_kv_find(map: *Vec<*SSAOptKV>, key: u64) -> *SSAOptKV {
+    var n: u64 = map.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var entry: *SSAOptKV = map.get(i);
+        if (entry != 0 && entry.active != 0 && entry.key == key) {
+            return entry;
+        }
+    }
+    return 0;
+}
+
+func _ssa_opt_kv_set(map: *Vec<*SSAOptKV>, key: u64, val: u64) -> u64 {
+    var entry: *SSAOptKV = _ssa_opt_kv_find(map, key);
+    if (entry != 0) {
+        entry.val = val;
+        entry.active = 1;
+        return 0;
+    }
+    var new_entry: *SSAOptKV = new SSAOptKV();
+    new_entry.key = key;
+    new_entry.val = val;
+    new_entry.active = 1;
+    map.push(new_entry);
+    return 0;
+}
+
+func _ssa_opt_kv_clear(map: *Vec<*SSAOptKV>, key: u64) -> u64 {
+    var entry: *SSAOptKV = _ssa_opt_kv_find(map, key);
+    if (entry != 0) { entry.active = 0; }
+    return 0;
+}
+
+func _ssa_opt_kv_get(map: *Vec<*SSAOptKV>, key: u64) -> u64 {
+    var entry: *SSAOptKV = _ssa_opt_kv_find(map, key);
+    if (entry == 0) { return 0; }
+    return entry.val;
+}
+
+func _ssa_opt_const_find(map: *Vec<*SSAOptKV>, key: u64) -> *SSAOptKV {
+    return _ssa_opt_kv_find(map, key);
+}
+
+func _ssa_opt_const_set(map: *Vec<*SSAOptKV>, key: u64, val: u64) -> u64 {
+    return _ssa_opt_kv_set(map, key, val);
+}
+
+func _ssa_opt_const_clear(map: *Vec<*SSAOptKV>, key: u64) -> u64 {
+    return _ssa_opt_kv_clear(map, key);
+}
+
+func _ssa_opt_const_get(map: *Vec<*SSAOptKV>, key: u64) -> u64 {
+    return _ssa_opt_kv_get(map, key);
+}
+
+// ============================================
+// DCE Helpers
+// ============================================
+
+func _ssa_opt_use_find(map: *Vec<*SSAOptKV>, key: u64) -> *SSAOptKV {
+    return _ssa_opt_kv_find(map, key);
+}
+
+func _ssa_opt_use_inc(map: *Vec<*SSAOptKV>, key: u64) -> u64 {
+    var entry: *SSAOptKV = _ssa_opt_use_find(map, key);
+    if (entry != 0) {
+        entry.val = entry.val + 1;
+        return 0;
+    }
+    var new_entry: *SSAOptKV = new SSAOptKV();
+    new_entry.key = key;
+    new_entry.val = 1;
+    new_entry.active = 1;
+    map.push(new_entry);
+    return 0;
+}
+
+func _ssa_opt_use_get(map: *Vec<*SSAOptKV>, key: u64) -> u64 {
+    var entry: *SSAOptKV = _ssa_opt_use_find(map, key);
+    if (entry == 0) { return 0; }
+    return entry.val;
+}
+
+func _ssa_opt_is_dce_pure(op: u64) -> u64 {
+    if (op == SSA_OP_CONST) { return true; }
+    if (op == SSA_OP_COPY) { return true; }
+    if (op == SSA_OP_ADD) { return true; }
+    if (op == SSA_OP_SUB) { return true; }
+    if (op == SSA_OP_MUL) { return true; }
+    if (op == SSA_OP_DIV) { return true; }
+    if (op == SSA_OP_UDIV) { return true; }
+    if (op == SSA_OP_MOD) { return true; }
+    if (op == SSA_OP_UMOD) { return true; }
+    if (op == SSA_OP_AND) { return true; }
+    if (op == SSA_OP_OR) { return true; }
+    if (op == SSA_OP_XOR) { return true; }
+    if (op == SSA_OP_SHL) { return true; }
+    if (op == SSA_OP_SHR) { return true; }
+    if (op == SSA_OP_SAR) { return true; }
+    if (op == SSA_OP_EQ) { return true; }
+    if (op == SSA_OP_NE) { return true; }
+    if (op == SSA_OP_LT) { return true; }
+    if (op == SSA_OP_GT) { return true; }
+    if (op == SSA_OP_LE) { return true; }
+    if (op == SSA_OP_GE) { return true; }
+    if (op == SSA_OP_ULT) { return true; }
+    if (op == SSA_OP_UGT) { return true; }
+    if (op == SSA_OP_ULE) { return true; }
+    if (op == SSA_OP_UGE) { return true; }
+    if (op == SSA_OP_LEA_STR) { return true; }
+    if (op == SSA_OP_LEA_LOCAL) { return true; }
+    if (op == SSA_OP_LEA_GLOBAL) { return true; }
+    if (op == SSA_OP_LEA_FUNC) { return true; }
+    return false;
+}
+
+func _ssa_opt_collect_uses(fn: *SSAFunction) -> *Vec<*SSAOptKV> {
+    var uses: *Vec<*SSAOptKV> = new Vec<*SSAOptKV>(64);
+    var blocks: []*SSABlock = fn.blocks;
+    var bcount: u64 = ssa_slice_len(blocks);
+
+    var bi: u64 = 0;
+        for (bi = 0; bi < bcount; bi = bi + 1) {
+        var b: *SSABlock = blocks[bi];
+
+        var phi: *SSAInstruction = b.phi_head;
+        while (phi != 0) {
+            var args: *SSAPhiArg = (*SSAPhiArg)phi.src1;
+            while (args != 0) {
+                _ssa_opt_use_inc(uses, args.val);
+                args = args.next;
+            }
+            phi = phi.next;
+        }
+
+        var cur: *SSAInstruction = b.inst_head;
+        while (cur != 0) {
+            var op: u64 = ssa_inst_get_op(cur);
+
+            if (op == SSA_OP_CALL) {
+                var info: *SSACallInfo = (*SSACallInfo)ssa_operand_value(cur.src1);
+                var arg_regs: *Vec<u64> = info.args_vec;
+                var total_regs: u64 = info.nargs;
+                if (total_regs == 0 && arg_regs != 0) { total_regs = arg_regs.len(); }
+                var i: u64 = 0;
+                for (i = 0; i < total_regs; i = i + 1) {
+                    _ssa_opt_use_inc(uses, arg_regs.get(i));
+                }
+            } else if (op == SSA_OP_CALL_SLICE_STORE) {
+                var info_slice: *SSACallSliceStoreInfo = (*SSACallSliceStoreInfo)ssa_operand_value(cur.src1);
+                if (info_slice.is_ptr > 1) {
+                    var info_call: *SSACallInfo = (*SSACallInfo)ssa_operand_value(cur.src1);
+                    var arg_regs_slice: *Vec<u64> = info_call.args_vec;
+                    var total_regs_slice: u64 = info_call.nargs;
+                    if (total_regs_slice == 0 && arg_regs_slice != 0) { total_regs_slice = arg_regs_slice.len(); }
+                    var k: u64 = 0;
+                    for (k = 0; k < total_regs_slice; k = k + 1) {
+                        _ssa_opt_use_inc(uses, arg_regs_slice.get(k));
+                    }
+                } else {
+                    var arg_regs_slice: *Vec<u64> = info_slice.args_vec;
+                    var total_regs_slice: u64 = info_slice.nargs;
+                    if (total_regs_slice == 0 && arg_regs_slice != 0) { total_regs_slice = arg_regs_slice.len(); }
+                    var k2: u64 = 0;
+                    for (k2 = 0; k2 < total_regs_slice; k2 = k2 + 1) {
+                        _ssa_opt_use_inc(uses, arg_regs_slice.get(k2));
+                    }
+                    if (info_slice.is_ptr != 0) {
+                        _ssa_opt_use_inc(uses, info_slice.callee_reg);
+                    }
+                }
+                if (cur.src2 != 0 && ssa_operand_is_const(cur.src2) == 0) {
+                    _ssa_opt_use_inc(uses, ssa_operand_value(cur.src2));
+                }
+            } else if (op == SSA_OP_CALL_PTR) {
+                var info2: *SSACallPtrInfo = (*SSACallPtrInfo)ssa_operand_value(cur.src1);
+                _ssa_opt_use_inc(uses, info2.callee_reg);
+                var arg_regs2: *Vec<u64> = info2.args_vec;
+                var total_regs2: u64 = info2.nargs;
+                if (total_regs2 == 0 && arg_regs2 != 0) { total_regs2 = arg_regs2.len(); }
+                var j: u64 = 0;
+                for (j = 0; j < total_regs2; j = j + 1) {
+                    _ssa_opt_use_inc(uses, arg_regs2.get(j));
+                }
+            } else {
+                if (cur.src1 != 0 && ssa_operand_is_const(cur.src1) == 0) {
+                    _ssa_opt_use_inc(uses, ssa_operand_value(cur.src1));
+                }
+                if (cur.src2 != 0 && ssa_operand_is_const(cur.src2) == 0) {
+                    _ssa_opt_use_inc(uses, ssa_operand_value(cur.src2));
+                }
+            }
+
+            cur = cur.next;
+        }
+    }
+
+    return uses;
+}
+
+func _ssa_opt_dce_run(fn: *SSAFunction) -> u64 {
+    var changed: u64 = 1;
+    while (changed != 0) {
+        changed = 0;
+        var uses: *Vec<*SSAOptKV> = _ssa_opt_collect_uses(fn);
+
+        var blocks: []*SSABlock = fn.blocks;
+        var bcount: u64 = ssa_slice_len(blocks);
+        var bi: u64 = 0;
+        for (bi = 0; bi < bcount; bi = bi + 1) {
+            var b: *SSABlock = blocks[bi];
+
+            var cur: *SSAInstruction = b.inst_head;
+            while (cur != 0) {
+                var op: u64 = ssa_inst_get_op(cur);
+
+                if (cur.dest != 0 && _ssa_opt_is_dce_pure(op) != 0) {
+                    if (_ssa_opt_use_get(uses, cur.dest) == 0) {
+                        ssa_inst_set_op(cur, SSA_OP_NOP);
+                        changed = 1;
+                    }
+                }
+
+                cur = cur.next;
+            }
+        }
+    }
+
+    var blocks2: []*SSABlock = fn.blocks;
+    var bcount2: u64 = ssa_slice_len(blocks2);
+    var bi2: u64 = 0;
+    for (bi2 = 0; bi2 < bcount2; bi2 = bi2 + 1) {
+        var b2: *SSABlock = blocks2[bi2];
+        _ssa_opt_remove_nops(b2);
+    }
+    return 0;
+}
+
+func _ssa_opt_is_foldable(op: u64) -> u64 {
+    push_trace("_ssa_opt_is_foldable", "ssa_opt_o1.b", __LINE__);
+    defer pop_trace();
+    if (op == SSA_OP_ADD) { return true; }
+    if (op == SSA_OP_SUB) { return true; }
+    if (op == SSA_OP_MUL) { return true; }
+    if (op == SSA_OP_DIV) { return true; }
+    if (op == SSA_OP_UDIV) { return true; }
+    if (op == SSA_OP_MOD) { return true; }
+    if (op == SSA_OP_UMOD) { return true; }
+    if (op == SSA_OP_AND) { return true; }
+    if (op == SSA_OP_OR) { return true; }
+    if (op == SSA_OP_XOR) { return true; }
+    if (op == SSA_OP_SHL) { return true; }
+    if (op == SSA_OP_SHR) { return true; }
+    if (op == SSA_OP_SAR) { return true; }
+    if (op == SSA_OP_EQ) { return true; }
+    if (op == SSA_OP_NE) { return true; }
+    if (op == SSA_OP_LT) { return true; }
+    if (op == SSA_OP_GT) { return true; }
+    if (op == SSA_OP_LE) { return true; }
+    if (op == SSA_OP_GE) { return true; }
+    if (op == SSA_OP_ULT) { return true; }
+    if (op == SSA_OP_UGT) { return true; }
+    if (op == SSA_OP_ULE) { return true; }
+    if (op == SSA_OP_UGE) { return true; }
+    return false;
+}
+
+func _ssa_opt_fold_inst(inst: *SSAInstruction) -> u64 {
+    push_trace("_ssa_opt_fold_inst", "ssa_opt_o1.b", __LINE__);
+    defer pop_trace();
+    var op: u64 = ssa_inst_get_op(inst);
+    if (_ssa_opt_is_foldable(op) == 0) { return false; }
+
+    if (!ssa_operand_is_const(inst.src1)) { return false; }
+    if (!ssa_operand_is_const(inst.src2)) { return false; }
+
+    var a: u64 = ssa_operand_value(inst.src1);
+    var b: u64 = ssa_operand_value(inst.src2);
+    var res: u64 = 0;
+
+    var i64_min_bits: u64 = 1;
+    i64_min_bits = i64_min_bits << 63;
+    var minus_one_bits: u64 = 0 - 1;
+
+    if (op == SSA_OP_ADD) { res = a + b; }
+    else if (op == SSA_OP_SUB) { res = a - b; }
+    else if (op == SSA_OP_MUL) { res = a * b; }
+    else if (op == SSA_OP_DIV) {
+        if (b == 0) { return false; }
+        // SSA integer division codegen uses signed idiv.
+        if (a == i64_min_bits && b == minus_one_bits) { return false; }
+        res = (u64)((i64)a / (i64)b);
+    }
+    else if (op == SSA_OP_UDIV) {
+        if (b == 0) { return false; }
+        res = a / b;
+    }
+    else if (op == SSA_OP_MOD) {
+        if (b == 0) { return false; }
+        // Preserve runtime trap behavior for INT64_MIN % -1.
+        if (a == i64_min_bits && b == minus_one_bits) { return false; }
+        res = (u64)((i64)a % (i64)b);
+    }
+    else if (op == SSA_OP_UMOD) {
+        if (b == 0) { return false; }
+        res = a % b;
+    }
+    else if (op == SSA_OP_AND) { res = a & b; }
+    else if (op == SSA_OP_OR) { res = a | b; }
+    else if (op == SSA_OP_XOR) { res = a ^ b; }
+    else if (op == SSA_OP_SHL) { res = a << b; }
+    else if (op == SSA_OP_SHR) { res = a >> b; }
+    else if (op == SSA_OP_SAR) { res = (u64)((i64)a >> b); }
+    else if (op == SSA_OP_EQ) { res = (a == b); }
+    else if (op == SSA_OP_NE) { res = (a != b); }
+    else if (op == SSA_OP_LT) { res = ((i64)a < (i64)b); }
+    else if (op == SSA_OP_GT) { res = ((i64)a > (i64)b); }
+    else if (op == SSA_OP_LE) { res = ((i64)a <= (i64)b); }
+    else if (op == SSA_OP_GE) { res = ((i64)a >= (i64)b); }
+    else if (op == SSA_OP_ULT) { res = (a < b); }
+    else if (op == SSA_OP_UGT) { res = (a > b); }
+    else if (op == SSA_OP_ULE) { res = (a <= b); }
+    else if (op == SSA_OP_UGE) { res = (a >= b); }
+    else { return false; }
+
+    ssa_inst_set_op(inst, SSA_OP_CONST);
+    inst.src1 = ssa_operand_const(res);
+    inst.src2 = 0;
+    return true;
+}
+
+func _ssa_opt_remove_nops(block: *SSABlock) -> u64 {
+    push_trace("_ssa_opt_remove_nops", "ssa_opt_o1.b", __LINE__);
+    defer pop_trace();
+    var cur: *SSAInstruction = block.inst_head;
+    while (cur != 0) {
+        var next: *SSAInstruction = cur.next;
+        var op: u64 = ssa_inst_get_op(cur);
+
+        if (op == SSA_OP_NOP) {
+            var prev_inst: *SSAInstruction = (*SSAInstruction)cur.prev;
+
+            if (prev_inst == 0) {
+                block.inst_head = next;
+            } else {
+                prev_inst.next = next;
+            }
+
+            if (next != 0) {
+                ssa_inst_set_prev(next, prev_inst);
+            }
+
+            if (next == 0) {
+                block.inst_tail = prev_inst;
+            }
+        }
+
+        cur = next;
+    }
+
+    return 0;
+}
+
+struct SSAOptConstValue {
+    public has: u64;
+    public val: u64;
+}
+
+func _ssa_opt_operand_const_value(reg_consts: *Vec<*SSAOptKV>, opr: u64) -> SSAOptConstValue {
+    var result: SSAOptConstValue;
+    result.has = 0;
+    result.val = 0;
+    if (ssa_operand_is_const(opr)) {
+        result.val = ssa_operand_value(opr);
+        result.has = 1;
+        return result;
+    }
+    var entry: *SSAOptKV = _ssa_opt_const_find(reg_consts, ssa_operand_value(opr));
+    if (entry != 0) {
+        result.val = entry.val;
+        result.has = 1;
+    }
+    return result;
+}
+
+func _ssa_opt_run_block_handle_copy(cur: *SSAInstruction, reg_consts: *Vec<*SSAOptKV>) -> u64 {
+    if (ssa_inst_get_op(cur) != SSA_OP_COPY) { return 0; }
+    var value: SSAOptConstValue = _ssa_opt_operand_const_value(reg_consts, cur.src1);
+    if (value.has != 0) {
+        ssa_inst_set_op(cur, SSA_OP_CONST);
+        cur.src1 = ssa_operand_const(value.val);
+        cur.src2 = 0;
+        _ssa_opt_const_set(reg_consts, cur.dest, value.val);
+    } else {
+        _ssa_opt_const_clear(reg_consts, cur.dest);
+    }
+    return 1;
+}
+
+func _ssa_opt_run_block_handle_store(cur: *SSAInstruction, reg_consts: *Vec<*SSAOptKV>, var_consts: *Vec<*SSAOptKV>) -> u64 {
+    if (ssa_inst_get_op(cur) != SSA_OP_STORE) { return 0; }
+    if (ssa_operand_is_const(cur.src1)) {
+        var var_id: u64 = ssa_operand_value(cur.src1);
+        var value2: SSAOptConstValue = _ssa_opt_operand_const_value(reg_consts, cur.src2);
+        if (value2.has != 0) {
+            _ssa_opt_const_set(var_consts, var_id, value2.val);
+        } else {
+            _ssa_opt_const_clear(var_consts, var_id);
+        }
+    }
+    return 1;
+}
+
+func _ssa_opt_run_block_handle_load(cur: *SSAInstruction, reg_consts: *Vec<*SSAOptKV>, var_consts: *Vec<*SSAOptKV>) -> u64 {
+    if (ssa_inst_get_op(cur) != SSA_OP_LOAD) { return 0; }
+    if (ssa_operand_is_const(cur.src1)) {
+        var var_id2: u64 = ssa_operand_value(cur.src1);
+        var entry_load: *SSAOptKV = _ssa_opt_const_find(var_consts, var_id2);
+        if (entry_load != 0) {
+            var v3: u64 = entry_load.val;
+            ssa_inst_set_op(cur, SSA_OP_CONST);
+            cur.src1 = ssa_operand_const(v3);
+            cur.src2 = 0;
+            _ssa_opt_const_set(reg_consts, cur.dest, v3);
+            return 1;
+        }
+    }
+    _ssa_opt_const_clear(reg_consts, cur.dest);
+    return 1;
+}
+
+func _ssa_opt_run_block_handle_foldable(cur: *SSAInstruction, reg_consts: *Vec<*SSAOptKV>) -> u64 {
+    var op: u64 = ssa_inst_get_op(cur);
+    if (_ssa_opt_is_foldable(op) == 0) { return 0; }
+
+    if (!ssa_operand_is_const(cur.src1)) {
+        var entry1: *SSAOptKV = _ssa_opt_const_find(reg_consts, ssa_operand_value(cur.src1));
+        if (entry1 != 0) {
+            var c1: u64 = entry1.val;
+            cur.src1 = ssa_operand_const(c1);
+        }
+    }
+    if (!ssa_operand_is_const(cur.src2)) {
+        var entry2: *SSAOptKV = _ssa_opt_const_find(reg_consts, ssa_operand_value(cur.src2));
+        if (entry2 != 0) {
+            var c2: u64 = entry2.val;
+            cur.src2 = ssa_operand_const(c2);
+        }
+    }
+
+    if (_ssa_opt_fold_inst(cur) != 0) {
+        _ssa_opt_const_set(reg_consts, cur.dest, ssa_operand_value(cur.src1));
+    } else if (cur.dest != 0) {
+        _ssa_opt_const_clear(reg_consts, cur.dest);
+    }
+    return 1;
+}
+
+func ssa_opt_o1_run_block(b: *SSABlock) -> u64 {
+    var reg_consts: *Vec<*SSAOptKV> = new Vec<*SSAOptKV>(32);
+    var var_consts: *Vec<*SSAOptKV> = new Vec<*SSAOptKV>(32);
+
+    var cur: *SSAInstruction = b.inst_head;
+    while (cur != 0) {
+        var op: u64 = ssa_inst_get_op(cur);
+
+        if (op == SSA_OP_CONST) {
+            _ssa_opt_const_set(reg_consts, cur.dest, ssa_operand_value(cur.src1));
+            cur = cur.next;
+            continue;
+        }
+
+        if (_ssa_opt_run_block_handle_copy(cur, reg_consts) != 0) {
+            cur = cur.next;
+            continue;
+        }
+
+        if (_ssa_opt_run_block_handle_store(cur, reg_consts, var_consts) != 0) {
+            cur = cur.next;
+            continue;
+        }
+
+        if (_ssa_opt_run_block_handle_load(cur, reg_consts, var_consts) != 0) {
+            cur = cur.next;
+            continue;
+        }
+
+        if (_ssa_opt_run_block_handle_foldable(cur, reg_consts) != 0) {
+            cur = cur.next;
+            continue;
+        }
+
+        if (cur.dest != 0) {
+            _ssa_opt_const_clear(reg_consts, cur.dest);
+        }
+
+        cur = cur.next;
+    }
+
+    _ssa_opt_remove_nops(b);
+    return 0;
+}
+
+func ssa_opt_o1_run(ctx: *SSAContext) -> u64 {
+    push_trace("ssa_opt_o1_run", "ssa_opt_o1.b", __LINE__);
+    defer pop_trace();
+    if (ctx == 0) { return 0; }
+
+    var funcs: []*SSAFunction = ctx.funcs;
+    var n: u64 = ssa_slice_len(funcs);
+    var i: u64 = 0;
+    for (i = 0; i < n; i = i + 1) {
+        var fn: *SSAFunction = funcs[i];
+
+        var blocks: []*SSABlock = fn.blocks;
+        var bcount: u64 = ssa_slice_len(blocks);
+        var bi: u64 = 0;
+        for (bi = 0; bi < bcount; bi = bi + 1) {
+            ssa_opt_o1_run_block(blocks[bi]);
+        }
+
+        _ssa_opt_dce_run(fn);
+    }
+
+    if (SSA_O1_DEBUG != 0) {
+        println("[DEBUG] ssa_opt_o1_run: done", 32);
+    }
+
+    return 0;
+}
