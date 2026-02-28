@@ -5,6 +5,7 @@ param(
     [string]$NasmPath = "nasm.exe",
     [string]$LinkerPath = "link.exe",
     [int]$TimeoutMs = 5000,
+    [bool]$StrictFailDiagnostics = $true,
     [switch]$Quiet
 )
 
@@ -57,6 +58,25 @@ function Read-DirectiveValue {
     }
 
     return ""
+}
+
+function Read-DirectiveValues {
+    param(
+        [string[]]$Lines,
+        [string]$Pattern
+    )
+
+    $values = New-Object System.Collections.Generic.List[string]
+    foreach ($line in $Lines) {
+        if ($line -match $Pattern) {
+            $value = $matches[1].Trim()
+            if ($value) {
+                $values.Add($value)
+            }
+        }
+    }
+
+    return ,$values.ToArray()
 }
 
 function Invoke-TestProcess {
@@ -213,6 +233,7 @@ Write-Host "========================================"
 Write-Host "[INFO] Compiler: $CompilerPath"
 Write-Host "[INFO] NASM    : $NasmPath"
 Write-Host "[INFO] Linker  : $LinkerPath"
+Write-Host "[INFO] Strict fail diagnostics: $StrictFailDiagnostics"
 Write-Host ""
 
 foreach ($testCase in $testCases) {
@@ -227,7 +248,10 @@ foreach ($testCase in $testCases) {
 
     $expectCompileFailRaw = (Read-DirectiveValue -Lines $lines -Pattern '^//\s*Expect compile fail:\s*(.+)$').ToLowerInvariant()
     $expectCompileFail = ($expectCompileFailRaw -eq "1" -or $expectCompileFailRaw -eq "true" -or $expectCompileFailRaw -eq "yes")
-    $expectErrContains = Read-DirectiveValue -Lines $lines -Pattern '^//\s*Expect error contains:\s*(.+)$'
+    $expectErrContainsList = @(Read-DirectiveValues -Lines $lines -Pattern '^//\s*Expect error contains:\s*(.+)$')
+    if ($expectCompileFail -and $StrictFailDiagnostics -and $expectErrContainsList.Count -eq 0) {
+        throw "Missing '// Expect error contains:' directive for compile-fail test: $displayName"
+    }
 
     $asmFile = Join-Path $BuildDir "${name}.asm"
     $objFile = Join-Path $BuildDir "${name}.obj"
@@ -247,11 +271,17 @@ foreach ($testCase in $testCases) {
 
     if ($compileCode -ne 0) {
         if ($expectCompileFail) {
-            if ($expectErrContains) {
+            if ($expectErrContainsList.Count -gt 0) {
                 $errText = Get-Content $errFile -Raw
-                if ($errText -notlike "*$expectErrContains*") {
+                $missing = @()
+                foreach ($pat in $expectErrContainsList) {
+                    if ($errText.IndexOf($pat, [System.StringComparison]::Ordinal) -lt 0) {
+                        $missing += $pat
+                    }
+                }
+                if ($missing.Count -gt 0) {
                     $caseOk = $false
-                    $status = "FAIL (compile error mismatch)"
+                    $status = "FAIL (compile error mismatch: $($missing[0]))"
                 } else {
                     $status = "PASS (expected compile fail)"
                 }

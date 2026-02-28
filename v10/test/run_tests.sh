@@ -41,6 +41,7 @@ TEST_MODE_FILTER=${TEST_MODE_FILTER:-}
 TEST_OPT_FILTER=${TEST_OPT_FILTER:-}
 COMPILE_FAIL_SINGLE_VARIANT=${COMPILE_FAIL_SINGLE_VARIANT:-}
 TEST_SUITE_CASE_LIMIT=${TEST_SUITE_CASE_LIMIT:-}
+STRICT_FAIL_DIAGNOSTICS=${STRICT_FAIL_DIAGNOSTICS:-1}
 FAST_IO_ACTIVE=0
 
 BUILD_DIR="$BUILD_DIR_BASE"
@@ -245,6 +246,7 @@ if [ "$TEST_QUIET" -eq 0 ]; then
     echo "[INFO] Mode filter: $GLOBAL_MODES_CSV"
     echo "[INFO] Opt filter: $GLOBAL_OPTS_CSV"
     echo "[INFO] Compile-fail single variant: $COMPILE_FAIL_SINGLE_VARIANT"
+    echo "[INFO] Strict fail diagnostics: $STRICT_FAIL_DIAGNOSTICS"
     echo "[INFO] Suite case limit: $TEST_SUITE_CASE_LIMIT (0=all)"
     echo "[INFO] Stress runs: $STRESS_RUNS"
     echo "[INFO] Stability runs: $STABILITY_RUNS"
@@ -254,6 +256,7 @@ fi
 JOBS_DIR="$RESULTS_DIR/.jobs"
 mkdir -p "$JOBS_DIR"
 rm -f "$JOBS_DIR"/*.result 2>/dev/null || true
+rm -f "$JOBS_DIR"/*.expect 2>/dev/null || true
 RUN_TAG="run_$$"
 CASE_RESULT_FILES=()
 IR_RESULT_FILES=()
@@ -277,7 +280,7 @@ run_matrix_case() {
     local opt="$6"
     local expected="$7"
     local expect_compile_fail="$8"
-    local expect_error_contains="$9"
+    local expect_error_file="$9"
     local result_file="${10}"
 
     local case_tag="[$case_num] Testing $test_label ($mode $opt)"
@@ -311,12 +314,29 @@ run_matrix_case() {
     if ! $COMPILER $opt_flag $ir_flag -asm "$test_file" > "$asm_file" 2>"$err_file"; then
         persist_result_file "$err_file" "$err_file_persist"
         if [ "$expect_compile_fail" -eq 1 ]; then
-            if [ -n "$expect_error_contains" ] && ! grep -Fq "$expect_error_contains" "$err_file"; then
+            if [ "$STRICT_FAIL_DIAGNOSTICS" -eq 1 ] && [ -z "$expect_error_file" ]; then
                 case_fail=1
-                case_status="FAIL (compile error mismatch)"
+                case_status="FAIL (missing expected compile error directive)"
             else
-                case_pass=1
-                case_status="PASS (expected compile fail)"
+                local missing_pat=""
+                if [ -n "$expect_error_file" ] && [ -f "$expect_error_file" ]; then
+                    while IFS= read -r pat || [ -n "$pat" ]; do
+                        if [ -z "$pat" ]; then
+                            continue
+                        fi
+                        if ! grep -Fq "$pat" "$err_file"; then
+                            missing_pat="$pat"
+                            break
+                        fi
+                    done < "$expect_error_file"
+                fi
+                if [ -n "$missing_pat" ]; then
+                    case_fail=1
+                    case_status="FAIL (compile error mismatch: $missing_pat)"
+                else
+                    case_pass=1
+                    case_status="PASS (expected compile fail)"
+                fi
             fi
         else
             case_fail=1
@@ -583,7 +603,17 @@ for TEST_FILE in "${TEST_FILES[@]}"; do
     if [ "$EXPECT_COMPILE_FAIL_RAW" = "1" ] || [ "$EXPECT_COMPILE_FAIL_RAW" = "true" ] || [ "$EXPECT_COMPILE_FAIL_RAW" = "yes" ]; then
         EXPECT_COMPILE_FAIL=1
     fi
-    EXPECT_ERROR_CONTAINS=$(grep -m1 -E '^// Expect error contains:' "$TEST_FILE" | sed -E 's|^// Expect error contains:[[:space:]]*||' || true)
+    EXPECT_ERROR_FILE="$JOBS_DIR/${RUN_TAG}_${TEST_NAME}.expect"
+    rm -f "$EXPECT_ERROR_FILE"
+    grep -E '^// Expect error contains:' "$TEST_FILE" | sed -E 's|^// Expect error contains:[[:space:]]*||' > "$EXPECT_ERROR_FILE" || true
+    if [ ! -s "$EXPECT_ERROR_FILE" ]; then
+        rm -f "$EXPECT_ERROR_FILE"
+        EXPECT_ERROR_FILE=""
+    fi
+    if [ "$EXPECT_COMPILE_FAIL" -eq 1 ] && [ "$STRICT_FAIL_DIAGNOSTICS" -eq 1 ] && [ -z "$EXPECT_ERROR_FILE" ]; then
+        echo "Error: Missing '// Expect error contains:' directive for compile-fail test: $TEST_LABEL"
+        exit 1
+    fi
 
     TEST_MODE_DIRECTIVE=$(grep -m1 -E '^// Mode:' "$TEST_FILE" | sed -E 's|^// Mode:[[:space:]]*||' || true)
     TEST_OPT_DIRECTIVE=$(grep -m1 -E '^// Opt:' "$TEST_FILE" | sed -E 's|^// Opt:[[:space:]]*||' || true)
@@ -609,7 +639,7 @@ for TEST_FILE in "${TEST_FILES[@]}"; do
             TOTAL=$((TOTAL + 1))
             RESULT_FILE="$JOBS_DIR/${RUN_TAG}_case_${TOTAL}.result"
             CASE_RESULT_FILES+=("$RESULT_FILE")
-            launch_job_with_limit run_matrix_case "$TOTAL" "$TEST_FILE" "$TEST_NAME" "$TEST_LABEL" "$MODE" "$OPT" "$EXPECTED" "$EXPECT_COMPILE_FAIL" "$EXPECT_ERROR_CONTAINS" "$RESULT_FILE"
+            launch_job_with_limit run_matrix_case "$TOTAL" "$TEST_FILE" "$TEST_NAME" "$TEST_LABEL" "$MODE" "$OPT" "$EXPECTED" "$EXPECT_COMPILE_FAIL" "$EXPECT_ERROR_FILE" "$RESULT_FILE"
         done
     done
 
@@ -627,7 +657,7 @@ for TEST_FILE in "${TEST_FILES[@]}"; do
                 TOTAL=$((TOTAL + 1))
                 RESULT_FILE="$JOBS_DIR/${RUN_TAG}_case_${TOTAL}.result"
                 CASE_RESULT_FILES+=("$RESULT_FILE")
-                launch_job_with_limit run_matrix_case "$TOTAL" "$TEST_FILE" "$TEST_NAME" "$TEST_LABEL" "$MODE" "$OPT" "$EXPECTED" "$EXPECT_COMPILE_FAIL" "$EXPECT_ERROR_CONTAINS" "$RESULT_FILE"
+                launch_job_with_limit run_matrix_case "$TOTAL" "$TEST_FILE" "$TEST_NAME" "$TEST_LABEL" "$MODE" "$OPT" "$EXPECTED" "$EXPECT_COMPILE_FAIL" "$EXPECT_ERROR_FILE" "$RESULT_FILE"
             done
         done
     fi
