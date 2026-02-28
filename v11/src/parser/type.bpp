@@ -1,0 +1,361 @@
+// parse_type.b - Type parsing
+//
+// Functions for parsing type declarations:
+// - parse_base_type: primitive types and struct names
+// - parse_type: simple type with pointer depth
+// - parse_type_ex: extended type info with struct name
+
+import std.io;
+import std.vec;
+import std.util;
+import std.str;
+import types;
+import lexer;
+import parser.util;
+import compiler;
+
+func parse_type_report_expected(p: *Parser) -> u64 {
+    emit_stderr("[ERROR] Expected type name\n");
+    parse_panic_here(p, "Expected type");
+    return 0;
+}
+
+func type_parser_set_generic_params(p: *Parser, params: *Vec<*GenericParam>) -> u64 {
+    var parser: *Parser = p;
+    parser.generic_params_ctx = (u64)params;
+    return 0;
+}
+
+func type_parser_clear_generic_params(p: *Parser) -> u64 {
+    var parser: *Parser = p;
+    parser.generic_params_ctx = 0;
+    return 0;
+}
+
+func type_parser_find_generic_param(p: *Parser, name_ptr: u64, name_len: u64) -> *GenericParam {
+    var parser: *Parser = p;
+    if (parser == 0 || parser.generic_params_ctx == 0) { return 0; }
+    var generic_params: *Vec<*GenericParam> = (*Vec<*GenericParam>)parser.generic_params_ctx;
+    var n: u64 = generic_params.?len();
+    if (n == 0) { return 0; }
+    for (var i: u64 = 0; i < n; i++) {
+        var gp: *GenericParam = generic_params.get(i);
+        if (str_eq(gp.name_ptr, gp.name_len, name_ptr, name_len)) {
+            return gp;
+        }
+    }
+    return 0;
+}
+
+func parse_typeinfo_make_f64(depth: u64, is_tagged: u64, tag_layout_ptr: u64, tag_layout_len: u64) -> *TypeInfo {
+    var ti: *TypeInfo = new TypeInfo(TYPE_F64, depth);
+    ti.set_name_and_tag(0, 0, is_tagged, tag_layout_ptr, tag_layout_len);
+    return ti;
+}
+
+struct ParseTypePrefixInfo {
+    public depth: u64;
+    public is_tagged: u64;
+    public tag_layout_ptr: u64;
+    public tag_layout_len: u64;
+}
+
+func parse_type_prefix(p: *Parser) -> ParseTypePrefixInfo {
+    var info: ParseTypePrefixInfo;
+    var depth: u64 = 0;
+    var is_tagged: u64 = 0;
+    var tag_layout_ptr: u64 = 0;
+    var tag_layout_len: u64 = 0;
+    while (parse_match(p, TOKEN_STAR)) {
+        depth = depth + 1;
+        if (parse_match(p, TOKEN_TAGGED)) {
+            if (is_tagged == 1) {
+                emit_stderr("[ERROR] Multiple tagged modifiers are not allowed\n");
+                parse_panic_here(p, "Syntax error");
+            }
+            if (parse_match(p, TOKEN_LPAREN)) {
+                if (parse_peek_kind(p) != TOKEN_IDENTIFIER) {
+                    emit_stderr("[ERROR] tagged layout must be an identifier\n");
+                    parse_panic_here(p, "Syntax error");
+                }
+                var layout_tok: *Token = parse_peek(p);
+                tag_layout_ptr = layout_tok.ptr;
+                tag_layout_len = layout_tok.len;
+                parse_consume(p, TOKEN_IDENTIFIER);
+                parse_consume(p, TOKEN_RPAREN);
+            }
+            if (parse_peek_kind(p) == TOKEN_STAR) {
+                emit_stderr("[ERROR] tagged must apply to the outermost pointer\n");
+                parse_panic_here(p, "Syntax error");
+            }
+            is_tagged = 1;
+        }
+    }
+    info.depth = depth;
+    info.is_tagged = is_tagged;
+    info.tag_layout_ptr = tag_layout_ptr;
+    info.tag_layout_len = tag_layout_len;
+    return info;
+}
+
+// ============================================
+// Type Parsing
+// ============================================
+
+func parse_primitive_type_kind(tok_kind: u64) -> u64 {
+    switch (tok_kind) {
+        case TOKEN_BOOL: return TYPE_BOOL;
+        case TOKEN_U8: return TYPE_U8;
+        case TOKEN_CHAR: return TYPE_U8;
+        case TOKEN_U16: return TYPE_U16;
+        case TOKEN_U32: return TYPE_U32;
+        case TOKEN_U64: return TYPE_U64;
+        case TOKEN_I8: return TYPE_I8;
+        case TOKEN_I16: return TYPE_I16;
+        case TOKEN_I32: return TYPE_I32;
+        case TOKEN_I64: return TYPE_I64;
+        case TOKEN_F64: return TYPE_F64;
+    }
+    return 0;
+}
+
+// Parse generic argument list in type position: <T, U, 8>
+func parse_generic_args_type(p: *Parser) -> *Vec<*GenericArg> {
+    parse_consume(p, TOKEN_LT);
+    var args: *Vec<*GenericArg> = new Vec<*GenericArg>(4);
+    var pk: u64 = parse_peek_kind(p);
+    if (pk == TOKEN_GT || pk == TOKEN_RSHIFT) {
+        parse_consume_generic_gt(p);
+        return args;
+    }
+
+    while (1) {
+        var k: u64 = parse_peek_kind(p);
+        if (k == TOKEN_NUMBER) {
+            var tok: *Token = parse_peek(p);
+            parse_adv(p);
+            var ga: *GenericArg = new GenericArg();
+            ga.kind = GENERIC_KIND_VALUE;
+            ga.type_ptr = 0;
+            ga.value = parse_num_val(tok);
+            args.push(ga);
+        } else {
+            var ty: *TypeInfo = parse_type_ex(p);
+            var ga2: *GenericArg = new GenericArg();
+            ga2.kind = GENERIC_KIND_TYPE;
+            ga2.type_ptr = ty;
+            ga2.value = 0;
+            args.push(ga2);
+        }
+
+        if (parse_match(p, TOKEN_COMMA)) { continue; }
+        break;
+    }
+
+    parse_consume_generic_gt(p);
+    return args;
+}
+
+func parse_base_type(p: *Parser) -> u64 {
+    var k: u64 = parse_peek_kind(p);
+    var primitive: u64 = parse_primitive_type_kind(k);
+    if (primitive != 0) {
+        parse_adv(p);
+        return primitive;
+    }
+    switch (k) {
+        case TOKEN_IDENTIFIER:
+            // Check for struct type name (allow any identifier in type position)
+            parse_adv(p);
+            return TYPE_STRUCT;
+        default:
+            return TYPE_VOID;
+    }
+}
+
+func parse_type(p: *Parser) -> *TypeInfo {
+    var prefix: ParseTypePrefixInfo = parse_type_prefix(p);
+    var depth: u64 = prefix.depth;
+    var is_tagged: u64 = prefix.is_tagged;
+    var tag_layout_ptr: u64 = prefix.tag_layout_ptr;
+    var tag_layout_len: u64 = prefix.tag_layout_len;
+    if (parse_peek_kind(p) == TOKEN_F64) {
+        parse_adv(p);
+        return parse_typeinfo_make_f64(depth, is_tagged, tag_layout_ptr, tag_layout_len);
+    }
+    var base: u64 = parse_base_type(p);
+    if (base == TYPE_VOID) {
+        parse_type_report_expected(p);
+    }
+    if (base == TYPE_STRUCT && tag_layout_ptr != 0) {
+        emit_stderr("[ERROR] tagged layout on struct pointers is not supported\n");
+        parse_panic_here(p, "Syntax error");
+    }
+    var result: *TypeInfo = new TypeInfo(base, depth);
+    result.set_name_and_tag(0, 0, is_tagged, tag_layout_ptr, tag_layout_len);
+    return result;
+}
+
+func parse_type_ex_parse_array_or_slice(p: *Parser, depth: u64, is_tagged: u64, tag_layout_ptr: u64, tag_layout_len: u64) -> *TypeInfo {
+    if (parse_match(p, TOKEN_LBRACKET) == 0) { return 0; }
+
+    var is_slice: u64 = 0;
+    var arr_len: u64 = 0;
+    var arr_len_is_param: u64 = 0;
+    var arr_len_param_ptr: u64 = 0;
+    var arr_len_param_len: u64 = 0;
+    if (parse_match(p, TOKEN_RBRACKET)) {
+        is_slice = 1;
+    } else {
+        var len_tok: *Token = parse_peek(p);
+        var len_kind: u64 = parse_peek_kind(p);
+        if (len_kind == TOKEN_NUMBER) {
+            arr_len = parse_num_val(len_tok);
+            parse_consume(p, TOKEN_NUMBER);
+        } else if (len_kind == TOKEN_IDENTIFIER) {
+            var gp: *GenericParam = type_parser_find_generic_param(p, len_tok.ptr, len_tok.len);
+            if (gp == 0) {
+                emit_stderr("[ERROR] Array length must be a number\n");
+                parse_panic_here(p, "Syntax error");
+            }
+            if (gp.kind != GENERIC_KIND_VALUE) {
+                emit_stderr("[ERROR] Array length must be a value generic\n");
+                parse_panic_here(p, "Syntax error");
+            }
+            arr_len_is_param = 1;
+            arr_len_param_ptr = gp.name_ptr;
+            arr_len_param_len = gp.name_len;
+            parse_consume(p, TOKEN_IDENTIFIER);
+        } else {
+            emit_stderr("[ERROR] Array length must be a number\n");
+            parse_panic_here(p, "Syntax error");
+        }
+        parse_consume(p, TOKEN_RBRACKET);
+    }
+
+    var elem_ty: *TypeInfo = parse_type_ex(p);
+
+    var result_kind: u64 = TYPE_ARRAY;
+    if (is_slice == 1) { result_kind = TYPE_SLICE; }
+    var result_arr: *TypeInfo = new TypeInfo(result_kind, depth);
+    result_arr.is_tagged = is_tagged;
+    if (tag_layout_ptr != 0) {
+        emit_stderr("[ERROR] tagged layout is not supported for array/slice types\n");
+        parse_panic_here(p, "Syntax error");
+    }
+    result_arr.struct_name_ptr = elem_ty.struct_name_ptr;
+    result_arr.struct_name_len = elem_ty.struct_name_len;
+    result_arr.tag_layout_ptr = 0;
+    result_arr.tag_layout_len = 0;
+    result_arr.struct_def = 0;
+    result_arr.elem_type_kind = elem_ty.type_kind;
+    result_arr.elem_ptr_depth = elem_ty.ptr_depth;
+    result_arr.array_len = arr_len;
+    result_arr.array_len_is_param = arr_len_is_param;
+    result_arr.array_len_param_ptr = arr_len_param_ptr;
+    result_arr.array_len_param_len = arr_len_param_len;
+    result_arr.elem_typeinfo = elem_ty;
+    return result_arr;
+}
+
+struct ParseTypeBaseInfo {
+    public base: u64;
+    public struct_name_ptr: u64;
+    public struct_name_len: u64;
+}
+
+func parse_type_ex_parse_base(p: *Parser) -> ParseTypeBaseInfo {
+    var base_info: ParseTypeBaseInfo;
+    var base: u64 = 0;
+    var struct_name_ptr: u64 = 0;
+    var struct_name_len: u64 = 0;
+
+    var k: u64 = parse_peek_kind(p);
+    var primitive2: u64 = parse_primitive_type_kind(k);
+    if (primitive2 != 0) {
+        parse_adv(p);
+        base = primitive2;
+    } else if (k == TOKEN_IDENTIFIER) {
+        var tok: *Token = parse_peek(p);
+        var name_ptr: u64 = tok.ptr;
+        var name_len: u64 = tok.len;
+        var gp2: *GenericParam = type_parser_find_generic_param(p, name_ptr, name_len);
+        if (gp2 != 0 && gp2.kind == GENERIC_KIND_TYPE) {
+            parse_adv(p);
+            base = TYPE_GENERIC;
+            struct_name_ptr = name_ptr;
+            struct_name_len = name_len;
+        }
+        if (base == 0) {
+            parse_adv(p);
+            if (compiler_is_trait_name(name_ptr, name_len) != 0) {
+                base = TYPE_TRAIT;
+                struct_name_ptr = name_ptr;
+                struct_name_len = name_len;
+            } else if (parse_peek_kind(p) == TOKEN_LT) {
+                var gargs: *Vec<*GenericArg> = parse_generic_args_type(p);
+                var name_info: *NameInfo = 0;
+                if (compiler_try_resolve_generic_struct_type_instance(name_ptr, name_len, gargs, &name_info) == 0) {
+                    emit_stderr("[ERROR] Generic struct template not found: ");
+                    emit_stderr_len(name_ptr, name_len);
+                    emit_stderr("\n");
+                    parse_panic_here(p, "Syntax error");
+                }
+                base = TYPE_STRUCT;
+                struct_name_ptr = name_info.ptr;
+                struct_name_len = name_info.len;
+            } else {
+                base = TYPE_STRUCT;
+                struct_name_ptr = name_ptr;
+                struct_name_len = name_len;
+            }
+        }
+    } else {
+        base = 0;
+    }
+
+    base_info.base = base;
+    base_info.struct_name_ptr = struct_name_ptr;
+    base_info.struct_name_len = struct_name_len;
+    return base_info;
+}
+
+// Extended type parsing that also captures struct type name.
+// Layout: [base:8][ptr_depth:8][struct_name_ptr:8][struct_name_len:8]
+func parse_type_ex(p: *Parser) -> *TypeInfo {
+    var prefix2: ParseTypePrefixInfo = parse_type_prefix(p);
+    var depth: u64 = prefix2.depth;
+    var is_tagged: u64 = prefix2.is_tagged;
+    var tag_layout_ptr: u64 = prefix2.tag_layout_ptr;
+    var tag_layout_len: u64 = prefix2.tag_layout_len;
+
+    if (parse_peek_kind(p) == TOKEN_F64) {
+        parse_adv(p);
+        return parse_typeinfo_make_f64(depth, is_tagged, tag_layout_ptr, tag_layout_len);
+    }
+
+    var array_or_slice: *TypeInfo = parse_type_ex_parse_array_or_slice(p, depth, is_tagged, tag_layout_ptr, tag_layout_len);
+    if (array_or_slice != 0) { return array_or_slice; }
+
+    var base_info2: ParseTypeBaseInfo = parse_type_ex_parse_base(p);
+    var base: u64 = base_info2.base;
+    var struct_name_ptr: u64 = base_info2.struct_name_ptr;
+    var struct_name_len: u64 = base_info2.struct_name_len;
+    if (base == 0) {
+        parse_type_report_expected(p);
+    }
+
+    if (base == TYPE_STRUCT && tag_layout_ptr != 0) {
+        emit_stderr("[ERROR] tagged layout on struct pointers is not supported\n");
+        parse_panic_here(p, "Syntax error");
+    }
+
+    if (base == TYPE_TRAIT && depth == 0) {
+        emit_stderr("[ERROR] Trait type must be used as a pointer\n");
+        parse_panic_here(p, "Syntax error");
+    }
+
+    var result: *TypeInfo = new TypeInfo(base, depth);
+    result.set_name_and_tag(struct_name_ptr, struct_name_len, is_tagged, tag_layout_ptr, tag_layout_len);
+    return result;
+}
