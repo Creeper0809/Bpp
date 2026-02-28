@@ -48,6 +48,56 @@ func typeinfo_make_slice(ptr_depth: u64, elem_type_kind: u64, elem_ptr_depth: u6
     return ti;
 }
 
+func typeinfo_resolve_struct_defs_recursive(ti: *TypeInfo) -> u64 {
+    if (ti == 0) { return 0; }
+    if (ti.type_kind == TYPE_STRUCT && ti.struct_def == 0 && ti.struct_name_ptr != 0) {
+        ti.struct_def = get_struct_def(ti.struct_name_ptr, ti.struct_name_len);
+    }
+    if (ti.type_kind == TYPE_ARRAY || ti.type_kind == TYPE_SLICE) {
+        if (ti.elem_type_kind == TYPE_STRUCT && ti.struct_def == 0 && ti.struct_name_ptr != 0) {
+            ti.struct_def = get_struct_def(ti.struct_name_ptr, ti.struct_name_len);
+        }
+        if (ti.elem_typeinfo != 0) {
+            typeinfo_resolve_struct_defs_recursive(ti.elem_typeinfo);
+        }
+    }
+    return 0;
+}
+
+func typeinfo_clone(src: *TypeInfo) -> *TypeInfo {
+    if (src == 0) { return 0; }
+    var ti: *TypeInfo = typeinfo_make(src.type_kind, src.ptr_depth);
+    ti.copy_from(src);
+    typeinfo_resolve_struct_defs_recursive(ti);
+    return ti;
+}
+
+func typeinfo_elem_type_from_container(container: *TypeInfo) -> *TypeInfo {
+    if (container == 0) { return 0; }
+    if (container.elem_typeinfo != 0) {
+        return typeinfo_clone(container.elem_typeinfo);
+    }
+    if (container.elem_type_kind == TYPE_STRUCT) {
+        var sdef: *AstStructDef = container.struct_def;
+        if (sdef == 0 && container.struct_name_ptr != 0) {
+            sdef = get_struct_def(container.struct_name_ptr, container.struct_name_len);
+        }
+        return typeinfo_make_struct(container.elem_ptr_depth, container.struct_name_ptr, container.struct_name_len, sdef);
+    }
+    var ti: *TypeInfo = typeinfo_make(container.elem_type_kind, container.elem_ptr_depth);
+    ti.struct_name_ptr = container.struct_name_ptr;
+    ti.struct_name_len = container.struct_name_len;
+    return ti;
+}
+
+func typeinfo_elem_size_from_container(container: *TypeInfo) -> u64 {
+    var elem_ti: *TypeInfo = typeinfo_elem_type_from_container(container);
+    if (elem_ti != 0) {
+        return sizeof_type_ex(elem_ti);
+    }
+    return sizeof_type(container.elem_type_kind, container.elem_ptr_depth, container.struct_name_ptr, container.struct_name_len);
+}
+
 func typeinfo_make_trait(ptr_depth: u64, trait_ptr: u64, trait_len: u64) -> *TypeInfo {
     var ti: *TypeInfo = typeinfo_make(TYPE_TRAIT, ptr_depth);
     ti.struct_name_ptr = trait_ptr;
@@ -162,14 +212,18 @@ func typeinfo_from_field_desc(field: *FieldDesc, disallow_struct_value: u64) -> 
         if (field.elem_type_kind == TYPE_STRUCT && field.struct_name_ptr != 0) {
             elem_struct_def = get_struct_def(field.struct_name_ptr, field.struct_name_len);
         }
-        return typeinfo_make_array(field.ptr_depth, field.elem_type_kind, field.elem_ptr_depth, field.struct_name_ptr, field.struct_name_len, elem_struct_def, field.array_len);
+        var ti_arr: *TypeInfo = typeinfo_make_array(field.ptr_depth, field.elem_type_kind, field.elem_ptr_depth, field.struct_name_ptr, field.struct_name_len, elem_struct_def, field.array_len);
+        ti_arr.elem_typeinfo = field.elem_typeinfo;
+        return ti_arr;
     }
     if (field.type_kind == TYPE_SLICE) {
         var elem_struct_def2: *AstStructDef = 0;
         if (field.elem_type_kind == TYPE_STRUCT && field.struct_name_ptr != 0) {
             elem_struct_def2 = get_struct_def(field.struct_name_ptr, field.struct_name_len);
         }
-        return typeinfo_make_slice(field.ptr_depth, field.elem_type_kind, field.elem_ptr_depth, field.struct_name_ptr, field.struct_name_len, elem_struct_def2);
+        var ti_sl: *TypeInfo = typeinfo_make_slice(field.ptr_depth, field.elem_type_kind, field.elem_ptr_depth, field.struct_name_ptr, field.struct_name_len, elem_struct_def2);
+        ti_sl.elem_typeinfo = field.elem_typeinfo;
+        return ti_sl;
     }
     var rf: *TypeInfo = typeinfo_make(field.type_kind, field.ptr_depth);
     rf.is_tagged = field.is_tagged;
@@ -217,7 +271,12 @@ func sizeof_field_desc(field: *FieldDesc) -> u64 {
         return (field.bit_width + 7) / 8;
     }
     if (field.type_kind == TYPE_ARRAY) {
-        var elem_size: u64 = sizeof_type(field.elem_type_kind, field.elem_ptr_depth, field.struct_name_ptr, field.struct_name_len);
+        var elem_size: u64 = 0;
+        if (field.elem_typeinfo != 0) {
+            elem_size = sizeof_type_ex(field.elem_typeinfo);
+        } else {
+            elem_size = sizeof_type(field.elem_type_kind, field.elem_ptr_depth, field.struct_name_ptr, field.struct_name_len);
+        }
         return elem_size * field.array_len;
     }
     if (field.type_kind == TYPE_SLICE) { return 16; }
@@ -330,7 +389,7 @@ func sizeof_type_ex(info: *TypeInfo) -> u64 {
         }
     }
     if (info.type_kind == TYPE_ARRAY) {
-        var elem_size: u64 = sizeof_type(info.elem_type_kind, info.elem_ptr_depth, info.struct_name_ptr, info.struct_name_len);
+        var elem_size: u64 = typeinfo_elem_size_from_container(info);
         return elem_size * info.array_len;
     }
     if (info.type_kind == TYPE_SLICE) { return 16; }
@@ -818,14 +877,18 @@ func typeinfo_from_new_expr(nw: *AstNew) -> *TypeInfo {
         if (nw.elem_type_kind == TYPE_STRUCT) {
             elem_def = get_struct_def(nw.struct_name_ptr, nw.struct_name_len);
         }
-        return typeinfo_make_array(out_ptr_depth, nw.elem_type_kind, nw.elem_ptr_depth, nw.struct_name_ptr, nw.struct_name_len, elem_def, nw.array_len);
+        var ti_arr: *TypeInfo = typeinfo_make_array(out_ptr_depth, nw.elem_type_kind, nw.elem_ptr_depth, nw.struct_name_ptr, nw.struct_name_len, elem_def, nw.array_len);
+        ti_arr.elem_typeinfo = nw.elem_typeinfo;
+        return ti_arr;
     }
     if (nw.type_kind == TYPE_SLICE) {
         var elem_def2: *AstStructDef = 0;
         if (nw.elem_type_kind == TYPE_STRUCT) {
             elem_def2 = get_struct_def(nw.struct_name_ptr, nw.struct_name_len);
         }
-        return typeinfo_make_slice(out_ptr_depth, nw.elem_type_kind, nw.elem_ptr_depth, nw.struct_name_ptr, nw.struct_name_len, elem_def2);
+        var ti_sl: *TypeInfo = typeinfo_make_slice(out_ptr_depth, nw.elem_type_kind, nw.elem_ptr_depth, nw.struct_name_ptr, nw.struct_name_len, elem_def2);
+        ti_sl.elem_typeinfo = nw.elem_typeinfo;
+        return ti_sl;
     }
     var ti_p: *TypeInfo = typeinfo_make(nw.type_kind, out_ptr_depth);
     ti_p.is_tagged = nw.is_tagged;
@@ -849,6 +912,13 @@ func typeinfo_from_stack_ctor_expr(sc: *AstStackCtor) -> *TypeInfo {
     ti_sc2.struct_name_len = sc.struct_name_len;
     ti_sc2.tag_layout_ptr = sc.tag_layout_ptr;
     ti_sc2.tag_layout_len = sc.tag_layout_len;
+    ti_sc2.elem_type_kind = sc.elem_type_kind;
+    ti_sc2.elem_ptr_depth = sc.elem_ptr_depth;
+    ti_sc2.array_len = sc.array_len;
+    ti_sc2.array_len_is_param = sc.array_len_is_param;
+    ti_sc2.array_len_param_ptr = sc.array_len_param_ptr;
+    ti_sc2.array_len_param_len = sc.array_len_param_len;
+    ti_sc2.elem_typeinfo = sc.elem_typeinfo;
     return ti_sc2;
 }
 
@@ -963,6 +1033,9 @@ func typeinfo_from_index_expr(index: *AstIndex, symtab: *Symtab) -> *TypeInfo {
             return typeinfo_make(bt.type_kind, bt.ptr_depth - 1);
         }
         if (bt.type_kind == TYPE_ARRAY || bt.type_kind == TYPE_SLICE) {
+            if (bt.elem_typeinfo != 0) {
+                return typeinfo_clone(bt.elem_typeinfo);
+            }
             if (bt.elem_type_kind == TYPE_STRUCT) {
                 return typeinfo_make_struct(bt.elem_ptr_depth, bt.struct_name_ptr, bt.struct_name_len, bt.struct_def);
             }
@@ -978,7 +1051,9 @@ func typeinfo_from_slice_expr(slice: *AstSlice, symtab: *Symtab) -> *TypeInfo {
         if (pt.type_kind == TYPE_STRUCT) {
             return typeinfo_make_slice(0, TYPE_STRUCT, pt.ptr_depth - 1, pt.struct_name_ptr, pt.struct_name_len, pt.struct_def);
         }
-        return typeinfo_make_slice(0, pt.type_kind, pt.ptr_depth - 1, 0, 0, 0);
+        var out: *TypeInfo = typeinfo_make_slice(0, pt.type_kind, pt.ptr_depth - 1, pt.struct_name_ptr, pt.struct_name_len, 0);
+        out.elem_typeinfo = pt.elem_typeinfo;
+        return out;
     }
     return typeinfo_make_slice(0, TYPE_U8, 0, 0, 0, 0);
 }

@@ -27,6 +27,115 @@ import parser.stmt;
 // Const Declaration
 // ============================================
 
+func parse_const_eval_expr(p: *Parser, node: *AstNode, ok: *u64) -> u64 {
+    if (node == 0) {
+        *ok = 0;
+        return 0;
+    }
+
+    var kind: u64 = ast_kind(node);
+    switch (kind) {
+        case AST_LITERAL:
+            return ((*AstLiteral)node).value;
+        case AST_IDENT:
+            var id: *AstIdent = (*AstIdent)node;
+            var cres: *ConstResult = (*ConstResult)compiler_find_const(id.name_ptr, id.name_len);
+            if (cres != 0 && cres.found != 0) {
+                return cres.value;
+            }
+            emit_stderr("[ERROR] Unknown const in const expression: ");
+            emit_stderr_len(id.name_ptr, id.name_len);
+            emit_stderr("\n");
+            *ok = 0;
+            return 0;
+        case AST_UNARY:
+            var un: *AstUnary = (*AstUnary)node;
+            var sub_ok: u64 = 1;
+            var val: u64 = parse_const_eval_expr(p, un.operand, &sub_ok);
+            if (sub_ok == 0) {
+                *ok = 0;
+                return 0;
+            }
+            switch (un.op) {
+                case TOKEN_MINUS:
+                    return 0 - val;
+                case TOKEN_BANG:
+                    if (val == 0) { return 1; }
+                    return 0;
+                case TOKEN_TILDE:
+                    return ~val;
+                default:
+                    emit_stderr("[ERROR] Unsupported unary operator in const expression\n");
+                    *ok = 0;
+                    return 0;
+            }
+        case AST_BINARY:
+            var bin: *AstBinary = (*AstBinary)node;
+            var left_ok: u64 = 1;
+            var right_ok: u64 = 1;
+            var left: u64 = parse_const_eval_expr(p, bin.left, &left_ok);
+            var right: u64 = parse_const_eval_expr(p, bin.right, &right_ok);
+            if (left_ok == 0 || right_ok == 0) {
+                *ok = 0;
+                return 0;
+            }
+            switch (bin.op) {
+                case TOKEN_PLUS: return left + right;
+                case TOKEN_MINUS: return left - right;
+                case TOKEN_STAR: return left * right;
+                case TOKEN_SLASH:
+                    if (right == 0) {
+                        emit_stderr("[ERROR] Division by zero in const expression\n");
+                        parse_panic_here(p, "Syntax error");
+                    }
+                    return left / right;
+                case TOKEN_PERCENT:
+                    if (right == 0) {
+                        emit_stderr("[ERROR] Modulo by zero in const expression\n");
+                        parse_panic_here(p, "Syntax error");
+                    }
+                    return left % right;
+                case TOKEN_LSHIFT: return left << right;
+                case TOKEN_RSHIFT: return left >> right;
+                case TOKEN_AMPERSAND: return left & right;
+                case TOKEN_PIPE: return left | right;
+                case TOKEN_CARET: return left ^ right;
+                case TOKEN_EQEQ:
+                    if (left == right) { return 1; }
+                    return 0;
+                case TOKEN_BANGEQ:
+                    if (left != right) { return 1; }
+                    return 0;
+                case TOKEN_LT:
+                    if (left < right) { return 1; }
+                    return 0;
+                case TOKEN_LTEQ:
+                    if (left <= right) { return 1; }
+                    return 0;
+                case TOKEN_GT:
+                    if (left > right) { return 1; }
+                    return 0;
+                case TOKEN_GTEQ:
+                    if (left >= right) { return 1; }
+                    return 0;
+                case TOKEN_ANDAND:
+                    if (left != 0 && right != 0) { return 1; }
+                    return 0;
+                case TOKEN_OROR:
+                    if (left != 0 || right != 0) { return 1; }
+                    return 0;
+                default:
+                    emit_stderr("[ERROR] Unsupported binary operator in const expression\n");
+                    *ok = 0;
+                    return 0;
+            }
+        default:
+            emit_stderr("[ERROR] Const expression must be compile-time evaluable\n");
+            *ok = 0;
+            return 0;
+    }
+}
+
 func parse_const_decl(p: *Parser) -> *AstConstDecl {
     parse_consume(p, TOKEN_CONST);
     
@@ -37,35 +146,16 @@ func parse_const_decl(p: *Parser) -> *AstConstDecl {
     parse_consume(p, TOKEN_IDENTIFIER);
     
     parse_consume(p, TOKEN_EQ);
-    
-    var value: u64 = 0;
-    var neg: u64 = 0;
-    
-    // Handle negative numbers
-    if (parse_match(p, TOKEN_MINUS)) {
-        neg = 1;
-    }
-    
-    if (parse_peek_kind(p) == TOKEN_NUMBER) {
-        var val_tok: *Token = parse_peek(p);
-        value = parse_num_val(val_tok);
-        parse_consume(p, TOKEN_NUMBER);
-    } else if (parse_peek_kind(p) == TOKEN_CHAR) {
-        var char_tok: *Token = parse_peek(p);
-        if (parse_is_char_literal_token(char_tok) == 0) {
-            emit_stderr("[ERROR] Expected char literal in const\n");
-            parse_panic_at_tok(char_tok, "Syntax error");
-        }
-        value = parse_char_literal_value(char_tok);
-        parse_consume(p, TOKEN_CHAR);
-    } else {
-        emit_stderr("[ERROR] Expected number or char in const\n");
-        parse_panic_here(p, "Syntax error");
-    }
-    
-    if (neg) { value = 0 - value; }
+
+    var expr: *AstNode = parse_expr(p);
     
     parse_consume(p, TOKEN_SEMICOLON);
+
+    var ok: u64 = 1;
+    var value: u64 = parse_const_eval_expr(p, expr, &ok);
+    if (ok == 0) {
+        parse_panic_here(p, "Syntax error");
+    }
     
     return ast_const_decl(name_ptr, name_len, value);
 }
@@ -285,7 +375,24 @@ func parse_param(p: *Parser) -> *Param {
         var ty: *TypeInfo = parse_type_ex(p);
         param.fill_from_typeinfo(ty);
         param.decay_array_to_ptr();
+        return param;
     }
+
+    // Backward-compatible shorthand: untyped parameters default to u64.
+    param.type_kind = TYPE_U64;
+    param.ptr_depth = 0;
+    param.is_tagged = 0;
+    param.struct_name_ptr = 0;
+    param.struct_name_len = 0;
+    param.tag_layout_ptr = 0;
+    param.tag_layout_len = 0;
+    param.elem_type_kind = 0;
+    param.elem_ptr_depth = 0;
+    param.array_len = 0;
+    param.array_len_is_param = 0;
+    param.array_len_param_ptr = 0;
+    param.array_len_param_len = 0;
+    param.elem_typeinfo = 0;
 
     return param;
 }
@@ -433,13 +540,34 @@ func parse_func_decl_signature(p: *Parser) -> *AstFunc {
     var is_generic_decl: u64 = 0;
     if (generic_params != 0) { is_generic_decl = 1; }
 
-    // Skip function body
-    parse_skip_block(p);
+    if (parse_peek_kind(p) == TOKEN_LBRACE) {
+        parse_skip_block(p);
+    } else if (parse_match(p, TOKEN_SEMICOLON) == 0) {
+        emit_stderr("[ERROR] Function declaration must have a body or end with ';'\n");
+        parse_panic_here(p, "Syntax error");
+    }
 
     var func_sig: *AstFunc = parse_func_from_header(parsed, 0);
     parse_register_generic_func(p, name_tok, generic_params, func_sig, 0);
     if (is_generic_decl != 0) { return 0; }
     return func_sig;
+}
+
+func parse_func_decl_top_level(p: *Parser) -> *AstFunc {
+    var parsed: *ParsedFuncHeader = parse_func_header(p);
+    var name_tok: *Token = parsed.name_tok;
+    var generic_params: *Vec<*GenericParam> = parsed.generic_params;
+
+    if (parse_match(p, TOKEN_SEMICOLON)) {
+        var sig: *AstFunc = parse_func_from_header(parsed, 0);
+        parse_register_generic_func(p, name_tok, generic_params, sig, 0);
+        return 0;
+    }
+
+    var body: *AstNode = parse_block(p);
+    var func_node: *AstFunc = parse_func_from_header(parsed, body);
+    parse_register_generic_func(p, name_tok, generic_params, func_node, 1);
+    return func_node;
 }
 
 // Parse abstract function signature (no body, ends with ';')
@@ -632,6 +760,7 @@ func parse_struct_parse_field(p: *Parser, is_packed: u64, struct_name_ptr: u64, 
     var field_elem_type_kind: u64 = 0;
     var field_elem_ptr_depth: u64 = 0;
     var field_array_len: u64 = 0;
+    var field_elem_typeinfo: *TypeInfo = 0;
     var field_is_tagged: u64 = 0;
     var field_bit_width: u64 = 0;
 
@@ -651,6 +780,7 @@ func parse_struct_parse_field(p: *Parser, is_packed: u64, struct_name_ptr: u64, 
         field_elem_type_kind = field_type.elem_type_kind;
         field_elem_ptr_depth = field_type.elem_ptr_depth;
         field_array_len = field_type.array_len;
+        field_elem_typeinfo = field_type.elem_typeinfo;
     }
 
     parse_consume(p, TOKEN_SEMICOLON);
@@ -669,6 +799,7 @@ func parse_struct_parse_field(p: *Parser, is_packed: u64, struct_name_ptr: u64, 
     field_desc.elem_type_kind = field_elem_type_kind;
     field_desc.elem_ptr_depth = field_elem_ptr_depth;
     field_desc.array_len = field_array_len;
+    field_desc.elem_typeinfo = field_elem_typeinfo;
     field_desc.access = access;
     field_desc.owner_struct_ptr = struct_name_ptr;
     field_desc.owner_struct_len = struct_name_len;
@@ -1293,6 +1424,7 @@ func parse_report_unexpected_top_level(p: *Parser) -> u64 {
     var err_tok: *Token = parse_peek(p);
     if (err_tok == 0) {
         emit_stderr("[ERROR] Unexpected EOF at top-level declaration\n");
+        parse_panic_here(p, "Unexpected token");
         return 0;
     }
     emit_stderr("[ERROR] Unexpected top-level token at line ");
@@ -1312,7 +1444,7 @@ func parse_report_unexpected_top_level(p: *Parser) -> u64 {
         emit_stderr("`");
     }
     emit_stderr("\n");
-    parse_adv(p);
+    parse_panic_at_tok(err_tok, "Unexpected token");
     return 0;
 }
 
@@ -1400,7 +1532,7 @@ func parse_global_var_decl_full(p: *Parser, globals: *Vec<*GlobalInfo>) -> u64 {
 
 func parse_program_handle_func(p: *Parser, mode: u64, funcs: *Vec<*AstFunc>) -> u64 {
     if (mode == PARSE_PROGRAM_MODE_FULL) {
-        var fn_ptr: *AstFunc = parse_func_decl(p);
+        var fn_ptr: *AstFunc = parse_func_decl_top_level(p);
         if (fn_ptr != 0) { funcs.push(fn_ptr); }
         return 0;
     }
