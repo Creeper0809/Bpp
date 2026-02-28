@@ -9,6 +9,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$SCRIPT_DIR"
 BUILD_DIR="$ROOT_DIR/build"
 BIN_DIR="$ROOT_DIR/bin"
+OLD_DIR="$ROOT_DIR/old"
 CONFIG_FILE="$SCRIPT_DIR/config.ini"
 
 read_config_value() {
@@ -61,6 +62,50 @@ pick_latest_stage1_file() {
     done
     if [ -n "$best_file" ]; then
         echo "$best_file"
+    fi
+}
+
+discover_latest_old_version_tag() {
+    if [ ! -d "$OLD_DIR" ]; then
+        return 0
+    fi
+
+    local best_ver=-1
+    local best_tag=""
+    local d base ver
+
+    for d in "$OLD_DIR"/v*; do
+        [ -d "$d" ] || continue
+        base="$(basename "$d")"
+        if [[ "$base" =~ ^v([0-9]+)$ ]]; then
+            ver="${BASH_REMATCH[1]}"
+            if [ "$ver" -ge "$best_ver" ]; then
+                best_ver="$ver"
+                best_tag="$base"
+            fi
+        fi
+    done
+
+    if [ -n "$best_tag" ]; then
+        echo "$best_tag"
+    fi
+}
+
+pick_old_latest_stage1_file() {
+    local old_tag
+    old_tag="$(discover_latest_old_version_tag)"
+    if [ -z "$old_tag" ]; then
+        return 0
+    fi
+
+    local candidate=""
+    candidate="$(pick_first_existing_file \
+        "$BIN_DIR/${old_tag}_stage1" \
+        "$OLD_DIR/${old_tag}/bin/${old_tag}_stage1" \
+        "$OLD_DIR/${old_tag}/bin/stage1" \
+        "$OLD_DIR/${old_tag}/bin/bootstrap" || true)"
+    if [ -n "$candidate" ]; then
+        echo "$candidate"
     fi
 }
 
@@ -130,6 +175,10 @@ if [ -n "$BASE_BIN" ] && [ ! -f "$BASE_BIN" ]; then
     exit 1
 fi
 if [ -z "$BASE_BIN" ]; then
+    # Default policy: use the last historical version from old/ as bootstrap base.
+    BASE_BIN="$(pick_old_latest_stage1_file || true)"
+fi
+if [ -z "$BASE_BIN" ]; then
     BASE_BIN="$(pick_first_existing_file \
         "./bin/stage1" \
         "./bin/bootstrap" \
@@ -142,7 +191,7 @@ if [ -z "$BASE_BIN" ]; then
 fi
 if [ -z "$BASE_BIN" ]; then
     echo "Error: Base compiler not found."
-    echo "   Tried: bin/bootstrap, bin/stage1, bin/${BASE_COMPILER}, bin/${VERSION}_stage1, bin/${VERSION}, bin/*_stage1"
+    echo "   Tried: old/<latest>/bin/*, bin/<old_latest>_stage1, bin/bootstrap, bin/stage1, bin/${BASE_COMPILER}, bin/${VERSION}_stage1, bin/${VERSION}, bin/*_stage1"
     echo "   Hint: set BPP_BASE_COMPILER=/abs/path/to/compiler"
     exit 1
 fi
