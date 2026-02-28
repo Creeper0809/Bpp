@@ -2548,6 +2548,32 @@ func cg_binary_emit_int_op(op: u64, use_signed: u64) -> u64 {
     return;
 }
 
+func cg_binary_emit_int_rax_to_f64(ti: *TypeInfo) -> u64 {
+    if (ti != 0 && ti.ptr_depth == 0) {
+        if (ti.type_kind == TYPE_I8) { emit("    movsx rax, al\n"); }
+        else if (ti.type_kind == TYPE_I16) { emit("    movsx rax, ax\n"); }
+        else if (ti.type_kind == TYPE_I32) { emit("    movsxd rax, eax\n"); }
+        else if (ti.type_kind == TYPE_U8 || ti.type_kind == TYPE_BOOL) { emit("    movzx eax, al\n"); }
+        else if (ti.type_kind == TYPE_U16) { emit("    movzx eax, ax\n"); }
+        else if (ti.type_kind == TYPE_U32) { emit("    mov eax, eax\n"); }
+    }
+    emit("    cvtsi2sd xmm0, rax\n");
+    return 0;
+}
+
+func cg_binary_emit_int_rbx_to_f64(ti: *TypeInfo) -> u64 {
+    if (ti != 0 && ti.ptr_depth == 0) {
+        if (ti.type_kind == TYPE_I8) { emit("    movsx rbx, bl\n"); }
+        else if (ti.type_kind == TYPE_I16) { emit("    movsx rbx, bx\n"); }
+        else if (ti.type_kind == TYPE_I32) { emit("    movsxd rbx, ebx\n"); }
+        else if (ti.type_kind == TYPE_U8 || ti.type_kind == TYPE_BOOL) { emit("    movzx ebx, bl\n"); }
+        else if (ti.type_kind == TYPE_U16) { emit("    movzx ebx, bx\n"); }
+        else if (ti.type_kind == TYPE_U32) { emit("    mov ebx, ebx\n"); }
+    }
+    emit("    cvtsi2sd xmm1, rbx\n");
+    return 0;
+}
+
 func cg_binary_expr(node: u64, symtab: *Symtab) -> u64 {
     var binary: *AstBinary = (*AstBinary)node;
     var op: u64 = binary.op;
@@ -2574,23 +2600,26 @@ func cg_binary_expr(node: u64, symtab: *Symtab) -> u64 {
 
     var left_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)left, symtab);
     var right_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)right, symtab);
-    var is_float: u64 = 0;
-    if (left_ti != 0 && right_ti != 0) {
-        if (left_ti.ptr_depth == 0 && right_ti.ptr_depth == 0 && left_ti.type_kind == TYPE_F64 && right_ti.type_kind == TYPE_F64) {
-            is_float = 1;
-        }
-    }
-    if (left_ti != 0 && right_ti != 0) {
-        var l_is_f: u64 = (left_ti.ptr_depth == 0 && left_ti.type_kind == TYPE_F64);
-        var r_is_f: u64 = (right_ti.ptr_depth == 0 && right_ti.type_kind == TYPE_F64);
-        if (l_is_f != r_is_f) {
-            emit_stderr("[ERROR] Mixed float/integer binary operation is not supported\n");
+    var l_is_f: u64 = 0;
+    var r_is_f: u64 = 0;
+    if (left_ti != 0) { l_is_f = (left_ti.ptr_depth == 0 && left_ti.type_kind == TYPE_F64); }
+    if (right_ti != 0) { r_is_f = (right_ti.ptr_depth == 0 && right_ti.type_kind == TYPE_F64); }
+    if (l_is_f != 0 || r_is_f != 0) {
+        if (l_is_f == 0 && left_ti != 0 && left_ti.ptr_depth > 0) {
+            emit_stderr("[ERROR] Float/integer binary operation does not support pointer operands\n");
             panic("Codegen error");
         }
-    }
-    if (is_float != 0) {
-        emit("    movq xmm0, rax\n");
-        emit("    movq xmm1, rbx\n");
+        if (r_is_f == 0 && right_ti != 0 && right_ti.ptr_depth > 0) {
+            emit_stderr("[ERROR] Float/integer binary operation does not support pointer operands\n");
+            panic("Codegen error");
+        }
+
+        if (l_is_f != 0) { emit("    movq xmm0, rax\n"); }
+        else { cg_binary_emit_int_rax_to_f64(left_ti); }
+
+        if (r_is_f != 0) { emit("    movq xmm1, rbx\n"); }
+        else { cg_binary_emit_int_rbx_to_f64(right_ti); }
+
         cg_binary_emit_float_op(op);
         return;
     }
@@ -3007,6 +3036,62 @@ func cg_method_push_receiver(receiver: u64, recv_ti: *TypeInfo, recv_is_ptr: u64
     return 1;
 }
 
+func cg_find_trait_method_sig(trait_ptr: u64, trait_len: u64, method_ptr: u64, method_len: u64) -> *AstFunc {
+    var trait_def: *TraitDef = compiler_get_trait_def(trait_ptr, trait_len);
+    if (trait_def == 0 || trait_def.methods_vec == 0) { return 0; }
+    var method_index: u64 = compiler_find_trait_method_index(trait_ptr, trait_len, method_ptr, method_len);
+    if (compiler_is_not_found_u64(method_index) != 0) { return 0; }
+    if (method_index >= trait_def.methods_vec.len()) { return 0; }
+    var method_desc: *TraitMethod = trait_def.methods_vec.get(method_index);
+    if (method_desc == 0) { return 0; }
+    return method_desc.sig;
+}
+
+func cg_method_try_normalize_named_args(method_call: *AstMethodCall, recv_ti: *TypeInfo) -> *AstFunc {
+    if (method_call == 0) { return 0; }
+    if (compiler_call_has_named_args(method_call.arg_names_vec) == 0) { return 0; }
+
+    var args: *Vec<*AstNode> = method_call.args_vec;
+    var nargs: u64 = 0;
+    if (args != 0) { nargs = args.len(); }
+
+    var fn_sig: *AstFunc = 0;
+    if (recv_ti != 0 && (recv_ti.type_kind == TYPE_TRAIT || compiler_is_trait_name(recv_ti.struct_name_ptr, recv_ti.struct_name_len) != 0)) {
+        fn_sig = cg_find_trait_method_sig(recv_ti.struct_name_ptr, recv_ti.struct_name_len, method_call.method_ptr, method_call.method_len);
+    } else if (recv_ti != 0 && recv_ti.type_kind == TYPE_STRUCT) {
+        var owner_ptr: u64 = recv_ti.struct_name_ptr;
+        var owner_len: u64 = recv_ti.struct_name_len;
+        if ((owner_ptr == 0 || owner_len == 0) && recv_ti.struct_def != 0) {
+            owner_ptr = recv_ti.struct_def.name_ptr;
+            owner_len = recv_ti.struct_def.name_len;
+        }
+        if (owner_ptr != 0 && owner_len != 0) {
+            var resolved: CompilerMethodResolveResult = compiler_resolve_method_overload_with_count_fallback(owner_ptr, owner_len, method_call.method_ptr, method_call.method_len, 0, nargs);
+            if (resolved.found != 0 && resolved.fn != 0) {
+                fn_sig = resolved.fn;
+            } else if (recv_ti.struct_def != 0) {
+                fn_sig = compiler_find_method_func_in_hierarchy(recv_ti.struct_def, method_call.method_ptr, method_call.method_len);
+            }
+        }
+    }
+
+    if (fn_sig == 0) {
+        emit_stderr("[ERROR] named arguments require a known method signature: ");
+        if (recv_ti != 0 && recv_ti.struct_name_ptr != 0 && recv_ti.struct_name_len != 0) {
+            emit_stderr_len(recv_ti.struct_name_ptr, recv_ti.struct_name_len);
+            emit_stderr(".");
+        }
+        emit_stderr_len(method_call.method_ptr, method_call.method_len);
+        emit_stderr("\n");
+        panic("Codegen error");
+    }
+
+    var params_start: u64 = compiler_method_param_start_index(fn_sig);
+    method_call.args_vec = compiler_normalize_call_args_for_params(method_call.method_ptr, method_call.method_len, fn_sig.params_vec, params_start, method_call.args_vec, method_call.arg_names_vec);
+    method_call.arg_names_vec = 0;
+    return fn_sig;
+}
+
 func cg_method_find_virtual_vptr_offset(recv_ti: *TypeInfo, trait_ptr: u64, trait_len: u64) -> u64 {
     if (recv_ti == 0) { return COMPILER_NOT_FOUND_U64; }
     var struct_def: *AstStructDef = recv_ti.struct_def;
@@ -3267,15 +3352,18 @@ func cg_safe_method_call_struct_ptr(method_call: *AstMethodCall, recv_ti: *TypeI
 func cg_safe_method_call(node: u64, symtab: *Symtab) -> u64 {
     var method_call: *AstMethodCall = (*AstMethodCall)node;
     var receiver: u64 = method_call.receiver;
-    var args: *Vec<*AstNode> = method_call.args_vec;
-    var nargs: u64 = 0;
-    if (args != 0) { nargs = args.len(); }
 
     var recv_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)receiver, symtab);
     if (recv_ti == 0) {
         emit_stderr("[ERROR] Safe method call receiver type not found\n");
         return 0;
     }
+    cg_method_try_normalize_named_args(method_call, recv_ti);
+
+    var args: *Vec<*AstNode> = method_call.args_vec;
+    var nargs: u64 = 0;
+    if (args != 0) { nargs = args.len(); }
+
     var recv_mode: u64 = compiler_safe_receiver_mode(recv_ti);
     if (recv_mode == COMPILER_SAFE_RECV_TRAIT_PTR) {
         return cg_safe_method_call_trait_ptr(method_call, recv_ti, args, nargs, symtab);
@@ -3288,13 +3376,16 @@ func cg_method_call(node: u64, symtab: *Symtab) -> u64 {
     var receiver: u64 = method_call.receiver;
     var method_ptr: u64 = method_call.method_ptr;
     var method_len: u64 = method_call.method_len;
+
+    var recv_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)receiver, symtab);
+    cg_method_try_normalize_named_args(method_call, recv_ti);
+
     var args: *Vec<*AstNode> = method_call.args_vec;
     var nargs: u64 = 0;
     if (args != 0) { nargs = args.len(); }
     var arg_types: *Vec<*TypeInfo> = typeinfo_collect_arg_types(args, symtab);
     var total_arg_words: u64 = 0;
 
-    var recv_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)receiver, symtab);
     var recv_is_ptr: u64 = 0;
     if (recv_ti != 0 && recv_ti.ptr_depth > 0) {
         recv_is_ptr = 1;

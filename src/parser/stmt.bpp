@@ -56,6 +56,47 @@ func parse_try_context_active(p: *Parser) -> u64 {
     return 1;
 }
 
+func parse_try_context_current_flag_ptr(p: *Parser) -> u64 {
+    if (parse_try_context_active(p) == 0) { return 0; }
+    var top_idx: u64 = p.try_throw_flag_ptr_stack.len() - 1;
+    return p.try_throw_flag_ptr_stack.get(top_idx);
+}
+
+func parse_try_context_current_flag_len(p: *Parser) -> u64 {
+    if (parse_try_context_active(p) == 0) { return 0; }
+    var top_idx: u64 = p.try_throw_flag_len_stack.len() - 1;
+    return p.try_throw_flag_len_stack.get(top_idx);
+}
+
+func parse_try_build_break_guard(flag_ptr: u64, flag_len: u64) -> *AstNode {
+    if (flag_ptr == 0 || flag_len == 0) { return 0; }
+    var cond: *AstNode = (*AstNode)ast_binary(TOKEN_BANGEQ, (*AstNode)ast_ident(flag_ptr, flag_len), (*AstNode)ast_literal(0));
+    var then_stmts: *Vec<*AstNode> = new Vec<*AstNode>(1);
+    then_stmts.push((*AstNode)ast_break());
+    return (*AstNode)ast_if(cond, (*AstNode)ast_block(then_stmts), 0);
+}
+
+func parse_try_wrap_loop_body_with_guard(body: *AstNode, flag_ptr: u64, flag_len: u64) -> *AstNode {
+    if (body == 0) { return 0; }
+    if (flag_ptr == 0 || flag_len == 0) { return body; }
+
+    var wrapped: *Vec<*AstNode> = new Vec<*AstNode>(8);
+    if (ast_kind(body) == AST_BLOCK) {
+        var blk: *AstBlock = (*AstBlock)body;
+        if (blk.stmts_vec != 0) {
+            var n: u64 = blk.stmts_vec.len();
+            for (var i: u64 = 0; i < n; i++) {
+                wrapped.push(blk.stmts_vec.get(i));
+                wrapped.push(parse_try_build_break_guard(flag_ptr, flag_len));
+            }
+        }
+    } else {
+        wrapped.push(body);
+        wrapped.push(parse_try_build_break_guard(flag_ptr, flag_len));
+    }
+    return (*AstNode)ast_block(wrapped);
+}
+
 // ============================================
 // Variable Declaration
 // ============================================
@@ -303,6 +344,12 @@ func parse_while_stmt(p: *Parser) -> *AstNode {
     p.breakable_depth = p.breakable_depth + 1;
     var body: *AstNode = parse_stmt_or_block(p);
     p.breakable_depth = p.breakable_depth - 1;
+
+    if (parse_try_context_active(p) != 0) {
+        var flag_ptr: u64 = parse_try_context_current_flag_ptr(p);
+        var flag_len: u64 = parse_try_context_current_flag_len(p);
+        body = parse_try_wrap_loop_body_with_guard(body, flag_ptr, flag_len);
+    }
     
     return ast_while(cond, body);
 }
@@ -363,6 +410,11 @@ func parse_for_stmt(p: *Parser) -> *AstNode {
     p.breakable_depth = p.breakable_depth + 1;
     var body: *AstNode = parse_stmt_or_block(p);
     p.breakable_depth = p.breakable_depth - 1;
+    if (parse_try_context_active(p) != 0) {
+        var flag_ptr: u64 = parse_try_context_current_flag_ptr(p);
+        var flag_len: u64 = parse_try_context_current_flag_len(p);
+        body = parse_try_wrap_loop_body_with_guard(body, flag_ptr, flag_len);
+    }
     return ast_for(init, cond, update, body);
 }
 
@@ -384,7 +436,7 @@ func parse_switch_stmt(p: *Parser) -> *AstNode {
         if (parse_peek_kind(p) == TOKEN_EOF) { break; }
 
         var is_default: u64 = 0;
-        var value: *AstNode = 0;
+        var case_values: *Vec<*AstNode> = 0;
         var matched: u64 = 0;
 
         switch (parse_peek_kind(p)) {
@@ -399,7 +451,18 @@ func parse_switch_stmt(p: *Parser) -> *AstNode {
                         break;
                     }
                 }
-                value = parse_expr(p);
+                case_values = new Vec<*AstNode>(2);
+                case_values.push(parse_expr(p));
+                while (parse_match(p, TOKEN_COMMA)) {
+                    if (parse_peek_kind(p) == TOKEN_IDENTIFIER) {
+                        var wc_tok2: *Token = parse_peek(p);
+                        if (wc_tok2.len == 1 && str_eq(wc_tok2.ptr, wc_tok2.len, "_", 1) != 0) {
+                            emit_stderr("[ERROR] wildcard '_' cannot be mixed with explicit case values\n");
+                            parse_panic_here(p, "Syntax error");
+                        }
+                    }
+                    case_values.push(parse_expr(p));
+                }
                 matched = 1;
                 break;
             case TOKEN_DEFAULT:
@@ -423,7 +486,18 @@ func parse_switch_stmt(p: *Parser) -> *AstNode {
         }
 
         var case_body: *AstNode = ast_block(stmts);
-        cases.push(ast_case(value, case_body, is_default));
+        if (is_default != 0) {
+            cases.push(ast_case(0, case_body, 1));
+            continue;
+        }
+        if (case_values == 0 || case_values.len() == 0) {
+            emit_stderr("[ERROR] case value is required\n");
+            parse_panic_here(p, "Syntax error");
+        }
+        var cvn: u64 = case_values.len();
+        for (var ci: u64 = 0; ci < cvn; ci++) {
+            cases.push(ast_case(case_values.get(ci), case_body, 0));
+        }
     }
 
     p.breakable_depth = p.breakable_depth - 1;
@@ -467,12 +541,6 @@ func parse_throw_stmt(p: *Parser) -> *AstNode {
     }
 
     var top_idx: u64 = p.try_throw_flag_ptr_stack.len() - 1;
-    var allowed_depth: u64 = p.try_throw_allowed_depth_stack.get(top_idx);
-    if (p.breakable_depth != allowed_depth) {
-        emit_stderr("[ERROR] throw inside nested loop/switch is not supported\n");
-        parse_panic_here(p, "Syntax error");
-    }
-
     var flag_ptr: u64 = p.try_throw_flag_ptr_stack.get(top_idx);
     var flag_len: u64 = p.try_throw_flag_len_stack.get(top_idx);
     var thrown_expr: *AstNode = parse_expr(p);
@@ -496,6 +564,23 @@ func parse_try_stmt_append_block_stmts(dst: *Vec<*AstNode>, block_node: *AstNode
     var n: u64 = blk.stmts_vec.len();
     for (var i: u64 = 0; i < n; i++) {
         dst.push(blk.stmts_vec.get(i));
+    }
+    return 0;
+}
+
+func parse_try_stmt_append_block_stmts_with_guard(dst: *Vec<*AstNode>, block_node: *AstNode, flag_ptr: u64, flag_len: u64) -> u64 {
+    if (block_node == 0) { return 0; }
+    if (ast_kind(block_node) != AST_BLOCK) {
+        dst.push(block_node);
+        dst.push(parse_try_build_break_guard(flag_ptr, flag_len));
+        return 0;
+    }
+    var blk: *AstBlock = (*AstBlock)block_node;
+    if (blk.stmts_vec == 0) { return 0; }
+    var n: u64 = blk.stmts_vec.len();
+    for (var i: u64 = 0; i < n; i++) {
+        dst.push(blk.stmts_vec.get(i));
+        dst.push(parse_try_build_break_guard(flag_ptr, flag_len));
     }
     return 0;
 }
@@ -529,7 +614,7 @@ func parse_try_stmt(p: *Parser) -> *AstNode {
     lowered_stmts.push((*AstNode)ast_var_decl(flag_name.ptr, flag_name.len, TYPE_U64, 0, (*AstNode)ast_literal(0)));
 
     var while_body_stmts: *Vec<*AstNode> = new Vec<*AstNode>(8);
-    parse_try_stmt_append_block_stmts(while_body_stmts, try_block);
+    parse_try_stmt_append_block_stmts_with_guard(while_body_stmts, try_block, flag_name.ptr, flag_name.len);
     while_body_stmts.push((*AstNode)ast_break());
     var while_body: *AstNode = (*AstNode)ast_block(while_body_stmts);
     lowered_stmts.push((*AstNode)ast_while((*AstNode)ast_literal(1), while_body));
