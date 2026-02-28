@@ -13,8 +13,8 @@
   - `.bpp` 파일 작성
   - `bpp <file>.bpp` 또는 stage 바이너리로 컴파일/실행
 - 개발자 관점:
-  - `v11/src`에서 parser/compiler/codegen 계층을 분리해 수정
-  - `v11/test/source` 케이스로 동작과 진단을 검증
+  - `src`에서 parser/compiler/codegen 계층을 분리해 수정
+  - `test/source` 케이스로 동작과 진단을 검증
 
 ## Constraints (v11)
 

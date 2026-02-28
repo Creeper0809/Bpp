@@ -42,7 +42,7 @@ func size_of_buf<const N: u64>() -> u64 {
 var sz: u64 = size_of_buf<4>();
 ```
 
-실제 사용 구문은 현재 파서/테스트 케이스(`v11/test/source/10_generics.bpp`, `11_const_generics_sizeof.bpp`) 기준으로 따르십시오.
+실제 사용 구문은 현재 파서/테스트 케이스(`test/source/10_generics.bpp`, `11_const_generics_sizeof.bpp`) 기준으로 따르십시오.
 
 ### Generic Struct Usage
 

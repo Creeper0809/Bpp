@@ -1,0 +1,1053 @@
+// codegen.b - Code generator wrapper for v3.13
+//
+// This is a thin wrapper that re-exports functionality from:
+// - symtab.b: Symbol table management
+// - typeinfo.b: Type size/compatibility calculations
+// - emitter.b: ASM output helpers and global state
+// - gen_expr.b: Expression code generation
+// - gen_stmt.b: Statement code generation
+
+import std.io;
+import std.util;
+import std.str;
+import types;
+import std.vec;
+import ast;
+import compiler;
+import ssa.datastruct;
+import ssa;
+import ssa.mem2reg;
+import ssa.opt_o1;
+import ssa.destroy;
+import ssa.regalloc;
+import ssa.lower_phys;
+import ssa.codegen;
+import ssa.dump;
+import opt;
+import emitter.symtab;
+import emitter.typeinfo;
+import emitter.emitter;
+import emitter.gen_expr;
+import emitter.gen_stmt;
+
+const CODEGEN_DEBUG = 0;
+
+const CG_USED_HAS_CALL_PTR = 1;
+const CG_USED_HAS_METHOD_CALL = 2;
+const CG_USED_HAS_FUNC_ADDR = 4;
+
+func _cg_used_mark_flag(flags_ptr: u64, mask: u64) -> u64 {
+    *(flags_ptr) = *(flags_ptr) | mask;
+    return 0;
+}
+
+func _cg_used_has_name(used: *Vec<*NameInfo>, name_ptr: u64, name_len: u64) -> u64 {
+    if (used == 0) { return false; }
+    var n: u64 = used.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var info: *NameInfo = used.get(i);
+        var ptr: u64 = info.ptr;
+        var len: u64 = info.len;
+        if (len == name_len && str_eq(ptr, len, name_ptr, name_len) != 0) { return true; }
+    }
+    return false;
+}
+
+func _cg_used_add_name(used: *Vec<*NameInfo>, name_ptr: u64, name_len: u64) -> u64 {
+    if (_cg_used_has_name(used, name_ptr, name_len) != 0) { return false; }
+    var info: *NameInfo = new NameInfo{name_ptr, name_len};
+    used.push(info);
+    return true;
+}
+
+func _cg_used_add_resolved_name(used: *Vec<*NameInfo>, name_ptr: u64, name_len: u64) -> u64 {
+    var resolved: *NameInfo = resolve_name(name_ptr, name_len);
+    if (resolved != 0) {
+        name_ptr = resolved.ptr;
+        name_len = resolved.len;
+    }
+    return _cg_used_add_name(used, name_ptr, name_len);
+}
+
+func _cg_collect_calls_in_args_vec(args: *Vec<*AstNode>, used: *Vec<*NameInfo>, flags_ptr: u64) -> u64 {
+    var n: u64 = args.?len();
+    for (var i: u64 = 0; i < n; i++) {
+        _cg_collect_calls_in_expr(args.get(i), used, flags_ptr);
+    }
+    return 0;
+}
+
+func _cg_collect_calls_in_call(call: *AstCall, used: *Vec<*NameInfo>, flags_ptr: u64) -> u64 {
+    _cg_used_add_resolved_name(used, call.name_ptr, call.name_len);
+    return _cg_collect_calls_in_args_vec(call.args_vec, used, flags_ptr);
+}
+
+func _cg_collect_calls_in_call_ptr(cp: *AstCallPtr, used: *Vec<*NameInfo>, flags_ptr: u64) -> u64 {
+    _cg_used_mark_flag(flags_ptr, CG_USED_HAS_CALL_PTR);
+    _cg_collect_calls_in_expr(cp.callee, used, flags_ptr);
+    return _cg_collect_calls_in_args_vec(cp.args_vec, used, flags_ptr);
+}
+
+func _cg_collect_calls_in_method_call(mc: *AstMethodCall, used: *Vec<*NameInfo>, flags_ptr: u64) -> u64 {
+    _cg_used_mark_flag(flags_ptr, CG_USED_HAS_METHOD_CALL);
+    _cg_collect_calls_in_expr(mc.receiver, used, flags_ptr);
+    return _cg_collect_calls_in_args_vec(mc.args_vec, used, flags_ptr);
+}
+
+func _cg_collect_calls_in_binary(bin: *AstBinary, used: *Vec<*NameInfo>, flags_ptr: u64) -> u64 {
+    _cg_collect_calls_in_expr(bin.left, used, flags_ptr);
+    _cg_collect_calls_in_expr(bin.right, used, flags_ptr);
+    return 0;
+}
+
+func _cg_collect_calls_in_unary(un: *AstUnary, used: *Vec<*NameInfo>, flags_ptr: u64) -> u64 {
+    _cg_collect_calls_in_expr(un.operand, used, flags_ptr);
+    return 0;
+}
+
+func _cg_collect_calls_in_addr_of(ao: *AstAddrOf, used: *Vec<*NameInfo>, flags_ptr: u64) -> u64 {
+    var op_kind: u64 = ast_kind(ao.operand);
+    if (op_kind == AST_IDENT) {
+        var idn: *AstIdent = (*AstIdent)ao.operand;
+        if (compiler_func_exists(idn.name_ptr, idn.name_len) != 0) {
+            _cg_used_mark_flag(flags_ptr, CG_USED_HAS_FUNC_ADDR);
+        }
+    }
+    _cg_collect_calls_in_expr(ao.operand, used, flags_ptr);
+    return 0;
+}
+
+func _cg_collect_calls_in_deref(dr: *AstDeref, used: *Vec<*NameInfo>, flags_ptr: u64) -> u64 {
+    _cg_collect_calls_in_expr(dr.operand, used, flags_ptr);
+    return 0;
+}
+
+func _cg_collect_calls_in_deref8(dr8: *AstDeref8, used: *Vec<*NameInfo>, flags_ptr: u64) -> u64 {
+    _cg_collect_calls_in_expr(dr8.operand, used, flags_ptr);
+    return 0;
+}
+
+func _cg_collect_calls_in_index(ix: *AstIndex, used: *Vec<*NameInfo>, flags_ptr: u64) -> u64 {
+    _cg_collect_calls_in_expr(ix.base, used, flags_ptr);
+    _cg_collect_calls_in_expr(ix.index, used, flags_ptr);
+    return 0;
+}
+
+func _cg_collect_calls_in_cast(ca: *AstCast, used: *Vec<*NameInfo>, flags_ptr: u64) -> u64 {
+    _cg_collect_calls_in_expr(ca.expr, used, flags_ptr);
+    return 0;
+}
+
+func _cg_collect_calls_in_member_access(ma: *AstMemberAccess, used: *Vec<*NameInfo>, flags_ptr: u64) -> u64 {
+    _cg_collect_calls_in_expr(ma.object, used, flags_ptr);
+    return 0;
+}
+
+func _cg_collect_calls_in_assign_expr(asg: *AstAssign, used: *Vec<*NameInfo>, flags_ptr: u64) -> u64 {
+    _cg_collect_calls_in_expr(asg.target, used, flags_ptr);
+    _cg_collect_calls_in_expr(asg.value, used, flags_ptr);
+    return 0;
+}
+
+func _cg_collect_calls_in_new(nw: *AstNew, used: *Vec<*NameInfo>, flags_ptr: u64) -> u64 {
+    _cg_used_add_resolved_name(used, (u64)"malloc", 6);
+    _cg_used_add_resolved_name(used, (u64)"memset", 6);
+
+    if (nw.literal_expr != 0) {
+        _cg_collect_calls_in_expr(nw.literal_expr, used, flags_ptr);
+    }
+
+    if (nw.ctor_args_vec != 0 && nw.type_kind == TYPE_STRUCT) {
+        var method_ptr: u64 = (u64)"constructor";
+        var method_len: u64 = 11;
+        var name_info: *NameInfo = compiler_build_method_name(nw.struct_name_ptr, nw.struct_name_len, method_ptr, method_len);
+        _cg_used_add_resolved_name(used, name_info.ptr, name_info.len);
+        _cg_collect_calls_in_args_vec(nw.ctor_args_vec, used, flags_ptr);
+    }
+    return 0;
+}
+
+func _cg_collect_calls_in_stack_ctor(sc: *AstStackCtor, used: *Vec<*NameInfo>, flags_ptr: u64) -> u64 {
+    _cg_used_add_resolved_name(used, (u64)"memset", 6);
+    if (sc.ctor_args_vec != 0 && sc.type_kind == TYPE_STRUCT) {
+        var method_ptr: u64 = (u64)"constructor";
+        var method_len: u64 = 11;
+        var name_info: *NameInfo = compiler_build_method_name(sc.struct_name_ptr, sc.struct_name_len, method_ptr, method_len);
+        _cg_used_add_resolved_name(used, name_info.ptr, name_info.len);
+        _cg_collect_calls_in_args_vec(sc.ctor_args_vec, used, flags_ptr);
+    }
+    return 0;
+}
+
+func _cg_collect_calls_in_expr(node: u64, used: *Vec<*NameInfo>, flags_ptr: u64) -> u64 {
+    if (node == 0) { return 0; }
+    var kind: u64 = ast_kind(node);
+    switch (kind) {
+        case AST_CALL: return _cg_collect_calls_in_call((*AstCall)node, used, flags_ptr);
+        case AST_CALL_PTR: return _cg_collect_calls_in_call_ptr((*AstCallPtr)node, used, flags_ptr);
+        case AST_METHOD_CALL: return _cg_collect_calls_in_method_call((*AstMethodCall)node, used, flags_ptr);
+        case AST_SAFE_METHOD_CALL: return _cg_collect_calls_in_method_call((*AstMethodCall)node, used, flags_ptr);
+        case AST_BINARY: return _cg_collect_calls_in_binary((*AstBinary)node, used, flags_ptr);
+        case AST_UNARY: return _cg_collect_calls_in_unary((*AstUnary)node, used, flags_ptr);
+        case AST_ADDR_OF: return _cg_collect_calls_in_addr_of((*AstAddrOf)node, used, flags_ptr);
+        case AST_DEREF: return _cg_collect_calls_in_deref((*AstDeref)node, used, flags_ptr);
+        case AST_DEREF8: return _cg_collect_calls_in_deref8((*AstDeref8)node, used, flags_ptr);
+        case AST_INDEX: return _cg_collect_calls_in_index((*AstIndex)node, used, flags_ptr);
+        case AST_CAST: return _cg_collect_calls_in_cast((*AstCast)node, used, flags_ptr);
+        case AST_MEMBER_ACCESS: return _cg_collect_calls_in_member_access((*AstMemberAccess)node, used, flags_ptr);
+        case AST_SAFE_MEMBER_ACCESS: return _cg_collect_calls_in_member_access((*AstMemberAccess)node, used, flags_ptr);
+        case AST_ASSIGN: return _cg_collect_calls_in_assign_expr((*AstAssign)node, used, flags_ptr);
+        case AST_NEW: return _cg_collect_calls_in_new((*AstNew)node, used, flags_ptr);
+        case AST_STACK_CTOR: return _cg_collect_calls_in_stack_ctor((*AstStackCtor)node, used, flags_ptr);
+        case AST_STRUCT_LITERAL:
+            var st: *AstStructLiteral = (*AstStructLiteral)node;
+            return _cg_collect_calls_in_args_vec(st.values_vec, used, flags_ptr);
+    }
+    return 0;
+}
+
+func _cg_collect_calls_in_assign_stmt(asg: *AstAssign, used: *Vec<*NameInfo>, flags_ptr: u64) -> u64 {
+    _cg_collect_calls_in_expr(asg.target, used, flags_ptr);
+    _cg_collect_calls_in_expr(asg.value, used, flags_ptr);
+    return 0;
+}
+
+func _cg_collect_calls_in_delete(dl: *AstDelete, used: *Vec<*NameInfo>, flags_ptr: u64) -> u64 {
+    _cg_used_mark_flag(flags_ptr, CG_USED_HAS_METHOD_CALL);
+    _cg_used_add_resolved_name(used, (u64)"free", 4);
+    if (dl.expr != 0) {
+        _cg_collect_calls_in_expr(dl.expr, used, flags_ptr);
+    }
+    return 0;
+}
+
+func _cg_collect_calls_in_if(ifs: *AstIf, used: *Vec<*NameInfo>, flags_ptr: u64) -> u64 {
+    _cg_collect_calls_in_expr(ifs.cond, used, flags_ptr);
+    _cg_collect_calls_in_stmt(ifs.then_block, used, flags_ptr);
+    _cg_collect_calls_in_stmt(ifs.else_block, used, flags_ptr);
+    return 0;
+}
+
+func _cg_collect_calls_in_while(wl: *AstWhile, used: *Vec<*NameInfo>, flags_ptr: u64) -> u64 {
+    _cg_collect_calls_in_expr(wl.cond, used, flags_ptr);
+    _cg_collect_calls_in_stmt(wl.body, used, flags_ptr);
+    return 0;
+}
+
+func _cg_collect_calls_in_for(fr: *AstFor, used: *Vec<*NameInfo>, flags_ptr: u64) -> u64 {
+    _cg_collect_calls_in_stmt(fr.init, used, flags_ptr);
+    _cg_collect_calls_in_expr(fr.cond, used, flags_ptr);
+    _cg_collect_calls_in_stmt(fr.update, used, flags_ptr);
+    _cg_collect_calls_in_stmt(fr.body, used, flags_ptr);
+    return 0;
+}
+
+func _cg_collect_calls_in_switch(sw: *AstSwitch, used: *Vec<*NameInfo>, flags_ptr: u64) -> u64 {
+    _cg_collect_calls_in_expr(sw.expr, used, flags_ptr);
+    var cases: *Vec<*AstCase> = sw.cases_vec;
+    var has_string_case: u64 = 0;
+    if (cases != 0) {
+        var n5: u64 = cases.len();
+        for (var c: u64 = 0; c < n5; c++) {
+            var cs: *AstCase = cases.get(c);
+            if (cs.is_default == 0) {
+                if (ast_kind(cs.value) == AST_STRING) {
+                    has_string_case = 1;
+                }
+                _cg_collect_calls_in_expr(cs.value, used, flags_ptr);
+            }
+            _cg_collect_calls_in_stmt(cs.body, used, flags_ptr);
+        }
+    }
+    if (has_string_case == 1) {
+        _cg_used_add_resolved_name(used, (u64)"str_len", 7);
+        _cg_used_add_resolved_name(used, (u64)"str_eq", 6);
+    }
+    return 0;
+}
+
+func _cg_collect_calls_in_block(blk: *AstBlock, used: *Vec<*NameInfo>, flags_ptr: u64) -> u64 {
+    var stmts: *Vec<*AstNode> = blk.stmts_vec;
+    if (stmts != 0) {
+        var n6: u64 = stmts.len();
+        for (var s: u64 = 0; s < n6; s++) {
+            _cg_collect_calls_in_stmt(stmts.get(s), used, flags_ptr);
+        }
+    }
+    return 0;
+}
+
+func _cg_collect_calls_in_stmt(node: u64, used: *Vec<*NameInfo>, flags_ptr: u64) -> u64 {
+    if (node == 0) { return 0; }
+    var kind: u64 = ast_kind(node);
+    switch (kind) {
+        case AST_RETURN:
+            var r: *AstReturn = (*AstReturn)node;
+            return _cg_collect_calls_in_expr(r.expr, used, flags_ptr);
+        case AST_VAR_DECL:
+            var vd: *AstVarDecl = (*AstVarDecl)node;
+            return _cg_collect_calls_in_expr(vd.init_expr, used, flags_ptr);
+        case AST_CONST_DECL:
+            var cd: *AstConstDecl = (*AstConstDecl)node;
+            return _cg_collect_calls_in_expr(cd.value, used, flags_ptr);
+        case AST_ASSIGN: return _cg_collect_calls_in_assign_stmt((*AstAssign)node, used, flags_ptr);
+        case AST_DELETE: return _cg_collect_calls_in_delete((*AstDelete)node, used, flags_ptr);
+        case AST_EXPR_STMT:
+            var es: *AstExprStmt = (*AstExprStmt)node;
+            return _cg_collect_calls_in_expr(es.expr, used, flags_ptr);
+        case AST_DEFER:
+            var df: *AstDefer = (*AstDefer)node;
+            return _cg_collect_calls_in_stmt((u64)df.stmt, used, flags_ptr);
+        case AST_IF: return _cg_collect_calls_in_if((*AstIf)node, used, flags_ptr);
+        case AST_WHILE: return _cg_collect_calls_in_while((*AstWhile)node, used, flags_ptr);
+        case AST_FOR: return _cg_collect_calls_in_for((*AstFor)node, used, flags_ptr);
+        case AST_SWITCH: return _cg_collect_calls_in_switch((*AstSwitch)node, used, flags_ptr);
+        case AST_BLOCK: return _cg_collect_calls_in_block((*AstBlock)node, used, flags_ptr);
+    }
+    return 0;
+}
+
+func _cg_collect_calls_in_func(fn: *AstFunc, used: *Vec<*NameInfo>, flags_ptr: u64) -> u64 {
+    if (fn == 0) { return 0; }
+    _cg_collect_calls_in_stmt(fn.body, used, flags_ptr);
+    return 0;
+}
+
+func _cg_collect_used_func_names(program: *AstProgram, used: *Vec<*NameInfo>, flags_ptr: u64) -> u64 {
+    if (program == 0) { return 0; }
+    var funcs: *Vec<*AstFunc> = program.funcs_vec;
+    if (funcs == 0) { return 0; }
+
+    _cg_used_add_name(used, (u64)"main", 4);
+
+    var changed: u64 = 1;
+    while (changed != 0) {
+        changed = 0;
+        var n: u64 = funcs.len();
+        for (var i: u64 = 0; i < n; i++) {
+            var fn: *AstFunc = funcs.get(i);
+            var fn_ptr: u64 = (u64)fn;
+            if (_cg_used_has_name(used, fn.name_ptr, fn.name_len) != 0) {
+                set_current_module_for_func(fn.name_ptr, fn.name_len);
+                var before: u64 = used.len();
+                _cg_collect_calls_in_func(fn, used, flags_ptr);
+                if (used.len() != before) { changed = 1; }
+            }
+        }
+    }
+    return 0;
+}
+
+func cg_is_generic_template(fn: *AstFunc) -> u64 {
+    if (fn == 0) { return false; }
+    if (compiler_is_generic_func_ptr(fn) != 0) { return true; }
+    if (fn.ret_type == TYPE_GENERIC) { return true; }
+
+    var params: *Vec<*Param> = fn.params_vec;
+    if (params != 0) {
+        var n: u64 = params.len();
+        for (var i: u64 = 0; i < n; i++) {
+            var p: *Param = params.get(i);
+            if (p.type_kind == TYPE_GENERIC) { return true; }
+            if (p.elem_type_kind == TYPE_GENERIC) { return true; }
+            if (p.array_len_is_param != 0) { return true; }
+        }
+    }
+    return false;
+}
+
+// ============================================
+// Function Codegen
+// ============================================
+
+// Function parameter layout (48 bytes)
+struct FuncParam {
+    public name_ptr: u64;
+    public name_len: u64;
+    public type_kind: u64;
+    public ptr_depth: u64;
+    public is_tagged: u64;
+    public struct_name_ptr: u64;
+    public struct_name_len: u64;
+    public tag_layout_ptr: u64;
+    public tag_layout_len: u64;
+    public elem_type_kind: u64;
+    public elem_ptr_depth: u64;
+    public array_len: u64;
+}
+
+func _cg_align_up_8(value: u64) -> u64 {
+    var rem: u64 = value % 8;
+    if (rem == 0) { return value; }
+    return value + (8 - rem);
+}
+
+func _cg_param_size(p: *Param) -> u64 {
+    if (p.type_kind == TYPE_SLICE && p.ptr_depth == 0) {
+        return 16;
+    }
+    if (p.type_kind == TYPE_STRUCT && p.ptr_depth == 0) {
+        var size: u64 = sizeof_type(TYPE_STRUCT, 0, p.struct_name_ptr, p.struct_name_len);
+        return _cg_align_up_8(size);
+    }
+    return 8;
+}
+
+func _cg_resolve_struct_def_for_param(ti: *TypeInfo, p: *Param, g_structs_vec: *Vec<*AstStructDef>) -> u64 {
+    if (g_structs_vec == 0) { return 0; }
+    if (p.struct_name_ptr == 0) { return 0; }
+
+    if (p.type_kind == TYPE_STRUCT) {
+        var num_structs: u64 = g_structs_vec.len();
+        for (var si: u64 = 0; si < num_structs; si++) {
+            var sd: *AstStructDef = g_structs_vec.get(si);
+            if (sd.name_len == p.struct_name_len && str_eq(sd.name_ptr, sd.name_len, p.struct_name_ptr, p.struct_name_len) != 0) {
+                ti.struct_def = sd;
+                break;
+            }
+        }
+    }
+
+    if (p.elem_type_kind == TYPE_STRUCT) {
+        var num_structs2: u64 = g_structs_vec.len();
+        for (var sj: u64 = 0; sj < num_structs2; sj++) {
+            var sd2: *AstStructDef = g_structs_vec.get(sj);
+            if (sd2.name_len == p.struct_name_len && str_eq(sd2.name_ptr, sd2.name_len, p.struct_name_ptr, p.struct_name_len) != 0) {
+                ti.struct_def = sd2;
+                break;
+            }
+        }
+    }
+    return 0;
+}
+
+func _cg_symtab_add_param(p: *Param, g_symtab: *Symtab, g_structs_vec: *Vec<*AstStructDef>) -> u64 {
+    var param_size: u64 = _cg_param_size(p);
+    var offset: u64 = symtab_add(g_symtab, p.name_ptr, p.name_len, p.type_kind, p.ptr_depth, param_size);
+    var ti: *TypeInfo = symtab_get_type(g_symtab, p.name_ptr, p.name_len);
+    p.apply_to_typeinfo(ti);
+    _cg_resolve_struct_def_for_param(ti, p, g_structs_vec);
+    return offset;
+}
+
+func _cg_param_struct_size(p: *Param) -> u64 {
+    if (p.type_kind != TYPE_STRUCT || p.ptr_depth != 0) { return 0; }
+    return sizeof_type(TYPE_STRUCT, 0, p.struct_name_ptr, p.struct_name_len);
+}
+
+func _cg_load_arg_ptr_to_rax(arg_word_index: u64) -> u64 {
+    if (arg_word_index < 6) {
+        emit("    mov rax, ");
+        _cg_sysv_emit_arg_reg_name(arg_word_index);
+        emit_nl();
+        return 0;
+    }
+    var src_offset: u64 = 16 + (arg_word_index - 6) * 8;
+    emit("    mov rax, [rbp+");
+    emit_u64(src_offset);
+    emit("]\n");
+    return 0;
+}
+
+func _cg_emit_struct_copy_to_stack(offset: u64, struct_size: u64) -> u64 {
+    emit("    lea rbx, [rbp");
+    emit_signed_disp(offset);
+    emit("]\n");
+
+    var off_copy: u64 = 0;
+    while (off_copy + 8 <= struct_size) {
+        emit("    mov rcx, [rax");
+        if (off_copy != 0) { emit("+"); emit_u64(off_copy); }
+        emit("]\n");
+        emit("    mov [rbx");
+        if (off_copy != 0) { emit("+"); emit_u64(off_copy); }
+        emit("], rcx\n");
+        off_copy = off_copy + 8;
+    }
+    var rem_copy: u64 = struct_size - off_copy;
+    if (rem_copy >= 4) {
+        emit("    mov ecx, [rax");
+        if (off_copy != 0) { emit("+"); emit_u64(off_copy); }
+        emit("]\n");
+        emit("    mov [rbx");
+        if (off_copy != 0) { emit("+"); emit_u64(off_copy); }
+        emit("], ecx\n");
+        off_copy = off_copy + 4;
+        rem_copy = rem_copy - 4;
+    }
+    if (rem_copy >= 2) {
+        emit("    mov cx, [rax");
+        if (off_copy != 0) { emit("+"); emit_u64(off_copy); }
+        emit("]\n");
+        emit("    mov [rbx");
+        if (off_copy != 0) { emit("+"); emit_u64(off_copy); }
+        emit("], cx\n");
+        off_copy = off_copy + 2;
+        rem_copy = rem_copy - 2;
+    }
+    if (rem_copy >= 1) {
+        emit("    mov cl, [rax");
+        if (off_copy != 0) { emit("+"); emit_u64(off_copy); }
+        emit("]\n");
+        emit("    mov [rbx");
+        if (off_copy != 0) { emit("+"); emit_u64(off_copy); }
+        emit("], cl\n");
+    }
+    return 0;
+}
+
+func _cg_store_large_struct_arg(arg_word_index: u64, offset: u64, struct_size: u64) -> u64 {
+    _cg_load_arg_ptr_to_rax(arg_word_index);
+    _cg_emit_struct_copy_to_stack(offset, struct_size);
+    return arg_word_index + 1;
+}
+
+func _cg_store_param_words(p: *Param, offset: u64, arg_word_index: u64) -> u64 {
+    if (p.type_kind == TYPE_SLICE && p.ptr_depth == 0) {
+        _cg_sysv_store_arg_word(arg_word_index, offset);
+        _cg_sysv_store_arg_word(arg_word_index + 1, offset + 8);
+        return arg_word_index + 2;
+    }
+
+    if (p.type_kind == TYPE_STRUCT && p.ptr_depth == 0) {
+        var struct_size: u64 = sizeof_type(TYPE_STRUCT, 0, p.struct_name_ptr, p.struct_name_len);
+        if (struct_size <= 8) {
+            _cg_sysv_store_arg_word(arg_word_index, offset);
+            return arg_word_index + 1;
+        }
+        if (struct_size <= 16) {
+            _cg_sysv_store_arg_word(arg_word_index, offset);
+            _cg_sysv_store_arg_word(arg_word_index + 1, offset + 8);
+            return arg_word_index + 2;
+        }
+        _cg_sysv_store_arg_word(arg_word_index, offset);
+        return arg_word_index + 1;
+    }
+
+    _cg_sysv_store_arg_word(arg_word_index, offset);
+    return arg_word_index + 1;
+}
+
+func _cg_emit_func_prologue(fn: *AstFunc, g_symtab: *Symtab) -> u64 {
+    compiler_reg_alias_reset();
+    set_current_module_for_func(fn.name_ptr, fn.name_len);
+    compiler_set_current_access_struct_from_func(fn.name_ptr, fn.name_len);
+
+    emitter_set_ret_type(fn.ret_type);
+    emitter_set_ret_ptr_depth(fn.ret_ptr_depth);
+    emitter_set_ret_struct_name(fn.ret_struct_name_ptr, fn.ret_struct_name_len);
+
+    symtab_clear(g_symtab);
+
+    emit_len(fn.name_ptr, fn.name_len);
+    emit(":\n");
+
+    emitln("    push rbp");
+    emitln("    mov rbp, rsp");
+    emitln("    sub rsp, 2048");
+
+    if (fn.ret_type == TYPE_STRUCT && fn.ret_ptr_depth == 0) {
+        var ret_struct_size: u64 = sizeof_type(TYPE_STRUCT, 0, fn.ret_struct_name_ptr, fn.ret_struct_name_len);
+        if (ret_struct_size > 16) {
+            var sret_ptr: u64 = (u64)"__sret_ptr";
+            var sret_len: u64 = 10;
+            var sret_offset: u64 = symtab_add(g_symtab, sret_ptr, sret_len, TYPE_U64, 1, 8);
+            emit("    mov [rbp");
+            emit_signed_disp(sret_offset);
+            emit("], rdi\n");
+        }
+    }
+    return 0;
+}
+
+func _cg_emit_func_epilogue() -> u64 {
+    emitln("   xor eax, eax");
+    emitln("    mov rsp, rbp");
+    emitln("    pop rbp");
+    emitln("   ret");
+    return 0;
+}
+
+func _cg_sysv_emit_arg_reg_name(idx: u64) -> u64 {
+    if (idx == 0) { emit("rdi"); return 0; }
+    if (idx == 1) { emit("rsi"); return 0; }
+    if (idx == 2) { emit("rdx"); return 0; }
+    if (idx == 3) { emit("rcx"); return 0; }
+    if (idx == 4) { emit("r8"); return 0; }
+    if (idx == 5) { emit("r9"); return 0; }
+    return 0;
+}
+
+func _cg_sysv_store_arg_word(arg_idx: u64, dst_offset: u64) -> u64 {
+    if (arg_idx < 6) {
+        emit("    mov [rbp");
+        emit_signed_disp(dst_offset);
+        emit("], ");
+        _cg_sysv_emit_arg_reg_name(arg_idx);
+        emit_nl();
+        return 0;
+    }
+    var src_offset: u64 = 16 + (arg_idx - 6) * 8;
+    emit("    mov rax, [rbp+");
+    emit_u64(src_offset);
+    emit("]\n");
+    emit("    mov [rbp");
+    emit_signed_disp(dst_offset);
+    emit("], rax\n");
+    return 0;
+}
+
+func cg_func(fn: *AstFunc) -> u64 {
+    if (fn == 0) { return 0; }
+
+    var g_symtab: *Symtab = emitter_get_symtab();
+    _cg_emit_func_prologue(fn, g_symtab);
+    
+    var g_structs_vec: *Vec<*AstStructDef> = typeinfo_get_structs();
+    
+    var nparams: u64 = fn.params_vec.len();
+    var arg_word_index: u64 = 0;
+    if (fn.ret_type == TYPE_STRUCT && fn.ret_ptr_depth == 0) {
+        var ret_struct_size: u64 = sizeof_type(TYPE_STRUCT, 0, fn.ret_struct_name_ptr, fn.ret_struct_name_len);
+        if (ret_struct_size > 16) { arg_word_index = 1; }
+    }
+    for(var i: u64 = 0 ; i < nparams ; i++){
+        var p: *Param = fn.params_vec.get(i);
+        var offset: u64 = _cg_symtab_add_param(p, g_symtab, g_structs_vec);
+        var struct_size_copy: u64 = _cg_param_struct_size(p);
+        if (struct_size_copy > 16) {
+            arg_word_index = _cg_store_large_struct_arg(arg_word_index, offset, struct_size_copy);
+            continue;
+        }
+        arg_word_index = _cg_store_param_words(p, offset, arg_word_index);
+    }
+    
+    cg_block(fn.body);
+
+    _cg_emit_func_epilogue();
+}
+
+// ============================================
+// Program Codegen
+// ============================================
+
+func _cg_program_has_runtime_global_init(program: *AstProgram) -> u64 {
+    if (program == 0) { return false; }
+    if (program.globals_vec == 0) { return false; }
+    var n: u64 = program.globals_vec.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var ginfo: *GlobalInfo = program.globals_vec.get(i);
+        if (ginfo.init_kind == GLOBAL_INIT_RUNTIME) { return true; }
+    }
+    return false;
+}
+
+func _cg_collect_used_names(program: *AstProgram, has_runtime_init: u64) -> *Vec<*NameInfo> {
+    if (opt_get_level() < 1) { return 0; }
+    var used_names: *Vec<*NameInfo> = new Vec<*NameInfo>(64);
+    var used_flags: u64 = 0;
+    _cg_collect_used_func_names(program, used_names, &used_flags);
+    if ((used_flags & (CG_USED_HAS_CALL_PTR | CG_USED_HAS_METHOD_CALL | CG_USED_HAS_FUNC_ADDR)) != 0) {
+        return 0;
+    }
+    if (has_runtime_init != 0) {
+        _cg_used_add_resolved_name(used_names, (u64)"__global_init", 13);
+    }
+    return used_names;
+}
+
+const CG_EXPR_FEATURE_SAFE_NAV = 1;
+const CG_EXPR_FEATURE_FLOAT = 2;
+
+func _cg_expr_vec_has_feature(exprs: *Vec<*AstNode>, feature: u64) -> u64 {
+    if (exprs == 0) { return false; }
+    var n: u64 = exprs.len();
+    for (var i: u64 = 0; i < n; i++) {
+        if (_cg_expr_has_feature(exprs.get(i), feature) != 0) { return true; }
+    }
+    return false;
+}
+
+func _cg_expr_has_feature(node: *AstNode, feature: u64) -> u64 {
+    if (node == 0) { return false; }
+    var kind: u64 = ast_kind(node);
+
+    if (feature == CG_EXPR_FEATURE_SAFE_NAV) {
+        if (kind == AST_SAFE_MEMBER_ACCESS || kind == AST_SAFE_METHOD_CALL) { return true; }
+    } else if (feature == CG_EXPR_FEATURE_FLOAT) {
+        if (kind == AST_FLOAT) { return true; }
+    }
+
+    switch (kind) {
+        case AST_BINARY:
+            var bin: *AstBinary = (*AstBinary)node;
+            if (_cg_expr_has_feature(bin.left, feature) != 0) { return true; }
+            return _cg_expr_has_feature(bin.right, feature);
+        case AST_UNARY:
+            var un: *AstUnary = (*AstUnary)node;
+            return _cg_expr_has_feature(un.operand, feature);
+        case AST_ADDR_OF:
+            var ao: *AstAddrOf = (*AstAddrOf)node;
+            return _cg_expr_has_feature(ao.operand, feature);
+        case AST_DEREF:
+            var dr: *AstDeref = (*AstDeref)node;
+            return _cg_expr_has_feature(dr.operand, feature);
+        case AST_DEREF8:
+            var dr8: *AstDeref8 = (*AstDeref8)node;
+            return _cg_expr_has_feature(dr8.operand, feature);
+        case AST_CAST:
+            var cs: *AstCast = (*AstCast)node;
+            if (feature == CG_EXPR_FEATURE_FLOAT && cs.target_type == TYPE_F64) { return true; }
+            return _cg_expr_has_feature(cs.expr, feature);
+        case AST_MEMBER_ACCESS:
+        case AST_SAFE_MEMBER_ACCESS:
+            var ma: *AstMemberAccess = (*AstMemberAccess)node;
+            return _cg_expr_has_feature(ma.object, feature);
+        case AST_METHOD_CALL:
+        case AST_SAFE_METHOD_CALL:
+            var mc: *AstMethodCall = (*AstMethodCall)node;
+            if (_cg_expr_has_feature(mc.receiver, feature) != 0) { return true; }
+            return _cg_expr_vec_has_feature(mc.args_vec, feature);
+        case AST_CALL:
+        case AST_GENERIC_CALL:
+            var call: *AstCall = (*AstCall)node;
+            return _cg_expr_vec_has_feature(call.args_vec, feature);
+        case AST_INDEX:
+            var ix: *AstIndex = (*AstIndex)node;
+            if (_cg_expr_has_feature(ix.base, feature) != 0) { return true; }
+            return _cg_expr_has_feature(ix.index, feature);
+        case AST_SLICE:
+            var sl: *AstSlice = (*AstSlice)node;
+            if (_cg_expr_has_feature(sl.ptr_expr, feature) != 0) { return true; }
+            return _cg_expr_has_feature(sl.len_expr, feature);
+        case AST_CALL_PTR:
+            if (feature == CG_EXPR_FEATURE_FLOAT) { return false; }
+            var cp: *AstCallPtr = (*AstCallPtr)node;
+            if (_cg_expr_has_feature(cp.callee, feature) != 0) { return true; }
+            return _cg_expr_vec_has_feature(cp.args_vec, feature);
+        case AST_NEW:
+            if (feature == CG_EXPR_FEATURE_FLOAT) { return false; }
+            var nw: *AstNew = (*AstNew)node;
+            if (_cg_expr_has_feature(nw.literal_expr, feature) != 0) { return true; }
+            return _cg_expr_vec_has_feature(nw.ctor_args_vec, feature);
+        case AST_STRUCT_LITERAL:
+            if (feature == CG_EXPR_FEATURE_FLOAT) { return false; }
+            var st: *AstStructLiteral = (*AstStructLiteral)node;
+            return _cg_expr_vec_has_feature(st.values_vec, feature);
+        case AST_SIZEOF_EXPR:
+            if (feature == CG_EXPR_FEATURE_FLOAT) { return false; }
+            var se: *AstSizeofExpr = (*AstSizeofExpr)node;
+            return _cg_expr_has_feature(se.expr, feature);
+        case AST_TRY:
+            if (feature == CG_EXPR_FEATURE_SAFE_NAV) { return false; }
+            var tr: *AstTry = (*AstTry)node;
+            return _cg_expr_has_feature(tr.operand, feature);
+    }
+    return false;
+}
+
+func _cg_stmt_has_feature(node: *AstNode, feature: u64) -> u64 {
+    if (node == 0) { return false; }
+    var kind: u64 = ast_kind(node);
+    switch (kind) {
+        case AST_RETURN:
+            var r: *AstReturn = (*AstReturn)node;
+            return _cg_expr_has_feature(r.expr, feature);
+        case AST_VAR_DECL:
+            var vd: *AstVarDecl = (*AstVarDecl)node;
+            if (feature == CG_EXPR_FEATURE_FLOAT && vd.type_kind == TYPE_F64 && vd.ptr_depth == 0) { return true; }
+            return _cg_expr_has_feature(vd.init_expr, feature);
+        case AST_CONST_DECL:
+            var cd: *AstConstDecl = (*AstConstDecl)node;
+            if (feature == CG_EXPR_FEATURE_SAFE_NAV) { return _cg_expr_has_feature(cd.value, feature); }
+            return false;
+        case AST_ASSIGN:
+            var asg: *AstAssign = (*AstAssign)node;
+            if (_cg_expr_has_feature(asg.target, feature) != 0) { return true; }
+            return _cg_expr_has_feature(asg.value, feature);
+        case AST_EXPR_STMT:
+            var es: *AstExprStmt = (*AstExprStmt)node;
+            return _cg_expr_has_feature(es.expr, feature);
+        case AST_IF:
+            var ifs: *AstIf = (*AstIf)node;
+            if (_cg_expr_has_feature(ifs.cond, feature) != 0) { return true; }
+            if (_cg_stmt_has_feature(ifs.then_block, feature) != 0) { return true; }
+            return _cg_stmt_has_feature(ifs.else_block, feature);
+        case AST_WHILE:
+            var wl: *AstWhile = (*AstWhile)node;
+            if (_cg_expr_has_feature(wl.cond, feature) != 0) { return true; }
+            return _cg_stmt_has_feature(wl.body, feature);
+        case AST_FOR:
+            var fr: *AstFor = (*AstFor)node;
+            if (_cg_stmt_has_feature(fr.init, feature) != 0) { return true; }
+            if (_cg_expr_has_feature(fr.cond, feature) != 0) { return true; }
+            if (_cg_expr_has_feature(fr.update, feature) != 0) { return true; }
+            return _cg_stmt_has_feature(fr.body, feature);
+        case AST_SWITCH:
+            var sw: *AstSwitch = (*AstSwitch)node;
+            if (_cg_expr_has_feature(sw.expr, feature) != 0) { return true; }
+            var cases: *Vec<*AstCase> = sw.cases_vec;
+            var cn: u64 = 0;
+            if (cases != 0) { cn = cases.len(); }
+            for (var i: u64 = 0; i < cn; i++) {
+                if (_cg_stmt_has_feature((*AstNode)cases.get(i), feature) != 0) { return true; }
+            }
+            return false;
+        case AST_CASE:
+            var cs: *AstCase = (*AstCase)node;
+            if (_cg_expr_has_feature(cs.value, feature) != 0) { return true; }
+            return _cg_stmt_has_feature(cs.body, feature);
+        case AST_BLOCK:
+            var blk: *AstBlock = (*AstBlock)node;
+            var stmts: *Vec<*AstNode> = blk.stmts_vec;
+            if (stmts == 0) { return false; }
+            var n: u64 = stmts.len();
+            for (var j: u64 = 0; j < n; j++) {
+                if (_cg_stmt_has_feature(stmts.get(j), feature) != 0) { return true; }
+            }
+            return false;
+    }
+    return false;
+}
+
+func _cg_program_has_safe_nav(program: *AstProgram) -> u64 {
+    if (program == 0) { return false; }
+    var funcs: *Vec<*AstFunc> = program.funcs_vec;
+    if (funcs != 0) {
+        var n: u64 = funcs.len();
+        for (var i: u64 = 0; i < n; i++) {
+            var fn: *AstFunc = funcs.get(i);
+            if (fn != 0 && _cg_stmt_has_feature(fn.body, CG_EXPR_FEATURE_SAFE_NAV) != 0) { return true; }
+        }
+    }
+    if (program.globals_vec != 0) {
+        var gn: u64 = program.globals_vec.len();
+        for (var j: u64 = 0; j < gn; j++) {
+            var ginfo: *GlobalInfo = program.globals_vec.get(j);
+            if (ginfo != 0 && ginfo.init_expr != 0) {
+                if (_cg_expr_has_feature((*AstNode)ginfo.init_expr, CG_EXPR_FEATURE_SAFE_NAV) != 0) { return true; }
+            }
+        }
+    }
+    return false;
+}
+
+// ============================================
+// Float Detection (SSA Disable)
+// ============================================
+
+func _cg_program_has_float(program: *AstProgram) -> u64 {
+    if (program == 0) { return false; }
+    var funcs: *Vec<*AstFunc> = program.funcs_vec;
+    if (funcs != 0) {
+        var n: u64 = funcs.len();
+        for (var i: u64 = 0; i < n; i++) {
+            var fn: *AstFunc = funcs.get(i);
+            if (fn != 0) {
+                if (fn.ret_type == TYPE_F64 && fn.ret_ptr_depth == 0) { return true; }
+                var params: *Vec<*Param> = fn.params_vec;
+                if (params != 0) {
+                    var pn: u64 = params.len();
+                    for (var pi: u64 = 0; pi < pn; pi++) {
+                        var p: *Param = params.get(pi);
+                        if (p.type_kind == TYPE_F64 && p.ptr_depth == 0) { return true; }
+                    }
+                }
+                if (_cg_stmt_has_feature(fn.body, CG_EXPR_FEATURE_FLOAT) != 0) { return true; }
+            }
+        }
+    }
+    if (program.globals_vec != 0) {
+        var gn: u64 = program.globals_vec.len();
+        for (var j: u64 = 0; j < gn; j++) {
+            var ginfo: *GlobalInfo = program.globals_vec.get(j);
+            if (ginfo != 0) {
+                if (ginfo.typeinfo_ptr != 0 && ginfo.typeinfo_ptr.type_kind == TYPE_F64 && ginfo.typeinfo_ptr.ptr_depth == 0) { return true; }
+                if (ginfo.init_expr != 0 && _cg_expr_has_feature((*AstNode)ginfo.init_expr, CG_EXPR_FEATURE_FLOAT) != 0) { return true; }
+            }
+        }
+    }
+    return false;
+}
+
+func _cg_prepare_ssa(program: *AstProgram, use_ssa: u64) -> *SSAContext {
+    if (use_ssa == 0) { return 0; }
+    var ssa_ctx_ptr: *SSAContext = ssa_builder_build_program(program);
+    ssa_mem2reg_run(ssa_ctx_ptr);
+    if (CODEGEN_DEBUG != 0) {
+        println("[DEBUG] codegen: mem2reg", 25);
+    }
+    if (opt_get_level() >= 1) {
+        ssa_opt_o1_run(ssa_ctx_ptr);
+        if (CODEGEN_DEBUG != 0) {
+            println("[DEBUG] codegen: opt_o1", 25);
+        }
+    }
+    ssa_destroy_run(ssa_ctx_ptr);
+    if (CODEGEN_DEBUG != 0) {
+        println("[DEBUG] codegen: destroy", 25);
+    }
+    ssa_regalloc_run(ssa_ctx_ptr, 8);
+    if (CODEGEN_DEBUG != 0) {
+        println("[DEBUG] codegen: regalloc", 26);
+    }
+    ssa_lower_phys_run(ssa_ctx_ptr);
+    if (CODEGEN_DEBUG != 0) {
+        println("[DEBUG] codegen: lower_phys", 27);
+    }
+    return ssa_ctx_ptr;
+}
+
+func _cg_setup_globals(program: *AstProgram) -> u64 {
+    if (program.globals_vec == 0) {
+        var globals_vec: *Vec<*GlobalInfo> = new Vec<*GlobalInfo>(32);
+        emitter_set_globals(globals_vec);
+    } else {
+        emitter_set_globals(program.globals_vec);
+    }
+    compiler_set_all_globals(emitter_get_globals());
+    return 0;
+}
+
+func _cg_copy_constants(program: *AstProgram) -> u64 {
+    emitter_load_consts(program.consts_vec);
+    return 0;
+}
+
+func _cg_emit_program_entry(has_runtime_init: u64) -> u64 {
+    emitln("default rel");
+    emitln("section .text");
+    emitln("global _start");
+    emitln("_start:");
+    if (has_runtime_init != 0) {
+        emitln("    call __global_init");
+    }
+    emitln("    pop rdi          ; argc");
+    emitln("    mov rsi, rsp     ; argv");
+    emitln("    push rsi");
+    emitln("    push rdi");
+    emitln("    call main");
+    emitln("    mov rdi, rax");
+    emitln("    mov rax, 60");
+    emitln("    syscall");
+    return 0;
+}
+
+func _cg_emit_program_functions(program: *AstProgram, used_names: *Vec<*NameInfo>, use_ssa: u64, ssa_ctx: *SSAContext) -> u64 {
+    var ssa_funcs: []*SSAFunction = slice(0, 0);
+    if (use_ssa != 0) {
+        ssa_funcs = ssa_ctx.funcs;
+    }
+    for (var i: u64 = 0; i < program.funcs_vec.len(); i++) {
+        var fn: *AstFunc = program.funcs_vec.get(i);
+        if (cg_is_generic_template(fn) != 0) {
+            continue;
+        }
+        if (used_names != 0 && _cg_used_has_name(used_names, fn.name_ptr, fn.name_len) == 0) {
+            continue;
+        }
+        if (use_ssa != 0) {
+            var ssa_fn_ptr: *SSAFunction = ssa_funcs[i];
+            var ssa_ready: u64 = 0;
+            if (ssa_fn_ptr != 0 && ssa_fn_ptr.regalloc_failed == 0 && ssa_fn_ptr.regalloc_done != 0) {
+                ssa_ready = 1;
+            }
+            if (ssa_codegen_is_supported_func(fn, program.globals_vec) != 0 &&
+                ssa_builder_is_build_ok(fn.name_ptr, fn.name_len) != 0 &&
+                ssa_ready != 0) {
+                ssa_codegen_emit_func(fn, (u64)ssa_fn_ptr);
+            } else {
+                cg_func(fn);
+            }
+        } else {
+            cg_func(fn);
+        }
+    }
+    return 0;
+}
+
+func cg_program_with_sigs(prog: *AstProgram, sigs: *Vec<*AstFunc>) -> u64 {
+    push_trace("cg_program_with_sigs", "codegen.b", __LINE__);
+    defer pop_trace();
+
+    var program: *AstProgram = prog;
+
+    var has_runtime_init: u64 = _cg_program_has_runtime_global_init(program);
+    var used_names: *Vec<*NameInfo> = _cg_collect_used_names(program, has_runtime_init);
+
+    // SSA CFG scaffold (no codegen impact unless SSA/opt enabled)
+    typeinfo_set_structs(program.structs_vec);
+    typeinfo_set_funcs(sigs);
+    var ir_mode: u64 = opt_get_ir_mode();
+    var out_mode: u64 = opt_get_output_mode();
+    var use_ir: u64 = 0;
+    if (ir_mode != IR_NONE) { use_ir = 1; }
+    var use_ssa: u64 = 0;
+    if (out_mode == OUT_IR) { use_ssa = 1; }
+
+    if (_cg_program_has_safe_nav(program) != 0) {
+        use_ssa = 0;
+    }
+
+
+    var ssa_ctx: *SSAContext = _cg_prepare_ssa(program, use_ssa);
+    if (ssa_ctx == 0) { use_ssa = 0; }
+
+    emitter_init();
+
+    // Set structs and functions for typeinfo module
+    typeinfo_set_structs(program.structs_vec);
+    typeinfo_set_funcs(sigs);
+    
+
+    _cg_setup_globals(program);
+    _cg_copy_constants(program);
+    _cg_emit_program_entry(has_runtime_init);
+    _cg_emit_program_functions(program, used_names, use_ssa, ssa_ctx);
+    
+    globals_emit_data();
+    string_emit_data();
+    float_emit_data();
+    globals_emit_bss();
+}
+
+func cg_program_with_sigs_ir(prog: *AstProgram, sigs: *Vec<*AstFunc>) -> u64 {
+    push_trace("cg_program_with_sigs_ir", "codegen.b", __LINE__);
+    defer pop_trace();
+
+    var program: *AstProgram = prog;
+
+    typeinfo_set_structs(program.structs_vec);
+    typeinfo_set_funcs(sigs);
+
+    var ir_mode: u64 = opt_get_ir_mode();
+    var opt_level: u64 = opt_get_level();
+    if (ir_mode == IR_3ADDR) {
+        var ssa_ctx_ptr3: *SSAContext = ssa_builder_build_program(prog);
+        if (opt_level >= 1) {
+            ssa_opt_o1_run(ssa_ctx_ptr3);
+        }
+        ssa_destroy_run(ssa_ctx_ptr3);
+        ssa_dump_ctx(ssa_ctx_ptr3, 0);
+    } else {
+        var ssa_ctx_ptr: *SSAContext = ssa_builder_build_program(prog);
+        ssa_mem2reg_run(ssa_ctx_ptr);
+        if (opt_level >= 1) {
+            ssa_opt_o1_run(ssa_ctx_ptr);
+        }
+        ssa_dump_ctx(ssa_ctx_ptr, 1);
+    }
+
+    return 0;
+}
+
+func cg_program(prog: u64) -> u64 {
+    push_trace("cg_program", "codegen.b", __LINE__);
+    defer pop_trace();
+    
+    var program: *AstProgram = (*AstProgram)prog;
+    
+    // Reuse full function list as signature list
+    cg_program_with_sigs(program, program.funcs_vec);
+    
+}

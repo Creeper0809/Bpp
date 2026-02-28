@@ -19,13 +19,13 @@ cd Bpp
 ## 3. 기본 빌드/테스트
 
 ```bash
-v11/build_and_test.sh
+build_and_test.sh
 ```
 
 빠른 검증만 할 때:
 
 ```bash
-TEST_PROFILE=quick TEST_QUIET=1 TEST_FAST_IO=1 TEST_JOBS=4 v11/build_and_test.sh
+TEST_PROFILE=quick TEST_QUIET=1 TEST_FAST_IO=1 TEST_JOBS=4 build_and_test.sh
 ```
 
 ## 4. 첫 컴파일
