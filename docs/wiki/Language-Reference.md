@@ -1,49 +1,42 @@
 # Language Reference
 
-이 페이지는 Bpp 언어 기능을 사용자 관점에서 요약합니다.
+이 페이지는 Bpp 언어 사양의 인덱스입니다.  
+각 절은 독립 페이지로 분리되어 있으며, 모든 페이지는 아래 네 가지를 공통으로 다룹니다.
 
-## 1. 기본 문법 요소
+- 존재 이유(왜 이 기능이 있는가)
+- 사용 방법(문법/예시)
+- 제약 사항(v11 기준)
+- 주의점(실무에서 자주 겪는 함정)
 
-- 함수: `func`
-- 변수/상수: `var`, `const`
-- 구조체/구현: `struct`, `impl`
-- 트레잇: `trait`, `impl Trait for Type`
-- 제어문: `if`, `while`, `for`, `switch`, `match`, `try/catch/finally`
+## Section Pages
 
-## 2. 타입 시스템
+1. [Language Scope](Language-Scope)
+2. [Lexical Rules](Lexical-Rules)
+3. [Type System](Type-System)
+4. [Declarations](Declarations)
+5. [Functions and Calls](Functions-and-Calls)
+6. [Expressions](Expressions)
+7. [Statements and Control Flow](Statements-and-Control-Flow)
+8. [Struct, Impl, and Inheritance](Struct-Impl-and-Inheritance)
+9. [Traits and Virtual Dispatch](Traits-and-Virtual-Dispatch)
+10. [Generics](Generics)
+11. [Annotations and Decorators](Annotations-and-Decorators)
+12. [Modules and Name Resolution](Modules-and-Name-Resolution)
+13. [Diagnostics and Errors](Diagnostics-and-Errors)
+14. [Current Limitations](Current-Limitations)
 
-- 정수/부동소수: `u8/u16/u32/u64`, `i8/i16/i32/i64`, `f64`
-- 포인터: `*T`
-- 배열/슬라이스: `[N]T`, `[]T`
-- 구조체/트레잇 타입
-- 제네릭(타입/상수)
+## Recommended Reading Order
 
-## 3. 함수 호출 기능
+1. [Language Scope](Language-Scope)
+2. [Lexical Rules](Lexical-Rules)
+3. [Type System](Type-System)
+4. [Functions and Calls](Functions-and-Calls)
+5. [Statements and Control Flow](Statements-and-Control-Flow)
+6. [Annotations and Decorators](Annotations-and-Decorators)
+7. [Diagnostics and Errors](Diagnostics-and-Errors)
 
-- 기본 인자(default arguments)
-- 이름 있는 인자(named arguments)
-- 정적/인스턴스 메서드 호출
-- 함수 포인터 호출
+## Related
 
-## 4. 어노테이션과 데코레이터
-
-- 선언 어노테이션 문법: `@[name]`
-- 예: `@[entry]`, `@[used]`, `@[hot]`
-- 함수 이름을 어노테이션으로 쓰면 데코레이터로 해석 가능
-- 데코레이터는 시그니처 검증 후 래퍼 함수로 낮춰져 동작이 바뀜
-
-## 5. 제약/주의사항(요약)
-
-- 일부 고급 기능은 점진적으로 확장 중
-- 실패 케이스는 테스트 스위트에서 엄격 검증
-- 구현 세부는 [Compiler Internals](Compiler-Internals) 참고
-
-## 상세 문서 분리 예정
-
-- Lexical Rules
-- Type System
-- Functions and Calls
-- Struct / Impl / Inheritance
-- Trait / Virtual Dispatch
-- Generics
-- Annotations and Decorators
+- [Getting Started](Getting-Started)
+- [Compiler Internals](Compiler-Internals)
+- [Testing and CI](Testing-and-CI)
