@@ -38,7 +38,7 @@ Type keywords: `u8`, `u16`, `u32`, `u64`, `i64`, `char`
 - **Logical**: `&&`, `||`, `!`
 - **Comparison**: `==`, `!=`, `<`, `>`, `<=`, `>=`
 - **Assignment**: `=`, `+=`, `-=`, `*=`, `/=`, `%=`
-- **Increment/Decrement**: `++`, `--` (prefix and postfix)
+- **Increment/Decrement**: `++`, `--` (statement sugar only; not general expression operands)
 - **Member Access**: `.`, `->`
 - **Pointer**: `*` (dereference), `&` (address-of)
 - **Delimiters**: `( )`, `{ }`, `[ ]`, `;`, `:`, `,`
@@ -239,13 +239,14 @@ c->increment();
 B supports a standard set of expressions with C-like precedence rules.
 
 - **Primary**: Literals, identifiers, `( ... )`.
-- **Postfix**: `expr[idx]`, `expr.member`, `expr->member`, `func(...)`, `expr++`, `expr--`.
-- **Prefix**: `&var`, `*ptr`, `!expr`, `-expr`, `++expr`, `--expr`.
+- **Postfix**: `expr[idx]`, `expr.member`, `expr->member`, `func(...)`.
+- **Prefix**: `&var`, `*ptr`, `!expr`, `-expr`.
 - **Binary**: Standard arithmetic, logical, and bitwise operators.
 - **Casting**: `(*TypeName)expr` or `(u64)expr`.
 - **`sizeof`**: `sizeof(TypeName)` or `sizeof(*TypeName)`.
 - **Slice Literal**: `slice(ptr_expr, len_expr)`.
 - **Struct Literal**: `Point { 10, 20 }`.
+- **Inc/Dec Statement Sugar**: `++x;`, `x++;`, `--x;`, `x--;` are lowered to assignments in statement position.
 
 ## 6. Statements
 
