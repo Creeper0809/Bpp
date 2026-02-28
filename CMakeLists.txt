@@ -4,6 +4,9 @@ project(Bpp LANGUAGES NONE)
 option(BPP_BOOTSTRAP_NASM "Automatically download NASM on Windows when not found" ON)
 set(BPP_NASM_VERSION "2.16.03" CACHE STRING "NASM version used for Windows bootstrap")
 set(BPP_ACTIVE_VERSION "v10" CACHE STRING "Active compiler version directory")
+set(BPP_INSTALL_BINDIR "bin" CACHE STRING "Install directory for bpp launcher")
+set(BPP_INSTALL_LIBEXECDIR "libexec" CACHE STRING "Install directory for bpp compiler binaries")
+set(BPP_INSTALL_DATADIR "share" CACHE STRING "Install directory for bpp shared data")
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(BppToolchain)
@@ -24,6 +27,30 @@ add_custom_target(toolchain-check
     COMMAND "${CMAKE_COMMAND}" -E echo "[BPP] Linker : ${BPP_LINKER_EXECUTABLE}"
     COMMAND "${CMAKE_COMMAND}" -E echo "[BPP] Env    : ${BPP_TOOLCHAIN_ENV_FILE}"
 )
+
+if(UNIX AND NOT WIN32)
+    set(BPP_STAGE1_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/bin/${BPP_ACTIVE_VERSION}_stage1")
+    if(NOT EXISTS "${BPP_STAGE1_SOURCE}")
+        message(WARNING
+            "Linux stage1 compiler binary not found at ${BPP_STAGE1_SOURCE}. "
+            "Install step will fail unless you build it first (e.g. run v10/build_and_test.sh)."
+        )
+    endif()
+
+    set(BPP_INSTALL_VERSION "${BPP_ACTIVE_VERSION}")
+    configure_file(
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/bpp_launcher.sh.in"
+        "${CMAKE_CURRENT_BINARY_DIR}/bpp"
+        @ONLY
+    )
+
+    install(PROGRAMS "${CMAKE_CURRENT_BINARY_DIR}/bpp" DESTINATION "${BPP_INSTALL_BINDIR}")
+    install(PROGRAMS "${BPP_STAGE1_SOURCE}" DESTINATION "${BPP_INSTALL_LIBEXECDIR}/bpp")
+    install(
+        DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/${BPP_ACTIVE_VERSION}/src/std"
+        DESTINATION "${BPP_INSTALL_DATADIR}/bpp/${BPP_ACTIVE_VERSION}/src"
+    )
+endif()
 
 if(WIN32)
     add_custom_target(windows-smoke

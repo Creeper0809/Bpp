@@ -96,6 +96,22 @@ cd v10
 bash build_and_test.sh
 ```
 
+### Linux (CMake install + bpp command)
+```bash
+# Build stage compiler first (required once)
+cd v10
+bash build_and_test.sh
+cd ..
+
+# Install bpp launcher + compiler + std library
+cmake -S . -B build-linux -DBPP_ACTIVE_VERSION=v10
+cmake --build build-linux --target toolchain-check
+sudo cmake --install build-linux
+
+# Use globally
+bpp hello.bpp
+```
+
 ### Windows (toolchain + smoke)
 ```powershell
 # Configure (auto-download NASM when missing)
