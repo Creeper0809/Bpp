@@ -566,7 +566,7 @@ func compiler_get_cached_module_tokens(file_path: u64, file_path_len: u64) -> *V
 }
 
 // ============================================
-// Config File Parsing
+// Manifest + Path Parsing
 // ============================================
 
 func compiler_trim_ascii_space(raw: u64) -> u64 {
@@ -622,16 +622,6 @@ func compiler_clean_manifest_value(raw: u64) -> u64 {
     return compiler_strip_wrapped_quotes(trimmed);
 }
 
-// Read config.ini and extract VERSION value
-func read_version_from_config(config_path: u64) -> u64 {
-    var content: u64 = read_entire_file(config_path);
-    if (content == 0) {
-        return 0;
-    }
-
-    return module_util_find_line_starting_with(content, g_compiler_ctx.file_len, "VERSION=", 8);
-}
-
 func read_manifest_value(manifest_path: u64, key_prefix: u64, key_prefix_len: u64) -> u64 {
     var content: u64 = read_entire_file(manifest_path);
     if (content == 0) { return 0; }
@@ -646,6 +636,42 @@ func compiler_manifest_resolve_path(manifest_dir: u64, manifest_dir_len: u64, va
     var val_u8: []u8 = slice(value_path, val_len);
     if (val_u8[0] == 47) { return value_path; }
     return str_concat3(manifest_dir, manifest_dir_len, "/", 1, value_path, val_len);
+}
+
+func compiler_try_set_lib_dir_candidate(candidate_dir: u64) -> u64 {
+    if (candidate_dir == 0) { return 0; }
+    var candidate_len: u64 = str_len(candidate_dir);
+    if (candidate_len == 0) { return 0; }
+
+    var std_candidate: u64 = str_concat(candidate_dir, candidate_len, "/std", 4);
+    if (module_util_file_exists(std_candidate) == 0) { return 0; }
+
+    g_compiler_ctx.lib_dir = candidate_dir;
+    g_compiler_ctx.lib_dir_len = candidate_len;
+    return 1;
+}
+
+func compiler_try_autodetect_lib_dir(start_dir: u64, start_dir_len: u64) -> u64 {
+    var cur: u64 = start_dir;
+    var cur_len: u64 = start_dir_len;
+
+    for (var depth: u64 = 0; depth < 64; depth++) {
+        if (compiler_try_set_lib_dir_candidate(cur) != 0) { return 1; }
+
+        var src_candidate: u64 = str_concat(cur, cur_len, "/src", 4);
+        if (compiler_try_set_lib_dir_candidate(src_candidate) != 0) { return 1; }
+
+        if (cur_len == 0) { break; }
+        var parent: u64 = path_dirname(cur, cur_len);
+        var parent_len: u64 = str_len(parent);
+        if (parent_len == cur_len) {
+            if (str_eq(parent, parent_len, cur, cur_len) != 0) { break; }
+        }
+        cur = parent;
+        cur_len = parent_len;
+    }
+
+    return 0;
 }
 
 func compiler_find_manifest_path(start_dir: u64, start_dir_len: u64) -> u64 {
@@ -7981,55 +8007,13 @@ func setup_paths_with_compiler(filename: u64, filename_len: u64) -> u64 {
         return 0;
     }
 
-    // Legacy fallback: infer version root from neighboring config.ini.
-    // src: B/v3_XX/src -> up 1 = B/v3_XX
-    // test: B/v3_XX/test/b -> up 2 = B/v3_XX
-    var up_one: u64 = path_dirname(g_compiler_ctx.base_dir, g_compiler_ctx.base_dir_len);
-    var up_one_len: u64 = str_len(up_one);
-    var version_dir2: u64 = path_dirname(up_one, up_one_len);
-    var version_dir_len2: u64 = str_len(version_dir2);
-    var slash_config: u64 = "/config.ini";
-    var config_path1: u64 = str_concat(up_one, up_one_len, slash_config, 11);
-    var config_path2: u64 = str_concat(version_dir2, version_dir_len2, slash_config, 11);
-    var version2: u64 = read_version_from_config(config_path1);
-
-    if (version2 == 0) {
-        version2 = read_version_from_config(config_path2);
+    if (compiler_try_autodetect_lib_dir(g_compiler_ctx.base_dir, g_compiler_ctx.base_dir_len) != 0) {
+        return 0;
     }
 
-    if (version2 == 0) {
-        emit_stderr("[ERROR] Could not determine compiler version from config.ini or bpp.toml\n");
-        emit_stderr("[ERROR] Checked: ");
-        emit_stderr(config_path1);
-        emit_stderr(" and ");
-        emit_stderr(config_path2);
-        emit_stderr("\n");
-        panic("Path setup error");
-    }
-
-    // Build lib_dir path: prefer base_dir parent when filename is in src/
-    var use_up_one: u64 = 0;
-    if (g_compiler_ctx.base_dir_len >= 4) {
-        var base_dir_u8: []u8 = slice(g_compiler_ctx.base_dir, g_compiler_ctx.base_dir_len);
-        var c0: u64 = base_dir_u8[g_compiler_ctx.base_dir_len - 4];
-        var c1: u64 = base_dir_u8[g_compiler_ctx.base_dir_len - 3];
-        var c2: u64 = base_dir_u8[g_compiler_ctx.base_dir_len - 2];
-        var c3: u64 = base_dir_u8[g_compiler_ctx.base_dir_len - 1];
-        if (c0 == 47 && c1 == 115 && c2 == 114 && c3 == 99) { // "/src"
-            use_up_one = 1;
-        }
-    }
-
-    var lib_root: u64 = version_dir2;
-    var lib_root_len: u64 = version_dir_len2;
-    if (use_up_one != 0) {
-        lib_root = up_one;
-        lib_root_len = up_one_len;
-    }
-
-    var src_suffix2: u64 = "/src";
-    g_compiler_ctx.lib_dir = str_concat(lib_root, lib_root_len, src_suffix2, 4);
-    g_compiler_ctx.lib_dir_len = str_len(g_compiler_ctx.lib_dir);
+    emit_stderr("[ERROR] Could not determine std root.\n");
+    emit_stderr("[ERROR] Provide std_root in bpp.toml or place sources under a tree that contains src/std.\n");
+    panic("Path setup error");
     return 0;
 }
 

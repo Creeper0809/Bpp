@@ -5,28 +5,128 @@
 set -e
 set -o pipefail
 
-# Load version from config.ini
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_FILE="$SCRIPT_DIR/../config.ini"
+ROOT_DIR="$SCRIPT_DIR/.."
+CONFIG_FILE="$ROOT_DIR/config.ini"
 
 # 프로젝트 루트로 이동 (repo/test -> repo root)
-ROOT_DIR="$SCRIPT_DIR/.."
 cd "$ROOT_DIR"
 
-if [ ! -f "$CONFIG_FILE" ]; then
-    echo "Error: config.ini not found at $CONFIG_FILE"
+read_config_value() {
+    local key="$1"
+    if [ ! -f "$CONFIG_FILE" ]; then
+        return 0
+    fi
+    grep -E "^${key}=" "$CONFIG_FILE" | head -n1 | cut -d'=' -f2- | tr -d '[:space:]'
+}
+
+detect_latest_stage1_compiler() {
+    local best_ver=-1
+    local best_file=""
+    local f base ver
+
+    for f in "$ROOT_DIR"/bin/v*_stage1; do
+        [ -x "$f" ] || continue
+        base="$(basename "$f")"
+        if [[ "$base" =~ ^v([0-9]+)_stage1$ ]]; then
+            ver="${BASH_REMATCH[1]}"
+            if [ "$ver" -ge "$best_ver" ]; then
+                best_ver="$ver"
+                best_file="$f"
+            fi
+        fi
+    done
+    if [ -n "$best_file" ]; then
+        echo "$best_file"
+        return 0
+    fi
+
+    for f in "$ROOT_DIR"/bin/*_stage1; do
+        [ -x "$f" ] || continue
+        base="$(basename "$f")"
+        if [[ "$base" == _* ]]; then
+            continue
+        fi
+        best_file="$f"
+    done
+    if [ -n "$best_file" ]; then
+        echo "$best_file"
+        return 0
+    fi
+    return 1
+}
+
+detect_default_compiler() {
+    if [ -n "${BPP_COMPILER:-}" ] && [ -x "${BPP_COMPILER}" ]; then
+        echo "$BPP_COMPILER"
+        return 0
+    fi
+
+    local version_hint="${BPP_VERSION:-}"
+    if [ -z "$version_hint" ]; then
+        version_hint="$(read_config_value VERSION)"
+    fi
+
+    if [ -n "$version_hint" ] && [ -x "$ROOT_DIR/bin/${version_hint}_stage1" ]; then
+        echo "$ROOT_DIR/bin/${version_hint}_stage1"
+        return 0
+    fi
+
+    if [ -x "$ROOT_DIR/bin/bootstrap" ]; then
+        echo "$ROOT_DIR/bin/bootstrap"
+        return 0
+    fi
+
+    if [ -x "$ROOT_DIR/bin/stage1" ]; then
+        echo "$ROOT_DIR/bin/stage1"
+        return 0
+    fi
+
+    local candidate=""
+    candidate="$(detect_latest_stage1_compiler || true)"
+    if [ -n "$candidate" ]; then
+        echo "$candidate"
+        return 0
+    fi
+
+    return 1
+}
+
+derive_version_label() {
+    local compiler_path="$1"
+    local base
+    base="$(basename "$compiler_path")"
+    if [[ "$base" =~ ^(.+)_stage1(\.exe)?$ ]]; then
+        echo "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    if [ -n "${BPP_VERSION:-}" ]; then
+        echo "$BPP_VERSION"
+        return 0
+    fi
+    local cfg
+    cfg="$(read_config_value VERSION)"
+    if [ -n "$cfg" ]; then
+        echo "$cfg"
+        return 0
+    fi
+    echo "bpp"
+}
+
+COMPILER="${1:-}"
+if [ -z "$COMPILER" ]; then
+    COMPILER="$(detect_default_compiler)" || {
+        echo "Error: Compiler not found."
+        echo "  Tried: BPP_COMPILER, bin/\${BPP_VERSION}_stage1, bin/bootstrap, bin/stage1, bin/*_stage1"
+        exit 1
+    }
+fi
+if [ ! -x "$COMPILER" ]; then
+    echo "Error: Compiler not found or not executable: $COMPILER"
     exit 1
 fi
 
-# Parse config.ini (simple key=value format)
-source <(grep -E '^(VERSION|PREV_VERSION)=' "$CONFIG_FILE")
-
-if [ -z "$VERSION" ]; then
-    echo "Error: VERSION not set in config.ini"
-    exit 1
-fi
-
-COMPILER="$ROOT_DIR/bin/${VERSION}_stage1"
+VERSION="$(derive_version_label "$COMPILER")"
 TEST_DIR="test/source"
 IR_TEST_DIR="test/ir"
 BUILD_DIR_BASE="build/${VERSION}_tests"

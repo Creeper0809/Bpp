@@ -144,8 +144,7 @@ https://aka.ms/vs/17/release/vs_BuildTools.exe
 ```bash
 # Linux
 bash test/run_tests.sh
-VERSION="$(grep -E '^VERSION=' config.ini | head -n1 | cut -d'=' -f2 | tr -d '[:space:]')"
-bash test/run_regression.sh "./bin/${VERSION}_stage1"
+bash test/run_regression.sh
 ```
 
 ```powershell

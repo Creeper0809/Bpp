@@ -14,13 +14,15 @@ $ErrorActionPreference = "Stop"
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RootDir = Resolve-Path (Join-Path $ScriptDir "..")
-$ConfigPath = Join-Path $RootDir "config.ini"
 
-function Get-IniValue {
-    param([string]$Path, [string]$Key)
-    $line = Get-Content $Path | Where-Object { $_ -match "^${Key}=" } | Select-Object -First 1
-    if (-not $line) { return "" }
-    return ($line -split "=", 2)[1].Trim()
+function Get-VersionFromCompilerPath {
+    param([string]$Path)
+    if (-not $Path) { return "" }
+    $base = [System.IO.Path]::GetFileName($Path)
+    if ($base -match '^(.*)_stage1(\.exe)?$') {
+        if ($matches[1]) { return $matches[1] }
+    }
+    return ""
 }
 
 function Invoke-Link {
@@ -168,15 +170,6 @@ function Expand-SuiteCases {
     return $cases
 }
 
-if (-not (Test-Path $ConfigPath)) {
-    throw "config.ini not found: $ConfigPath"
-}
-
-$Version = Get-IniValue -Path $ConfigPath -Key "VERSION"
-if (-not $Version) {
-    throw "VERSION is missing in config.ini"
-}
-
 if (-not (Test-Path $CompilerPath)) {
     throw "Compiler not found: $CompilerPath"
 }
@@ -189,6 +182,15 @@ if (-not (Test-Path $LinkerPath)) {
     $resolvedLinker = Get-Command $LinkerPath -ErrorAction SilentlyContinue
     if (-not $resolvedLinker) { throw "Linker not found: $LinkerPath" }
     $LinkerPath = $resolvedLinker.Source
+}
+
+$Version = Get-VersionFromCompilerPath -Path $CompilerPath
+if (-not $Version) {
+    if ($env:BPP_VERSION) {
+        $Version = $env:BPP_VERSION
+    } else {
+        $Version = "bpp"
+    }
 }
 
 $BuildDir = Join-Path $RootDir "build\${Version}_tests_win"

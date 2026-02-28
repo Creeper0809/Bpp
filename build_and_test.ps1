@@ -25,6 +25,58 @@ function Get-IniValue {
     return ($line -split "=", 2)[1].Trim()
 }
 
+function Get-OptionalConfigValue {
+    param([string]$Path, [string]$Key)
+    if (-not (Test-Path $Path)) { return "" }
+    return Get-IniValue -Path $Path -Key $Key
+}
+
+function Get-VersionFromCompilerPath {
+    param([string]$Path)
+    if (-not $Path) { return "" }
+    $base = [System.IO.Path]::GetFileName($Path)
+    if ($base -match '^(.*)_stage1(\.exe)?$') {
+        if ($matches[1]) { return $matches[1] }
+    }
+    return ""
+}
+
+function Find-DefaultCompiler {
+    param(
+        [string]$Root,
+        [string]$VersionHint
+    )
+
+    if ($env:BPP_COMPILER -and (Test-Path $env:BPP_COMPILER)) {
+        return (Resolve-Path $env:BPP_COMPILER).Path
+    }
+
+    $candidates = New-Object System.Collections.Generic.List[string]
+    if ($VersionHint) {
+        $candidates.Add((Join-Path $Root "bin\${VersionHint}_stage1.exe"))
+        $candidates.Add((Join-Path $Root "bin\${VersionHint}_stage1"))
+        $candidates.Add((Join-Path $Root "bin\${VersionHint}_base.exe"))
+    }
+    $candidates.Add((Join-Path $Root "bin\bootstrap.exe"))
+    $candidates.Add((Join-Path $Root "bin\bootstrap"))
+    $candidates.Add((Join-Path $Root "bin\stage1.exe"))
+    $candidates.Add((Join-Path $Root "bin\stage1"))
+
+    foreach ($candidate in $candidates) {
+        if (Test-Path $candidate) {
+            return (Resolve-Path $candidate).Path
+        }
+    }
+
+    $glob = Get-ChildItem -Path (Join-Path $Root "bin") -Filter "*_stage1*" -File -ErrorAction SilentlyContinue |
+        Sort-Object Name
+    if ($glob) {
+        return $glob[-1].FullName
+    }
+
+    return ""
+}
+
 function Resolve-Tool {
     param(
         [string]$ExplicitPath,
@@ -45,15 +97,8 @@ function Resolve-Tool {
     throw "$Description not found."
 }
 
-if (-not (Test-Path $ConfigPath)) {
-    throw "config.ini not found: $ConfigPath"
-}
-
-$Version = Get-IniValue -Path $ConfigPath -Key "VERSION"
-$PrevVersion = Get-IniValue -Path $ConfigPath -Key "PREV_VERSION"
-if (-not $Version) {
-    throw "VERSION is missing in config.ini"
-}
+$ConfigVersion = Get-OptionalConfigValue -Path $ConfigPath -Key "VERSION"
+$VersionHint = if ($env:BPP_VERSION) { $env:BPP_VERSION } elseif ($ConfigVersion) { $ConfigVersion } else { "" }
 
 if (-not $NasmPath -and $env:BPP_NASM_EXECUTABLE) {
     $NasmPath = $env:BPP_NASM_EXECUTABLE
@@ -75,6 +120,19 @@ try {
     throw "No Windows linker found. Install Visual Studio Build Tools (https://aka.ms/vs/17/release/vs_BuildTools.exe) or LLVM lld-link (https://releases.llvm.org/)"
 }
 
+if (-not $CompilerPath) {
+    $CompilerPath = Find-DefaultCompiler -Root $RootDir -VersionHint $VersionHint
+}
+
+$Version = Get-VersionFromCompilerPath -Path $CompilerPath
+if (-not $Version) {
+    if ($VersionHint) {
+        $Version = $VersionHint
+    } else {
+        $Version = "bpp"
+    }
+}
+
 Write-Host "========================================="
 Write-Host "$Version Windows Build & Test"
 Write-Host "========================================="
@@ -86,25 +144,14 @@ if ($ToolchainOnly) {
     exit 0
 }
 
-if (-not $CompilerPath) {
-    $CompilerPath = Join-Path $RootDir "bin\${Version}_stage1.exe"
-}
-
 if (-not (Test-Path $CompilerPath)) {
-    $fallbackCandidates = @(
-        (Join-Path $RootDir "bin\${Version}_base.exe"),
-        (Join-Path $RootDir "bin\${PrevVersion}_stage1.exe"),
-        (Join-Path $RootDir "bin\${PrevVersion}.exe")
-    )
-
-    $fallbackFound = $fallbackCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+    $fallbackFound = Find-DefaultCompiler -Root $RootDir -VersionHint $VersionHint
     if ($fallbackFound) {
         $CompilerPath = $fallbackFound
     } else {
         throw @"
 Windows hosted compiler binary was not found.
-Expected: $(Join-Path $RootDir "bin\${Version}_stage1.exe")
-Fallback: $(($fallbackCandidates -join ", "))
+Tried: BPP_COMPILER, bin/\${BPP_VERSION}_stage1(.exe), bin/bootstrap(.exe), bin/stage1(.exe), bin/*_stage1*
 
 Current repository contains Linux stage binaries only.
 Provide a Windows stage compiler binary first, then rerun this script.
