@@ -84,10 +84,6 @@ var g_module_exports: *HashMap<u64, *Vec<*ExportEntry>> = new HashMap<u64, *Vec<
 var g_module_export_maps: *HashMap<u64, *HashMap<u64, *NameInfo>> = new HashMap<u64, *HashMap<u64, *NameInfo>>(64);  // HashMap: module_id -> export name map
 var g_func_module_map: *HashMap<u64, *NameInfo> = new HashMap<u64, *NameInfo>(128);    // HashMap: mangled func -> module_id
 var g_global_module_map: *HashMap<u64, *NameInfo> = new HashMap<u64, *NameInfo>(128);  // HashMap: mangled global -> module_id
-var g_current_module_ptr = 0;
-var g_current_module_len = 0;
-var g_impl_prefix_ptr = 0;
-var g_impl_prefix_len = 0;
 var g_impl_methods: *HashMap<u64, u64> = new HashMap<u64, u64>(64);       // HashMap: impl-lowered name -> 1
 var g_impl_method_access: *HashMap<u64, u64> = new HashMap<u64, u64>(64); // HashMap: impl-lowered name -> access modifier
 var g_impl_method_owner: *HashMap<u64, *NameInfo> = new HashMap<u64, *NameInfo>(64); // HashMap: impl-lowered name -> owner struct
@@ -95,8 +91,6 @@ var g_impl_method_funcs: *HashMap<u64, *AstFunc> = new HashMap<u64, *AstFunc>(64
 var g_abst_methods_access: *HashMap<u64, *HashMap<u64, u64>> = 0; // HashMap: struct name -> (method -> access)
 var g_abst_methods_sigs: *HashMap<u64, *HashMap<u64, *AstFunc>> = 0; // HashMap: struct name -> (method -> signature)
 var g_virtual_dispatch_traits: *HashMap<u64, *HashMap<u64, *NameInfo>> = 0; // HashMap: struct -> (method -> virtual trait)
-var g_current_access_struct_ptr: u64 = 0;
-var g_current_access_struct_len: u64 = 0;
 var g_resolve_name_hits: *HashMap<u64, *HashMap<u64, *NameInfo>> = 0;     // HashMap: module_id -> (name -> resolved)
 var g_resolve_name_misses: *HashMap<u64, *HashMap<u64, u64>> = 0;          // HashMap: module_id -> (name -> miss=1)
 var g_reg_aliases: *HashMap<u64, *NameInfo> = new HashMap<u64, *NameInfo>(64);   // HashMap: alias name -> register name
@@ -109,7 +103,6 @@ struct CompilerCtx {
     public impl_prefix_len: u64;
     public current_access_struct_ptr: u64;
     public current_access_struct_len: u64;
-    public super_instance_method_ctx: u64;
 }
 
 impl CompilerCtx {
@@ -120,11 +113,10 @@ impl CompilerCtx {
         self.impl_prefix_len = 0;
         self.current_access_struct_ptr = 0;
         self.current_access_struct_len = 0;
-        self.super_instance_method_ctx = 0;
     }
 }
 
-var g_compiler_ctx: *CompilerCtx = new CompilerCtx();
+var g_compiler_ctx: CompilerCtx;
 
 const PRELUDE_MODULE_COUNT = 7;
 
@@ -566,12 +558,24 @@ func compiler_panic(msg: u64) -> u64 {
         emit_stderr_len(panic_msg, str_len(panic_msg));
         emit_stderr_nl();
     }
-    if (g_current_module_ptr != 0 && g_current_module_len != 0) {
+    if (g_compiler_ctx.current_module_ptr != 0 && g_compiler_ctx.current_module_len != 0) {
         emit_stderr("[ERROR] while compiling module: ");
-        emit_stderr_len(g_current_module_ptr, g_current_module_len);
+        emit_stderr_len(g_compiler_ctx.current_module_ptr, g_compiler_ctx.current_module_len);
         emit_stderr_nl();
     }
     panic(panic_msg);
+    return 0;
+}
+
+func compiler_panic_callsite(msg: u64, call_name_ptr: u64, call_name_len: u64) -> u64 {
+    emit_stderr("[ERROR] ");
+    emit_stderr(msg);
+    if (call_name_ptr != 0 && call_name_len != 0) {
+        emit_stderr(": ");
+        emit_stderr_len(call_name_ptr, call_name_len);
+    }
+    emit_stderr("\n");
+    panic("Compiler error");
     return 0;
 }
 
@@ -1141,9 +1145,9 @@ func resolve_prelude_alias_lazy(name_ptr: u64, name_len: u64) -> *NameInfo {
 func resolve_name(name_ptr: u64, name_len: u64) -> *NameInfo {
     var module_ptr: u64 = 0;
     var module_len: u64 = 0;
-    if (g_current_module_ptr != 0 && g_current_module_len != 0) {
-        module_ptr = g_current_module_ptr;
-        module_len = g_current_module_len;
+    if (g_compiler_ctx.current_module_ptr != 0 && g_compiler_ctx.current_module_len != 0) {
+        module_ptr = g_compiler_ctx.current_module_ptr;
+        module_len = g_compiler_ctx.current_module_len;
     }
 
     var hit_bucket: *HashMap<u64, *NameInfo> = resolve_name_hits_bucket_get(module_ptr, module_len);
@@ -1174,19 +1178,19 @@ func resolve_name(name_ptr: u64, name_len: u64) -> *NameInfo {
             result = new NameInfo{combined_ptr, combined_len};
         }
     }
-    if (result == 0 && g_current_module_ptr != 0 && g_current_module_len != 0) {
-        var import_alias: *NameInfo = resolve_import_alias(g_current_module_ptr, g_current_module_len, name_ptr, name_len);
+    if (result == 0 && g_compiler_ctx.current_module_ptr != 0 && g_compiler_ctx.current_module_len != 0) {
+        var import_alias: *NameInfo = resolve_import_alias(g_compiler_ctx.current_module_ptr, g_compiler_ctx.current_module_len, name_ptr, name_len);
         if (import_alias != 0) { result = import_alias; }
     }
 
-    if (result == 0 && g_current_module_ptr != 0 && g_current_module_len != 0) {
-        var export_map: *HashMap<u64, *NameInfo> = module_export_map_get(g_current_module_ptr, g_current_module_len);
+    if (result == 0 && g_compiler_ctx.current_module_ptr != 0 && g_compiler_ctx.current_module_len != 0) {
+        var export_map: *HashMap<u64, *NameInfo> = module_export_map_get(g_compiler_ctx.current_module_ptr, g_compiler_ctx.current_module_len);
         if (export_map != 0) {
             var mapped: *NameInfo = export_map.get(name_ptr, name_len);
             if (mapped != 0) { result = mapped; }
         }
         if (result == 0 && export_map == 0) {
-            var exports: *Vec<*ExportEntry> = module_exports_get(g_current_module_ptr, g_current_module_len);
+            var exports: *Vec<*ExportEntry> = module_exports_get(g_compiler_ctx.current_module_ptr, g_compiler_ctx.current_module_len);
             if (exports != 0 && exports.len() != 0) {
                 emit_stderr("[ERROR] module export map missing for loaded module\n");
                 panic("Compiler state error");
@@ -1361,25 +1365,25 @@ func finalize_import_aliases() -> u64 {
 }
 
 func set_current_module_for_func(func_ptr: u64, func_len: u64) -> u64 {
-    g_current_module_ptr = 0;
-    g_current_module_len = 0;
+    g_compiler_ctx.current_module_ptr = 0;
+    g_compiler_ctx.current_module_len = 0;
     if (g_func_module_map == 0) { return 0; }
     var info: *NameInfo = g_func_module_map.get(func_ptr, func_len);
     if (info != 0) {
-        g_current_module_ptr = info.ptr;
-        g_current_module_len = info.len;
+        g_compiler_ctx.current_module_ptr = info.ptr;
+        g_compiler_ctx.current_module_len = info.len;
     }
     return 0;
 }
 
 func set_current_module_for_global(name_ptr: u64, name_len: u64) -> u64 {
-    g_current_module_ptr = 0;
-    g_current_module_len = 0;
+    g_compiler_ctx.current_module_ptr = 0;
+    g_compiler_ctx.current_module_len = 0;
     if (g_global_module_map == 0) { return 0; }
     var info: *NameInfo = g_global_module_map.get(name_ptr, name_len);
     if (info != 0) {
-        g_current_module_ptr = info.ptr;
-        g_current_module_len = info.len;
+        g_compiler_ctx.current_module_ptr = info.ptr;
+        g_compiler_ctx.current_module_len = info.len;
     }
     return 0;
 }
@@ -2069,7 +2073,7 @@ func compiler_generic_adopt_impl_params(params_vec: *Vec<*GenericParam>, name_pt
     if (params_vec != 0 && params_vec.len() != 0) { return params_vec; }
     if (compiler_is_impl_context() == 0) { return params_vec; }
 
-    var tpl: *GenericStructTemplate = compiler_find_generic_struct_template_by_name(g_impl_prefix_ptr, g_impl_prefix_len);
+    var tpl: *GenericStructTemplate = compiler_find_generic_struct_template_by_name(g_compiler_ctx.impl_prefix_ptr, g_compiler_ctx.impl_prefix_len);
     if (tpl == 0 || tpl.params_vec == 0 || tpl.params_vec.len() == 0) { return params_vec; }
 
     if (GENERIC_DEBUG != 0) {
@@ -2085,10 +2089,10 @@ func compiler_generic_adopt_impl_params(params_vec: *Vec<*GenericParam>, name_pt
 }
 
 func compiler_generic_register_name(name_ptr: u64, name_len: u64) -> *NameInfo {
-    if (g_impl_prefix_ptr == 0 || g_impl_prefix_len == 0) {
+    if (g_compiler_ctx.impl_prefix_ptr == 0 || g_compiler_ctx.impl_prefix_len == 0) {
         return new NameInfo{name_ptr, name_len};
     }
-    return module_util_build_joined_name(g_impl_prefix_ptr, g_impl_prefix_len, name_ptr, name_len);
+    return module_util_build_joined_name(g_compiler_ctx.impl_prefix_ptr, g_compiler_ctx.impl_prefix_len, name_ptr, name_len);
 }
 
 func compiler_register_generic_func_sig(name_ptr: u64, name_len: u64, params_vec: *Vec<*GenericParam>, func_sig: *AstFunc) -> u64 {
@@ -2119,25 +2123,25 @@ func compiler_register_generic_func_def(name_ptr: u64, name_len: u64, params_vec
 }
 
 func compiler_set_impl_prefix(prefix_ptr: u64, prefix_len: u64) -> u64 {
-    g_impl_prefix_ptr = prefix_ptr;
-    g_impl_prefix_len = prefix_len;
+    g_compiler_ctx.impl_prefix_ptr = prefix_ptr;
+    g_compiler_ctx.impl_prefix_len = prefix_len;
     return 0;
 }
 
 func compiler_clear_impl_prefix() -> u64 {
-    g_impl_prefix_ptr = 0;
-    g_impl_prefix_len = 0;
+    g_compiler_ctx.impl_prefix_ptr = 0;
+    g_compiler_ctx.impl_prefix_len = 0;
     return 0;
 }
 
 func compiler_is_impl_context() -> u64 {
-    if (g_impl_prefix_ptr != 0 && g_impl_prefix_len != 0) { return true; }
+    if (g_compiler_ctx.impl_prefix_ptr != 0 && g_compiler_ctx.impl_prefix_len != 0) { return true; }
     return false;
 }
 
 func compiler_impl_has_generic_param(name_ptr: u64, name_len: u64) -> u64 {
     if (compiler_is_impl_context() == 0) { return false; }
-    var tpl: *GenericStructTemplate = compiler_find_generic_struct_template_by_name(g_impl_prefix_ptr, g_impl_prefix_len);
+    var tpl: *GenericStructTemplate = compiler_find_generic_struct_template_by_name(g_compiler_ctx.impl_prefix_ptr, g_compiler_ctx.impl_prefix_len);
     if (tpl == 0 || tpl.params_vec == 0) { return false; }
     var n: u64 = tpl.params_vec.len();
     for (var i: u64 = 0; i < n; i++) {
@@ -2150,14 +2154,14 @@ func compiler_impl_has_generic_param(name_ptr: u64, name_len: u64) -> u64 {
 }
 
 func compiler_set_current_access_struct(struct_ptr: u64, struct_len: u64) -> u64 {
-    g_current_access_struct_ptr = struct_ptr;
-    g_current_access_struct_len = struct_len;
+    g_compiler_ctx.current_access_struct_ptr = struct_ptr;
+    g_compiler_ctx.current_access_struct_len = struct_len;
     return 0;
 }
 
 func compiler_clear_current_access_struct() -> u64 {
-    g_current_access_struct_ptr = 0;
-    g_current_access_struct_len = 0;
+    g_compiler_ctx.current_access_struct_ptr = 0;
+    g_compiler_ctx.current_access_struct_len = 0;
     return 0;
 }
 
@@ -2785,7 +2789,7 @@ func compiler_can_access_member_from(caller_struct_ptr: u64, caller_struct_len: 
 }
 
 func compiler_can_access_member(owner_struct_ptr: u64, owner_struct_len: u64, access: u64) -> u64 {
-    return compiler_can_access_member_from(g_current_access_struct_ptr, g_current_access_struct_len, owner_struct_ptr, owner_struct_len, access);
+    return compiler_can_access_member_from(g_compiler_ctx.current_access_struct_ptr, g_compiler_ctx.current_access_struct_len, owner_struct_ptr, owner_struct_len, access);
 }
 
 func compiler_is_generic_func_ptr(fn: *AstFunc) -> u64 {
@@ -4479,25 +4483,26 @@ func generic_try_instantiate_method_template(mc: *AstMethodCall, args: *Vec<*Ast
     return 0;
 }
 
-func generic_process_method_call_expr(mc: *AstMethodCall, symtab: *HashMap<u64, *TypeInfo>) -> u64 {
-    mc.receiver = generic_process_expr(mc.receiver, symtab);
-    var args: *Vec<*AstNode> = new Vec<*AstNode>(4);
-    var an: u64 = mc.args_vec.?len();
-    for (var i: u64 = 0; i < an; i++) {
-        args.push(generic_process_expr(mc.args_vec.get(i), symtab));
-    }
-    mc.args_vec = args;
-    var recv_ti: *TypeInfo = generic_infer_expr_type(mc.receiver, symtab);
-    generic_try_instantiate_method_template(mc, args, recv_ti, symtab);
-    return 0;
+const GENERIC_AST_VISIT_PROCESS = 1;
+
+struct GenericAstVisitor {
+    public mode: u64;
+    public symtab: *HashMap<u64, *TypeInfo>;
 }
 
-func generic_process_args_vec(args_in: *Vec<*AstNode>, symtab: *HashMap<u64, *TypeInfo>) -> *Vec<*AstNode> {
+func generic_ast_visitor_new_process(symtab: *HashMap<u64, *TypeInfo>) -> GenericAstVisitor {
+    var visitor: GenericAstVisitor;
+    visitor.mode = GENERIC_AST_VISIT_PROCESS;
+    visitor.symtab = symtab;
+    return visitor;
+}
+
+func generic_ast_visitor_walk_args(visitor: *GenericAstVisitor, args_in: *Vec<*AstNode>) -> *Vec<*AstNode> {
     if (args_in == 0) { return 0; }
     var args_out: *Vec<*AstNode> = new Vec<*AstNode>(4);
     var n: u64 = args_in.len();
     for (var i: u64 = 0; i < n; i++) {
-        args_out.push(generic_process_expr(args_in.get(i), symtab));
+        args_out.push(generic_ast_visitor_walk_expr(visitor, args_in.get(i)));
     }
     return args_out;
 }
@@ -4518,7 +4523,7 @@ func generic_try_instantiate_ctor_template(type_kind: u64, struct_name_ptr: u64,
     return 0;
 }
 
-func generic_process_generic_call_expr(gc: *AstGenericCall, symtab: *HashMap<u64, *TypeInfo>) -> *AstNode {
+func generic_process_generic_call_expr_visitor(gc: *AstGenericCall, visitor: *GenericAstVisitor) -> *AstNode {
     var tpl_ptr: *GenericFuncTemplate = generic_resolve_template(gc.name_ptr, gc.name_len);
     if (tpl_ptr == 0) {
         emit_stderr("[ERROR] Generic function not found\n");
@@ -4526,205 +4531,232 @@ func generic_process_generic_call_expr(gc: *AstGenericCall, symtab: *HashMap<u64
     }
     var bindings: *Vec<*GenericBinding> = generic_build_bindings_for_explicit(tpl_ptr, gc.generic_args_vec);
     var name_info: *NameInfo = generic_get_or_create_instance(tpl_ptr, bindings);
-    var args_new: *Vec<*AstNode> = generic_process_args_vec(gc.args_vec, symtab);
+    var args_new: *Vec<*AstNode> = generic_ast_visitor_walk_args(visitor, gc.args_vec);
     return ast_call_with_origin(name_info.ptr, name_info.len, args_new, gc.origin);
 }
 
-func generic_process_call_expr(call: *AstCall, symtab: *HashMap<u64, *TypeInfo>) -> *AstNode {
+func generic_process_call_expr_visitor(call: *AstCall, visitor: *GenericAstVisitor) -> *AstNode {
     var tpl_ptr: *GenericFuncTemplate = generic_resolve_template(call.name_ptr, call.name_len);
     if (tpl_ptr == 0) {
-        var args_new2: *Vec<*AstNode> = generic_process_args_vec(call.args_vec, symtab);
+        var args_new2: *Vec<*AstNode> = generic_ast_visitor_walk_args(visitor, call.args_vec);
         return ast_call_with_origin(call.name_ptr, call.name_len, args_new2, call.origin);
     }
-    var bindings2: *Vec<*GenericBinding> = generic_build_bindings_by_infer(tpl_ptr, call.args_vec, symtab);
+    var bindings2: *Vec<*GenericBinding> = generic_build_bindings_by_infer(tpl_ptr, call.args_vec, visitor.symtab);
     if (bindings2 == 0) {
-        var args_fallback: *Vec<*AstNode> = generic_process_args_vec(call.args_vec, symtab);
+        var args_fallback: *Vec<*AstNode> = generic_ast_visitor_walk_args(visitor, call.args_vec);
         return ast_call_with_origin(call.name_ptr, call.name_len, args_fallback, call.origin);
     }
     var name_info2: *NameInfo = generic_get_or_create_instance(tpl_ptr, bindings2);
-    var args_new3: *Vec<*AstNode> = generic_process_args_vec(call.args_vec, symtab);
+    var args_new3: *Vec<*AstNode> = generic_ast_visitor_walk_args(visitor, call.args_vec);
     return ast_call_with_origin(name_info2.ptr, name_info2.len, args_new3, call.origin);
 }
 
-func generic_process_new_expr(nw: *AstNew, symtab: *HashMap<u64, *TypeInfo>) -> *AstNode {
-    if (nw.literal_expr != 0) {
-        nw.literal_expr = generic_process_expr(nw.literal_expr, symtab);
+func generic_process_method_call_expr_visitor(mc: *AstMethodCall, visitor: *GenericAstVisitor) -> u64 {
+    mc.receiver = generic_ast_visitor_walk_expr(visitor, mc.receiver);
+    var args: *Vec<*AstNode> = generic_ast_visitor_walk_args(visitor, mc.args_vec);
+    if (args == 0) {
+        args = new Vec<*AstNode>(0);
     }
-    nw.ctor_args_vec = generic_process_args_vec(nw.ctor_args_vec, symtab);
+    mc.args_vec = args;
+    var recv_ti: *TypeInfo = generic_infer_expr_type(mc.receiver, visitor.symtab);
+    generic_try_instantiate_method_template(mc, args, recv_ti, visitor.symtab);
+    return 0;
+}
+
+func generic_process_new_expr_visitor(nw: *AstNew, visitor: *GenericAstVisitor) -> *AstNode {
+    if (nw.literal_expr != 0) {
+        nw.literal_expr = generic_ast_visitor_walk_expr(visitor, nw.literal_expr);
+    }
+    nw.ctor_args_vec = generic_ast_visitor_walk_args(visitor, nw.ctor_args_vec);
     generic_try_instantiate_ctor_template(nw.type_kind, nw.struct_name_ptr, nw.struct_name_len, nw.ctor_args_vec);
     return (*AstNode)nw;
 }
 
-func generic_process_stack_ctor_expr(sc2: *AstStackCtor, symtab: *HashMap<u64, *TypeInfo>) -> *AstNode {
-    sc2.ctor_args_vec = generic_process_args_vec(sc2.ctor_args_vec, symtab);
+func generic_process_stack_ctor_expr_visitor(sc2: *AstStackCtor, visitor: *GenericAstVisitor) -> *AstNode {
+    sc2.ctor_args_vec = generic_ast_visitor_walk_args(visitor, sc2.ctor_args_vec);
     generic_try_instantiate_ctor_template(sc2.type_kind, sc2.struct_name_ptr, sc2.struct_name_len, sc2.ctor_args_vec);
     return (*AstNode)sc2;
 }
 
-func generic_process_call_ptr_expr(cp: *AstCallPtr, symtab: *HashMap<u64, *TypeInfo>) -> *AstNode {
-    cp.callee = generic_process_expr(cp.callee, symtab);
-    cp.args_vec = generic_process_args_vec(cp.args_vec, symtab);
+func generic_process_call_ptr_expr_visitor(cp: *AstCallPtr, visitor: *GenericAstVisitor) -> *AstNode {
+    cp.callee = generic_ast_visitor_walk_expr(visitor, cp.callee);
+    cp.args_vec = generic_ast_visitor_walk_args(visitor, cp.args_vec);
     return (*AstNode)cp;
 }
 
-func generic_process_index_expr(ix: *AstIndex, symtab: *HashMap<u64, *TypeInfo>) -> *AstNode {
-    ix.base = generic_process_expr(ix.base, symtab);
-    ix.index = generic_process_expr(ix.index, symtab);
+func generic_process_index_expr_visitor(ix: *AstIndex, visitor: *GenericAstVisitor) -> *AstNode {
+    ix.base = generic_ast_visitor_walk_expr(visitor, ix.base);
+    ix.index = generic_ast_visitor_walk_expr(visitor, ix.index);
     return (*AstNode)ix;
 }
 
-func generic_process_slice_expr(sl: *AstSlice, symtab: *HashMap<u64, *TypeInfo>) -> *AstNode {
-    sl.ptr_expr = generic_process_expr(sl.ptr_expr, symtab);
-    sl.len_expr = generic_process_expr(sl.len_expr, symtab);
+func generic_process_slice_expr_visitor(sl: *AstSlice, visitor: *GenericAstVisitor) -> *AstNode {
+    sl.ptr_expr = generic_ast_visitor_walk_expr(visitor, sl.ptr_expr);
+    sl.len_expr = generic_ast_visitor_walk_expr(visitor, sl.len_expr);
     return (*AstNode)sl;
 }
 
-func generic_process_expr(expr: *AstNode, symtab: *HashMap<u64, *TypeInfo>) -> *AstNode {
+func generic_ast_visitor_walk_expr(visitor: *GenericAstVisitor, expr: *AstNode) -> *AstNode {
     if (expr == 0) { return 0; }
     var kind: u64 = ast_kind(expr);
     switch (kind) {
         case AST_GENERIC_CALL:
-            return generic_process_generic_call_expr((*AstGenericCall)expr, symtab);
+            return generic_process_generic_call_expr_visitor((*AstGenericCall)expr, visitor);
         case AST_STATIC_GENERIC_CALL:
             var sgc: *AstStaticGenericCall = (*AstStaticGenericCall)expr;
-            sgc.args_vec = generic_process_args_vec(sgc.args_vec, symtab);
-            return generic_process_expr(compiler_lower_parse_sugar_static_generic_method_call(sgc), symtab);
+            sgc.args_vec = generic_ast_visitor_walk_args(visitor, sgc.args_vec);
+            return generic_ast_visitor_walk_expr(visitor, compiler_lower_parse_sugar_static_generic_method_call(sgc));
         case AST_GENERIC_STRUCT_LITERAL:
             var gsl: *AstGenericStructLiteral = (*AstGenericStructLiteral)expr;
-            gsl.values_vec = generic_process_args_vec(gsl.values_vec, symtab);
+            gsl.values_vec = generic_ast_visitor_walk_args(visitor, gsl.values_vec);
             return compiler_lower_parse_sugar_generic_struct_literal(gsl);
         case AST_CALL:
-            return generic_process_call_expr((*AstCall)expr, symtab);
+            return generic_process_call_expr_visitor((*AstCall)expr, visitor);
         case AST_BINARY:
             var bin: *AstBinary = (*AstBinary)expr;
-            bin.left = generic_process_expr(bin.left, symtab);
-            bin.right = generic_process_expr(bin.right, symtab);
+            bin.left = generic_ast_visitor_walk_expr(visitor, bin.left);
+            bin.right = generic_ast_visitor_walk_expr(visitor, bin.right);
             return expr;
         case AST_UNARY:
             var un: *AstUnary = (*AstUnary)expr;
-            un.operand = generic_process_expr(un.operand, symtab);
+            un.operand = generic_ast_visitor_walk_expr(visitor, un.operand);
             return expr;
         case AST_ADDR_OF:
             var ao: *AstAddrOf = (*AstAddrOf)expr;
-            ao.operand = generic_process_expr(ao.operand, symtab);
+            ao.operand = generic_ast_visitor_walk_expr(visitor, ao.operand);
             return expr;
         case AST_DEREF:
             var dr: *AstDeref = (*AstDeref)expr;
-            dr.operand = generic_process_expr(dr.operand, symtab);
+            dr.operand = generic_ast_visitor_walk_expr(visitor, dr.operand);
             return expr;
         case AST_DEREF8:
             var dr8: *AstDeref8 = (*AstDeref8)expr;
-            dr8.operand = generic_process_expr(dr8.operand, symtab);
+            dr8.operand = generic_ast_visitor_walk_expr(visitor, dr8.operand);
             return expr;
         case AST_CAST:
             var cs: *AstCast = (*AstCast)expr;
-            cs.expr = generic_process_expr(cs.expr, symtab);
+            cs.expr = generic_ast_visitor_walk_expr(visitor, cs.expr);
             return expr;
         case AST_MEMBER_ACCESS:
             var ma: *AstMemberAccess = (*AstMemberAccess)expr;
-            ma.object = generic_process_expr(ma.object, symtab);
+            ma.object = generic_ast_visitor_walk_expr(visitor, ma.object);
             return expr;
         case AST_SAFE_MEMBER_ACCESS:
             var sma: *AstMemberAccess = (*AstMemberAccess)expr;
-            sma.object = generic_process_expr(sma.object, symtab);
+            sma.object = generic_ast_visitor_walk_expr(visitor, sma.object);
             return expr;
         case AST_TRY:
             var tr2: *AstTry = (*AstTry)expr;
-            tr2.operand = generic_process_expr(tr2.operand, symtab);
+            tr2.operand = generic_ast_visitor_walk_expr(visitor, tr2.operand);
             return expr;
         case AST_FLOAT:
             return expr;
         case AST_SUPER:
             return expr;
         case AST_METHOD_CALL:
-            generic_process_method_call_expr((*AstMethodCall)expr, symtab);
+            generic_process_method_call_expr_visitor((*AstMethodCall)expr, visitor);
             return expr;
         case AST_SAFE_METHOD_CALL:
-            generic_process_method_call_expr((*AstMethodCall)expr, symtab);
+            generic_process_method_call_expr_visitor((*AstMethodCall)expr, visitor);
             return expr;
         case AST_NEW:
-            return generic_process_new_expr((*AstNew)expr, symtab);
+            return generic_process_new_expr_visitor((*AstNew)expr, visitor);
         case AST_STACK_CTOR:
-            return generic_process_stack_ctor_expr((*AstStackCtor)expr, symtab);
+            return generic_process_stack_ctor_expr_visitor((*AstStackCtor)expr, visitor);
         case AST_INDEX:
-            return generic_process_index_expr((*AstIndex)expr, symtab);
+            return generic_process_index_expr_visitor((*AstIndex)expr, visitor);
         case AST_SLICE:
-            return generic_process_slice_expr((*AstSlice)expr, symtab);
+            return generic_process_slice_expr_visitor((*AstSlice)expr, visitor);
         case AST_CALL_PTR:
-            return generic_process_call_ptr_expr((*AstCallPtr)expr, symtab);
+            return generic_process_call_ptr_expr_visitor((*AstCallPtr)expr, visitor);
         case AST_SIZEOF_EXPR:
             var se: *AstSizeofExpr = (*AstSizeofExpr)expr;
-            se.expr = generic_process_expr(se.expr, symtab);
+            se.expr = generic_ast_visitor_walk_expr(visitor, se.expr);
             return expr;
         default:
             return expr;
     }
 }
 
-func generic_process_stmt_block(stmts: *Vec<*AstNode>, symtab: *HashMap<u64, *TypeInfo>) -> u64 {
+func generic_ast_visitor_walk_stmt_block(visitor: *GenericAstVisitor, stmts: *Vec<*AstNode>) -> u64 {
     if (stmts == 0) { return 0; }
     var n: u64 = stmts.len();
     for (var i: u64 = 0; i < n; i++) {
-        generic_process_stmt(stmts.get(i), symtab);
+        generic_ast_visitor_walk_stmt(visitor, stmts.get(i));
     }
     return 0;
 }
 
-func generic_process_stmt(stmt: *AstNode, symtab: *HashMap<u64, *TypeInfo>) -> u64 {
+func generic_ast_visitor_walk_stmt(visitor: *GenericAstVisitor, stmt: *AstNode) -> u64 {
     if (stmt == 0) { return 0; }
     var kind: u64 = ast_kind(stmt);
     switch (kind) {
         case AST_RETURN:
             var r: *AstReturn = (*AstReturn)stmt;
-            r.expr = generic_process_expr(r.expr, symtab);
-            return stmt;
+            r.expr = generic_ast_visitor_walk_expr(visitor, r.expr);
+            return 0;
         case AST_VAR_DECL:
             var vd: *AstVarDecl = (*AstVarDecl)stmt;
-            vd.init_expr = generic_process_expr(vd.init_expr, symtab);
-            return stmt;
+            vd.init_expr = generic_ast_visitor_walk_expr(visitor, vd.init_expr);
+            return 0;
         case AST_ASSIGN:
             var assign_stmt: *AstAssign = (*AstAssign)stmt;
-            assign_stmt.target = generic_process_expr(assign_stmt.target, symtab);
-            assign_stmt.value = generic_process_expr(assign_stmt.value, symtab);
-            return stmt;
+            assign_stmt.target = generic_ast_visitor_walk_expr(visitor, assign_stmt.target);
+            assign_stmt.value = generic_ast_visitor_walk_expr(visitor, assign_stmt.value);
+            return 0;
         case AST_EXPR_STMT:
             var es: *AstExprStmt = (*AstExprStmt)stmt;
-            es.expr = generic_process_expr(es.expr, symtab);
-            return stmt;
+            es.expr = generic_ast_visitor_walk_expr(visitor, es.expr);
+            return 0;
         case AST_IF:
             var ifs: *AstIf = (*AstIf)stmt;
-            ifs.cond = generic_process_expr(ifs.cond, symtab);
-            generic_process_stmt(ifs.then_block, symtab);
-            generic_process_stmt(ifs.else_block, symtab);
-            return stmt;
+            ifs.cond = generic_ast_visitor_walk_expr(visitor, ifs.cond);
+            generic_ast_visitor_walk_stmt(visitor, ifs.then_block);
+            generic_ast_visitor_walk_stmt(visitor, ifs.else_block);
+            return 0;
         case AST_WHILE:
             var wl: *AstWhile = (*AstWhile)stmt;
-            wl.cond = generic_process_expr(wl.cond, symtab);
-            generic_process_stmt(wl.body, symtab);
-            return stmt;
+            wl.cond = generic_ast_visitor_walk_expr(visitor, wl.cond);
+            generic_ast_visitor_walk_stmt(visitor, wl.body);
+            return 0;
         case AST_FOR:
             var fr: *AstFor = (*AstFor)stmt;
-            generic_process_stmt(fr.init, symtab);
-            fr.cond = generic_process_expr(fr.cond, symtab);
-            fr.update = generic_process_expr(fr.update, symtab);
-            generic_process_stmt(fr.body, symtab);
-            return stmt;
+            generic_ast_visitor_walk_stmt(visitor, fr.init);
+            fr.cond = generic_ast_visitor_walk_expr(visitor, fr.cond);
+            fr.update = generic_ast_visitor_walk_expr(visitor, fr.update);
+            generic_ast_visitor_walk_stmt(visitor, fr.body);
+            return 0;
         case AST_SWITCH:
             var sw: *AstSwitch = (*AstSwitch)stmt;
-            sw.expr = generic_process_expr(sw.expr, symtab);
-            generic_process_stmt_block(sw.cases_vec, symtab);
-            return stmt;
+            sw.expr = generic_ast_visitor_walk_expr(visitor, sw.expr);
+            generic_ast_visitor_walk_stmt_block(visitor, sw.cases_vec);
+            return 0;
         case AST_CASE:
             var cs: *AstCase = (*AstCase)stmt;
-            generic_process_stmt(cs.body, symtab);
-            return stmt;
+            generic_ast_visitor_walk_stmt(visitor, cs.body);
+            return 0;
         case AST_BLOCK:
             var blk: *AstBlock = (*AstBlock)stmt;
-            generic_process_stmt_block(blk.stmts_vec, symtab);
-            return stmt;
+            generic_ast_visitor_walk_stmt_block(visitor, blk.stmts_vec);
+            return 0;
         default:
-            return stmt;
+            return 0;
     }
+}
+
+func generic_process_expr(expr: *AstNode, symtab: *HashMap<u64, *TypeInfo>) -> *AstNode {
+    var visitor: GenericAstVisitor = generic_ast_visitor_new_process(symtab);
+    return generic_ast_visitor_walk_expr(&visitor, expr);
+}
+
+func generic_process_stmt_block(stmts: *Vec<*AstNode>, symtab: *HashMap<u64, *TypeInfo>) -> u64 {
+    var visitor: GenericAstVisitor = generic_ast_visitor_new_process(symtab);
+    return generic_ast_visitor_walk_stmt_block(&visitor, stmts);
+}
+
+func generic_process_stmt(stmt: *AstNode, symtab: *HashMap<u64, *TypeInfo>) -> u64 {
+    var visitor: GenericAstVisitor = generic_ast_visitor_new_process(symtab);
+    return generic_ast_visitor_walk_stmt(&visitor, stmt);
 }
 
 func compiler_try_resolve_struct_name(name_ptr: u64, name_len: u64) -> CompilerResolvedStructName {
@@ -4810,15 +4842,75 @@ func compiler_clone_default_expr(expr_u64: u64) -> *AstNode {
     return generic_clone_expr((*AstNode)expr_u64, 0);
 }
 
+func compiler_call_params_need_normalize(params: *Vec<*Param>, params_start: u64, arg_names: *Vec<*NameInfo>) -> u64 {
+    if (compiler_call_has_named_args(arg_names) != 0) { return 1; }
+    if (params == 0) { return 0; }
+    var param_count: u64 = params.len();
+    if (params_start > param_count) { params_start = param_count; }
+    if (params_start >= param_count) { return 0; }
+    for (var i: u64 = params_start; i < param_count; i++) {
+        var p: *Param = params.get(i);
+        if (p == 0) { continue; }
+        if (p.has_default != 0 || p.is_variadic != 0) { return 1; }
+    }
+    return 0;
+}
+
+func compiler_call_has_variadic_param(params: *Vec<*Param>, param_count: u64, effective_count: u64) -> u64 {
+    if (params == 0 || param_count == 0 || effective_count == 0) { return 0; }
+    var last_param: *Param = params.get(param_count - 1);
+    if (last_param == 0) { return 0; }
+    if (last_param.is_variadic == 0) { return 0; }
+    return 1;
+}
+
+func compiler_call_fill_missing_defaults(call_name_ptr: u64, call_name_len: u64, params: *Vec<*Param>, params_start: u64, fixed_count: u64, out_fixed: *Vec<*AstNode>, assigned: *Vec<u64>) -> u64 {
+    for (var fi: u64 = 0; fi < fixed_count; fi++) {
+        if (assigned.get(fi) != 0) { continue; }
+        var param: *Param = params.get(params_start + fi);
+        if (param != 0 && param.has_default != 0) {
+            var def_expr: *AstNode = compiler_clone_default_expr(param.default_expr);
+            out_fixed.set(fi, compiler_lower_parse_sugar_expr(def_expr));
+            assigned.set(fi, 1);
+            continue;
+        }
+        emit_stderr("[ERROR] missing required argument '");
+        if (param != 0) { emit_stderr_len(param.name_ptr, param.name_len); }
+        emit_stderr("' in call: ");
+        emit_stderr_len(call_name_ptr, call_name_len);
+        emit_stderr("\n");
+        panic("Compiler error");
+    }
+    return 0;
+}
+
+func compiler_call_pack_variadic_args(out_fixed: *Vec<*AstNode>, variadic_args: *Vec<*AstNode>) -> *Vec<*AstNode> {
+    var out: *Vec<*AstNode> = new Vec<*AstNode>(out_fixed.len() + variadic_args.len() + 1);
+    var fixed_n: u64 = out_fixed.len();
+    for (var i: u64 = 0; i < fixed_n; i++) {
+        out.push(out_fixed.get(i));
+    }
+
+    if (variadic_args.len() == 0) {
+        // Keep variadic slot deterministic when no extra argument is provided.
+        out.push((*AstNode)ast_literal(0));
+        return out;
+    }
+
+    out.push(variadic_args.get(0));
+    var vn: u64 = variadic_args.len();
+    for (var vi: u64 = 1; vi < vn; vi++) {
+        out.push(variadic_args.get(vi));
+    }
+    return out;
+}
+
 func compiler_normalize_call_args_for_params(call_name_ptr: u64, call_name_len: u64, params: *Vec<*Param>, params_start: u64, args: *Vec<*AstNode>, arg_names: *Vec<*NameInfo>) -> *Vec<*AstNode> {
     var input_args: *Vec<*AstNode> = args;
     if (input_args == 0) { input_args = new Vec<*AstNode>(0); }
     if (params == 0) {
         if (compiler_call_has_named_args(arg_names) != 0) {
-            emit_stderr("[ERROR] named arguments require a resolvable function signature: ");
-            emit_stderr_len(call_name_ptr, call_name_len);
-            emit_stderr("\n");
-            panic("Compiler error");
+            compiler_panic_callsite("named arguments require a resolvable function signature", call_name_ptr, call_name_len);
         }
         return input_args;
     }
@@ -4827,28 +4919,12 @@ func compiler_normalize_call_args_for_params(call_name_ptr: u64, call_name_len: 
     if (params_start > param_count) { params_start = param_count; }
     var effective_count: u64 = param_count - params_start;
 
-    var should_normalize: u64 = compiler_call_has_named_args(arg_names);
-    if (should_normalize == 0 && effective_count > 0) {
-        for (var si: u64 = params_start; si < param_count; si++) {
-            var sp: *Param = params.get(si);
-            if (sp == 0) { continue; }
-            if (sp.has_default != 0 || sp.is_variadic != 0) {
-                should_normalize = 1;
-                break;
-            }
-        }
-    }
+    var should_normalize: u64 = compiler_call_params_need_normalize(params, params_start, arg_names);
     if (should_normalize == 0) {
         return input_args;
     }
 
-    var has_variadic: u64 = 0;
-    if (effective_count > 0) {
-        var last_param: *Param = params.get(param_count - 1);
-        if (last_param != 0 && last_param.is_variadic != 0) {
-            has_variadic = 1;
-        }
-    }
+    var has_variadic: u64 = compiler_call_has_variadic_param(params, param_count, effective_count);
 
     var fixed_count: u64 = effective_count;
     if (has_variadic != 0 && fixed_count > 0) {
@@ -4903,10 +4979,7 @@ func compiler_normalize_call_args_for_params(call_name_ptr: u64, call_name_len: 
         }
 
         if (seen_named != 0) {
-            emit_stderr("[ERROR] positional argument cannot follow named arguments in call: ");
-            emit_stderr_len(call_name_ptr, call_name_len);
-            emit_stderr("\n");
-            panic("Compiler error");
+            compiler_panic_callsite("positional argument cannot follow named arguments in call", call_name_ptr, call_name_len);
         }
 
         if (next_positional < fixed_count) {
@@ -4917,53 +4990,17 @@ func compiler_normalize_call_args_for_params(call_name_ptr: u64, call_name_len: 
         }
 
         if (has_variadic == 0) {
-            emit_stderr("[ERROR] too many arguments in call: ");
-            emit_stderr_len(call_name_ptr, call_name_len);
-            emit_stderr("\n");
-            panic("Compiler error");
+            compiler_panic_callsite("too many arguments in call", call_name_ptr, call_name_len);
         }
         variadic_args.push(arg_expr);
     }
 
-    for (var fi: u64 = 0; fi < fixed_count; fi++) {
-        if (assigned.get(fi) != 0) { continue; }
-        var param: *Param = params.get(params_start + fi);
-        if (param != 0 && param.has_default != 0) {
-            var def_expr: *AstNode = compiler_clone_default_expr(param.default_expr);
-            out_fixed.set(fi, compiler_lower_parse_sugar_expr(def_expr));
-            assigned.set(fi, 1);
-            continue;
-        }
-        emit_stderr("[ERROR] missing required argument '");
-        if (param != 0) { emit_stderr_len(param.name_ptr, param.name_len); }
-        emit_stderr("' in call: ");
-        emit_stderr_len(call_name_ptr, call_name_len);
-        emit_stderr("\n");
-        panic("Compiler error");
-    }
+    compiler_call_fill_missing_defaults(call_name_ptr, call_name_len, params, params_start, fixed_count, out_fixed, assigned);
 
     if (has_variadic == 0) {
         return out_fixed;
     }
-
-    var out: *Vec<*AstNode> = new Vec<*AstNode>(out_fixed.len() + variadic_args.len() + 1);
-    var out_fixed_n: u64 = out_fixed.len();
-    for (var oi: u64 = 0; oi < out_fixed_n; oi++) {
-        out.push(out_fixed.get(oi));
-    }
-
-    if (variadic_args.len() == 0) {
-        // Keep variadic slot deterministic when no extra argument is provided.
-        out.push((*AstNode)ast_literal(0));
-        return out;
-    }
-
-    out.push(variadic_args.get(0));
-    var vn: u64 = variadic_args.len();
-    for (var vi: u64 = 1; vi < vn; vi++) {
-        out.push(variadic_args.get(vi));
-    }
-    return out;
+    return compiler_call_pack_variadic_args(out_fixed, variadic_args);
 }
 
 func compiler_name_matches_tail(full_ptr: u64, full_len: u64, target_ptr: u64, target_len: u64) -> u64 {
