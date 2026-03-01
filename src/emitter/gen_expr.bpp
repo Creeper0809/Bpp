@@ -1005,41 +1005,10 @@ func cg_expr_call(node: u64, symtab: *Symtab) -> u64 {
     var var_type: *TypeInfo = symtab_get_type(symtab, name_ptr, name_len);
     var is_global: u64 = is_global_var(resolved_ptr, resolved_len);
     if (var_type != 0 || is_global != 0) {
-        var args2: *Vec<*AstNode> = call.args_vec;
-        var nargs2: u64 = 0;
-        if (args2 != 0) { nargs2 = args2.len(); }
-
-        if (var_type != 0) {
-            var offset2: u64 = symtab_find(symtab, name_ptr, name_len);
-            emit("    mov rax, [rbp");
-            emit_signed_disp(offset2);
-            emit("]\n");
-        } else {
-            emit("    mov rax, [rel _gvar_");
-            emit_len(resolved_ptr, resolved_len);
-            emit("]\n");
-        }
-        emit("    push rax\n");
-
-        var total_arg_words2: u64 = 0;
-        if (nargs2 != 0) {
-            var i2: u64 = nargs2;
-            while (i2 > 0) {
-                i2 = i2 - 1;
-                var arg2: *AstNode = args2.get(i2);
-                total_arg_words2 = total_arg_words2 + _cg_sysv_push_call_arg(arg2, symtab);
-            }
-        }
-        var stack_words2: u64 = _cg_sysv_pop_arg_regs(total_arg_words2);
-
-        emit("    pop rax\n");
-        emit("    call rax\n");
-
-        if (stack_words2 > 0) {
-            emit("    add rsp, ");
-            emit_u64(stack_words2 * 8);
-            emit_nl();
-        }
+        // Local/global symbol call through function pointer path so signature checks apply.
+        var callee_ident: *AstNode = (*AstNode)ast_ident(name_ptr, name_len);
+        var call_ptr_expr: *AstCallPtr = ast_call_ptr(callee_ident, call.args_vec);
+        cg_expr_call_ptr((u64)call_ptr_expr, symtab);
         return;
     }
     var fn_call_direct: *AstFunc = typeinfo_find_func(name_ptr, name_len);
@@ -1078,6 +1047,83 @@ func cg_expr_call_ptr(node: u64, symtab: *Symtab) -> u64 {
     var args3: *Vec<*AstNode> = cp.args_vec;
     var nargs3: u64 = 0;
     if (args3 != 0) { nargs3 = args3.len(); }
+
+    var callee_ti: *TypeInfo = get_expr_type_with_symtab(cp.callee, symtab);
+    var sig_ti: *TypeInfo = typeinfo_func_signature(callee_ti);
+    if (sig_ti != 0 && sig_ti.fn_params_vec != 0) {
+        var expected_n: u64 = sig_ti.fn_params_vec.len();
+        var fixed_n: u64 = expected_n;
+        var min_n: u64 = expected_n;
+        if (sig_ti.fn_is_variadic != 0 && expected_n > 0) {
+            fixed_n = expected_n - 1;
+            min_n = fixed_n;
+        }
+        if (sig_ti.fn_is_variadic == 0 && nargs3 != expected_n) {
+            emit_stderr("[ERROR] function pointer call argument count mismatch: expected ");
+            emit_u64_stderr(expected_n);
+            emit_stderr(", got ");
+            emit_u64_stderr(nargs3);
+            emit_stderr("\n");
+            panic("Codegen error");
+        }
+        if (sig_ti.fn_is_variadic != 0 && nargs3 < min_n) {
+            emit_stderr("[ERROR] function pointer call missing required arguments: expected at least ");
+            emit_u64_stderr(min_n);
+            emit_stderr(", got ");
+            emit_u64_stderr(nargs3);
+            emit_stderr("\n");
+            panic("Codegen error");
+        }
+
+        for (var i_sig: u64 = 0; i_sig < fixed_n; i_sig++) {
+            var expected_ti: *TypeInfo = sig_ti.fn_params_vec.get(i_sig);
+            var actual_ti: *TypeInfo = get_expr_type_with_symtab(args3.get(i_sig), symtab);
+            if (expected_ti == 0 || actual_ti == 0) {
+                emit_stderr("[ERROR] function pointer call argument type mismatch at index ");
+                emit_u64_stderr(i_sig);
+                emit_stderr("\n");
+                panic("Codegen error");
+            }
+            var mismatch: u64 = check_type_compat(
+                actual_ti.type_kind, actual_ti.ptr_depth, actual_ti.is_tagged, actual_ti.tag_layout_ptr, actual_ti.tag_layout_len,
+                expected_ti.type_kind, expected_ti.ptr_depth, expected_ti.is_tagged, expected_ti.tag_layout_ptr, expected_ti.tag_layout_len
+            );
+            if (expected_ti.type_kind == TYPE_FUNC || actual_ti.type_kind == TYPE_FUNC) {
+                mismatch = (typeinfo_equal(expected_ti, actual_ti) == 0);
+            }
+            if (mismatch != 0) {
+                emit_stderr("[ERROR] function pointer call argument type mismatch at index ");
+                emit_u64_stderr(i_sig);
+                emit_stderr("\n");
+                panic("Codegen error");
+            }
+        }
+        if (sig_ti.fn_is_variadic != 0 && expected_n > 0) {
+            var rest_ti: *TypeInfo = sig_ti.fn_params_vec.get(expected_n - 1);
+            for (var ri: u64 = fixed_n; ri < nargs3; ri++) {
+                var actual_rest_ti: *TypeInfo = get_expr_type_with_symtab(args3.get(ri), symtab);
+                if (rest_ti == 0 || actual_rest_ti == 0) {
+                    emit_stderr("[ERROR] function pointer variadic argument type mismatch at index ");
+                    emit_u64_stderr(ri);
+                    emit_stderr("\n");
+                    panic("Codegen error");
+                }
+                var mismatch2: u64 = check_type_compat(
+                    actual_rest_ti.type_kind, actual_rest_ti.ptr_depth, actual_rest_ti.is_tagged, actual_rest_ti.tag_layout_ptr, actual_rest_ti.tag_layout_len,
+                    rest_ti.type_kind, rest_ti.ptr_depth, rest_ti.is_tagged, rest_ti.tag_layout_ptr, rest_ti.tag_layout_len
+                );
+                if (rest_ti.type_kind == TYPE_FUNC || actual_rest_ti.type_kind == TYPE_FUNC) {
+                    mismatch2 = (typeinfo_equal(rest_ti, actual_rest_ti) == 0);
+                }
+                if (mismatch2 != 0) {
+                    emit_stderr("[ERROR] function pointer variadic argument type mismatch at index ");
+                    emit_u64_stderr(ri);
+                    emit_stderr("\n");
+                    panic("Codegen error");
+                }
+            }
+        }
+    }
 
     // Preserve callee address across arg evaluation.
     cg_expr(cp.callee);
@@ -1287,6 +1333,16 @@ func cg_expr_ident(node: u64, symtab: *Symtab) -> u64 {
     }
 
     var offset: u64 = symtab_find(symtab, name_ptr, name_len);
+    if (offset == 0) {
+        // Bare function symbol as value is allowed only when inferred as function type.
+        var inferred: *TypeInfo = get_expr_type_with_symtab((*AstNode)ident, symtab);
+        if (inferred != 0 && inferred.type_kind == TYPE_FUNC && compiler_func_exists(resolved_ptr, resolved_len) != 0) {
+            emit("    lea rax, [rel ");
+            emit_len(resolved_ptr, resolved_len);
+            emit("]\n");
+            return;
+        }
+    }
     emit("    mov rax, [rbp");
     emit_signed_disp(offset);
     emit("]\n");
@@ -3522,6 +3578,28 @@ func cg_method_call(node: u64, symtab: *Symtab) -> u64 {
         if (fn_direct == 0) {
             fn_direct = typeinfo_find_func(name_info.ptr, name_info.len);
         }
+    }
+    if (fn_direct == 0) {
+        // If no method exists, allow calling function-typed field: obj.field(args...)
+        var recv_def: *AstStructDef = type_info.struct_def;
+        if (recv_def == 0) {
+            recv_def = get_struct_def(struct_name_ptr, struct_name_len);
+        }
+        if (recv_def != 0) {
+            var field_desc: *FieldDesc = compiler_find_struct_field_desc_scoped(recv_def, 0, 0, method_ptr, method_len);
+            if (field_desc != 0 && field_desc.type_kind == TYPE_FUNC) {
+                var member_expr: *AstMemberAccess = ast_member_access((*AstNode)receiver, method_ptr, method_len);
+                var call_ptr_expr: *AstCallPtr = ast_call_ptr((*AstNode)member_expr, args);
+                cg_expr_call_ptr((u64)call_ptr_expr, symtab);
+                return;
+            }
+        }
+        emit_stderr("[ERROR] Method not found: ");
+        emit_stderr_len(struct_name_ptr, struct_name_len);
+        emit_stderr(".");
+        emit_stderr_len(method_ptr, method_len);
+        emit_stderr("\n");
+        panic("Codegen error");
     }
     total_arg_words = cg_method_push_user_args(args, nargs, fn_direct, 1, symtab);
     total_arg_words = total_arg_words + cg_method_push_receiver(receiver, recv_ti, recv_is_ptr);
