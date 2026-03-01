@@ -164,6 +164,10 @@ func parse_lambda_param_exists(params: *Vec<*Param>, name_ptr: u64, name_len: u6
 }
 
 func parse_lambda_symbol_is_global(name_ptr: u64, name_len: u64) -> u64 {
+    if (name_ptr != 0 && name_len >= 5) {
+        var suffix_ptr: u64 = name_ptr + (name_len - 5);
+        if (str_eq(suffix_ptr, 5, "_ctor", 5) != 0) { return 1; }
+    }
     if (compiler_func_exists(name_ptr, name_len) != 0) { return 1; }
     if (compiler_global_exists(name_ptr, name_len) != 0) { return 1; }
     var cres: *ConstResult = (*ConstResult)compiler_find_const(name_ptr, name_len);
@@ -465,6 +469,257 @@ func parse_lambda_make_u64_param(name_ptr: u64, name_len: u64) -> *Param {
     return p;
 }
 
+func parse_lambda_make_u64_field(owner_ptr: u64, owner_len: u64, field_ptr: u64, field_len: u64) -> *FieldDesc {
+    var f: *FieldDesc = new FieldDesc();
+    f.name_ptr = field_ptr;
+    f.name_len = field_len;
+    f.type_kind = TYPE_U64;
+    f.ptr_depth = 0;
+    f.is_tagged = 0;
+    f.struct_name_ptr = 0;
+    f.struct_name_len = 0;
+    f.tag_layout_ptr = 0;
+    f.tag_layout_len = 0;
+    f.bit_width = 0;
+    f.elem_type_kind = 0;
+    f.elem_ptr_depth = 0;
+    f.array_len = 0;
+    f.elem_typeinfo = 0;
+    f.access = ACCESS_PUBLIC;
+    f.owner_struct_ptr = owner_ptr;
+    f.owner_struct_len = owner_len;
+    return f;
+}
+
+func parse_lambda_build_env_struct_name(lambda_id: u64) -> *NameInfo {
+    return parse_lambda_build_name_with_prefix("__lambda_env_", 13, lambda_id);
+}
+
+func parse_lambda_set_capture_field_names(captures: *Vec<*LambdaCapture>) -> u64 {
+    if (captures == 0) { return 0; }
+    var n: u64 = captures.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var c: *LambdaCapture = captures.get(i);
+        var field_name: *NameInfo = parse_lambda_build_bind_param_name(i);
+        c.slot_ptr = field_name.ptr;
+        c.slot_len = field_name.len;
+    }
+    return 0;
+}
+
+func parse_lambda_build_env_struct(captures: *Vec<*LambdaCapture>, lambda_id: u64) -> *AstStructDef {
+    if (captures == 0) { return 0; }
+    var env_name: *NameInfo = parse_lambda_build_env_struct_name(lambda_id);
+    var fields: *Vec<*FieldDesc> = new Vec<*FieldDesc>(captures.len());
+    var n: u64 = captures.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var c: *LambdaCapture = captures.get(i);
+        fields.push(parse_lambda_make_u64_field(env_name.ptr, env_name.len, c.slot_ptr, c.slot_len));
+    }
+    var env_struct: *AstStructDef = ast_struct_def(env_name.ptr, env_name.len, 0, fields, 0, 0, 0);
+    register_struct_type(env_struct);
+    return env_struct;
+}
+
+func parse_lambda_ensure_runtime_closure_struct() -> *AstStructDef {
+    var closure_name_ptr: u64 = (u64)"__LambdaClosureObj";
+    var closure_name_len: u64 = 18;
+    var existing: *AstStructDef = get_struct_def(closure_name_ptr, closure_name_len);
+    if (existing != 0) { return existing; }
+
+    var fields: *Vec<*FieldDesc> = new Vec<*FieldDesc>(2);
+    fields.push(parse_lambda_make_u64_field(closure_name_ptr, closure_name_len, "fn", 2));
+    fields.push(parse_lambda_make_u64_field(closure_name_ptr, closure_name_len, "env", 3));
+    var closure_struct: *AstStructDef = ast_struct_def(closure_name_ptr, closure_name_len, 0, fields, 0, 0, 0);
+    register_struct_type(closure_struct);
+    return closure_struct;
+}
+
+func parse_lambda_make_env_param(env_struct: *AstStructDef) -> *Param {
+    var p: *Param = new Param();
+    p.name_ptr = "__env";
+    p.name_len = 5;
+    p.type_kind = TYPE_STRUCT;
+    p.ptr_depth = 1;
+    p.is_tagged = 0;
+    p.struct_name_ptr = env_struct.name_ptr;
+    p.struct_name_len = env_struct.name_len;
+    p.tag_layout_ptr = 0;
+    p.tag_layout_len = 0;
+    p.elem_type_kind = 0;
+    p.elem_ptr_depth = 0;
+    p.array_len = 0;
+    p.array_len_is_param = 0;
+    p.array_len_param_ptr = 0;
+    p.array_len_param_len = 0;
+    p.elem_typeinfo = 0;
+    return p;
+}
+
+func parse_lambda_capture_field_expr(env_param_ptr: u64, env_param_len: u64, capture: *LambdaCapture) -> *AstNode {
+    var env_deref: *AstNode = (*AstNode)ast_deref((*AstNode)ast_ident(env_param_ptr, env_param_len));
+    return (*AstNode)ast_member_access(env_deref, capture.slot_ptr, capture.slot_len);
+}
+
+func parse_lambda_rewrite_expr_captures_env(p: *Parser, node: *AstNode, captures: *Vec<*LambdaCapture>, env_param_ptr: u64, env_param_len: u64) -> *AstNode {
+    if (node == 0 || captures == 0 || captures.len() == 0) { return node; }
+    var kind: u64 = ast_kind(node);
+    switch (kind) {
+        case AST_IDENT:
+            var id: *AstIdent = (*AstIdent)node;
+            var slot: *LambdaCapture = parse_lambda_capture_slot_for_name(captures, id.name_ptr, id.name_len);
+            if (slot == 0) { return node; }
+            var field_expr: *AstNode = parse_lambda_capture_field_expr(env_param_ptr, env_param_len, slot);
+            if (slot.mode == LAMBDA_CAPTURE_BY_REF) {
+                var as_ptr: *AstNode = (*AstNode)ast_cast_ex(field_expr, TYPE_U64, 1, 0, 0, 0, 0, 0);
+                return (*AstNode)ast_deref(as_ptr);
+            }
+            return field_expr;
+        case AST_CALL:
+            var call: *AstCall = (*AstCall)node;
+            var slot2: *LambdaCapture = parse_lambda_capture_slot_for_name(captures, call.name_ptr, call.name_len);
+            if (call.args_vec != 0) {
+                var cn: u64 = call.args_vec.len();
+                for (var ci: u64 = 0; ci < cn; ci++) {
+                    call.args_vec.set(ci, parse_lambda_rewrite_expr_captures_env(p, call.args_vec.get(ci), captures, env_param_ptr, env_param_len));
+                }
+            }
+            if (slot2 == 0) { return node; }
+            if (slot2.mode == LAMBDA_CAPTURE_BY_REF) {
+                emit_stderr("[ERROR] by-ref captured symbol cannot be used as direct call target in lambda\n");
+                parse_panic_here(p, "Syntax error");
+            }
+            return (*AstNode)ast_call_ptr(parse_lambda_capture_field_expr(env_param_ptr, env_param_len, slot2), call.args_vec);
+        case AST_BINARY:
+            var bin: *AstBinary = (*AstBinary)node;
+            bin.left = parse_lambda_rewrite_expr_captures_env(p, bin.left, captures, env_param_ptr, env_param_len);
+            bin.right = parse_lambda_rewrite_expr_captures_env(p, bin.right, captures, env_param_ptr, env_param_len);
+            return node;
+        case AST_UNARY:
+            var un: *AstUnary = (*AstUnary)node;
+            un.operand = parse_lambda_rewrite_expr_captures_env(p, un.operand, captures, env_param_ptr, env_param_len);
+            return node;
+        case AST_ADDR_OF:
+            var ao: *AstAddrOf = (*AstAddrOf)node;
+            ao.operand = parse_lambda_rewrite_expr_captures_env(p, ao.operand, captures, env_param_ptr, env_param_len);
+            return node;
+        case AST_DEREF:
+            var dr: *AstDeref = (*AstDeref)node;
+            dr.operand = parse_lambda_rewrite_expr_captures_env(p, dr.operand, captures, env_param_ptr, env_param_len);
+            return node;
+        case AST_DEREF8:
+            var dr8: *AstDeref8 = (*AstDeref8)node;
+            dr8.operand = parse_lambda_rewrite_expr_captures_env(p, dr8.operand, captures, env_param_ptr, env_param_len);
+            return node;
+        case AST_CAST:
+            var cs: *AstCast = (*AstCast)node;
+            cs.expr = parse_lambda_rewrite_expr_captures_env(p, cs.expr, captures, env_param_ptr, env_param_len);
+            return node;
+        case AST_TRY:
+            var tr: *AstTry = (*AstTry)node;
+            tr.operand = parse_lambda_rewrite_expr_captures_env(p, tr.operand, captures, env_param_ptr, env_param_len);
+            return node;
+        case AST_SIZEOF_EXPR:
+            var se: *AstSizeofExpr = (*AstSizeofExpr)node;
+            se.expr = parse_lambda_rewrite_expr_captures_env(p, se.expr, captures, env_param_ptr, env_param_len);
+            return node;
+        case AST_INDEX:
+            var idx: *AstIndex = (*AstIndex)node;
+            idx.base = parse_lambda_rewrite_expr_captures_env(p, idx.base, captures, env_param_ptr, env_param_len);
+            idx.index = parse_lambda_rewrite_expr_captures_env(p, idx.index, captures, env_param_ptr, env_param_len);
+            return node;
+        case AST_MEMBER_ACCESS:
+        case AST_SAFE_MEMBER_ACCESS:
+            var ma: *AstMemberAccess = (*AstMemberAccess)node;
+            ma.object = parse_lambda_rewrite_expr_captures_env(p, ma.object, captures, env_param_ptr, env_param_len);
+            return node;
+        case AST_METHOD_CALL:
+        case AST_SAFE_METHOD_CALL:
+            var mc: *AstMethodCall = (*AstMethodCall)node;
+            mc.receiver = parse_lambda_rewrite_expr_captures_env(p, mc.receiver, captures, env_param_ptr, env_param_len);
+            if (mc.args_vec != 0) {
+                var an: u64 = mc.args_vec.len();
+                for (var ai: u64 = 0; ai < an; ai++) {
+                    mc.args_vec.set(ai, parse_lambda_rewrite_expr_captures_env(p, mc.args_vec.get(ai), captures, env_param_ptr, env_param_len));
+                }
+            }
+            return node;
+        case AST_CALL_PTR:
+            var cp: *AstCallPtr = (*AstCallPtr)node;
+            cp.callee = parse_lambda_rewrite_expr_captures_env(p, cp.callee, captures, env_param_ptr, env_param_len);
+            if (cp.args_vec != 0) {
+                var cpn: u64 = cp.args_vec.len();
+                for (var cpi: u64 = 0; cpi < cpn; cpi++) {
+                    cp.args_vec.set(cpi, parse_lambda_rewrite_expr_captures_env(p, cp.args_vec.get(cpi), captures, env_param_ptr, env_param_len));
+                }
+            }
+            return node;
+        case AST_GENERIC_CALL:
+            var gc: *AstGenericCall = (*AstGenericCall)node;
+            if (gc.args_vec != 0) {
+                var gcn: u64 = gc.args_vec.len();
+                for (var gci: u64 = 0; gci < gcn; gci++) {
+                    gc.args_vec.set(gci, parse_lambda_rewrite_expr_captures_env(p, gc.args_vec.get(gci), captures, env_param_ptr, env_param_len));
+                }
+            }
+            return node;
+        case AST_STATIC_GENERIC_CALL:
+            var sgc: *AstStaticGenericCall = (*AstStaticGenericCall)node;
+            if (sgc.args_vec != 0) {
+                var sgn: u64 = sgc.args_vec.len();
+                for (var sgi: u64 = 0; sgi < sgn; sgi++) {
+                    sgc.args_vec.set(sgi, parse_lambda_rewrite_expr_captures_env(p, sgc.args_vec.get(sgi), captures, env_param_ptr, env_param_len));
+                }
+            }
+            return node;
+        case AST_STRUCT_LITERAL:
+            var sl: *AstStructLiteral = (*AstStructLiteral)node;
+            if (sl.values_vec != 0) {
+                var sn: u64 = sl.values_vec.len();
+                for (var si: u64 = 0; si < sn; si++) {
+                    sl.values_vec.set(si, parse_lambda_rewrite_expr_captures_env(p, sl.values_vec.get(si), captures, env_param_ptr, env_param_len));
+                }
+            }
+            return node;
+        case AST_GENERIC_STRUCT_LITERAL:
+            var gsl: *AstGenericStructLiteral = (*AstGenericStructLiteral)node;
+            if (gsl.values_vec != 0) {
+                var gsn: u64 = gsl.values_vec.len();
+                for (var gsi: u64 = 0; gsi < gsn; gsi++) {
+                    gsl.values_vec.set(gsi, parse_lambda_rewrite_expr_captures_env(p, gsl.values_vec.get(gsi), captures, env_param_ptr, env_param_len));
+                }
+            }
+            return node;
+        case AST_SLICE:
+            var slice_node: *AstSlice = (*AstSlice)node;
+            slice_node.ptr_expr = parse_lambda_rewrite_expr_captures_env(p, slice_node.ptr_expr, captures, env_param_ptr, env_param_len);
+            slice_node.len_expr = parse_lambda_rewrite_expr_captures_env(p, slice_node.len_expr, captures, env_param_ptr, env_param_len);
+            return node;
+        case AST_NEW:
+            var nw: *AstNew = (*AstNew)node;
+            if (nw.literal_expr != 0) {
+                nw.literal_expr = parse_lambda_rewrite_expr_captures_env(p, nw.literal_expr, captures, env_param_ptr, env_param_len);
+            }
+            if (nw.ctor_args_vec != 0) {
+                var nn: u64 = nw.ctor_args_vec.len();
+                for (var ni: u64 = 0; ni < nn; ni++) {
+                    nw.ctor_args_vec.set(ni, parse_lambda_rewrite_expr_captures_env(p, nw.ctor_args_vec.get(ni), captures, env_param_ptr, env_param_len));
+                }
+            }
+            return node;
+        case AST_STACK_CTOR:
+            var sc: *AstStackCtor = (*AstStackCtor)node;
+            if (sc.ctor_args_vec != 0) {
+                var sn2: u64 = sc.ctor_args_vec.len();
+                for (var si2: u64 = 0; si2 < sn2; si2++) {
+                    sc.ctor_args_vec.set(si2, parse_lambda_rewrite_expr_captures_env(p, sc.ctor_args_vec.get(si2), captures, env_param_ptr, env_param_len));
+                }
+            }
+            return node;
+    }
+    return node;
+}
+
 func parse_lambda_emit_capture_globals(p: *Parser, captures: *Vec<*LambdaCapture>, lambda_id: u64) -> u64 {
     if (captures == 0) { return 0; }
     var n: u64 = captures.len();
@@ -726,28 +981,51 @@ func parse_primary_lambda_expr(p: *Parser) -> *AstNode {
     } else {
         parse_lambda_collect_expr_captures(p, body_expr, params, captures);
     }
-    parse_lambda_emit_capture_globals(p, captures, lambda_id);
-    body_expr = parse_lambda_rewrite_expr_captures(p, body_expr, captures);
+
+    var lambda_params: *Vec<*Param> = params;
+    var has_captures: u64 = 0;
+    var env_struct: *AstStructDef = 0;
+    if (captures != 0 && captures.len() != 0) {
+        has_captures = 1;
+        parse_lambda_set_capture_field_names(captures);
+        env_struct = parse_lambda_build_env_struct(captures, lambda_id);
+        body_expr = parse_lambda_rewrite_expr_captures_env(p, body_expr, captures, "__env", 5);
+
+        lambda_params = new Vec<*Param>(params.len() + 1);
+        lambda_params.push(parse_lambda_make_env_param(env_struct));
+        var pn: u64 = params.len();
+        for (var pi: u64 = 0; pi < pn; pi++) {
+            lambda_params.push(params.get(pi));
+        }
+    }
 
     var body_stmts: *Vec<*AstNode> = new Vec<*AstNode>(1);
     body_stmts.push((*AstNode)ast_return(body_expr));
     var body: *AstNode = (*AstNode)ast_block(body_stmts);
 
-    var lambda_fn: *AstFunc = ast_func_ex(lambda_body_name.ptr, lambda_body_name.len, params,
+    var lambda_fn: *AstFunc = ast_func_ex(lambda_body_name.ptr, lambda_body_name.len, lambda_params,
                                           ret_type, ret_ptr_depth, ret_is_tagged,
                                           ret_struct_name_ptr, ret_struct_name_len,
                                           ret_tag_layout_ptr, ret_tag_layout_len, body);
     parse_generated_funcs_push(p, (u64)lambda_fn);
 
-    if (captures == 0 || captures.len() == 0) {
+    if (has_captures == 0) {
         var fn_ident: *AstNode = (*AstNode)ast_ident(lambda_body_name.ptr, lambda_body_name.len);
         return (*AstNode)ast_addr_of(fn_ident);
     }
 
+    var closure_struct: *AstStructDef = parse_lambda_ensure_runtime_closure_struct();
     var bind_name: *NameInfo = parse_lambda_build_name_with_prefix("__lambda_bind_", 14, lambda_id);
     var bind_params: *Vec<*Param> = new Vec<*Param>(captures.len());
-    var bind_body_stmts: *Vec<*AstNode> = new Vec<*AstNode>(captures.len() + 1);
+    var bind_body_stmts: *Vec<*AstNode> = new Vec<*AstNode>(captures.len() + 8);
     var bind_call_args: *Vec<*AstNode> = new Vec<*AstNode>(captures.len());
+
+    var env_alloc: *AstNode = (*AstNode)ast_new(TYPE_STRUCT, 0, 0, env_struct.name_ptr, env_struct.name_len,
+                                                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    var env_decl: *AstVarDecl = ast_var_decl("__env_obj", 9, TYPE_STRUCT, 1, env_alloc);
+    env_decl.struct_name_ptr = env_struct.name_ptr;
+    env_decl.struct_name_len = env_struct.name_len;
+    bind_body_stmts.push((*AstNode)env_decl);
 
     var cap_n: u64 = captures.len();
     for (var ci: u64 = 0; ci < cap_n; ci++) {
@@ -755,8 +1033,9 @@ func parse_primary_lambda_expr(p: *Parser) -> *AstNode {
         var bind_param_name: *NameInfo = parse_lambda_build_bind_param_name(ci);
         bind_params.push(parse_lambda_make_u64_param(bind_param_name.ptr, bind_param_name.len));
 
+        var env_target: *AstNode = (*AstNode)ast_member_access((*AstNode)ast_deref((*AstNode)ast_ident("__env_obj", 9)), cap.slot_ptr, cap.slot_len);
         bind_body_stmts.push((*AstNode)ast_assign(
-            (*AstNode)ast_ident(cap.slot_ptr, cap.slot_len),
+            env_target,
             (*AstNode)ast_ident(bind_param_name.ptr, bind_param_name.len)
         ));
         if (cap.mode == LAMBDA_CAPTURE_BY_REF) {
@@ -766,11 +1045,36 @@ func parse_primary_lambda_expr(p: *Parser) -> *AstNode {
         }
     }
 
-    bind_body_stmts.push((*AstNode)ast_return(
-        (*AstNode)ast_addr_of((*AstNode)ast_ident(lambda_body_name.ptr, lambda_body_name.len))
-    ));
-    var bind_body: *AstNode = (*AstNode)ast_block(bind_body_stmts);
+    var closure_alloc: *AstNode = (*AstNode)ast_new(TYPE_STRUCT, 0, 0, closure_struct.name_ptr, closure_struct.name_len,
+                                                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    var closure_decl: *AstVarDecl = ast_var_decl("__clo_obj", 9, TYPE_STRUCT, 1, closure_alloc);
+    closure_decl.struct_name_ptr = closure_struct.name_ptr;
+    closure_decl.struct_name_len = closure_struct.name_len;
+    bind_body_stmts.push((*AstNode)closure_decl);
 
+    var fn_addr_u64: *AstNode = (*AstNode)ast_cast_ex(
+        (*AstNode)ast_addr_of((*AstNode)ast_ident(lambda_body_name.ptr, lambda_body_name.len)),
+        TYPE_U64, 0, 0, 0, 0, 0, 0
+    );
+    bind_body_stmts.push((*AstNode)ast_assign(
+        (*AstNode)ast_member_access((*AstNode)ast_deref((*AstNode)ast_ident("__clo_obj", 9)), "fn", 2),
+        fn_addr_u64
+    ));
+
+    var env_ptr_u64: *AstNode = (*AstNode)ast_cast_ex((*AstNode)ast_ident("__env_obj", 9), TYPE_U64, 0, 0, 0, 0, 0, 0);
+    bind_body_stmts.push((*AstNode)ast_assign(
+        (*AstNode)ast_member_access((*AstNode)ast_deref((*AstNode)ast_ident("__clo_obj", 9)), "env", 3),
+        env_ptr_u64
+    ));
+
+    var closure_tagged: *AstNode = (*AstNode)ast_binary(
+        TOKEN_PIPE,
+        (*AstNode)ast_cast_ex((*AstNode)ast_ident("__clo_obj", 9), TYPE_U64, 0, 0, 0, 0, 0, 0),
+        (*AstNode)ast_literal(9223372036854775808)
+    );
+    bind_body_stmts.push((*AstNode)ast_return(closure_tagged));
+
+    var bind_body: *AstNode = (*AstNode)ast_block(bind_body_stmts);
     var bind_fn: *AstFunc = ast_func_ex(bind_name.ptr, bind_name.len, bind_params,
                                         TYPE_U64, 0, 0, 0, 0, 0, 0, bind_body);
     parse_generated_funcs_push(p, (u64)bind_fn);
@@ -778,15 +1082,429 @@ func parse_primary_lambda_expr(p: *Parser) -> *AstNode {
     return (*AstNode)ast_call_with_origin_named(bind_name.ptr, bind_name.len, bind_call_args, 0, AST_CALL_ORIGIN_DIRECT);
 }
 
-func parse_match_expr_make_case_body(expr: *AstNode) -> *AstNode {
-    var stmts: *Vec<*AstNode> = new Vec<*AstNode>(1);
-    stmts.push((*AstNode)ast_return(expr));
-    return (*AstNode)ast_block(stmts);
+const MATCH_EXPR_ARM_SIMPLE = 1;
+const MATCH_EXPR_ARM_VARIANT = 2;
+const MATCH_EXPR_ARM_DEFAULT = 3;
+
+struct ParseMatchExprArm {
+    public kind: u64;
+    public values_vec: *Vec<*AstNode>;
+    public enum_ptr: u64;
+    public enum_len: u64;
+    public variant_ptr: u64;
+    public variant_len: u64;
+    public bind_names: *Vec<*NameInfo>;
+    public value_expr: *AstNode;
+}
+
+impl ParseMatchExprArm {
+    public constructor() {
+        self.kind = 0;
+        self.values_vec = 0;
+        self.enum_ptr = 0;
+        self.enum_len = 0;
+        self.variant_ptr = 0;
+        self.variant_len = 0;
+        self.bind_names = 0;
+        self.value_expr = 0;
+    }
 }
 
 func parse_match_expr_make_empty_call(name_ptr: u64, name_len: u64) -> *AstNode {
     var args: *Vec<*AstNode> = new Vec<*AstNode>(0);
     return (*AstNode)ast_call_with_origin_named(name_ptr, name_len, args, 0, AST_CALL_ORIGIN_DIRECT);
+}
+
+func parse_match_expr_wrap_stmt_in_block(stmt: *AstNode) -> *AstNode {
+    var stmts: *Vec<*AstNode> = new Vec<*AstNode>(1);
+    stmts.push(stmt);
+    return (*AstNode)ast_block(stmts);
+}
+
+func parse_match_expr_payload_field_name(idx: u64) -> *NameInfo {
+    var prefix_ptr: u64 = (u64)"v";
+    var prefix_len: u64 = 1;
+    var idx_buf: u64 = heap_alloc(32 * sizeof(u8));
+    var idx_len: u64 = io_u64_to_ascii(idx_buf, idx);
+    var out_len: u64 = prefix_len + idx_len;
+    var out_ptr: u64 = heap_alloc((out_len + 1) * sizeof(u8));
+    var out_u8: []u8 = slice(out_ptr, out_len + 1);
+    str_copy(out_ptr, prefix_ptr, prefix_len);
+    str_copy(out_ptr + prefix_len, idx_buf, idx_len);
+    out_u8[out_len] = 0;
+    return new NameInfo{out_ptr, out_len};
+}
+
+func parse_match_expr_parse_variant_case_head(p: *Parser) -> *ParseMatchExprArm {
+    if (parse_peek_kind(p) != TOKEN_IDENTIFIER) { return 0; }
+    var saved: u64 = parser_pos(p);
+    var enum_tok: *Token = parse_peek(p);
+    parse_adv(p);
+    if (parse_match(p, TOKEN_DOT) == 0) {
+        parser_set_pos(p, saved);
+        return 0;
+    }
+    if (parse_peek_kind(p) != TOKEN_IDENTIFIER) {
+        parser_set_pos(p, saved);
+        return 0;
+    }
+    var variant_tok: *Token = parse_peek(p);
+    parse_adv(p);
+
+    var expected_arity: u64 = compiler_get_enum_variant_arity(enum_tok.ptr, enum_tok.len, variant_tok.ptr, variant_tok.len);
+    if (expected_arity == 9223372036854775807) {
+        parser_set_pos(p, saved);
+        return 0;
+    }
+
+    var bind_names: *Vec<*NameInfo> = new Vec<*NameInfo>(expected_arity);
+    if (parse_match(p, TOKEN_LPAREN)) {
+        if (parse_peek_kind(p) != TOKEN_RPAREN) {
+            while (1) {
+                if (parse_peek_kind(p) != TOKEN_IDENTIFIER) {
+                    emit_stderr("[ERROR] match expression variant payload binding must be identifier\n");
+                    parse_panic_here(p, "Syntax error");
+                }
+                var bind_tok: *Token = parse_peek(p);
+                parse_consume(p, TOKEN_IDENTIFIER);
+                bind_names.push(new NameInfo{bind_tok.ptr, bind_tok.len});
+                if (parse_match(p, TOKEN_COMMA) == 0) { break; }
+            }
+        }
+        parse_consume(p, TOKEN_RPAREN);
+    }
+
+    if (bind_names.len() != expected_arity) {
+        emit_stderr("[ERROR] match expression variant payload arity mismatch: ");
+        emit_stderr_len(enum_tok.ptr, enum_tok.len);
+        emit_stderr(".");
+        emit_stderr_len(variant_tok.ptr, variant_tok.len);
+        emit_stderr(" expects ");
+        emit_u64_stderr(expected_arity);
+        emit_stderr(" binding(s), got ");
+        emit_u64_stderr(bind_names.len());
+        emit_stderr("\n");
+        parse_panic_here(p, "Syntax error");
+    }
+    if (parse_peek_kind(p) == TOKEN_COMMA) {
+        emit_stderr("[ERROR] variant match case cannot be combined with comma-separated values in match expression\n");
+        parse_panic_here(p, "Syntax error");
+    }
+
+    var arm: *ParseMatchExprArm = new ParseMatchExprArm();
+    arm.kind = MATCH_EXPR_ARM_VARIANT;
+    arm.enum_ptr = enum_tok.ptr;
+    arm.enum_len = enum_tok.len;
+    arm.variant_ptr = variant_tok.ptr;
+    arm.variant_len = variant_tok.len;
+    arm.bind_names = bind_names;
+    return arm;
+}
+
+func parse_match_expr_parse_case_head(p: *Parser) -> *ParseMatchExprArm {
+    var arm: *ParseMatchExprArm = new ParseMatchExprArm();
+    if (parse_peek_kind(p) == TOKEN_DEFAULT) {
+        parse_consume(p, TOKEN_DEFAULT);
+        arm.kind = MATCH_EXPR_ARM_DEFAULT;
+        return arm;
+    }
+    if (parse_peek_kind(p) != TOKEN_CASE) { return 0; }
+    parse_consume(p, TOKEN_CASE);
+
+    if (parse_peek_kind(p) == TOKEN_IDENTIFIER) {
+        var wc_tok: *Token = parse_peek(p);
+        if (wc_tok.len == 1 && str_eq(wc_tok.ptr, wc_tok.len, "_", 1) != 0) {
+            parse_adv(p);
+            arm.kind = MATCH_EXPR_ARM_DEFAULT;
+            return arm;
+        }
+    }
+
+    var variant_arm: *ParseMatchExprArm = parse_match_expr_parse_variant_case_head(p);
+    if (variant_arm != 0) { return variant_arm; }
+
+    arm.kind = MATCH_EXPR_ARM_SIMPLE;
+    arm.values_vec = new Vec<*AstNode>(2);
+    arm.values_vec.push(parse_expr(p));
+    while (parse_match(p, TOKEN_COMMA)) {
+        if (parse_peek_kind(p) == TOKEN_IDENTIFIER) {
+            var wc_tok2: *Token = parse_peek(p);
+            if (wc_tok2.len == 1 && str_eq(wc_tok2.ptr, wc_tok2.len, "_", 1) != 0) {
+                emit_stderr("[ERROR] wildcard '_' cannot be mixed with explicit case values in match expression\n");
+                parse_panic_here(p, "Syntax error");
+            }
+        }
+        arm.values_vec.push(parse_expr(p));
+    }
+    return arm;
+}
+
+func parse_match_expr_build_tag_expr(tmp_name_ptr: u64, tmp_name_len: u64) -> *AstNode {
+    return (*AstNode)ast_member_access((*AstNode)ast_ident(tmp_name_ptr, tmp_name_len), "__tag", 5);
+}
+
+func parse_match_expr_build_simple_case_cond(tmp_name_ptr: u64, tmp_name_len: u64, values: *Vec<*AstNode>, enum_mode: u64) -> *AstNode {
+    if (values == 0 || values.len() == 0) { return (*AstNode)ast_literal(0); }
+    var lhs: *AstNode = (*AstNode)ast_ident(tmp_name_ptr, tmp_name_len);
+    if (enum_mode != 0) {
+        lhs = parse_match_expr_build_tag_expr(tmp_name_ptr, tmp_name_len);
+    }
+    var cond: *AstNode = (*AstNode)ast_binary(TOKEN_EQEQ, lhs, values.get(0));
+    var n: u64 = values.len();
+    for (var i: u64 = 1; i < n; i++) {
+        var cmp_lhs: *AstNode = (*AstNode)ast_ident(tmp_name_ptr, tmp_name_len);
+        if (enum_mode != 0) {
+            cmp_lhs = parse_match_expr_build_tag_expr(tmp_name_ptr, tmp_name_len);
+        }
+        var cmp: *AstNode = (*AstNode)ast_binary(TOKEN_EQEQ, cmp_lhs, values.get(i));
+        cond = (*AstNode)ast_binary(TOKEN_OROR, cond, cmp);
+    }
+    return cond;
+}
+
+func parse_match_expr_is_enum_variant_const(node: *AstNode, enum_ptr: u64, enum_len: u64, variant_ptr: u64, variant_len: u64) -> u64 {
+    if (node == 0) { return 0; }
+    var kind: u64 = ast_kind(node);
+    if (kind == AST_CAST) {
+        return parse_match_expr_is_enum_variant_const(((*AstCast)node).expr, enum_ptr, enum_len, variant_ptr, variant_len);
+    }
+    if (kind == AST_MEMBER_ACCESS) {
+        var ma: *AstMemberAccess = (*AstMemberAccess)node;
+        if (ma.object == 0 || ast_kind(ma.object) != AST_IDENT) { return 0; }
+        var obj: *AstIdent = (*AstIdent)ma.object;
+        if (str_eq(obj.name_ptr, obj.name_len, enum_ptr, enum_len) == 0) { return 0; }
+        if (str_eq(ma.member_ptr, ma.member_len, variant_ptr, variant_len) == 0) { return 0; }
+        return 1;
+    }
+    if (kind == AST_IDENT) {
+        var id: *AstIdent = (*AstIdent)node;
+        var scoped: *NameInfo = module_util_build_joined_name(enum_ptr, enum_len, variant_ptr, variant_len);
+        if (str_eq(id.name_ptr, id.name_len, scoped.ptr, scoped.len) != 0) { return 1; }
+    }
+    return 0;
+}
+
+func parse_match_expr_arm_covers_variant(arm: *ParseMatchExprArm, enum_ptr: u64, enum_len: u64, variant_ptr: u64, variant_len: u64) -> u64 {
+    if (arm == 0) { return 0; }
+    if (arm.kind == MATCH_EXPR_ARM_VARIANT) {
+        if (str_eq(arm.enum_ptr, arm.enum_len, enum_ptr, enum_len) == 0) { return 0; }
+        if (str_eq(arm.variant_ptr, arm.variant_len, variant_ptr, variant_len) == 0) { return 0; }
+        return 1;
+    }
+    if (arm.kind != MATCH_EXPR_ARM_SIMPLE || arm.values_vec == 0) { return 0; }
+    var n: u64 = arm.values_vec.len();
+    for (var i: u64 = 0; i < n; i++) {
+        if (parse_match_expr_is_enum_variant_const(arm.values_vec.get(i), enum_ptr, enum_len, variant_ptr, variant_len) != 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+func parse_match_expr_has_default_arm(arms: *Vec<*ParseMatchExprArm>) -> u64 {
+    if (arms == 0) { return 0; }
+    var n: u64 = arms.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var arm: *ParseMatchExprArm = arms.get(i);
+        if (arm != 0 && arm.kind == MATCH_EXPR_ARM_DEFAULT) { return 1; }
+    }
+    return 0;
+}
+
+func parse_match_expr_is_exhaustive_enum(arms: *Vec<*ParseMatchExprArm>, enum_ptr: u64, enum_len: u64) -> u64 {
+    if (arms == 0 || enum_ptr == 0 || enum_len == 0) { return 0; }
+    var variants: *Vec<*NameInfo> = compiler_get_enum_variants(enum_ptr, enum_len);
+    if (variants == 0 || variants.len() == 0) { return 0; }
+
+    var vn: u64 = variants.len();
+    for (var vi: u64 = 0; vi < vn; vi++) {
+        var variant: *NameInfo = variants.get(vi);
+        var covered: u64 = 0;
+        var an: u64 = arms.len();
+        for (var ai: u64 = 0; ai < an; ai++) {
+            if (parse_match_expr_arm_covers_variant(arms.get(ai), enum_ptr, enum_len, variant.ptr, variant.len) != 0) {
+                covered = 1;
+                break;
+            }
+        }
+        if (covered == 0) { return 0; }
+    }
+    return 1;
+}
+
+func parse_match_expr_find_payload_field_desc(struct_def: *AstStructDef, field_ptr: u64, field_len: u64) -> *FieldDesc {
+    if (struct_def == 0 || struct_def.fields_vec == 0) { return 0; }
+    var n: u64 = struct_def.fields_vec.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var field: *FieldDesc = struct_def.fields_vec.get(i);
+        if (str_eq(field.name_ptr, field.name_len, field_ptr, field_len) != 0) {
+            return field;
+        }
+    }
+    return 0;
+}
+
+func parse_match_expr_build_binding_decl(name_ptr: u64, name_len: u64, field_expr: *AstNode, field_desc: *FieldDesc) -> *AstVarDecl {
+    var decl: *AstVarDecl = ast_var_decl(name_ptr, name_len, TYPE_U64, 0, field_expr);
+    if (field_desc == 0) { return decl; }
+    decl.type_kind = field_desc.type_kind;
+    decl.ptr_depth = field_desc.ptr_depth;
+    decl.is_tagged = field_desc.is_tagged;
+    decl.struct_name_ptr = field_desc.struct_name_ptr;
+    decl.struct_name_len = field_desc.struct_name_len;
+    decl.tag_layout_ptr = field_desc.tag_layout_ptr;
+    decl.tag_layout_len = field_desc.tag_layout_len;
+    decl.elem_type_kind = field_desc.elem_type_kind;
+    decl.elem_ptr_depth = field_desc.elem_ptr_depth;
+    decl.array_len = field_desc.array_len;
+    decl.elem_typeinfo = field_desc.elem_typeinfo;
+    return decl;
+}
+
+func parse_match_expr_variant_then_block(p: *Parser, tmp_name_ptr: u64, tmp_name_len: u64, arm: *ParseMatchExprArm) -> *AstNode {
+    var stmts: *Vec<*AstNode> = new Vec<*AstNode>(8);
+    if (arm.bind_names != 0 && arm.bind_names.len() != 0) {
+        var payload_info: *NameInfo = compiler_get_enum_variant_payload_struct(arm.enum_ptr, arm.enum_len, arm.variant_ptr, arm.variant_len);
+        if (payload_info == 0) {
+            emit_stderr("[ERROR] enum variant payload metadata is missing for match expression arm\n");
+            parse_panic_here(p, "Syntax error");
+        }
+        var payload_struct: *AstStructDef = get_struct_def(payload_info.ptr, payload_info.len);
+        if (payload_struct == 0) {
+            emit_stderr("[ERROR] enum payload struct type not found: ");
+            emit_stderr_len(payload_info.ptr, payload_info.len);
+            emit_stderr("\n");
+            parse_panic_here(p, "Syntax error");
+        }
+
+        var payload_tmp: *NameInfo = parse_lambda_build_name_with_prefix("__match_payload_", 16, parse_next_generated_id(p));
+        var payload_slot_expr: *AstNode = (*AstNode)ast_member_access((*AstNode)ast_ident(tmp_name_ptr, tmp_name_len), "__payload", 9);
+        var payload_cast: *AstNode = (*AstNode)ast_cast_ex(payload_slot_expr, TYPE_STRUCT, 1, 0, payload_info.ptr, payload_info.len, 0, 0);
+        var payload_decl: *AstVarDecl = ast_var_decl(payload_tmp.ptr, payload_tmp.len, TYPE_STRUCT, 1, payload_cast);
+        payload_decl.struct_name_ptr = payload_info.ptr;
+        payload_decl.struct_name_len = payload_info.len;
+        stmts.push((*AstNode)payload_decl);
+
+        var bn: u64 = arm.bind_names.len();
+        for (var bi: u64 = 0; bi < bn; bi++) {
+            var bind: *NameInfo = arm.bind_names.get(bi);
+            var field_name: *NameInfo = parse_match_expr_payload_field_name(bi);
+            var field_desc: *FieldDesc = parse_match_expr_find_payload_field_desc(payload_struct, field_name.ptr, field_name.len);
+            var field_expr: *AstNode = (*AstNode)ast_member_access((*AstNode)ast_deref((*AstNode)ast_ident(payload_tmp.ptr, payload_tmp.len)), field_name.ptr, field_name.len);
+            stmts.push((*AstNode)parse_match_expr_build_binding_decl(bind.ptr, bind.len, field_expr, field_desc));
+        }
+    }
+    stmts.push((*AstNode)ast_return(arm.value_expr));
+    return (*AstNode)ast_block(stmts);
+}
+
+func parse_match_expr_lower_if_chain(p: *Parser, scrutinee_expr: *AstNode, arms: *Vec<*ParseMatchExprArm>, tmp_name_ptr: u64, tmp_name_len: u64) -> *AstNode {
+    if (arms == 0 || arms.len() == 0) { return 0; }
+    var enum_ptr: u64 = 0;
+    var enum_len: u64 = 0;
+    var n: u64 = arms.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var arm0: *ParseMatchExprArm = arms.get(i);
+        if (arm0.kind != MATCH_EXPR_ARM_VARIANT) { continue; }
+        if (enum_ptr == 0) {
+            enum_ptr = arm0.enum_ptr;
+            enum_len = arm0.enum_len;
+        } else if (str_eq(enum_ptr, enum_len, arm0.enum_ptr, arm0.enum_len) == 0) {
+            emit_stderr("[ERROR] all variant match expression arms must target the same enum type\n");
+            parse_panic_here(p, "Syntax error");
+        }
+    }
+
+    var has_default: u64 = parse_match_expr_has_default_arm(arms);
+    var is_exhaustive_enum: u64 = 0;
+    if (has_default == 0 && enum_ptr != 0) {
+        is_exhaustive_enum = parse_match_expr_is_exhaustive_enum(arms, enum_ptr, enum_len);
+        if (is_exhaustive_enum == 0) {
+            var variants: *Vec<*NameInfo> = compiler_get_enum_variants(enum_ptr, enum_len);
+            if (variants != 0) {
+                var vn: u64 = variants.len();
+                for (var vi: u64 = 0; vi < vn; vi++) {
+                    var variant: *NameInfo = variants.get(vi);
+                    if (parse_match_expr_arm_covers_variant(arms.get(0), enum_ptr, enum_len, variant.ptr, variant.len) == 0) {
+                        // Find the first uncovered case for diagnostics.
+                        var covered: u64 = 0;
+                        for (var ai: u64 = 0; ai < n; ai++) {
+                            if (parse_match_expr_arm_covers_variant(arms.get(ai), enum_ptr, enum_len, variant.ptr, variant.len) != 0) {
+                                covered = 1;
+                                break;
+                            }
+                        }
+                        if (covered == 0) {
+                            emit_stderr("[ERROR] non-exhaustive match expression: missing case ");
+                            emit_stderr_len(enum_ptr, enum_len);
+                            emit_stderr(".");
+                            emit_stderr_len(variant.ptr, variant.len);
+                            emit_stderr("\n");
+                            parse_panic_here(p, "Syntax error");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (has_default == 0 && is_exhaustive_enum == 0) {
+        emit_stderr("[ERROR] match expression requires a default arm or exhaustive enum variant arms\n");
+        parse_panic_here(p, "Syntax error");
+    }
+
+    var tmp_decl: *AstVarDecl = ast_var_decl(tmp_name_ptr, tmp_name_len, TYPE_U64, 0, scrutinee_expr);
+    if (enum_ptr != 0) {
+        tmp_decl.type_kind = TYPE_STRUCT;
+        tmp_decl.ptr_depth = 0;
+        tmp_decl.struct_name_ptr = enum_ptr;
+        tmp_decl.struct_name_len = enum_len;
+    }
+
+    var chain: *AstNode = 0;
+    for (var ri: i64 = (i64)n - 1; ri >= 0; ri = ri - 1) {
+        var arm: *ParseMatchExprArm = arms.get((u64)ri);
+        if (arm.kind == MATCH_EXPR_ARM_DEFAULT) {
+            chain = (*AstNode)ast_block(new Vec<*AstNode>(1));
+            ((*AstBlock)chain).stmts_vec.push((*AstNode)ast_return(arm.value_expr));
+            continue;
+        }
+        var else_block: *AstNode = chain;
+        if (else_block != 0 && ast_kind(else_block) == AST_IF) {
+            else_block = parse_match_expr_wrap_stmt_in_block(else_block);
+        }
+        if (arm.kind == MATCH_EXPR_ARM_VARIANT) {
+            var tag_const: *NameInfo = module_util_build_joined_name(arm.enum_ptr, arm.enum_len, arm.variant_ptr, arm.variant_len);
+            var cond_v: *AstNode = (*AstNode)ast_binary(TOKEN_EQEQ, parse_match_expr_build_tag_expr(tmp_name_ptr, tmp_name_len), (*AstNode)ast_ident(tag_const.ptr, tag_const.len));
+            var then_v: *AstNode = parse_match_expr_variant_then_block(p, tmp_name_ptr, tmp_name_len, arm);
+            chain = (*AstNode)ast_if(cond_v, then_v, else_block);
+            continue;
+        }
+        var cond_s: *AstNode = parse_match_expr_build_simple_case_cond(tmp_name_ptr, tmp_name_len, arm.values_vec, enum_ptr != 0);
+        var then_s_stmts: *Vec<*AstNode> = new Vec<*AstNode>(1);
+        then_s_stmts.push((*AstNode)ast_return(arm.value_expr));
+        chain = (*AstNode)ast_if(cond_s, (*AstNode)ast_block(then_s_stmts), else_block);
+    }
+
+    var fn_body_stmts: *Vec<*AstNode> = new Vec<*AstNode>(4);
+    fn_body_stmts.push((*AstNode)tmp_decl);
+    if (chain != 0) { fn_body_stmts.push(chain); }
+    fn_body_stmts.push((*AstNode)ast_return((*AstNode)ast_literal(0)));
+    return (*AstNode)ast_block(fn_body_stmts);
+}
+
+func parse_match_expr_make_bind_params(bind_names: *Vec<*NameInfo>) -> *Vec<*Param> {
+    if (bind_names == 0) { return 0; }
+    var params: *Vec<*Param> = new Vec<*Param>(bind_names.len());
+    var n: u64 = bind_names.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var info: *NameInfo = bind_names.get(i);
+        var p: *Param = new Param();
+        p.name_ptr = info.ptr;
+        p.name_len = info.len;
+        parse_lambda_param_set_default(p);
+        params.push(p);
+    }
+    return params;
 }
 
 func parse_primary_match_expr(p: *Parser) -> *AstNode {
@@ -803,123 +1521,109 @@ func parse_primary_match_expr(p: *Parser) -> *AstNode {
     var captures: *Vec<*LambdaCapture> = new Vec<*LambdaCapture>(4);
     parse_lambda_collect_expr_captures(p, scrutinee_expr, 0, captures);
 
-    var cases: *Vec<*AstNode> = new Vec<*AstNode>(8);
+    var arms: *Vec<*ParseMatchExprArm> = new Vec<*ParseMatchExprArm>(8);
     var case_value_nodes: *Vec<*AstNode> = new Vec<*AstNode>(8);
     var arm_expr_nodes: *Vec<*AstNode> = new Vec<*AstNode>(8);
-    var default_count: u64 = 0;
 
     while (parse_peek_kind(p) != TOKEN_RBRACE && parse_peek_kind(p) != TOKEN_EOF) {
-        var is_default_case: u64 = 0;
-        var case_values: *Vec<*AstNode> = new Vec<*AstNode>(2);
-
-        if (parse_peek_kind(p) == TOKEN_CASE) {
-            parse_consume(p, TOKEN_CASE);
-            while (1) {
-                if (parse_peek_kind(p) == TOKEN_IDENTIFIER) {
-                    var maybe_wild: *Token = parse_peek(p);
-                    if (maybe_wild.len == 1) {
-                        var wild_u8: []u8 = slice(maybe_wild.ptr, 1);
-                        if (wild_u8[0] == 95) {
-                            parse_adv(p);
-                            is_default_case = 1;
-                            default_count = default_count + 1;
-                            if (parse_peek_kind(p) == TOKEN_COMMA) {
-                                emit_stderr("[ERROR] wildcard '_' cannot be mixed with other case values in match expression\n");
-                                parse_panic_here(p, "Syntax error");
-                            }
-                            break;
-                        }
-                    }
-                }
-                case_values.push(parse_expr(p));
-                if (parse_match(p, TOKEN_COMMA) == 0) { break; }
-            }
-            parse_consume(p, TOKEN_COLON);
-        } else if (parse_peek_kind(p) == TOKEN_DEFAULT) {
-            parse_consume(p, TOKEN_DEFAULT);
-            parse_consume(p, TOKEN_COLON);
-            is_default_case = 1;
-            default_count = default_count + 1;
-        } else {
+        var arm: *ParseMatchExprArm = parse_match_expr_parse_case_head(p);
+        if (arm == 0) {
             emit_stderr("[ERROR] Expected 'case' or 'default' in match expression\n");
             parse_panic_here(p, "Syntax error");
-            break;
         }
+        parse_consume(p, TOKEN_COLON);
 
         if (parse_peek_kind(p) == TOKEN_SEMICOLON) {
             emit_stderr("[ERROR] match expression arm value is required\n");
             parse_panic_here(p, "Syntax error");
         }
-        var arm_expr: *AstNode = parse_expr(p);
+        arm.value_expr = parse_expr(p);
         parse_consume(p, TOKEN_SEMICOLON);
-        arm_expr_nodes.push(arm_expr);
-        parse_lambda_collect_expr_captures(p, arm_expr, 0, captures);
+        arm_expr_nodes.push(arm.value_expr);
 
-        if (is_default_case != 0) {
-            cases.push(ast_case((*AstNode)ast_literal(0), parse_match_expr_make_case_body(arm_expr), 1));
-        } else {
-            if (case_values.len() == 0) {
-                emit_stderr("[ERROR] case value is required in match expression\n");
-                parse_panic_here(p, "Syntax error");
-            }
-            var cvn: u64 = case_values.len();
+        var bind_params: *Vec<*Param> = parse_match_expr_make_bind_params(arm.bind_names);
+        parse_lambda_collect_expr_captures(p, arm.value_expr, bind_params, captures);
+
+        if (arm.kind == MATCH_EXPR_ARM_SIMPLE && arm.values_vec != 0) {
+            var cvn: u64 = arm.values_vec.len();
             for (var cvi: u64 = 0; cvi < cvn; cvi++) {
-                var cexpr: *AstNode = case_values.get(cvi);
+                var cexpr: *AstNode = arm.values_vec.get(cvi);
                 case_value_nodes.push(cexpr);
                 parse_lambda_collect_expr_captures(p, cexpr, 0, captures);
-                cases.push(ast_case(cexpr, parse_match_expr_make_case_body(arm_expr), 0));
             }
+        }
+        arms.push(arm);
+    }
+    parse_consume(p, TOKEN_RBRACE);
+
+    var fn_params: *Vec<*Param> = new Vec<*Param>(0);
+    var has_captures: u64 = 0;
+    var env_struct: *AstStructDef = 0;
+    if (captures != 0 && captures.len() != 0) {
+        has_captures = 1;
+        parse_lambda_set_capture_field_names(captures);
+        env_struct = parse_lambda_build_env_struct(captures, lambda_id);
+        fn_params.push(parse_lambda_make_env_param(env_struct));
+
+        scrutinee_expr = parse_lambda_rewrite_expr_captures_env(p, scrutinee_expr, captures, "__env", 5);
+        var cvn2: u64 = case_value_nodes.len();
+        for (var i: u64 = 0; i < cvn2; i++) {
+            case_value_nodes.set(i, parse_lambda_rewrite_expr_captures_env(p, case_value_nodes.get(i), captures, "__env", 5));
+        }
+        var an: u64 = arm_expr_nodes.len();
+        for (var ai: u64 = 0; ai < an; ai++) {
+            arm_expr_nodes.set(ai, parse_lambda_rewrite_expr_captures_env(p, arm_expr_nodes.get(ai), captures, "__env", 5));
         }
     }
 
-    parse_consume(p, TOKEN_RBRACE);
-    if (default_count == 0) {
-        emit_stderr("[ERROR] match expression requires a default arm ('default' or 'case _')\n");
-        parse_panic_here(p, "Syntax error");
-    }
-
-    parse_lambda_emit_capture_globals(p, captures, lambda_id);
-    scrutinee_expr = parse_lambda_rewrite_expr_captures(p, scrutinee_expr, captures);
-    var cvn2: u64 = case_value_nodes.len();
-    for (var i: u64 = 0; i < cvn2; i++) {
-        case_value_nodes.set(i, parse_lambda_rewrite_expr_captures(p, case_value_nodes.get(i), captures));
-    }
-    var an: u64 = arm_expr_nodes.len();
-    for (var ai: u64 = 0; ai < an; ai++) {
-        arm_expr_nodes.set(ai, parse_lambda_rewrite_expr_captures(p, arm_expr_nodes.get(ai), captures));
-    }
-
-    var fn_body_stmts: *Vec<*AstNode> = new Vec<*AstNode>(4);
-    fn_body_stmts.push((*AstNode)ast_var_decl(tmp_name.ptr, tmp_name.len, TYPE_U64, 0, scrutinee_expr));
-    fn_body_stmts.push((*AstNode)ast_match((*AstNode)ast_ident(tmp_name.ptr, tmp_name.len), cases));
-    fn_body_stmts.push((*AstNode)ast_return((*AstNode)ast_literal(0)));
-    var fn_body: *AstNode = (*AstNode)ast_block(fn_body_stmts);
-
-    var fn: *AstFunc = ast_func_ex(fn_name.ptr, fn_name.len, new Vec<*Param>(0),
+    var fn_body: *AstNode = parse_match_expr_lower_if_chain(p, scrutinee_expr, arms, tmp_name.ptr, tmp_name.len);
+    var fn: *AstFunc = ast_func_ex(fn_name.ptr, fn_name.len, fn_params,
                                    TYPE_U64, 0, 0, 0, 0, 0, 0, fn_body);
     parse_generated_funcs_push(p, (u64)fn);
 
-    if (captures == 0 || captures.len() == 0) {
+    if (has_captures == 0) {
         return parse_match_expr_make_empty_call(fn_name.ptr, fn_name.len);
     }
 
     var bind_name: *NameInfo = parse_lambda_build_name_with_prefix("__match_bind_", 13, lambda_id);
     var bind_params: *Vec<*Param> = new Vec<*Param>(captures.len());
-    var bind_stmts: *Vec<*AstNode> = new Vec<*AstNode>(captures.len() + 1);
+    var bind_stmts: *Vec<*AstNode> = new Vec<*AstNode>(captures.len() + 8);
     var bind_call_args: *Vec<*AstNode> = new Vec<*AstNode>(captures.len());
+
+    var env_alloc: *AstNode = (*AstNode)ast_new(TYPE_STRUCT, 0, 0, env_struct.name_ptr, env_struct.name_len,
+                                                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    var env_decl: *AstVarDecl = ast_var_decl("__env_obj", 9, TYPE_STRUCT, 1, env_alloc);
+    env_decl.struct_name_ptr = env_struct.name_ptr;
+    env_decl.struct_name_len = env_struct.name_len;
+    bind_stmts.push((*AstNode)env_decl);
 
     var cap_n: u64 = captures.len();
     for (var ci: u64 = 0; ci < cap_n; ci++) {
         var cap: *LambdaCapture = captures.get(ci);
         var bind_param_name: *NameInfo = parse_lambda_build_bind_param_name(ci);
         bind_params.push(parse_lambda_make_u64_param(bind_param_name.ptr, bind_param_name.len));
+
+        var env_target: *AstNode = (*AstNode)ast_member_access((*AstNode)ast_deref((*AstNode)ast_ident("__env_obj", 9)), cap.slot_ptr, cap.slot_len);
         bind_stmts.push((*AstNode)ast_assign(
-            (*AstNode)ast_ident(cap.slot_ptr, cap.slot_len),
+            env_target,
             (*AstNode)ast_ident(bind_param_name.ptr, bind_param_name.len)
         ));
-        bind_call_args.push((*AstNode)ast_ident(cap.name_ptr, cap.name_len));
+
+        if (cap.mode == LAMBDA_CAPTURE_BY_REF) {
+            bind_call_args.push((*AstNode)ast_cast_ex(
+                (*AstNode)ast_addr_of((*AstNode)ast_ident(cap.name_ptr, cap.name_len)),
+                TYPE_U64, 0, 0, 0, 0, 0, 0
+            ));
+        } else {
+            bind_call_args.push((*AstNode)ast_ident(cap.name_ptr, cap.name_len));
+        }
     }
-    bind_stmts.push((*AstNode)ast_return(parse_match_expr_make_empty_call(fn_name.ptr, fn_name.len)));
+
+    var call_args: *Vec<*AstNode> = new Vec<*AstNode>(1);
+    call_args.push((*AstNode)ast_ident("__env_obj", 9));
+    bind_stmts.push((*AstNode)ast_return(
+        (*AstNode)ast_call_with_origin_named(fn_name.ptr, fn_name.len, call_args, 0, AST_CALL_ORIGIN_DIRECT)
+    ));
     var bind_body: *AstNode = (*AstNode)ast_block(bind_stmts);
     var bind_fn: *AstFunc = ast_func_ex(bind_name.ptr, bind_name.len, bind_params,
                                         TYPE_U64, 0, 0, 0, 0, 0, 0, bind_body);

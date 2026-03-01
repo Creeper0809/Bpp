@@ -152,11 +152,13 @@ func parse_set_recovery_mode(p: *Parser, enabled: u64, max_errors: u64) -> u64 {
     p.recovery_enabled = enabled;
     if (max_errors == 0) { max_errors = 20; }
     p.max_errors = max_errors;
+    p.error_limit_reached = 0;
     return 0;
 }
 
 func parse_record_error(p: *Parser) -> u64 {
     if (p == 0) { return 0; }
+    if (p.error_limit_reached != 0) { return p.error_count; }
     p.error_count = p.error_count + 1;
     return p.error_count;
 }
@@ -182,6 +184,12 @@ func parse_is_sync_decl_token(kind: u64) -> u64 {
 func parse_recover_sync(p: *Parser) -> u64 {
     if (p == 0) { return 0; }
     if (p.recovering != 0) { return 0; }
+    if (p.error_limit_reached != 0) {
+        while (parse_peek_kind(p) != TOKEN_EOF) {
+            parse_adv(p);
+        }
+        return 0;
+    }
     p.recovering = 1;
 
     // Ensure forward progress first.
@@ -235,8 +243,12 @@ func parse_panic_at_tok(tok: *Token, msg: u64) -> u64 {
     if (p != 0 && p.recovery_enabled != 0) {
         var total: u64 = parse_record_error(p);
         if (total >= p.max_errors) {
-            emit_stderr("[ERROR] parser error limit reached; aborting parse\n");
-            panic(err_msg);
+            if (p.error_limit_reached == 0) {
+                emit_stderr("[ERROR] parser error limit reached; aborting parse\n");
+            }
+            p.error_limit_reached = 1;
+            parse_recover_sync(p);
+            return 0;
         }
         parse_recover_sync(p);
         return 0;
@@ -371,6 +383,7 @@ func parse_new(tokens: *Vec<*Token>) -> *Parser {
     p.recovering = 0;
     p.error_count = 0;
     p.max_errors = 20;
+    p.error_limit_reached = 0;
     return p;
 }
 
@@ -389,6 +402,7 @@ func parse_peek(p: *Parser) -> *Token {
 }
 
 func parse_peek_kind(p: *Parser) -> u64 {
+    if (p != 0 && p.error_limit_reached != 0) { return TOKEN_EOF; }
     var tok: *Token = parse_peek(p);
     if (tok == 0) { return TOKEN_EOF; }
     return tok.kind;
@@ -434,6 +448,7 @@ func parse_match(p: *Parser, kind: u64) -> u64 {
 }
 
 func parse_consume(p: *Parser, kind: u64) -> u64 {
+    if (p != 0 && p.error_limit_reached != 0) { return 0; }
     if (!parse_match(p, kind)) {
         var tok: *Token = parse_peek(p);
         var got: u64 = parse_peek_kind(p);
@@ -461,14 +476,21 @@ func parse_consume_generic_gt(p: *Parser) -> u64 {
     report_parse_error(TOKEN_GT, k, tok2);
 }
 
-func parse_skip_annotation_args(p: *Parser) -> u64 {
-    if (parse_match(p, TOKEN_LPAREN) == 0) { return 0; }
+func parse_capture_annotation_args(p: *Parser) -> *NameInfo {
+    if (parse_peek_kind(p) != TOKEN_LPAREN) { return 0; }
+    var start_tok: *Token = parse_peek(p);
+    var start_ptr: u64 = start_tok.ptr;
+    parse_adv(p);
+
     var depth: u64 = 1;
+    var end_ptr: u64 = start_ptr + 1;
     while (depth > 0) {
-        var k: u64 = parse_peek_kind(p);
+        var tok: *Token = parse_peek(p);
+        var k: u64 = tok.kind;
         if (k == TOKEN_EOF) {
             emit_stderr("[ERROR] annotation argument list is not closed\n");
             parse_panic_here(p, "Syntax error");
+            return 0;
         }
         if (k == TOKEN_LPAREN) {
             depth = depth + 1;
@@ -476,8 +498,22 @@ func parse_skip_annotation_args(p: *Parser) -> u64 {
             depth = depth - 1;
         }
         parse_adv(p);
+        end_ptr = tok.ptr + tok.len;
     }
-    return 1;
+    return new NameInfo{start_ptr, end_ptr - start_ptr};
+}
+
+func parse_annotation_compose_name(name_ptr: u64, name_len: u64, args: *NameInfo) -> *NameInfo {
+    if (args == 0 || args.ptr == 0 || args.len == 0) {
+        return new NameInfo{name_ptr, name_len};
+    }
+    var out_len: u64 = name_len + args.len;
+    var out_ptr: u64 = heap_alloc((out_len + 1) * sizeof(u8));
+    var out_u8: []u8 = slice(out_ptr, out_len + 1);
+    str_copy(out_ptr, name_ptr, name_len);
+    str_copy(out_ptr + name_len, args.ptr, args.len);
+    out_u8[out_len] = 0;
+    return new NameInfo{out_ptr, out_len};
 }
 
 func parse_consume_annotation_group(p: *Parser) -> *Vec<*NameInfo> {
@@ -492,10 +528,11 @@ func parse_consume_annotation_group(p: *Parser) -> *Vec<*NameInfo> {
             parse_panic_here(p, "Syntax error");
         }
         parse_adv(p);
-        names.push(new NameInfo{name_tok.ptr, name_tok.len});
+        var ann_args: *NameInfo = 0;
         if (parse_peek_kind(p) == TOKEN_LPAREN) {
-            parse_skip_annotation_args(p);
+            ann_args = parse_capture_annotation_args(p);
         }
+        names.push(parse_annotation_compose_name(name_tok.ptr, name_tok.len, ann_args));
         if (parse_match(p, TOKEN_COMMA) == 0) { break; }
     }
 
@@ -524,12 +561,31 @@ func parse_take_leading_annotations(p: *Parser) -> *Vec<*NameInfo> {
     return annotations;
 }
 
+func parse_annotation_name_base_len(name_ptr: u64, name_len: u64) -> u64 {
+    if (name_ptr == 0 || name_len == 0) { return 0; }
+    var s: []u8 = slice(name_ptr, name_len);
+    for (var i: u64 = 0; i < name_len; i++) {
+        if (s[i] == 40) { // '('
+            return i;
+        }
+    }
+    return name_len;
+}
+
+func parse_annotation_name_matches(info: *NameInfo, name_ptr: u64, name_len: u64) -> u64 {
+    if (info == 0 || info.ptr == 0 || info.len == 0) { return 0; }
+    var base_len: u64 = parse_annotation_name_base_len(info.ptr, info.len);
+    if (base_len != name_len) { return 0; }
+    if (str_eq(info.ptr, base_len, name_ptr, name_len) == 0) { return 0; }
+    return 1;
+}
+
 func parse_annotations_contains(annotations: *Vec<*NameInfo>, name_ptr: u64, name_len: u64) -> u64 {
     if (annotations == 0) { return 0; }
     var n: u64 = annotations.len();
     for (var i: u64 = 0; i < n; i++) {
         var info: *NameInfo = annotations.get(i);
-        if (str_eq(info.ptr, info.len, name_ptr, name_len) != 0) { return 1; }
+        if (parse_annotation_name_matches(info, name_ptr, name_len) != 0) { return 1; }
     }
     return 0;
 }

@@ -607,6 +607,7 @@ struct BuilderCtx {
     public var_map: *HashMap<u64, u64>;         // hashmap: name -> var_id
     public const_map: *HashMap<u64, u64>;       // hashmap: name -> const value
     public func_ptr_map: *HashMap<u64, *PtrLen>;    // hashmap: name -> [func_name_ptr, func_name_len]
+    public closure_handle_map: *HashMap<u64, u64>;  // hashmap: name -> 1 if tagged lambda closure handle
     public addr_taken_map: *HashMap<u64, u64>;  // hashmap: name -> 1
     public symtab: *Symtab;           // symtab for type/offset lookup
     public next_reg: u64;
@@ -626,6 +627,7 @@ impl BuilderCtx {
         self.var_map = 0;
         self.const_map = 0;
         self.func_ptr_map = 0;
+        self.closure_handle_map = 0;
         self.addr_taken_map = 0;
         self.symtab = 0;
         self.next_reg = 0;
@@ -681,6 +683,7 @@ func builder_reset_func(ctx: *BuilderCtx) -> u64 {
     ctx.var_map = new HashMap<u64, u64>(16);
     ctx.const_map = 0;
     ctx.func_ptr_map = 0;
+    ctx.closure_handle_map = new HashMap<u64, u64>(16);
     ctx.addr_taken_map = new HashMap<u64, u64>(16);
     ctx.symtab = symtab_new();
     ctx.next_reg = 1;
@@ -1060,6 +1063,55 @@ func builder_set_func_ptr(ctx: *BuilderCtx, name_ptr: u64, name_len: u64, func_p
 func builder_get_func_ptr(ctx: *BuilderCtx, name_ptr: u64, name_len: u64) -> *PtrLen {
     if (ctx.func_ptr_map == 0) { return 0; }
     return ctx.func_ptr_map.get(name_ptr, name_len);
+}
+
+func builder_set_closure_handle(ctx: *BuilderCtx, name_ptr: u64, name_len: u64, enabled: u64) -> u64 {
+    if (ctx == 0) { return 0; }
+    if (ctx.closure_handle_map == 0) {
+        ctx.closure_handle_map = new HashMap<u64, u64>(16);
+    }
+    if (enabled == 0) {
+        ctx.closure_handle_map.put(name_ptr, name_len, 0);
+        return 0;
+    }
+    ctx.closure_handle_map.put(name_ptr, name_len, 1);
+    return 0;
+}
+
+func builder_is_closure_handle(ctx: *BuilderCtx, name_ptr: u64, name_len: u64) -> u64 {
+    if (ctx == 0 || ctx.closure_handle_map == 0) { return 0; }
+    if (ctx.closure_handle_map.get(name_ptr, name_len) == 1) { return 1; }
+    return 0;
+}
+
+func builder_is_lambda_bind_name(name_ptr: u64, name_len: u64) -> u64 {
+    if (name_ptr == 0 || name_len < 14) { return 0; }
+    if (str_eq(name_ptr, 14, "__lambda_bind_", 14) == 0) { return 0; }
+    return 1;
+}
+
+func builder_expr_is_lambda_closure_handle(ctx: *BuilderCtx, expr: u64) -> u64 {
+    if (expr == 0) { return 0; }
+    var kind: u64 = ast_kind(expr);
+    if (kind == AST_CALL) {
+        var call: *AstCall = (*AstCall)expr;
+        if (builder_is_lambda_bind_name(call.name_ptr, call.name_len) != 0) { return 1; }
+        return 0;
+    }
+    if (kind == AST_IDENT) {
+        var idn: *AstIdent = (*AstIdent)expr;
+        return builder_is_closure_handle(ctx, idn.name_ptr, idn.name_len);
+    }
+    return 0;
+}
+
+func builder_track_closure_handle_from_expr(ctx: *BuilderCtx, target_name_ptr: u64, target_name_len: u64, value_expr: u64) -> u64 {
+    if (builder_expr_is_lambda_closure_handle(ctx, value_expr) != 0) {
+        builder_set_closure_handle(ctx, target_name_ptr, target_name_len, 1);
+        return 0;
+    }
+    builder_set_closure_handle(ctx, target_name_ptr, target_name_len, 0);
+    return 0;
 }
 
 func builder_apply_param_typeinfo(p: *Param, ti: *TypeInfo) -> u64 {
@@ -2109,6 +2161,70 @@ func builder_emit_method_call_slice_store(ctx: *BuilderCtx, mc: *AstMethodCall, 
     return 0;
 }
 
+func builder_lambda_closure_unpack_regs(ctx: *BuilderCtx, closure_handle_reg: u64) -> *SliceRegs {
+    var obj_reg: u64 = builder_new_reg(ctx);
+    var mask_reg: u64 = build_const(ctx, 9223372036854775807);
+    var and_ptr: *SSAInstruction = ssa_new_inst(ctx.ssa_ctx, SSA_OP_AND, obj_reg, ssa_operand_reg(closure_handle_reg), ssa_operand_reg(mask_reg));
+    ssa_inst_append(ctx.cur_block, and_ptr);
+
+    var fn_reg: u64 = builder_load_by_size(ctx, obj_reg, 8);
+    var off8: u64 = build_const(ctx, 8);
+    var env_addr: u64 = builder_new_reg(ctx);
+    var add_ptr: *SSAInstruction = ssa_new_inst(ctx.ssa_ctx, SSA_OP_ADD, env_addr, ssa_operand_reg(obj_reg), ssa_operand_reg(off8));
+    ssa_inst_append(ctx.cur_block, add_ptr);
+    var env_reg: u64 = builder_load_by_size(ctx, env_addr, 8);
+    return new SliceRegs{fn_reg, env_reg};
+}
+
+func builder_emit_lambda_closure_call(ctx: *BuilderCtx, cp: *AstCallPtr, dst: u64, extra_dst: u64) -> u64 {
+    var closure_reg: u64 = builder_call_ptr_callee_reg(ctx, cp.callee);
+    var unpacked: *SliceRegs = builder_lambda_closure_unpack_regs(ctx, closure_reg);
+    var fn_reg: u64 = unpacked.ptr_reg;
+    var env_reg: u64 = unpacked.len_reg;
+
+    var args: *Vec<u64> = cp.args_vec;
+    var arg_regs: *Vec<u64> = builder_make_call_arg_regs(ctx, args, builder_call_prefix_one(env_reg));
+    var ret_meta: BuilderCallRetMeta = builder_call_ret_meta(ctx, (u64)cp, TYPE_I64, 0);
+    var info: *SSACallPtrInfo = builder_make_call_ptr_info(fn_reg, arg_regs, ret_meta.ret_type, ret_meta.ret_ptr_depth, ret_meta.ret_struct_size);
+
+    var extra_opr: u64 = 0;
+    if (extra_dst != 0) { extra_opr = ssa_operand_reg(extra_dst); }
+    var call_ptr: *SSAInstruction = ssa_new_inst(ctx.ssa_ctx, SSA_OP_CALL_PTR, dst, ssa_operand_const((u64)info), extra_opr);
+    ssa_inst_append(ctx.cur_block, call_ptr);
+    return dst;
+}
+
+func builder_emit_lambda_closure_call_sret(ctx: *BuilderCtx, cp: *AstCallPtr, addr_reg: u64) -> u64 {
+    if (addr_reg == 0) { return 0; }
+    var closure_reg: u64 = builder_call_ptr_callee_reg(ctx, cp.callee);
+    var unpacked: *SliceRegs = builder_lambda_closure_unpack_regs(ctx, closure_reg);
+    var fn_reg: u64 = unpacked.ptr_reg;
+    var env_reg: u64 = unpacked.len_reg;
+
+    var args: *Vec<u64> = cp.args_vec;
+    var arg_regs: *Vec<u64> = builder_make_call_arg_regs(ctx, args, builder_call_prefix_two(addr_reg, env_reg));
+    var ret_meta: BuilderCallRetMeta = builder_call_ret_meta(ctx, (u64)cp, TYPE_STRUCT, 0);
+    var info: *SSACallPtrInfo = builder_make_call_ptr_info(fn_reg, arg_regs, ret_meta.ret_type, ret_meta.ret_ptr_depth, ret_meta.ret_struct_size);
+    var call_ptr: *SSAInstruction = ssa_new_inst(ctx.ssa_ctx, SSA_OP_CALL_PTR, 0, ssa_operand_const((u64)info), 0);
+    ssa_inst_append(ctx.cur_block, call_ptr);
+    return 0;
+}
+
+func builder_emit_lambda_closure_call_slice_store(ctx: *BuilderCtx, cp: *AstCallPtr, addr_reg: u64) -> u64 {
+    var closure_reg: u64 = builder_call_ptr_callee_reg(ctx, cp.callee);
+    var unpacked: *SliceRegs = builder_lambda_closure_unpack_regs(ctx, closure_reg);
+    var fn_reg: u64 = unpacked.ptr_reg;
+    var env_reg: u64 = unpacked.len_reg;
+
+    var args: *Vec<u64> = cp.args_vec;
+    var arg_regs: *Vec<u64> = builder_make_call_arg_regs(ctx, args, builder_call_prefix_one(env_reg));
+    var ret_meta: BuilderCallRetMeta = builder_call_ret_meta(ctx, (u64)cp, TYPE_I64, 0);
+    var info: *SSACallSliceStoreInfo = builder_make_call_slice_store_info(1, 0, 0, fn_reg, arg_regs, ret_meta.ret_type, ret_meta.ret_ptr_depth);
+    var call_ptr: *SSAInstruction = ssa_new_inst(ctx.ssa_ctx, SSA_OP_CALL_SLICE_STORE, 0, ssa_operand_const((u64)info), ssa_operand_reg(addr_reg));
+    ssa_inst_append(ctx.cur_block, call_ptr);
+    return 0;
+}
+
 func builder_emit_call_ptr(ctx: *BuilderCtx, cp: *AstCallPtr, dst: u64, extra_dst: u64) -> u64 {
     var callee_ti: *TypeInfo = get_expr_type_with_symtab(cp.callee, ctx.symtab);
     var sig_ti: *TypeInfo = typeinfo_func_signature(callee_ti);
@@ -2182,6 +2298,10 @@ func builder_emit_call_ptr(ctx: *BuilderCtx, cp: *AstCallPtr, dst: u64, extra_ds
         }
     }
 
+    if (builder_expr_is_lambda_closure_handle(ctx, cp.callee) != 0) {
+        return builder_emit_lambda_closure_call(ctx, cp, dst, extra_dst);
+    }
+
     var args: *Vec<u64> = cp.args_vec;
     var arg_regs: *Vec<u64> = builder_make_call_arg_regs(ctx, args, builder_call_prefix_none());
 
@@ -2199,6 +2319,9 @@ func builder_emit_call_ptr(ctx: *BuilderCtx, cp: *AstCallPtr, dst: u64, extra_ds
 
 func builder_emit_call_ptr_sret(ctx: *BuilderCtx, cp: *AstCallPtr, addr_reg: u64) -> u64 {
     if (addr_reg == 0) { return 0; }
+    if (builder_expr_is_lambda_closure_handle(ctx, cp.callee) != 0) {
+        return builder_emit_lambda_closure_call_sret(ctx, cp, addr_reg);
+    }
     var callee_reg: u64 = build_expr(ctx, cp.callee);
     var args: *Vec<u64> = cp.args_vec;
     var arg_regs: *Vec<u64> = builder_make_call_arg_regs(ctx, args, builder_call_prefix_one(addr_reg));
@@ -2211,6 +2334,9 @@ func builder_emit_call_ptr_sret(ctx: *BuilderCtx, cp: *AstCallPtr, addr_reg: u64
 }
 
 func builder_emit_call_ptr_slice_store(ctx: *BuilderCtx, cp: *AstCallPtr, addr_reg: u64) -> u64 {
+    if (builder_expr_is_lambda_closure_handle(ctx, cp.callee) != 0) {
+        return builder_emit_lambda_closure_call_slice_store(ctx, cp, addr_reg);
+    }
     var args: *Vec<u64> = cp.args_vec;
     var arg_regs: *Vec<u64> = builder_make_call_arg_regs(ctx, args, builder_call_prefix_none());
 
@@ -4538,6 +4664,7 @@ func builder_stmt_var_decl(ctx: *BuilderCtx, node: u64) -> u64 {
     if (vd.init_expr != 0) {
         var init_kind: u64 = ast_kind(vd.init_expr);
         builder_track_func_ptr_from_addr_of_ident(ctx, vd.name_ptr, vd.name_len, vd.init_expr);
+        builder_track_closure_handle_from_expr(ctx, vd.name_ptr, vd.name_len, vd.init_expr);
         if (vd.type_kind == TYPE_SLICE && vd.ptr_depth == 0) {
             var offset_slice: u64 = symtab_find(ctx.symtab, vd.name_ptr, vd.name_len);
             var base_addr: u64 = builder_new_lea_local(ctx, offset_slice);
@@ -4742,6 +4869,7 @@ func builder_stmt_assign(ctx: *BuilderCtx, node: u64) -> u64 {
     if (target_kind == AST_IDENT && asn.value != 0) {
         var idn_tgt: *AstIdent = (*AstIdent)asn.target;
         builder_track_func_ptr_from_addr_of_ident(ctx, idn_tgt.name_ptr, idn_tgt.name_len, asn.value);
+        builder_track_closure_handle_from_expr(ctx, idn_tgt.name_ptr, idn_tgt.name_len, asn.value);
     }
     if (builder_assign_addr_taken_ident(ctx, asn) != 0) {
         return 0;

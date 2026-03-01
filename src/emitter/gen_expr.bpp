@@ -637,6 +637,15 @@ func _cg_sysv_push_call_arg(arg: *AstNode, symtab: *Symtab) -> u64 {
     if (arg_kind == AST_CALL) {
         var call_arg: *AstCall = (*AstCall)arg;
         var fn: *AstFunc = typeinfo_find_func(call_arg.name_ptr, call_arg.name_len);
+        if (fn == 0) {
+            fn = compiler_find_func_signature_for_call(call_arg.name_ptr, call_arg.name_len);
+        }
+        if (fn == 0) {
+            var resolved_call: *NameInfo = resolve_name(call_arg.name_ptr, call_arg.name_len);
+            if (resolved_call != 0) {
+                fn = compiler_find_func_signature_for_call(resolved_call.ptr, resolved_call.len);
+            }
+        }
         if (fn != 0) {
             if (fn.ret_type == TYPE_STRUCT && fn.ret_ptr_depth == 0) {
                 var call_struct_size: u64 = sizeof_type(TYPE_STRUCT, 0, fn.ret_struct_name_ptr, fn.ret_struct_name_len);
@@ -684,13 +693,13 @@ func cg_call_param_at(fn: *AstFunc, index: u64) -> *Param {
 
 func cg_call_push_arg_with_param(arg: *AstNode, expected: *Param, symtab: *Symtab) -> u64 {
     if (expected == 0) { return _cg_sysv_push_call_arg(arg, symtab); }
-    if (expected.type_kind != TYPE_STRUCT || expected.ptr_depth == 0) {
+    if (expected.type_kind != TYPE_STRUCT) {
         return _cg_sysv_push_call_arg(arg, symtab);
     }
 
     var at: *TypeInfo = get_expr_type_with_symtab((*AstNode)arg, symtab);
     if (at == 0) { return _cg_sysv_push_call_arg(arg, symtab); }
-    if (at.type_kind != TYPE_STRUCT || at.ptr_depth == 0) {
+    if (at.type_kind != TYPE_STRUCT) {
         return _cg_sysv_push_call_arg(arg, symtab);
     }
 
@@ -710,34 +719,47 @@ func cg_call_push_arg_with_param(arg: *AstNode, expected: *Param, symtab: *Symta
         expected_name_len = expected_resolved.len;
     }
 
-    if (str_eq(src_name_ptr, src_name_len, expected_name_ptr, expected_name_len) != 0) {
-        cg_expr(arg);
-        if (at.is_tagged == 1) { emit_tagged_mask(); }
-        emit("    push rax\n");
-        return 1;
-    }
-
-    var src_def: *AstStructDef = get_struct_def(src_name_ptr, src_name_len);
-    if (src_def == 0 && (src_name_ptr != at.struct_name_ptr || src_name_len != at.struct_name_len)) {
-        src_def = get_struct_def(at.struct_name_ptr, at.struct_name_len);
-    }
-    if (src_def != 0) {
-        var up_offset: u64 = 0;
-        var up_def: *AstStructDef = 0;
-        var found_upcast: u64 = typeinfo_find_parent_offset(src_def, expected_name_ptr, expected_name_len, &up_offset, &up_def);
-        if (found_upcast == 0 && (expected_name_ptr != expected.struct_name_ptr || expected_name_len != expected.struct_name_len)) {
-            found_upcast = typeinfo_find_parent_offset(src_def, expected.struct_name_ptr, expected.struct_name_len, &up_offset, &up_def);
-        }
-        if (found_upcast != 0) {
+    // Pointer argument: keep cast-adjust path for multiple inheritance upcasts.
+    if (expected.ptr_depth > 0) {
+        if (at.ptr_depth == 0) { return _cg_sysv_push_call_arg(arg, symtab); }
+        if (str_eq(src_name_ptr, src_name_len, expected_name_ptr, expected_name_len) != 0) {
             cg_expr(arg);
             if (at.is_tagged == 1) { emit_tagged_mask(); }
-            cg_emit_adjust_rax_add(up_offset);
             emit("    push rax\n");
             return 1;
         }
+
+        var src_def: *AstStructDef = get_struct_def(src_name_ptr, src_name_len);
+        if (src_def == 0 && (src_name_ptr != at.struct_name_ptr || src_name_len != at.struct_name_len)) {
+            src_def = get_struct_def(at.struct_name_ptr, at.struct_name_len);
+        }
+        if (src_def != 0) {
+            var up_offset: u64 = 0;
+            var up_def: *AstStructDef = 0;
+            var found_upcast: u64 = typeinfo_find_parent_offset(src_def, expected_name_ptr, expected_name_len, &up_offset, &up_def);
+            if (found_upcast == 0 && (expected_name_ptr != expected.struct_name_ptr || expected_name_len != expected.struct_name_len)) {
+                found_upcast = typeinfo_find_parent_offset(src_def, expected.struct_name_ptr, expected.struct_name_len, &up_offset, &up_def);
+            }
+            if (found_upcast != 0) {
+                cg_expr(arg);
+                if (at.is_tagged == 1) { emit_tagged_mask(); }
+                cg_emit_adjust_rax_add(up_offset);
+                emit("    push rax\n");
+                return 1;
+            }
+        }
+        return _cg_sysv_push_call_arg(arg, symtab);
     }
 
-    return _cg_sysv_push_call_arg(arg, symtab);
+    if (at.ptr_depth != 0) { return _cg_sysv_push_call_arg(arg, symtab); }
+    var expected_def: *AstStructDef = get_struct_def(expected.struct_name_ptr, expected.struct_name_len);
+    var expected_ti: *TypeInfo = typeinfo_make_struct(0, expected.struct_name_ptr, expected.struct_name_len, expected_def);
+    if (typeinfo_is_assignable(at, expected_ti) == 0) {
+        return _cg_sysv_push_call_arg(arg, symtab);
+    }
+
+    var struct_size: u64 = sizeof_type(TYPE_STRUCT, 0, expected.struct_name_ptr, expected.struct_name_len);
+    return cg_sysv_push_struct_arg(arg, ast_kind(arg), struct_size, symtab);
 }
 
 func cg_index_addr(node: u64, symtab: *Symtab) -> u64 {
@@ -1015,6 +1037,12 @@ func cg_expr_call(node: u64, symtab: *Symtab) -> u64 {
     if (fn_call_direct == 0) {
         fn_call_direct = typeinfo_find_func(resolved_ptr, resolved_len);
     }
+    if (fn_call_direct == 0) {
+        fn_call_direct = compiler_find_func_signature_for_call(name_ptr, name_len);
+    }
+    if (fn_call_direct == 0) {
+        fn_call_direct = compiler_find_func_signature_for_call(resolved_ptr, resolved_len);
+    }
     var args: *Vec<*AstNode> = call.args_vec;
     var nargs: u64 = 0;
     if (args != 0) { nargs = args.len(); }
@@ -1132,8 +1160,45 @@ func cg_expr_call_ptr(node: u64, symtab: *Symtab) -> u64 {
             total_arg_words3 = total_arg_words3 + _cg_sysv_push_call_arg(arg3, symtab);
         }
     }
-    var stack_words3: u64 = _cg_sysv_pop_arg_regs(total_arg_words3);
+    // Runtime-dispatch between:
+    // - direct function pointer call (plain pointer)
+    // - tagged lambda closure handle ((u64)obj | (1<<63))
+    var label_direct: u64 = new_label();
+    var label_done: u64 = new_label();
 
+    emit("    mov r11, [rsp");
+    if (total_arg_words3 != 0) {
+        emit("+");
+        emit_u64(total_arg_words3 * 8);
+    }
+    emit("]\n");
+    emit("    mov r10, 9223372036854775808\n");
+    emit("    test r11, r10\n");
+    emit("    jz ");
+    emit_label(label_direct);
+    emit_nl();
+
+    // Closure call path: prepend env pointer argument.
+    emit("    mov rax, 9223372036854775807\n");
+    emit("    and r11, rax\n");
+    emit("    mov r10, [r11]\n");
+    emit("    mov r12, [r11+8]\n");
+    emit("    push r12\n");
+    var stack_words_closure: u64 = _cg_sysv_pop_arg_regs(total_arg_words3 + 1);
+    emit("    call r10\n");
+    var cleanup_words_closure: u64 = stack_words_closure + 1; // + hidden callee handle slot
+    if (cleanup_words_closure > 0) {
+        emit("    add rsp, ");
+        emit_u64(cleanup_words_closure * 8);
+        emit_nl();
+    }
+    emit("    jmp ");
+    emit_label(label_done);
+    emit_nl();
+
+    // Direct function pointer path.
+    emit_label_def(label_direct);
+    var stack_words3: u64 = _cg_sysv_pop_arg_regs(total_arg_words3);
     emit("    pop rax\n");
     emit("    call rax\n");
 
@@ -1142,6 +1207,7 @@ func cg_expr_call_ptr(node: u64, symtab: *Symtab) -> u64 {
         emit_u64(stack_words3 * 8);
         emit_nl();
     }
+    emit_label_def(label_done);
     return;
 }
 

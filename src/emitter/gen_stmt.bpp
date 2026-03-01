@@ -921,6 +921,9 @@ func cg_var_decl_stmt(node: u64, symtab: *Symtab, g_structs_vec: *Vec<*AstStruct
         if (cg_var_decl_init_value(decl, init, spec, offset, symtab) != 0) {
             return;
         }
+        emitter_track_closure_handle_from_expr(name_ptr, name_len, init);
+    } else {
+        emitter_set_closure_handle(name_ptr, name_len, 0);
     }
 
     cg_var_decl_emit_struct_vptr_init(spec, offset);
@@ -1240,6 +1243,92 @@ func cg_assign_try_slice_copy(target: u64, target_kind: u64, value: u64, value_k
     return 1;
 }
 
+func cg_assign_array_elem_struct_name_matches(target_ti: *TypeInfo, value_ti: *TypeInfo) -> u64 {
+    if (target_ti == 0 || value_ti == 0) { return 0; }
+    if (target_ti.elem_type_kind != TYPE_STRUCT) { return 1; }
+    if (target_ti.struct_name_ptr == 0 || target_ti.struct_name_len == 0) { return 1; }
+
+    var value_struct_ptr: u64 = value_ti.struct_name_ptr;
+    var value_struct_len: u64 = value_ti.struct_name_len;
+    if (value_ti.type_kind == TYPE_ARRAY) {
+        value_struct_ptr = value_ti.struct_name_ptr;
+        value_struct_len = value_ti.struct_name_len;
+    }
+    if (value_struct_ptr == 0 || value_struct_len == 0) { return 0; }
+    if (str_eq(target_ti.struct_name_ptr, target_ti.struct_name_len, value_struct_ptr, value_struct_len) == 0) { return 0; }
+    return 1;
+}
+
+func cg_assign_array_total_size(target_ti: *TypeInfo) -> u64 {
+    if (target_ti == 0 || target_ti.type_kind != TYPE_ARRAY || target_ti.ptr_depth != 0) { return 0; }
+    if (target_ti.array_len == 0) { return 0; }
+    var elem_size: u64 = 0;
+    if (target_ti.elem_typeinfo != 0) {
+        elem_size = sizeof_type_ex(target_ti.elem_typeinfo);
+    } else {
+        elem_size = sizeof_type(target_ti.elem_type_kind, target_ti.elem_ptr_depth, target_ti.struct_name_ptr, target_ti.struct_name_len);
+    }
+    return elem_size * target_ti.array_len;
+}
+
+func cg_assign_try_array_copy(target: u64, value: u64, symtab: *Symtab) -> u64 {
+    var target_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)target, symtab);
+    if (target_ti == 0 || target_ti.type_kind != TYPE_ARRAY || target_ti.ptr_depth != 0) { return 0; }
+
+    var value_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)value, symtab);
+    if (value_ti == 0) {
+        emit_stderr("[ERROR] array assignment requires array source or compatible element pointer\n");
+        panic("Codegen error");
+    }
+
+    var source_mode: u64 = 0; // 1=array lvalue, 2=element pointer
+    if (value_ti.type_kind == TYPE_ARRAY && value_ti.ptr_depth == 0) {
+        if (value_ti.array_len != 0 && target_ti.array_len != 0 && value_ti.array_len != target_ti.array_len) {
+            emit_stderr("[ERROR] array assignment length mismatch\n");
+            panic("Codegen error");
+        }
+        if (value_ti.elem_type_kind != 0 && target_ti.elem_type_kind != 0 && value_ti.elem_type_kind != target_ti.elem_type_kind) {
+            emit_stderr("[ERROR] array assignment element type mismatch\n");
+            panic("Codegen error");
+        }
+        if (value_ti.elem_ptr_depth != target_ti.elem_ptr_depth) {
+            emit_stderr("[ERROR] array assignment element pointer depth mismatch\n");
+            panic("Codegen error");
+        }
+        if (cg_assign_array_elem_struct_name_matches(target_ti, value_ti) == 0) {
+            emit_stderr("[ERROR] array assignment struct element type mismatch\n");
+            panic("Codegen error");
+        }
+        source_mode = 1;
+    } else if (value_ti.ptr_depth == target_ti.elem_ptr_depth + 1 && value_ti.type_kind == target_ti.elem_type_kind) {
+        if (cg_assign_array_elem_struct_name_matches(target_ti, value_ti) == 0) {
+            emit_stderr("[ERROR] array assignment pointer source element type mismatch\n");
+            panic("Codegen error");
+        }
+        source_mode = 2;
+    } else {
+        emit_stderr("[ERROR] array assignment requires array source or compatible element pointer\n");
+        panic("Codegen error");
+    }
+
+    var total_size: u64 = cg_assign_array_total_size(target_ti);
+    if (total_size == 0) {
+        emit_stderr("[ERROR] array assignment requires concrete array length\n");
+        panic("Codegen error");
+    }
+
+    if (source_mode == 1) {
+        cg_lvalue(value);
+    } else {
+        cg_expr(value);
+    }
+    emit("    mov rbx, rax\n");
+    cg_lvalue(target);
+    emit("    mov r8, rax\n");
+    emit_copy_bytes_with_regs("rbx", 3, "r8", 2, total_size);
+    return 1;
+}
+
 func cg_assign_apply_tagged_mask_if_needed(target_type_info: *TypeInfo, value_type_info: *TypeInfo) -> u64 {
     if (target_type_info == 0) { return 0; }
     if (!(target_type_info.ptr_depth > 0 && target_type_info.is_tagged == 1)) { return 0; }
@@ -1308,6 +1397,10 @@ func cg_assign_stmt(node: u64, symtab: *Symtab) -> u64 {
     
     var target_kind: u64 = ast_kind(target);
     var value_kind: u64 = ast_kind(value);
+    if (target_kind == AST_IDENT) {
+        var idn_tgt: *AstIdent = (*AstIdent)target;
+        emitter_track_closure_handle_from_expr(idn_tgt.name_ptr, idn_tgt.name_len, value);
+    }
     if (target_kind == AST_SAFE_MEMBER_ACCESS) {
         emit_stderr("[ERROR] Safe member access cannot be used in assignment\n");
         panic("Codegen error");
@@ -1336,6 +1429,9 @@ func cg_assign_stmt(node: u64, symtab: *Symtab) -> u64 {
     var value_type_info: *TypeInfo = get_expr_type_with_symtab((*AstNode)value, symtab);
 
     if (cg_assign_try_slice_copy(target, target_kind, value, value_kind, symtab) != 0) {
+        return;
+    }
+    if (cg_assign_try_array_copy(target, value, symtab) != 0) {
         return;
     }
     
