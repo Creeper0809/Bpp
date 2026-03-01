@@ -780,11 +780,13 @@ func compiler_diag_has_errors() -> u64 {
 }
 
 func compiler_diag_should_stop_pass() -> u64 {
-    // Non fail-fast mode: always allow pass traversal to continue.
+    if (g_compiler_diag_limit_reached != 0) { return 1; }
+    if (g_compiler_diag_count != 0) { return 1; }
     return 0;
 }
 
 func compiler_diag_force_stop_pass() -> u64 {
+    g_compiler_diag_limit_reached = 1;
     compiler_diag_note_error();
     return g_compiler_diag_count;
 }
@@ -3080,7 +3082,7 @@ func compiler_resolve_method_overload(struct_ptr: u64, struct_len: u64, method_p
         emit_stderr_len(method_ptr, method_len);
         emit_stderr("\n");
         compiler_error("Compiler error");
-        return 0;
+        return result;
     }
     if (best_fn == 0) { return result; }
 
@@ -4068,7 +4070,7 @@ func _compiler_find_method_decl_in_hierarchy(struct_def: *AstStructDef, method_p
     if (depth > 64) {
         emit_stderr("[ERROR] Inheritance depth exceeded\n");
         compiler_error("Compiler error");
-        return 0;
+        return lookup;
     }
 
     var method_name: *NameInfo = compiler_build_method_name(struct_def.name_ptr, struct_def.name_len, method_ptr, method_len);
@@ -4114,7 +4116,7 @@ func _compiler_find_method_decl_in_hierarchy(struct_def: *AstStructDef, method_p
         emit_stderr_len(method_ptr, method_len);
         emit_stderr("\n");
         compiler_error("Compiler error");
-        return 0;
+        return lookup;
     }
     if (found == 0) { return lookup; }
     return first_hit;
@@ -6737,12 +6739,12 @@ func compiler_super_resolve_parent(owner_ptr: u64, owner_len: u64, super_allowed
     if (owner_ptr == 0 || owner_len == 0) {
         emit_stderr("[ERROR] 'super' is only allowed inside impl methods\n");
         compiler_error("Compiler error");
-        return 0;
+        return result;
     }
     if (super_allowed == 0) {
         emit_stderr("[ERROR] 'super' is not allowed in static methods\n");
         compiler_error("Compiler error");
-        return 0;
+        return result;
     }
 
     var owner_def: *AstStructDef = get_struct_def(owner_ptr, owner_len);
@@ -6751,21 +6753,22 @@ func compiler_super_resolve_parent(owner_ptr: u64, owner_len: u64, super_allowed
         emit_stderr_len(owner_ptr, owner_len);
         emit_stderr("\n");
         compiler_error("Compiler error");
-        return 0;
+        return result;
     }
     if (owner_def.parents_vec == 0 || owner_def.parents_vec.len() == 0) {
         emit_stderr("[ERROR] 'super' requires a parent struct\n");
         compiler_error("Compiler error");
-        return 0;
+        return result;
     }
     if (owner_def.parents_vec.len() != 1) {
         emit_stderr("[ERROR] ambiguous 'super' with multiple parents; use self.<Parent>member\n");
         compiler_error("Compiler error");
-        return 0;
+        return result;
     }
 
     var parent_desc: *ParentDesc = owner_def.parents_vec.get(0);
     var parent_def: *AstStructDef = compiler_resolve_parent_def(parent_desc, "Compiler error");
+    if (parent_def == 0) { return result; }
     result.parent_ptr = parent_def.name_ptr;
     result.parent_len = parent_def.name_len;
     result.parent_def = parent_def;
@@ -6857,6 +6860,7 @@ func compiler_lower_super_member_access_expr(ma: *AstMemberAccess, owner_ptr: u6
     var parent_ptr: u64 = resolved_parent.parent_ptr;
     var parent_len: u64 = resolved_parent.parent_len;
     var parent_def: *AstStructDef = resolved_parent.parent_def;
+    if (parent_def == 0 || parent_ptr == 0 || parent_len == 0) { return 0; }
 
     var field_desc: *FieldDesc = _compiler_find_field_desc_unscoped(parent_def, ma.member_ptr, ma.member_len, 0);
     if (field_desc == 0) {
@@ -6869,7 +6873,9 @@ func compiler_lower_super_member_access_expr(ma: *AstMemberAccess, owner_ptr: u6
         return 0;
     }
 
-    compiler_super_check_access(owner_ptr, owner_len, field_desc.owner_struct_ptr, field_desc.owner_struct_len, field_desc.access, ma.member_ptr, ma.member_len, "field");
+    if (compiler_super_check_access(owner_ptr, owner_len, field_desc.owner_struct_ptr, field_desc.owner_struct_len, field_desc.access, ma.member_ptr, ma.member_len, "field") == 0) {
+        return 0;
+    }
     return (*AstNode)ast_member_access_scoped((*AstNode)ast_ident("self", 4), parent_ptr, parent_len, ma.member_ptr, ma.member_len);
 }
 
@@ -6892,6 +6898,7 @@ func compiler_lower_super_method_call_expr(mc: *AstMethodCall, owner_ptr: u64, o
     var parent_ptr: u64 = resolved_parent2.parent_ptr;
     var parent_len: u64 = resolved_parent2.parent_len;
     var parent_def: *AstStructDef = resolved_parent2.parent_def;
+    if (parent_def == 0 || parent_ptr == 0 || parent_len == 0) { return 0; }
 
     var arg_count_hint: u64 = 0;
     if (mc.args_vec != 0) { arg_count_hint = mc.args_vec.len(); }
@@ -6921,7 +6928,9 @@ func compiler_lower_super_method_call_expr(mc: *AstMethodCall, owner_ptr: u64, o
         return 0;
     }
 
-    compiler_super_check_access(owner_ptr, owner_len, member_lookup.owner_ptr, member_lookup.owner_len, member_lookup.access, mc.method_ptr, mc.method_len, "method");
+    if (compiler_super_check_access(owner_ptr, owner_len, member_lookup.owner_ptr, member_lookup.owner_len, member_lookup.access, mc.method_ptr, mc.method_len, "method") == 0) {
+        return 0;
+    }
     var member_owner_ptr: u64 = member_lookup.owner_ptr;
     var member_owner_len: u64 = member_lookup.owner_len;
     if (member_owner_ptr == 0 || member_owner_len == 0) {
@@ -7171,7 +7180,6 @@ func compiler_require_checked_struct_downcast_info(src_struct_ptr: u64, src_stru
     emit_stderr_len(target_struct_ptr, target_struct_len);
     emit_stderr("\n");
     compiler_error("Compiler error");
-    return 0;
     return info;
 }
 
@@ -8082,7 +8090,7 @@ func _compiler_find_abst_decl_in_hierarchy(struct_def: *AstStructDef, method_ptr
     if (depth > 64) {
         emit_stderr("[ERROR] Inheritance depth exceeded\n");
         compiler_error("Compiler error");
-        return 0;
+        return lookup;
     }
 
     if (compiler_is_abst_method(struct_def.name_ptr, struct_def.name_len, method_ptr, method_len) != 0) {

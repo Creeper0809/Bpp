@@ -575,6 +575,133 @@ func cg_return_slice(expr: u64, symtab: *Symtab) -> u64 {
     return 0;
 }
 
+func cg_return_emit_type_desc(type_kind: u64, ptr_depth: u64, struct_name_ptr: u64, struct_name_len: u64) -> u64 {
+    for (var i: u64 = 0; i < ptr_depth; i++) {
+        emit_stderr("*");
+    }
+    switch (type_kind) {
+        case TYPE_VOID: emit_stderr("void"); break;
+        case TYPE_BOOL: emit_stderr("bool"); break;
+        case TYPE_U8: emit_stderr("u8"); break;
+        case TYPE_U16: emit_stderr("u16"); break;
+        case TYPE_U32: emit_stderr("u32"); break;
+        case TYPE_U64: emit_stderr("u64"); break;
+        case TYPE_I8: emit_stderr("i8"); break;
+        case TYPE_I16: emit_stderr("i16"); break;
+        case TYPE_I32: emit_stderr("i32"); break;
+        case TYPE_I64: emit_stderr("i64"); break;
+        case TYPE_F64: emit_stderr("f64"); break;
+        case TYPE_STRUCT:
+            if (struct_name_ptr != 0 && struct_name_len != 0) {
+                emit_stderr_len(struct_name_ptr, struct_name_len);
+            } else {
+                emit_stderr("<struct>");
+            }
+            break;
+        case TYPE_TRAIT:
+            emit_stderr("trait ");
+            if (struct_name_ptr != 0 && struct_name_len != 0) {
+                emit_stderr_len(struct_name_ptr, struct_name_len);
+            } else {
+                emit_stderr("<trait>");
+            }
+            break;
+        case TYPE_GENERIC:
+            emit_stderr("generic ");
+            if (struct_name_ptr != 0 && struct_name_len != 0) {
+                emit_stderr_len(struct_name_ptr, struct_name_len);
+            } else {
+                emit_stderr("<generic>");
+            }
+            break;
+        case TYPE_ARRAY: emit_stderr("array"); break;
+        case TYPE_SLICE: emit_stderr("slice"); break;
+        case TYPE_FUNC: emit_stderr("func"); break;
+        default: emit_stderr("<type>"); break;
+    }
+    return 0;
+}
+
+func cg_return_emit_typeinfo_desc(ti: *TypeInfo) -> u64 {
+    if (ti == 0) {
+        emit_stderr("<unknown>");
+        return 0;
+    }
+    cg_return_emit_type_desc(ti.type_kind, ti.ptr_depth, ti.struct_name_ptr, ti.struct_name_len);
+    return 0;
+}
+
+func cg_return_report_type_error(expected_type: u64, expected_ptr_depth: u64, expected_struct_ptr: u64, expected_struct_len: u64, actual_ti: *TypeInfo, detail: u64) -> u64 {
+    emit_stderr("[ERROR] return type mismatch");
+    if (detail != 0) {
+        emit_stderr(": ");
+        emit_stderr(detail);
+    }
+    emit_stderr(" (expected ");
+    cg_return_emit_type_desc(expected_type, expected_ptr_depth, expected_struct_ptr, expected_struct_len);
+    emit_stderr(", got ");
+    cg_return_emit_typeinfo_desc(actual_ti);
+    emit_stderr(")\n");
+    compiler_diag_force_stop_pass();
+    return 0;
+}
+
+func cg_return_is_strict_value_type(type_kind: u64, ptr_depth: u64) -> u64 {
+    if (ptr_depth != 0) { return 0; }
+    if (type_kind == TYPE_STRUCT) { return 1; }
+    if (type_kind == TYPE_TRAIT) { return 1; }
+    if (type_kind == TYPE_GENERIC) { return 1; }
+    if (type_kind == TYPE_ARRAY) { return 1; }
+    if (type_kind == TYPE_SLICE) { return 1; }
+    return 0;
+}
+
+func cg_return_is_zero_literal(expr: u64) -> u64 {
+    if (expr == 0) { return 0; }
+    if (ast_kind(expr) != AST_LITERAL) { return 0; }
+    var lit: *AstLiteral = (*AstLiteral)expr;
+    return (lit.value == 0);
+}
+
+func cg_return_validate_expr(expr: u64, symtab: *Symtab) -> u64 {
+    var ret_type: u64 = emitter_get_ret_type();
+    var ret_ptr_depth: u64 = emitter_get_ret_ptr_depth();
+    var ret_struct_name_ptr: u64 = emitter_get_ret_struct_name_ptr();
+    var ret_struct_name_len: u64 = emitter_get_ret_struct_name_len();
+
+    // Preserve historical semantics: bare `return;` in non-void context
+    // is lowered as zero/default value by backend conventions.
+    if (expr == 0) { return 1; }
+
+    var actual_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)expr, symtab);
+    if (actual_ti == 0) { return 1; }
+
+    var expected_strict: u64 = cg_return_is_strict_value_type(ret_type, ret_ptr_depth);
+    if (expected_strict == 0) { return 1; }
+    if (cg_return_is_zero_literal(expr) != 0) { return 1; }
+
+    if (ret_type == TYPE_STRUCT || ret_type == TYPE_TRAIT || ret_type == TYPE_GENERIC) {
+        if (actual_ti.type_kind != ret_type || actual_ti.ptr_depth != ret_ptr_depth) {
+            return cg_return_report_type_error(ret_type, ret_ptr_depth, ret_struct_name_ptr, ret_struct_name_len, actual_ti, 0);
+        }
+        if (ret_struct_name_ptr != 0 && ret_struct_name_len != 0 &&
+            actual_ti.struct_name_ptr != 0 && actual_ti.struct_name_len != 0 &&
+            str_eq(actual_ti.struct_name_ptr, actual_ti.struct_name_len, ret_struct_name_ptr, ret_struct_name_len) == 0) {
+            return cg_return_report_type_error(ret_type, ret_ptr_depth, ret_struct_name_ptr, ret_struct_name_len, actual_ti, 0);
+        }
+        return 1;
+    }
+
+    if (ret_type == TYPE_ARRAY || ret_type == TYPE_SLICE) {
+        if (actual_ti.type_kind != ret_type || actual_ti.ptr_depth != ret_ptr_depth) {
+            return cg_return_report_type_error(ret_type, ret_ptr_depth, ret_struct_name_ptr, ret_struct_name_len, actual_ti, 0);
+        }
+        return 1;
+    }
+
+    return cg_return_report_type_error(ret_type, ret_ptr_depth, ret_struct_name_ptr, ret_struct_name_len, actual_ti, 0);
+}
+
 func cg_return_stmt(node: u64, symtab: *Symtab) -> u64 {
     var ret: *AstReturn = (*AstReturn)node;
     var expr: u64 = ret.expr;
@@ -588,17 +715,18 @@ func cg_return_stmt(node: u64, symtab: *Symtab) -> u64 {
         }
     }
 
+    var ret_type: u64 = emitter_get_ret_type();
+    var ret_ptr_depth: u64 = emitter_get_ret_ptr_depth();
+    var ret_struct_name_ptr: u64 = emitter_get_ret_struct_name_ptr();
+    var ret_struct_name_len: u64 = emitter_get_ret_struct_name_len();
+    if (cg_return_validate_expr(expr, symtab) == 0) { return 0; }
+
     if (expr == 0) {
         cg_defer_emit_for_return(0, 0);
         emit("    xor eax, eax\n");
         cg_return_emit_epilogue();
         return 0;
     }
-
-    var ret_type: u64 = emitter_get_ret_type();
-    var ret_ptr_depth: u64 = emitter_get_ret_ptr_depth();
-    var ret_struct_name_ptr: u64 = emitter_get_ret_struct_name_ptr();
-    var ret_struct_name_len: u64 = emitter_get_ret_struct_name_len();
 
     if (ret_type == TYPE_STRUCT && ret_ptr_depth == 0) {
         cg_defer_emit_for_return(0, 0);

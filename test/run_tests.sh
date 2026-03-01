@@ -416,9 +416,17 @@ run_matrix_case() {
         opt_flag="-O1"
     fi
 
-    if ! $COMPILER $opt_flag $ir_flag -asm "$test_file" > "$asm_file" 2>"$err_file"; then
+    local compile_exit=0
+    $COMPILER $opt_flag $ir_flag -asm "$test_file" > "$asm_file" 2>"$err_file"
+    compile_exit="$?"
+
+    if [ "$compile_exit" -ne 0 ]; then
         persist_result_file "$err_file" "$err_file_persist"
-        if [ "$expect_compile_fail" -eq 1 ]; then
+        if [ "$compile_exit" -ge 128 ]; then
+            local sig=$((compile_exit - 128))
+            case_fail=1
+            case_status="FAIL (compiler crash: signal $sig, exit=$compile_exit)"
+        elif [ "$expect_compile_fail" -eq 1 ]; then
             if [ "$STRICT_FAIL_DIAGNOSTICS" -eq 1 ] && [ -z "$expect_error_file" ]; then
                 case_fail=1
                 case_status="FAIL (missing expected compile error directive)"
@@ -445,7 +453,7 @@ run_matrix_case() {
             fi
         else
             case_fail=1
-            case_status="FAIL (compile)"
+            case_status="FAIL (compile exit=$compile_exit)"
         fi
     else
         if [ "$expect_compile_fail" -eq 1 ]; then
@@ -620,22 +628,40 @@ run_ir_case() {
     local err_file_persist="$RESULTS_DIR_BASE/${test_name}.ir.err"
     rm -f "$err_file"
 
-    if ! $COMPILER -dump-ssa "$test_file" > "$ssa_out" 2>"$err_file"; then
+    local ssa_exit=0
+    $COMPILER -dump-ssa "$test_file" > "$ssa_out" 2>"$err_file"
+    ssa_exit="$?"
+    if [ "$ssa_exit" -ne 0 ]; then
         persist_result_file "$err_file" "$err_file_persist"
         case_fail=1
-        case_status="FAIL (ssa dump)"
+        if [ "$ssa_exit" -ge 128 ]; then
+            local sig=$((ssa_exit - 128))
+            case_status="FAIL (ssa dump crash: signal $sig, exit=$ssa_exit)"
+        else
+            case_status="FAIL (ssa dump exit=$ssa_exit)"
+        fi
     elif ! grep -q "phi" "$ssa_out"; then
         case_fail=1
         case_status="FAIL (ssa missing phi)"
-    elif ! $COMPILER -dump-ir "$test_file" > "$addr_out" 2>>"$err_file"; then
-        persist_result_file "$err_file" "$err_file_persist"
-        case_fail=1
-        case_status="FAIL (3addr dump)"
-    elif grep -q "phi" "$addr_out"; then
-        case_fail=1
-        case_status="FAIL (3addr has phi)"
     else
-        case_pass=1
+        local ir_exit=0
+        $COMPILER -dump-ir "$test_file" > "$addr_out" 2>>"$err_file"
+        ir_exit="$?"
+        if [ "$ir_exit" -ne 0 ]; then
+            persist_result_file "$err_file" "$err_file_persist"
+            case_fail=1
+            if [ "$ir_exit" -ge 128 ]; then
+                local sig2=$((ir_exit - 128))
+                case_status="FAIL (3addr dump crash: signal $sig2, exit=$ir_exit)"
+            else
+                case_status="FAIL (3addr dump exit=$ir_exit)"
+            fi
+        elif grep -q "phi" "$addr_out"; then
+            case_fail=1
+            case_status="FAIL (3addr has phi)"
+        else
+            case_pass=1
+        fi
     fi
 
     if [ "$KEEP_TEST_ARTIFACTS" -eq 0 ]; then

@@ -95,6 +95,16 @@ function Invoke-TestProcess {
     return $proc.ExitCode
 }
 
+function Test-IsCrashExitCode {
+    param([int]$ExitCode)
+
+    # Windows crash exits are typically negative NTSTATUS values
+    # (e.g. 0xC0000005 -> -1073741819). Keep POSIX 128+ handling too.
+    if ($ExitCode -lt 0) { return $true }
+    if ($ExitCode -ge 128) { return $true }
+    return $false
+}
+
 function Get-SanitizedCaseName {
     param([string]$Name)
 
@@ -271,7 +281,10 @@ foreach ($testCase in $testCases) {
     $status = "PASS"
 
     if ($compileCode -ne 0) {
-        if ($expectCompileFail) {
+        if (Test-IsCrashExitCode -ExitCode $compileCode) {
+            $caseOk = $false
+            $status = "FAIL (compiler crash exit=$compileCode)"
+        } elseif ($expectCompileFail) {
             if ($expectErrContainsList.Count -gt 0) {
                 $errText = Get-Content $errFile -Raw
                 $missing = @()
