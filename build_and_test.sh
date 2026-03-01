@@ -149,8 +149,15 @@ TEST_SUITE_CASE_LIMIT="${TEST_SUITE_CASE_LIMIT:-0}"
 # Use RAM disk for large self-host ASM I/O when available (no build step skipped).
 ASM_WORK_DIR="$BUILD_DIR"
 if [ -d "/dev/shm" ] && [ -w "/dev/shm" ]; then
-    ASM_WORK_DIR="/dev/shm/bpp_${VERSION}_selfhost_$$"
-    mkdir -p "$ASM_WORK_DIR"
+    # Avoid silent truncation when tmpfs is full (would produce invalid stage binaries).
+    SHM_AVAIL_KB="$(df -Pk /dev/shm | awk 'NR==2 {print $4}')"
+    SHM_MIN_KB=1048576  # 1 GiB safety margin for large self-host ASM outputs
+    if [ -n "$SHM_AVAIL_KB" ] && [ "$SHM_AVAIL_KB" -ge "$SHM_MIN_KB" ]; then
+        ASM_WORK_DIR="/dev/shm/bpp_${VERSION}_selfhost_$$"
+        mkdir -p "$ASM_WORK_DIR"
+    else
+        echo "[WARN] /dev/shm free space is low (${SHM_AVAIL_KB:-unknown} KB). Falling back to build/."
+    fi
 fi
 trap 'if [ "$ASM_WORK_DIR" != "$BUILD_DIR" ]; then rm -rf "$ASM_WORK_DIR"; fi' EXIT
 
