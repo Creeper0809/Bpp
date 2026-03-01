@@ -11,6 +11,7 @@ import std.util;
 import std.str;
 import types;
 import lexer;
+import ast;
 import compiler;
 
 var g_active_parser: *Parser = 0;
@@ -385,7 +386,33 @@ func parse_new(tokens: *Vec<*Token>) -> *Parser {
     p.max_errors = 20;
     p.error_limit_reached = 0;
     p.fn_param_scope_stack = 0;
+    p.fn_local_scope_stack = 0;
     return p;
+}
+
+func parser_clone_param_for_local_scope(src: *Param) -> *Param {
+    if (src == 0) { return 0; }
+    var out: *Param = new Param();
+    out.name_ptr = src.name_ptr;
+    out.name_len = src.name_len;
+    out.type_kind = src.type_kind;
+    out.ptr_depth = src.ptr_depth;
+    out.is_tagged = src.is_tagged;
+    out.struct_name_ptr = src.struct_name_ptr;
+    out.struct_name_len = src.struct_name_len;
+    out.tag_layout_ptr = src.tag_layout_ptr;
+    out.tag_layout_len = src.tag_layout_len;
+    out.elem_type_kind = src.elem_type_kind;
+    out.elem_ptr_depth = src.elem_ptr_depth;
+    out.array_len = src.array_len;
+    out.array_len_is_param = src.array_len_is_param;
+    out.array_len_param_ptr = src.array_len_param_ptr;
+    out.array_len_param_len = src.array_len_param_len;
+    out.elem_typeinfo = src.elem_typeinfo;
+    out.is_variadic = src.is_variadic;
+    out.has_default = src.has_default;
+    out.default_expr = src.default_expr;
+    return out;
 }
 
 func parser_push_function_param_scope(p: *Parser, params: *Vec<*Param>) -> u64 {
@@ -394,6 +421,16 @@ func parser_push_function_param_scope(p: *Parser, params: *Vec<*Param>) -> u64 {
         p.fn_param_scope_stack = new Vec<*Vec<*Param>>(8);
     }
     p.fn_param_scope_stack.push(params);
+
+    if (p.fn_local_scope_stack == 0) {
+        p.fn_local_scope_stack = new Vec<*Vec<*Param>>(8);
+    }
+    var local_scope: *Vec<*Param> = new Vec<*Param>(params.len() + 8);
+    var n: u64 = params.len();
+    for (var i: u64 = 0; i < n; i++) {
+        local_scope.push(parser_clone_param_for_local_scope(params.get(i)));
+    }
+    p.fn_local_scope_stack.push(local_scope);
     return 0;
 }
 
@@ -401,6 +438,9 @@ func parser_pop_function_param_scope(p: *Parser) -> u64 {
     if (p == 0 || p.fn_param_scope_stack == 0) { return 0; }
     if (p.fn_param_scope_stack.len() == 0) { return 0; }
     p.fn_param_scope_stack.pop();
+    if (p.fn_local_scope_stack != 0 && p.fn_local_scope_stack.len() > 0) {
+        p.fn_local_scope_stack.pop();
+    }
     return 0;
 }
 
@@ -434,6 +474,76 @@ func parser_current_function_find_param(p: *Parser, name_ptr: u64, name_len: u64
         if (str_eq(param.name_ptr, param.name_len, name_ptr, name_len) != 0) {
             return param;
         }
+    }
+    return 0;
+}
+
+func parser_current_function_find_symbol(p: *Parser, name_ptr: u64, name_len: u64) -> *Param {
+    if (p == 0 || name_ptr == 0 || name_len == 0) { return 0; }
+    if (p.fn_local_scope_stack != 0 && p.fn_local_scope_stack.len() > 0) {
+        var top_idx: u64 = p.fn_local_scope_stack.len() - 1;
+        var locals: *Vec<*Param> = p.fn_local_scope_stack.get(top_idx);
+        if (locals != 0 && locals.len() > 0) {
+            var i: u64 = locals.len();
+            while (i > 0) {
+                i = i - 1;
+                var local_param: *Param = locals.get(i);
+                if (local_param == 0) { continue; }
+                if (str_eq(local_param.name_ptr, local_param.name_len, name_ptr, name_len) != 0) {
+                    return local_param;
+                }
+            }
+        }
+    }
+    return parser_current_function_find_param(p, name_ptr, name_len);
+}
+
+func parser_register_local_decl(p: *Parser, decl: *AstVarDecl) -> u64 {
+    if (p == 0 || decl == 0) { return 0; }
+    if (p.fn_local_scope_stack == 0 || p.fn_local_scope_stack.len() == 0) { return 0; }
+    var top_idx: u64 = p.fn_local_scope_stack.len() - 1;
+    var locals: *Vec<*Param> = p.fn_local_scope_stack.get(top_idx);
+    if (locals == 0) { return 0; }
+
+    var out: *Param = new Param();
+    out.name_ptr = decl.name_ptr;
+    out.name_len = decl.name_len;
+    out.type_kind = decl.type_kind;
+    out.ptr_depth = decl.ptr_depth;
+    out.is_tagged = decl.is_tagged;
+    out.struct_name_ptr = decl.struct_name_ptr;
+    out.struct_name_len = decl.struct_name_len;
+    out.tag_layout_ptr = decl.tag_layout_ptr;
+    out.tag_layout_len = decl.tag_layout_len;
+    out.elem_type_kind = decl.elem_type_kind;
+    out.elem_ptr_depth = decl.elem_ptr_depth;
+    out.array_len = decl.array_len;
+    out.array_len_is_param = decl.array_len_is_param;
+    out.array_len_param_ptr = decl.array_len_param_ptr;
+    out.array_len_param_len = decl.array_len_param_len;
+    out.elem_typeinfo = decl.elem_typeinfo;
+    out.is_variadic = 0;
+    out.has_default = 0;
+    out.default_expr = 0;
+    locals.push(out);
+    return 0;
+}
+
+func parser_mark_local_scope(p: *Parser) -> u64 {
+    if (p == 0 || p.fn_local_scope_stack == 0 || p.fn_local_scope_stack.len() == 0) { return 0; }
+    var top_idx: u64 = p.fn_local_scope_stack.len() - 1;
+    var locals: *Vec<*Param> = p.fn_local_scope_stack.get(top_idx);
+    if (locals == 0) { return 0; }
+    return locals.len();
+}
+
+func parser_restore_local_scope(p: *Parser, mark: u64) -> u64 {
+    if (p == 0 || p.fn_local_scope_stack == 0 || p.fn_local_scope_stack.len() == 0) { return 0; }
+    var top_idx: u64 = p.fn_local_scope_stack.len() - 1;
+    var locals: *Vec<*Param> = p.fn_local_scope_stack.get(top_idx);
+    if (locals == 0) { return 0; }
+    while (locals.len() > mark) {
+        locals.pop();
     }
     return 0;
 }
