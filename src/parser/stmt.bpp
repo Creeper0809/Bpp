@@ -11,6 +11,7 @@ import std.io;
 import std.vec;
 import std.util;
 import std.str;
+import module_utils;
 import types;
 import lexer;
 import ast;
@@ -470,6 +471,353 @@ func parse_for_stmt(p: *Parser) -> *AstNode {
     return ast_for(init, cond, update, body);
 }
 
+const PARSE_SWITCH_ARM_SIMPLE = 1;
+const PARSE_SWITCH_ARM_VARIANT = 2;
+const PARSE_SWITCH_ARM_DEFAULT = 3;
+
+struct ParseSwitchArm {
+    public kind: u64;
+    public values_vec: *Vec<*AstNode>;
+    public enum_ptr: u64;
+    public enum_len: u64;
+    public variant_ptr: u64;
+    public variant_len: u64;
+    public bind_names: *Vec<*NameInfo>;
+    public body: *AstNode;
+}
+
+impl ParseSwitchArm {
+    public constructor() {
+        self.kind = 0;
+        self.values_vec = 0;
+        self.enum_ptr = 0;
+        self.enum_len = 0;
+        self.variant_ptr = 0;
+        self.variant_len = 0;
+        self.bind_names = 0;
+        self.body = 0;
+    }
+}
+
+func parse_match_build_payload_field_name(idx: u64) -> *NameInfo {
+    var prefix_ptr: u64 = (u64)"v";
+    var prefix_len: u64 = 1;
+    var idx_buf: u64 = heap_alloc(32 * sizeof(u8));
+    var idx_len: u64 = io_u64_to_ascii(idx_buf, idx);
+    var out_len: u64 = prefix_len + idx_len;
+    var out_ptr: u64 = heap_alloc((out_len + 1) * sizeof(u8));
+    var out_u8: []u8 = slice(out_ptr, out_len + 1);
+    str_copy(out_ptr, prefix_ptr, prefix_len);
+    str_copy(out_ptr + prefix_len, idx_buf, idx_len);
+    out_u8[out_len] = 0;
+    return new NameInfo{out_ptr, out_len};
+}
+
+func parse_switch_parse_variant_case_head(p: *Parser, is_match_stmt: u64) -> *ParseSwitchArm {
+    if (is_match_stmt == 0) { return 0; }
+    if (parse_peek_kind(p) != TOKEN_IDENTIFIER) { return 0; }
+
+    var saved: u64 = parser_pos(p);
+    var enum_tok: *Token = parse_peek(p);
+    parse_adv(p);
+    if (parse_match(p, TOKEN_DOT) == 0) {
+        parser_set_pos(p, saved);
+        return 0;
+    }
+    if (parse_peek_kind(p) != TOKEN_IDENTIFIER) {
+        parser_set_pos(p, saved);
+        return 0;
+    }
+    var variant_tok: *Token = parse_peek(p);
+    parse_adv(p);
+
+    var expected_arity: u64 = compiler_get_enum_variant_arity(enum_tok.ptr, enum_tok.len, variant_tok.ptr, variant_tok.len);
+    if (expected_arity == 9223372036854775807) {
+        parser_set_pos(p, saved);
+        return 0;
+    }
+
+    var bind_names: *Vec<*NameInfo> = new Vec<*NameInfo>(expected_arity);
+    if (parse_match(p, TOKEN_LPAREN)) {
+        if (parse_peek_kind(p) != TOKEN_RPAREN) {
+            while (1) {
+                if (parse_peek_kind(p) != TOKEN_IDENTIFIER) {
+                    emit_stderr("[ERROR] match variant payload binding must be identifier\n");
+                    parse_panic_here(p, "Syntax error");
+                }
+                var bind_tok: *Token = parse_peek(p);
+                parse_consume(p, TOKEN_IDENTIFIER);
+                bind_names.push(new NameInfo{bind_tok.ptr, bind_tok.len});
+                if (parse_match(p, TOKEN_COMMA) == 0) { break; }
+            }
+        }
+        parse_consume(p, TOKEN_RPAREN);
+    }
+
+    if (bind_names.len() != expected_arity) {
+        emit_stderr("[ERROR] match variant payload arity mismatch: ");
+        emit_stderr_len(enum_tok.ptr, enum_tok.len);
+        emit_stderr(".");
+        emit_stderr_len(variant_tok.ptr, variant_tok.len);
+        emit_stderr(" expects ");
+        emit_u64_stderr(expected_arity);
+        emit_stderr(" binding(s), got ");
+        emit_u64_stderr(bind_names.len());
+        emit_stderr("\n");
+        parse_panic_here(p, "Syntax error");
+    }
+    if (parse_peek_kind(p) == TOKEN_COMMA) {
+        emit_stderr("[ERROR] variant match case cannot be combined with comma-separated values\n");
+        parse_panic_here(p, "Syntax error");
+    }
+
+    var arm: *ParseSwitchArm = new ParseSwitchArm();
+    arm.kind = PARSE_SWITCH_ARM_VARIANT;
+    arm.enum_ptr = enum_tok.ptr;
+    arm.enum_len = enum_tok.len;
+    arm.variant_ptr = variant_tok.ptr;
+    arm.variant_len = variant_tok.len;
+    arm.bind_names = bind_names;
+    return arm;
+}
+
+func parse_switch_parse_case_head(p: *Parser, is_match_stmt: u64) -> *ParseSwitchArm {
+    var arm: *ParseSwitchArm = new ParseSwitchArm();
+    if (parse_peek_kind(p) == TOKEN_DEFAULT) {
+        parse_consume(p, TOKEN_DEFAULT);
+        arm.kind = PARSE_SWITCH_ARM_DEFAULT;
+        return arm;
+    }
+    if (parse_peek_kind(p) != TOKEN_CASE) {
+        return 0;
+    }
+    parse_consume(p, TOKEN_CASE);
+
+    if (parse_peek_kind(p) == TOKEN_IDENTIFIER) {
+        var wc_tok: *Token = parse_peek(p);
+        if (wc_tok.len == 1 && str_eq(wc_tok.ptr, wc_tok.len, "_", 1) != 0) {
+            parse_adv(p);
+            arm.kind = PARSE_SWITCH_ARM_DEFAULT;
+            return arm;
+        }
+    }
+
+    var variant_arm: *ParseSwitchArm = parse_switch_parse_variant_case_head(p, is_match_stmt);
+    if (variant_arm != 0) { return variant_arm; }
+
+    arm.kind = PARSE_SWITCH_ARM_SIMPLE;
+    arm.values_vec = new Vec<*AstNode>(2);
+    arm.values_vec.push(parse_expr(p));
+    while (parse_match(p, TOKEN_COMMA)) {
+        if (parse_peek_kind(p) == TOKEN_IDENTIFIER) {
+            var wc_tok2: *Token = parse_peek(p);
+            if (wc_tok2.len == 1 && str_eq(wc_tok2.ptr, wc_tok2.len, "_", 1) != 0) {
+                emit_stderr("[ERROR] wildcard '_' cannot be mixed with explicit case values\n");
+                parse_panic_here(p, "Syntax error");
+            }
+        }
+        arm.values_vec.push(parse_expr(p));
+    }
+    return arm;
+}
+
+func parse_switch_parse_case_body(p: *Parser) -> *AstNode {
+    var stmts: *Vec<*AstNode> = new Vec<*AstNode>(8);
+    while (parse_peek_kind(p) != TOKEN_CASE) {
+        if (parse_peek_kind(p) == TOKEN_DEFAULT) { break; }
+        if (parse_peek_kind(p) == TOKEN_RBRACE) { break; }
+        if (parse_peek_kind(p) == TOKEN_EOF) { break; }
+        stmts.push(parse_stmt(p));
+    }
+    return (*AstNode)ast_block(stmts);
+}
+
+func parse_switch_build_tag_expr(tmp_name_ptr: u64, tmp_name_len: u64) -> *AstNode {
+    return (*AstNode)ast_member_access((*AstNode)ast_ident(tmp_name_ptr, tmp_name_len), "__tag", 5);
+}
+
+func parse_switch_build_simple_case_cond(tmp_name_ptr: u64, tmp_name_len: u64, values: *Vec<*AstNode>, enum_mode: u64) -> *AstNode {
+    if (values == 0 || values.len() == 0) {
+        return (*AstNode)ast_literal(0);
+    }
+    var lhs_base: *AstNode = (*AstNode)ast_ident(tmp_name_ptr, tmp_name_len);
+    if (enum_mode != 0) {
+        lhs_base = parse_switch_build_tag_expr(tmp_name_ptr, tmp_name_len);
+    }
+    var cond: *AstNode = (*AstNode)ast_binary(TOKEN_EQEQ, lhs_base, values.get(0));
+    var n: u64 = values.len();
+    for (var i: u64 = 1; i < n; i++) {
+        var cmp_lhs: *AstNode = (*AstNode)ast_ident(tmp_name_ptr, tmp_name_len);
+        if (enum_mode != 0) {
+            cmp_lhs = parse_switch_build_tag_expr(tmp_name_ptr, tmp_name_len);
+        }
+        var cmp: *AstNode = (*AstNode)ast_binary(TOKEN_EQEQ, cmp_lhs, values.get(i));
+        cond = (*AstNode)ast_binary(TOKEN_OROR, cond, cmp);
+    }
+    return cond;
+}
+
+func parse_switch_expr_is_enum_variant_const(node: *AstNode, enum_ptr: u64, enum_len: u64, variant_ptr: u64, variant_len: u64) -> u64 {
+    if (node == 0) { return 0; }
+    var kind: u64 = ast_kind(node);
+    if (kind == AST_CAST) {
+        return parse_switch_expr_is_enum_variant_const(((*AstCast)node).expr, enum_ptr, enum_len, variant_ptr, variant_len);
+    }
+    if (kind == AST_MEMBER_ACCESS) {
+        var ma: *AstMemberAccess = (*AstMemberAccess)node;
+        if (ma.object == 0 || ast_kind(ma.object) != AST_IDENT) { return 0; }
+        var obj: *AstIdent = (*AstIdent)ma.object;
+        if (str_eq(obj.name_ptr, obj.name_len, enum_ptr, enum_len) == 0) { return 0; }
+        if (str_eq(ma.member_ptr, ma.member_len, variant_ptr, variant_len) == 0) { return 0; }
+        return 1;
+    }
+    if (kind == AST_IDENT) {
+        var id: *AstIdent = (*AstIdent)node;
+        var scoped: *NameInfo = module_util_build_joined_name(enum_ptr, enum_len, variant_ptr, variant_len);
+        if (str_eq(id.name_ptr, id.name_len, scoped.ptr, scoped.len) != 0) { return 1; }
+    }
+    return 0;
+}
+
+func parse_switch_arm_covers_variant(arm: *ParseSwitchArm, enum_ptr: u64, enum_len: u64, variant_ptr: u64, variant_len: u64) -> u64 {
+    if (arm == 0) { return 0; }
+    if (arm.kind == PARSE_SWITCH_ARM_VARIANT) {
+        if (str_eq(arm.enum_ptr, arm.enum_len, enum_ptr, enum_len) == 0) { return 0; }
+        if (str_eq(arm.variant_ptr, arm.variant_len, variant_ptr, variant_len) == 0) { return 0; }
+        return 1;
+    }
+    if (arm.kind != PARSE_SWITCH_ARM_SIMPLE || arm.values_vec == 0) { return 0; }
+    var n: u64 = arm.values_vec.len();
+    for (var i: u64 = 0; i < n; i++) {
+        if (parse_switch_expr_is_enum_variant_const(arm.values_vec.get(i), enum_ptr, enum_len, variant_ptr, variant_len) != 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+func parse_switch_has_default_arm(arms: *Vec<*ParseSwitchArm>) -> u64 {
+    if (arms == 0) { return 0; }
+    var n: u64 = arms.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var arm: *ParseSwitchArm = arms.get(i);
+        if (arm != 0 && arm.kind == PARSE_SWITCH_ARM_DEFAULT) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+func parse_switch_validate_variant_exhaustive(p: *Parser, arms: *Vec<*ParseSwitchArm>, enum_ptr: u64, enum_len: u64) -> u64 {
+    if (arms == 0 || enum_ptr == 0 || enum_len == 0) { return 0; }
+    if (parse_switch_has_default_arm(arms) != 0) { return 0; }
+    var variants: *Vec<*NameInfo> = compiler_get_enum_variants(enum_ptr, enum_len);
+    if (variants == 0 || variants.len() == 0) { return 0; }
+
+    var vn: u64 = variants.len();
+    for (var vi: u64 = 0; vi < vn; vi++) {
+        var variant: *NameInfo = variants.get(vi);
+        var covered: u64 = 0;
+        var an: u64 = arms.len();
+        for (var ai: u64 = 0; ai < an; ai++) {
+            if (parse_switch_arm_covers_variant(arms.get(ai), enum_ptr, enum_len, variant.ptr, variant.len) != 0) {
+                covered = 1;
+                break;
+            }
+        }
+        if (covered == 0) {
+            emit_stderr("[ERROR] non-exhaustive match: missing case ");
+            emit_stderr_len(enum_ptr, enum_len);
+            emit_stderr(".");
+            emit_stderr_len(variant.ptr, variant.len);
+            emit_stderr("\n");
+            parse_panic_here(p, "Syntax error");
+        }
+    }
+    return 0;
+}
+
+func parse_switch_variant_arm_with_bindings(tmp_name_ptr: u64, tmp_name_len: u64, arm: *ParseSwitchArm) -> *AstNode {
+    var then_stmts: *Vec<*AstNode> = new Vec<*AstNode>(8);
+    if (arm.bind_names != 0) {
+        var bn: u64 = arm.bind_names.len();
+        for (var i: u64 = 0; i < bn; i++) {
+            var bind: *NameInfo = arm.bind_names.get(i);
+            var field_name: *NameInfo = parse_match_build_payload_field_name(i);
+            var field_expr: *AstNode = (*AstNode)ast_member_access((*AstNode)ast_ident(tmp_name_ptr, tmp_name_len), field_name.ptr, field_name.len);
+            then_stmts.push((*AstNode)ast_var_decl(bind.ptr, bind.len, TYPE_U64, 0, field_expr));
+        }
+    }
+    parse_try_stmt_append_block_stmts(then_stmts, arm.body);
+    return (*AstNode)ast_block(then_stmts);
+}
+
+func parse_switch_lower_pattern_match(p: *Parser, expr: *AstNode, arms: *Vec<*ParseSwitchArm>, is_match_stmt: u64) -> *AstNode {
+    if (arms == 0 || arms.len() == 0) {
+        return (*AstNode)ast_block(new Vec<*AstNode>(0));
+    }
+
+    var enum_ptr: u64 = 0;
+    var enum_len: u64 = 0;
+    var n: u64 = arms.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var arm0: *ParseSwitchArm = arms.get(i);
+        if (arm0.kind != PARSE_SWITCH_ARM_VARIANT) { continue; }
+        if (enum_ptr == 0) {
+            enum_ptr = arm0.enum_ptr;
+            enum_len = arm0.enum_len;
+        } else if (str_eq(enum_ptr, enum_len, arm0.enum_ptr, arm0.enum_len) == 0) {
+            emit_stderr("[ERROR] all variant match arms must target the same enum type\n");
+            parse_panic_here(p, "Syntax error");
+        }
+    }
+
+    if (is_match_stmt != 0 && enum_ptr != 0) {
+        parse_switch_validate_variant_exhaustive(p, arms, enum_ptr, enum_len);
+    }
+
+    var tmp_id: u64 = parse_next_generated_id(p);
+    var tmp_name: *NameInfo = parse_stmt_internal_name("__match_tmp_", 12, tmp_id);
+    var tmp_decl: *AstVarDecl = ast_var_decl(tmp_name.ptr, tmp_name.len, TYPE_U64, 0, expr);
+    if (enum_ptr != 0) {
+        tmp_decl.type_kind = TYPE_STRUCT;
+        tmp_decl.ptr_depth = 0;
+        tmp_decl.struct_name_ptr = enum_ptr;
+        tmp_decl.struct_name_len = enum_len;
+    }
+
+    var chain: *AstNode = 0;
+    for (var ri: i64 = (i64)n - 1; ri >= 0; ri--) {
+        var arm: *ParseSwitchArm = arms.get((u64)ri);
+        if (arm.kind == PARSE_SWITCH_ARM_DEFAULT) {
+            chain = arm.body;
+            continue;
+        }
+        var else_block: *AstNode = chain;
+        if (else_block != 0 && ast_kind(else_block) == AST_IF) {
+            else_block = parse_wrap_stmt_in_block(else_block);
+        }
+        if (arm.kind == PARSE_SWITCH_ARM_VARIANT) {
+            var tag_const: *NameInfo = module_util_build_joined_name(arm.enum_ptr, arm.enum_len, arm.variant_ptr, arm.variant_len);
+            var cond: *AstNode = (*AstNode)ast_binary(TOKEN_EQEQ, parse_switch_build_tag_expr(tmp_name.ptr, tmp_name.len), (*AstNode)ast_ident(tag_const.ptr, tag_const.len));
+            var then_block: *AstNode = parse_switch_variant_arm_with_bindings(tmp_name.ptr, tmp_name.len, arm);
+            chain = (*AstNode)ast_if(cond, then_block, else_block);
+            continue;
+        }
+        var cond2: *AstNode = parse_switch_build_simple_case_cond(tmp_name.ptr, tmp_name.len, arm.values_vec, enum_ptr != 0);
+        chain = (*AstNode)ast_if(cond2, arm.body, else_block);
+    }
+
+    var lowered_stmts: *Vec<*AstNode> = new Vec<*AstNode>(2);
+    lowered_stmts.push((*AstNode)tmp_decl);
+    if (chain != 0) {
+        lowered_stmts.push(chain);
+    } else if (is_match_stmt == 0) {
+        // no-op for switch/match without default arm
+    }
+    return (*AstNode)ast_block(lowered_stmts);
+}
+
 func parse_switch_stmt(p: *Parser) -> *AstNode {
     var is_match_stmt: u64 = 0;
     if (parse_peek_kind(p) == TOKEN_MATCH) {
@@ -484,78 +832,42 @@ func parse_switch_stmt(p: *Parser) -> *AstNode {
     parse_consume(p, TOKEN_LBRACE);
 
     var cases: *Vec<*AstNode> = new Vec<*AstNode>(16);
+    var arms: *Vec<*ParseSwitchArm> = new Vec<*ParseSwitchArm>(16);
+    var has_pattern_arm: u64 = 0;
     p.breakable_depth = p.breakable_depth + 1;
 
     while (parse_peek_kind(p) != TOKEN_RBRACE) {
         if (parse_peek_kind(p) == TOKEN_EOF) { break; }
-
-        var is_default: u64 = 0;
-        var case_values: *Vec<*AstNode> = 0;
-        var matched: u64 = 0;
-
-        switch (parse_peek_kind(p)) {
-            case TOKEN_CASE:
-                parse_consume(p, TOKEN_CASE);
-                if (parse_peek_kind(p) == TOKEN_IDENTIFIER) {
-                    var wc_tok: *Token = parse_peek(p);
-                    if (wc_tok.len == 1 && str_eq(wc_tok.ptr, wc_tok.len, "_", 1) != 0) {
-                        parse_adv(p);
-                        is_default = 1;
-                        matched = 1;
-                        break;
-                    }
-                }
-                case_values = new Vec<*AstNode>(2);
-                case_values.push(parse_expr(p));
-                while (parse_match(p, TOKEN_COMMA)) {
-                    if (parse_peek_kind(p) == TOKEN_IDENTIFIER) {
-                        var wc_tok2: *Token = parse_peek(p);
-                        if (wc_tok2.len == 1 && str_eq(wc_tok2.ptr, wc_tok2.len, "_", 1) != 0) {
-                            emit_stderr("[ERROR] wildcard '_' cannot be mixed with explicit case values\n");
-                            parse_panic_here(p, "Syntax error");
-                        }
-                    }
-                    case_values.push(parse_expr(p));
-                }
-                matched = 1;
-                break;
-            case TOKEN_DEFAULT:
-                parse_consume(p, TOKEN_DEFAULT);
-                is_default = 1;
-                matched = 1;
-                break;
-            default:
-                break;
-        }
-        if (matched == 0) { break; }
-
+        var arm: *ParseSwitchArm = parse_switch_parse_case_head(p, is_match_stmt);
+        if (arm == 0) { break; }
         parse_consume(p, TOKEN_COLON);
-
-        var stmts: *Vec<*AstNode> = new Vec<*AstNode>(8);
-        while (parse_peek_kind(p) != TOKEN_CASE) {
-            if (parse_peek_kind(p) == TOKEN_DEFAULT) { break; }
-            if (parse_peek_kind(p) == TOKEN_RBRACE) { break; }
-            if (parse_peek_kind(p) == TOKEN_EOF) { break; }
-            stmts.push(parse_stmt(p));
+        arm.body = parse_switch_parse_case_body(p);
+        if (arm.kind == PARSE_SWITCH_ARM_VARIANT) {
+            has_pattern_arm = 1;
         }
+        arms.push(arm);
 
-        var case_body: *AstNode = ast_block(stmts);
-        if (is_default != 0) {
-            cases.push(ast_case(0, case_body, 1));
+        if (arm.kind == PARSE_SWITCH_ARM_DEFAULT) {
+            cases.push(ast_case(0, arm.body, 1));
             continue;
         }
-        if (case_values == 0 || case_values.len() == 0) {
-            emit_stderr("[ERROR] case value is required\n");
-            parse_panic_here(p, "Syntax error");
-        }
-        var cvn: u64 = case_values.len();
-        for (var ci: u64 = 0; ci < cvn; ci++) {
-            cases.push(ast_case(case_values.get(ci), case_body, 0));
+        if (arm.kind == PARSE_SWITCH_ARM_SIMPLE) {
+            if (arm.values_vec == 0 || arm.values_vec.len() == 0) {
+                emit_stderr("[ERROR] case value is required\n");
+                parse_panic_here(p, "Syntax error");
+            }
+            var cvn: u64 = arm.values_vec.len();
+            for (var ci: u64 = 0; ci < cvn; ci++) {
+                cases.push(ast_case(arm.values_vec.get(ci), arm.body, 0));
+            }
         }
     }
 
     p.breakable_depth = p.breakable_depth - 1;
     parse_consume(p, TOKEN_RBRACE);
+    if (has_pattern_arm != 0) {
+        return parse_switch_lower_pattern_match(p, expr, arms, is_match_stmt);
+    }
     if (is_match_stmt != 0) {
         return ast_match(expr, cases);
     }

@@ -10,6 +10,7 @@ import std.io;
 import std.vec;
 import std.util;
 import std.str;
+import module_utils;
 import types;
 import lexer;
 import ast;
@@ -183,7 +184,11 @@ struct LambdaCapture {
     public name_len: u64;
     public slot_ptr: u64;
     public slot_len: u64;
+    public mode: u64;
 }
+
+const LAMBDA_CAPTURE_BY_VALUE = 1;
+const LAMBDA_CAPTURE_BY_REF = 2;
 
 func parse_lambda_capture_find(captures: *Vec<*LambdaCapture>, name_ptr: u64, name_len: u64) -> *LambdaCapture {
     if (captures == 0) { return 0; }
@@ -197,14 +202,55 @@ func parse_lambda_capture_find(captures: *Vec<*LambdaCapture>, name_ptr: u64, na
     return 0;
 }
 
-func parse_lambda_capture_add(captures: *Vec<*LambdaCapture>, name_ptr: u64, name_len: u64) -> u64 {
+func parse_lambda_parse_capture_list(p: *Parser, params: *Vec<*Param>, captures: *Vec<*LambdaCapture>) -> u64 {
+    if (parse_match(p, TOKEN_LBRACKET) == 0) { return 0; }
+    if (parse_peek_kind(p) != TOKEN_RBRACKET) {
+        while (1) {
+            var mode: u64 = LAMBDA_CAPTURE_BY_VALUE;
+            if (parse_match(p, TOKEN_AMPERSAND)) {
+                mode = LAMBDA_CAPTURE_BY_REF;
+            }
+            if (parse_peek_kind(p) != TOKEN_IDENTIFIER) {
+                emit_stderr("[ERROR] lambda capture entry must be identifier or '&identifier'\n");
+                parse_panic_here(p, "Syntax error");
+            }
+            var cap_tok: *Token = parse_peek(p);
+            parse_consume(p, TOKEN_IDENTIFIER);
+
+            if (parse_lambda_param_exists(params, cap_tok.ptr, cap_tok.len) != 0) {
+                emit_stderr("[ERROR] lambda capture cannot duplicate parameter name: ");
+                emit_stderr_len(cap_tok.ptr, cap_tok.len);
+                emit_stderr("\n");
+                parse_panic_here(p, "Syntax error");
+            }
+            if (parse_lambda_symbol_is_global(cap_tok.ptr, cap_tok.len) != 0) {
+                emit_stderr("[ERROR] lambda capture list cannot include global symbol: ");
+                emit_stderr_len(cap_tok.ptr, cap_tok.len);
+                emit_stderr("\n");
+                parse_panic_here(p, "Syntax error");
+            }
+            parse_lambda_capture_add_with_mode(captures, cap_tok.ptr, cap_tok.len, mode);
+            if (parse_match(p, TOKEN_COMMA) == 0) { break; }
+        }
+    }
+    parse_consume(p, TOKEN_RBRACKET);
+    return 1;
+}
+
+func parse_lambda_capture_add_with_mode(captures: *Vec<*LambdaCapture>, name_ptr: u64, name_len: u64, mode: u64) -> u64 {
     if (captures == 0) { return 0; }
-    if (parse_lambda_capture_find(captures, name_ptr, name_len) != 0) { return 0; }
+    var ex: *LambdaCapture = parse_lambda_capture_find(captures, name_ptr, name_len);
+    if (ex != 0) {
+        ex.mode = mode;
+        return 0;
+    }
     var c: *LambdaCapture = new LambdaCapture();
     c.name_ptr = name_ptr;
     c.name_len = name_len;
     c.slot_ptr = 0;
     c.slot_len = 0;
+    if (mode == 0) { mode = LAMBDA_CAPTURE_BY_VALUE; }
+    c.mode = mode;
     captures.push(c);
     return 0;
 }
@@ -212,7 +258,7 @@ func parse_lambda_capture_add(captures: *Vec<*LambdaCapture>, name_ptr: u64, nam
 func parse_lambda_collect_capture_name(p: *Parser, params: *Vec<*Param>, captures: *Vec<*LambdaCapture>, name_ptr: u64, name_len: u64) -> u64 {
     if (parse_lambda_param_exists(params, name_ptr, name_len) != 0) { return 0; }
     if (parse_lambda_symbol_is_global(name_ptr, name_len) != 0) { return 0; }
-    parse_lambda_capture_add(captures, name_ptr, name_len);
+    parse_lambda_capture_add_with_mode(captures, name_ptr, name_len, LAMBDA_CAPTURE_BY_VALUE);
     return 0;
 }
 
@@ -443,154 +489,179 @@ func parse_lambda_emit_capture_globals(p: *Parser, captures: *Vec<*LambdaCapture
     return 0;
 }
 
-func parse_lambda_capture_slot_for_name(captures: *Vec<*LambdaCapture>, name_ptr: u64, name_len: u64) -> *NameInfo {
+func parse_lambda_capture_slot_for_name(captures: *Vec<*LambdaCapture>, name_ptr: u64, name_len: u64) -> *LambdaCapture {
     var c: *LambdaCapture = parse_lambda_capture_find(captures, name_ptr, name_len);
     if (c == 0 || c.slot_ptr == 0 || c.slot_len == 0) { return 0; }
-    return new NameInfo{c.slot_ptr, c.slot_len};
+    return c;
 }
 
-func parse_lambda_rewrite_expr_captures(node: *AstNode, captures: *Vec<*LambdaCapture>) -> u64 {
-    if (node == 0 || captures == 0 || captures.len() == 0) { return 0; }
+func parse_lambda_rewrite_expr_captures(p: *Parser, node: *AstNode, captures: *Vec<*LambdaCapture>) -> *AstNode {
+    if (node == 0 || captures == 0 || captures.len() == 0) { return node; }
     var kind: u64 = ast_kind(node);
     switch (kind) {
         case AST_IDENT:
             var id: *AstIdent = (*AstIdent)node;
-            var slot: *NameInfo = parse_lambda_capture_slot_for_name(captures, id.name_ptr, id.name_len);
+            var slot: *LambdaCapture = parse_lambda_capture_slot_for_name(captures, id.name_ptr, id.name_len);
             if (slot != 0) {
-                id.name_ptr = slot.ptr;
-                id.name_len = slot.len;
+                if (slot.mode == LAMBDA_CAPTURE_BY_REF) {
+                    return (*AstNode)ast_deref((*AstNode)ast_ident(slot.slot_ptr, slot.slot_len));
+                }
+                id.name_ptr = slot.slot_ptr;
+                id.name_len = slot.slot_len;
             }
-            return 0;
+            return node;
         case AST_CALL:
             var call: *AstCall = (*AstCall)node;
-            var slot2: *NameInfo = parse_lambda_capture_slot_for_name(captures, call.name_ptr, call.name_len);
+            var slot2: *LambdaCapture = parse_lambda_capture_slot_for_name(captures, call.name_ptr, call.name_len);
             if (slot2 != 0) {
-                call.name_ptr = slot2.ptr;
-                call.name_len = slot2.len;
+                if (slot2.mode == LAMBDA_CAPTURE_BY_REF) {
+                    emit_stderr("[ERROR] by-ref captured symbol cannot be used as direct call target in lambda\n");
+                    parse_panic_here(p, "Syntax error");
+                }
+                call.name_ptr = slot2.slot_ptr;
+                call.name_len = slot2.slot_len;
             }
             if (call.args_vec != 0) {
                 var cn: u64 = call.args_vec.len();
                 for (var ci: u64 = 0; ci < cn; ci++) {
-                    parse_lambda_rewrite_expr_captures(call.args_vec.get(ci), captures);
+                    call.args_vec.set(ci, parse_lambda_rewrite_expr_captures(p, call.args_vec.get(ci), captures));
                 }
             }
-            return 0;
+            return node;
         case AST_BINARY:
             var bin: *AstBinary = (*AstBinary)node;
-            parse_lambda_rewrite_expr_captures(bin.left, captures);
-            parse_lambda_rewrite_expr_captures(bin.right, captures);
-            return 0;
+            bin.left = parse_lambda_rewrite_expr_captures(p, bin.left, captures);
+            bin.right = parse_lambda_rewrite_expr_captures(p, bin.right, captures);
+            return node;
         case AST_UNARY:
-            return parse_lambda_rewrite_expr_captures(((*AstUnary)node).operand, captures);
+            var un: *AstUnary = (*AstUnary)node;
+            un.operand = parse_lambda_rewrite_expr_captures(p, un.operand, captures);
+            return node;
         case AST_ADDR_OF:
-            return parse_lambda_rewrite_expr_captures(((*AstAddrOf)node).operand, captures);
+            var ao: *AstAddrOf = (*AstAddrOf)node;
+            ao.operand = parse_lambda_rewrite_expr_captures(p, ao.operand, captures);
+            return node;
         case AST_DEREF:
-            return parse_lambda_rewrite_expr_captures(((*AstDeref)node).operand, captures);
+            var dr: *AstDeref = (*AstDeref)node;
+            dr.operand = parse_lambda_rewrite_expr_captures(p, dr.operand, captures);
+            return node;
         case AST_DEREF8:
-            return parse_lambda_rewrite_expr_captures(((*AstDeref8)node).operand, captures);
+            var dr8: *AstDeref8 = (*AstDeref8)node;
+            dr8.operand = parse_lambda_rewrite_expr_captures(p, dr8.operand, captures);
+            return node;
         case AST_CAST:
-            return parse_lambda_rewrite_expr_captures(((*AstCast)node).expr, captures);
+            var cs: *AstCast = (*AstCast)node;
+            cs.expr = parse_lambda_rewrite_expr_captures(p, cs.expr, captures);
+            return node;
         case AST_TRY:
-            return parse_lambda_rewrite_expr_captures(((*AstTry)node).operand, captures);
+            var tr: *AstTry = (*AstTry)node;
+            tr.operand = parse_lambda_rewrite_expr_captures(p, tr.operand, captures);
+            return node;
         case AST_SIZEOF_EXPR:
-            return parse_lambda_rewrite_expr_captures(((*AstSizeofExpr)node).expr, captures);
+            var se: *AstSizeofExpr = (*AstSizeofExpr)node;
+            se.expr = parse_lambda_rewrite_expr_captures(p, se.expr, captures);
+            return node;
         case AST_INDEX:
             var idx: *AstIndex = (*AstIndex)node;
-            parse_lambda_rewrite_expr_captures(idx.base, captures);
-            parse_lambda_rewrite_expr_captures(idx.index, captures);
-            return 0;
+            idx.base = parse_lambda_rewrite_expr_captures(p, idx.base, captures);
+            idx.index = parse_lambda_rewrite_expr_captures(p, idx.index, captures);
+            return node;
         case AST_MEMBER_ACCESS:
         case AST_SAFE_MEMBER_ACCESS:
-            return parse_lambda_rewrite_expr_captures(((*AstMemberAccess)node).object, captures);
+            var ma: *AstMemberAccess = (*AstMemberAccess)node;
+            ma.object = parse_lambda_rewrite_expr_captures(p, ma.object, captures);
+            return node;
         case AST_METHOD_CALL:
         case AST_SAFE_METHOD_CALL:
             var mc: *AstMethodCall = (*AstMethodCall)node;
-            parse_lambda_rewrite_expr_captures(mc.receiver, captures);
+            mc.receiver = parse_lambda_rewrite_expr_captures(p, mc.receiver, captures);
             if (mc.args_vec != 0) {
                 var an: u64 = mc.args_vec.len();
                 for (var ai: u64 = 0; ai < an; ai++) {
-                    parse_lambda_rewrite_expr_captures(mc.args_vec.get(ai), captures);
+                    mc.args_vec.set(ai, parse_lambda_rewrite_expr_captures(p, mc.args_vec.get(ai), captures));
                 }
             }
-            return 0;
+            return node;
         case AST_CALL_PTR:
             var cp: *AstCallPtr = (*AstCallPtr)node;
-            parse_lambda_rewrite_expr_captures(cp.callee, captures);
+            cp.callee = parse_lambda_rewrite_expr_captures(p, cp.callee, captures);
             if (cp.args_vec != 0) {
                 var cpn: u64 = cp.args_vec.len();
                 for (var cpi: u64 = 0; cpi < cpn; cpi++) {
-                    parse_lambda_rewrite_expr_captures(cp.args_vec.get(cpi), captures);
+                    cp.args_vec.set(cpi, parse_lambda_rewrite_expr_captures(p, cp.args_vec.get(cpi), captures));
                 }
             }
-            return 0;
+            return node;
         case AST_GENERIC_CALL:
             var gc: *AstGenericCall = (*AstGenericCall)node;
             if (gc.args_vec != 0) {
                 var gcn: u64 = gc.args_vec.len();
                 for (var gci: u64 = 0; gci < gcn; gci++) {
-                    parse_lambda_rewrite_expr_captures(gc.args_vec.get(gci), captures);
+                    gc.args_vec.set(gci, parse_lambda_rewrite_expr_captures(p, gc.args_vec.get(gci), captures));
                 }
             }
-            return 0;
+            return node;
         case AST_STATIC_GENERIC_CALL:
             var sgc: *AstStaticGenericCall = (*AstStaticGenericCall)node;
             if (sgc.args_vec != 0) {
                 var sgn: u64 = sgc.args_vec.len();
                 for (var sgi: u64 = 0; sgi < sgn; sgi++) {
-                    parse_lambda_rewrite_expr_captures(sgc.args_vec.get(sgi), captures);
+                    sgc.args_vec.set(sgi, parse_lambda_rewrite_expr_captures(p, sgc.args_vec.get(sgi), captures));
                 }
             }
-            return 0;
+            return node;
         case AST_STRUCT_LITERAL:
             var sl: *AstStructLiteral = (*AstStructLiteral)node;
             if (sl.values_vec != 0) {
                 var sn: u64 = sl.values_vec.len();
                 for (var si: u64 = 0; si < sn; si++) {
-                    parse_lambda_rewrite_expr_captures(sl.values_vec.get(si), captures);
+                    sl.values_vec.set(si, parse_lambda_rewrite_expr_captures(p, sl.values_vec.get(si), captures));
                 }
             }
-            return 0;
+            return node;
         case AST_GENERIC_STRUCT_LITERAL:
             var gsl: *AstGenericStructLiteral = (*AstGenericStructLiteral)node;
             if (gsl.values_vec != 0) {
                 var gsn: u64 = gsl.values_vec.len();
                 for (var gsi: u64 = 0; gsi < gsn; gsi++) {
-                    parse_lambda_rewrite_expr_captures(gsl.values_vec.get(gsi), captures);
+                    gsl.values_vec.set(gsi, parse_lambda_rewrite_expr_captures(p, gsl.values_vec.get(gsi), captures));
                 }
             }
-            return 0;
+            return node;
         case AST_SLICE:
             var slice_node: *AstSlice = (*AstSlice)node;
-            parse_lambda_rewrite_expr_captures(slice_node.ptr_expr, captures);
-            parse_lambda_rewrite_expr_captures(slice_node.len_expr, captures);
-            return 0;
+            slice_node.ptr_expr = parse_lambda_rewrite_expr_captures(p, slice_node.ptr_expr, captures);
+            slice_node.len_expr = parse_lambda_rewrite_expr_captures(p, slice_node.len_expr, captures);
+            return node;
         case AST_NEW:
             var nw: *AstNew = (*AstNew)node;
             if (nw.literal_expr != 0) {
-                parse_lambda_rewrite_expr_captures(nw.literal_expr, captures);
+                nw.literal_expr = parse_lambda_rewrite_expr_captures(p, nw.literal_expr, captures);
             }
             if (nw.ctor_args_vec != 0) {
                 var nn: u64 = nw.ctor_args_vec.len();
                 for (var ni: u64 = 0; ni < nn; ni++) {
-                    parse_lambda_rewrite_expr_captures(nw.ctor_args_vec.get(ni), captures);
+                    nw.ctor_args_vec.set(ni, parse_lambda_rewrite_expr_captures(p, nw.ctor_args_vec.get(ni), captures));
                 }
             }
-            return 0;
+            return node;
         case AST_STACK_CTOR:
             var sc: *AstStackCtor = (*AstStackCtor)node;
             if (sc.ctor_args_vec != 0) {
                 var sn2: u64 = sc.ctor_args_vec.len();
                 for (var si2: u64 = 0; si2 < sn2; si2++) {
-                    parse_lambda_rewrite_expr_captures(sc.ctor_args_vec.get(si2), captures);
+                    sc.ctor_args_vec.set(si2, parse_lambda_rewrite_expr_captures(p, sc.ctor_args_vec.get(si2), captures));
                 }
             }
-            return 0;
+            return node;
     }
-    return 0;
+    return node;
 }
 
 func parse_primary_lambda_expr(p: *Parser) -> *AstNode {
     parse_consume(p, TOKEN_FUNC);
+    var captures: *Vec<*LambdaCapture> = new Vec<*LambdaCapture>(4);
+    var has_explicit_capture_list: u64 = parse_lambda_parse_capture_list(p, 0, captures);
     parse_consume(p, TOKEN_LPAREN);
 
     var params: *Vec<*Param> = new Vec<*Param>(4);
@@ -641,10 +712,22 @@ func parse_primary_lambda_expr(p: *Parser) -> *AstNode {
     var lambda_id: u64 = parse_next_generated_id(p);
     var lambda_body_name: *NameInfo = parse_lambda_build_name_with_prefix("__lambda_body_", 14, lambda_id);
 
-    var captures: *Vec<*LambdaCapture> = new Vec<*LambdaCapture>(4);
-    parse_lambda_collect_expr_captures(p, body_expr, params, captures);
+    if (has_explicit_capture_list != 0) {
+        var cap_n0: u64 = captures.len();
+        for (var ci0: u64 = 0; ci0 < cap_n0; ci0++) {
+            var cap0: *LambdaCapture = captures.get(ci0);
+            if (parse_lambda_param_exists(params, cap0.name_ptr, cap0.name_len) != 0) {
+                emit_stderr("[ERROR] lambda capture cannot duplicate parameter name: ");
+                emit_stderr_len(cap0.name_ptr, cap0.name_len);
+                emit_stderr("\n");
+                parse_panic_here(p, "Syntax error");
+            }
+        }
+    } else {
+        parse_lambda_collect_expr_captures(p, body_expr, params, captures);
+    }
     parse_lambda_emit_capture_globals(p, captures, lambda_id);
-    parse_lambda_rewrite_expr_captures(body_expr, captures);
+    body_expr = parse_lambda_rewrite_expr_captures(p, body_expr, captures);
 
     var body_stmts: *Vec<*AstNode> = new Vec<*AstNode>(1);
     body_stmts.push((*AstNode)ast_return(body_expr));
@@ -676,7 +759,11 @@ func parse_primary_lambda_expr(p: *Parser) -> *AstNode {
             (*AstNode)ast_ident(cap.slot_ptr, cap.slot_len),
             (*AstNode)ast_ident(bind_param_name.ptr, bind_param_name.len)
         ));
-        bind_call_args.push((*AstNode)ast_ident(cap.name_ptr, cap.name_len));
+        if (cap.mode == LAMBDA_CAPTURE_BY_REF) {
+            bind_call_args.push((*AstNode)ast_addr_of((*AstNode)ast_ident(cap.name_ptr, cap.name_len)));
+        } else {
+            bind_call_args.push((*AstNode)ast_ident(cap.name_ptr, cap.name_len));
+        }
     }
 
     bind_body_stmts.push((*AstNode)ast_return(
@@ -792,14 +879,14 @@ func parse_primary_match_expr(p: *Parser) -> *AstNode {
     }
 
     parse_lambda_emit_capture_globals(p, captures, lambda_id);
-    parse_lambda_rewrite_expr_captures(scrutinee_expr, captures);
+    scrutinee_expr = parse_lambda_rewrite_expr_captures(p, scrutinee_expr, captures);
     var cvn2: u64 = case_value_nodes.len();
     for (var i: u64 = 0; i < cvn2; i++) {
-        parse_lambda_rewrite_expr_captures(case_value_nodes.get(i), captures);
+        case_value_nodes.set(i, parse_lambda_rewrite_expr_captures(p, case_value_nodes.get(i), captures));
     }
     var an: u64 = arm_expr_nodes.len();
     for (var ai: u64 = 0; ai < an; ai++) {
-        parse_lambda_rewrite_expr_captures(arm_expr_nodes.get(ai), captures);
+        arm_expr_nodes.set(ai, parse_lambda_rewrite_expr_captures(p, arm_expr_nodes.get(ai), captures));
     }
 
     var fn_body_stmts: *Vec<*AstNode> = new Vec<*AstNode>(4);
@@ -846,6 +933,24 @@ func parse_resolve_struct_def(name_ptr: u64, name_len: u64) -> *AstStructDef {
     var resolved: *NameInfo = resolve_name(name_ptr, name_len);
     if (resolved == 0) { return 0; }
     return get_struct_def(resolved.ptr, resolved.len);
+}
+
+func parse_try_build_enum_ctor_name(enum_ptr: u64, enum_len: u64, variant_ptr: u64, variant_len: u64) -> *NameInfo {
+    if (enum_ptr == 0 || enum_len == 0 || variant_ptr == 0 || variant_len == 0) { return 0; }
+    var e_u8: []u8 = slice(enum_ptr, enum_len);
+    var v_u8: []u8 = slice(variant_ptr, variant_len);
+    if (e_u8[0] < 65 || e_u8[0] > 90) { return 0; }
+    if (v_u8[0] < 65 || v_u8[0] > 90) { return 0; }
+    var joined: *NameInfo = module_util_build_joined_name(enum_ptr, enum_len, variant_ptr, variant_len);
+    var suffix_ptr: u64 = (u64)"_ctor";
+    var suffix_len: u64 = 5;
+    var out_len: u64 = joined.len + suffix_len;
+    var out_ptr: u64 = heap_alloc((out_len + 1) * sizeof(u8));
+    var out_u8: []u8 = slice(out_ptr, out_len + 1);
+    str_copy(out_ptr, joined.ptr, joined.len);
+    str_copy(out_ptr + joined.len, suffix_ptr, suffix_len);
+    out_u8[out_len] = 0;
+    return new NameInfo{out_ptr, out_len};
 }
 
 func parse_primary_identifier_generic_call(p: *Parser, tok4: *Token) -> *AstNode {
@@ -918,6 +1023,31 @@ func parse_primary_identifier_static_method_call(p: *Parser, tok4: *Token) -> *A
     // and lowered in compiler pass. Keep this parser fast path only for generic static calls
     // because postfix parser doesn't represent method generic arguments yet.
     if (has_generic == 0) {
+        if (parse_peek_kind(p) == TOKEN_LPAREN) {
+            var enum_ctor: *NameInfo = compiler_get_enum_variant_ctor(tok4.ptr, tok4.len, method_tok.ptr, method_tok.len);
+            if (enum_ctor == 0) {
+                enum_ctor = parse_try_build_enum_ctor_name(tok4.ptr, tok4.len, method_tok.ptr, method_tok.len);
+            }
+            if (enum_ctor != 0) {
+                var args2: *ParseCallArgs = parse_call_args_paren(p, 1);
+                var expected_arity: u64 = compiler_get_enum_variant_arity(tok4.ptr, tok4.len, method_tok.ptr, method_tok.len);
+                var got_arity: u64 = 0;
+                if (args2.args != 0) { got_arity = args2.args.len(); }
+                if (expected_arity != 9223372036854775807 && expected_arity != got_arity) {
+                    emit_stderr("[ERROR] enum variant constructor arity mismatch: ");
+                    emit_stderr_len(tok4.ptr, tok4.len);
+                    emit_stderr(".");
+                    emit_stderr_len(method_tok.ptr, method_tok.len);
+                    emit_stderr(" expects ");
+                    emit_u64_stderr(expected_arity);
+                    emit_stderr(" argument(s), got ");
+                    emit_u64_stderr(got_arity);
+                    emit_stderr("\n");
+                    parse_panic_here(p, "Syntax error");
+                }
+                return (*AstNode)ast_call_with_origin_named(enum_ctor.ptr, enum_ctor.len, args2.args, args2.arg_names, AST_CALL_ORIGIN_DIRECT);
+            }
+        }
         parser_set_pos(p, saved_pos);
         return 0;
     }
