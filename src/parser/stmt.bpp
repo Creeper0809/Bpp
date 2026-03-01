@@ -14,6 +14,7 @@ import std.str;
 import types;
 import lexer;
 import ast;
+import compiler;
 import parser.util;
 import parser.type;
 import parser.expr;
@@ -30,14 +31,18 @@ func parse_stmt_internal_name(prefix_ptr: u64, prefix_len: u64, id: u64) -> *Nam
     return new NameInfo{out_ptr, total_len};
 }
 
-func parse_try_context_push(p: *Parser, flag_ptr: u64, flag_len: u64, allowed_depth: u64) -> u64 {
+func parse_try_context_push(p: *Parser, flag_ptr: u64, flag_len: u64, value_ptr: u64, value_len: u64, allowed_depth: u64) -> u64 {
     if (p.try_throw_flag_ptr_stack == 0) {
         p.try_throw_flag_ptr_stack = new Vec<u64>(8);
         p.try_throw_flag_len_stack = new Vec<u64>(8);
+        p.try_throw_value_ptr_stack = new Vec<u64>(8);
+        p.try_throw_value_len_stack = new Vec<u64>(8);
         p.try_throw_allowed_depth_stack = new Vec<u64>(8);
     }
     p.try_throw_flag_ptr_stack.push(flag_ptr);
     p.try_throw_flag_len_stack.push(flag_len);
+    p.try_throw_value_ptr_stack.push(value_ptr);
+    p.try_throw_value_len_stack.push(value_len);
     p.try_throw_allowed_depth_stack.push(allowed_depth);
     return 0;
 }
@@ -46,6 +51,8 @@ func parse_try_context_pop(p: *Parser) -> u64 {
     if (p.try_throw_flag_ptr_stack == 0 || p.try_throw_flag_ptr_stack.len() == 0) { return 0; }
     p.try_throw_flag_ptr_stack.pop();
     p.try_throw_flag_len_stack.pop();
+    p.try_throw_value_ptr_stack.pop();
+    p.try_throw_value_len_stack.pop();
     p.try_throw_allowed_depth_stack.pop();
     return 0;
 }
@@ -66,6 +73,18 @@ func parse_try_context_current_flag_len(p: *Parser) -> u64 {
     if (parse_try_context_active(p) == 0) { return 0; }
     var top_idx: u64 = p.try_throw_flag_len_stack.len() - 1;
     return p.try_throw_flag_len_stack.get(top_idx);
+}
+
+func parse_try_context_current_value_ptr(p: *Parser) -> u64 {
+    if (parse_try_context_active(p) == 0) { return 0; }
+    var top_idx: u64 = p.try_throw_value_ptr_stack.len() - 1;
+    return p.try_throw_value_ptr_stack.get(top_idx);
+}
+
+func parse_try_context_current_value_len(p: *Parser) -> u64 {
+    if (parse_try_context_active(p) == 0) { return 0; }
+    var top_idx: u64 = p.try_throw_value_len_stack.len() - 1;
+    return p.try_throw_value_len_stack.get(top_idx);
 }
 
 func parse_try_build_break_guard(flag_ptr: u64, flag_len: u64) -> *AstNode {
@@ -194,6 +213,33 @@ func is_assignable_expr(expr: *AstNode) -> u64 {
     }
 }
 
+func parse_is_enum_member_const_target(target: *AstNode) -> u64 {
+    if (target == 0) { return 0; }
+    if (ast_kind(target) != AST_MEMBER_ACCESS) { return 0; }
+
+    var ma: *AstMemberAccess = (*AstMemberAccess)target;
+    if (ma.parent_ptr != 0) { return 0; }
+    if (ma.object == 0 || ast_kind(ma.object) != AST_IDENT) { return 0; }
+
+    var sid: *AstIdent = (*AstIdent)ma.object;
+    var scoped_const: *ConstResult = (*ConstResult)compiler_find_scoped_const(sid.name_ptr, sid.name_len, ma.member_ptr, ma.member_len);
+    if (scoped_const == 0 || scoped_const.found == 0) { return 0; }
+    return 1;
+}
+
+func parse_validate_assignment_target_not_enum_const(p: *Parser, target: *AstNode) -> u64 {
+    if (parse_is_enum_member_const_target(target) == 0) { return 0; }
+    var ma: *AstMemberAccess = (*AstMemberAccess)target;
+    var sid: *AstIdent = (*AstIdent)ma.object;
+    emit_stderr("[ERROR] Cannot assign to enum member constant: ");
+    emit_stderr_len(sid.name_ptr, sid.name_len);
+    emit_stderr(".");
+    emit_stderr_len(ma.member_ptr, ma.member_len);
+    emit_stderr("\n");
+    parse_panic_here(p, "Syntax error");
+    return 0;
+}
+
 func make_incdec_rhs(incdec_kind: u64, target: *AstNode) -> *AstNode {
     var one: *AstNode = ast_literal(1);
     switch (incdec_kind) {
@@ -208,6 +254,7 @@ func make_incdec_rhs(incdec_kind: u64, target: *AstNode) -> *AstNode {
 
 func parse_assign_or_postfix_expr(p: *Parser, lhs: *AstNode) -> *AstNode {
     if (parse_match(p, TOKEN_EQ)) {
+        parse_validate_assignment_target_not_enum_const(p, lhs);
         var rhs: *AstNode = parse_expr(p);
         return ast_assign(lhs, rhs);
     }
@@ -222,6 +269,7 @@ func parse_prefix_incdec_assign(p: *Parser) -> *AstNode {
         emit_stderr("[ERROR] ++/-- requires assignable expression\n");
         parse_panic_here(p, "Syntax error");
     }
+    parse_validate_assignment_target_not_enum_const(p, target);
     var rhs: *AstNode = make_incdec_rhs(k, target);
     return ast_assign(target, rhs);
 }
@@ -240,6 +288,7 @@ func parse_postfix_incdec_after_expr(p: *Parser, expr: *AstNode) -> *AstNode {
         emit_stderr("[ERROR] ++/-- requires assignable expression\n");
         parse_panic_here(p, "Syntax error");
     }
+    parse_validate_assignment_target_not_enum_const(p, expr);
     var rhs: *AstNode = make_incdec_rhs(k, expr);
     return ast_assign(expr, rhs);
 }
@@ -261,6 +310,7 @@ func parse_assign_or_expr(p: *Parser) -> *AstNode {
     var expr: *AstNode = parse_expr(p);
     
     if (parse_match(p, TOKEN_EQ)) {
+        parse_validate_assignment_target_not_enum_const(p, expr);
         var val: *AstNode = parse_expr(p);
         parse_consume(p, TOKEN_SEMICOLON);
         return ast_assign(expr, val);
@@ -283,6 +333,7 @@ func parse_assign_or_expr(p: *Parser) -> *AstNode {
             emit_stderr("[ERROR] Compound assignment requires assignable expression\n");
             parse_panic_here(p, "Syntax error");
         }
+        parse_validate_assignment_target_not_enum_const(p, expr);
         var rhs: *AstNode = parse_expr(p);
         
         var new_val: *AstNode = ast_binary(bin_op, expr, rhs);
@@ -300,6 +351,7 @@ func parse_assign_or_expr(p: *Parser) -> *AstNode {
                 emit_stderr("[ERROR] ++/-- requires assignable expression\n");
                 parse_panic_here(p, "Syntax error");
             }
+            parse_validate_assignment_target_not_enum_const(p, expr);
             var rhs: *AstNode = make_incdec_rhs(post_k, expr);
             parse_consume(p, TOKEN_SEMICOLON);
             return ast_assign(expr, rhs);
@@ -511,12 +563,20 @@ func parse_switch_stmt(p: *Parser) -> *AstNode {
 
 func parse_break_stmt(p: *Parser) -> *AstNode {
     parse_consume(p, TOKEN_BREAK);
+    if (p.breakable_depth == 0) {
+        emit_stderr("[ERROR] break can only be used inside loop/switch\n");
+        parse_panic_here(p, "Syntax error");
+    }
     parse_consume(p, TOKEN_SEMICOLON);
     return ast_break();
 }
 
 func parse_continue_stmt(p: *Parser) -> *AstNode {
     parse_consume(p, TOKEN_CONTINUE);
+    if (p.breakable_depth == 0) {
+        emit_stderr("[ERROR] continue can only be used inside loop\n");
+        parse_panic_here(p, "Syntax error");
+    }
     parse_consume(p, TOKEN_SEMICOLON);
     return ast_continue();
 }
@@ -543,11 +603,13 @@ func parse_throw_stmt(p: *Parser) -> *AstNode {
     var top_idx: u64 = p.try_throw_flag_ptr_stack.len() - 1;
     var flag_ptr: u64 = p.try_throw_flag_ptr_stack.get(top_idx);
     var flag_len: u64 = p.try_throw_flag_len_stack.get(top_idx);
+    var value_ptr: u64 = p.try_throw_value_ptr_stack.get(top_idx);
+    var value_len: u64 = p.try_throw_value_len_stack.get(top_idx);
     var thrown_expr: *AstNode = parse_expr(p);
     parse_consume(p, TOKEN_SEMICOLON);
 
     var throw_stmts: *Vec<*AstNode> = new Vec<*AstNode>(3);
-    throw_stmts.push((*AstNode)ast_expr_stmt(thrown_expr));
+    throw_stmts.push((*AstNode)ast_assign((*AstNode)ast_ident(value_ptr, value_len), thrown_expr));
     throw_stmts.push((*AstNode)ast_assign((*AstNode)ast_ident(flag_ptr, flag_len), (*AstNode)ast_literal(1)));
     throw_stmts.push((*AstNode)ast_break());
     return (*AstNode)ast_block(throw_stmts);
@@ -589,16 +651,26 @@ func parse_try_stmt(p: *Parser) -> *AstNode {
     parse_consume(p, TOKEN_TRY);
     p.try_stmt_counter = p.try_stmt_counter + 1;
     var flag_name: *NameInfo = parse_stmt_internal_name("__try_thrown_", 12, p.try_stmt_counter);
+    var value_name: *NameInfo = parse_stmt_internal_name("__try_value_", 11, p.try_stmt_counter);
 
     var allowed_depth: u64 = p.breakable_depth;
-    parse_try_context_push(p, flag_name.ptr, flag_name.len, allowed_depth);
+    parse_try_context_push(p, flag_name.ptr, flag_name.len, value_name.ptr, value_name.len, allowed_depth);
     var try_block: *AstNode = parse_block(p);
     parse_try_context_pop(p);
 
     var catch_block: *AstNode = 0;
+    var catch_name_ptr: u64 = 0;
+    var catch_name_len: u64 = 0;
     var finally_block: *AstNode = 0;
     if (parse_peek_kind(p) == TOKEN_CATCH) {
         parse_consume(p, TOKEN_CATCH);
+        if (parse_match(p, TOKEN_LPAREN)) {
+            var catch_tok: *Token = parse_peek(p);
+            parse_consume(p, TOKEN_IDENTIFIER);
+            catch_name_ptr = catch_tok.ptr;
+            catch_name_len = catch_tok.len;
+            parse_consume(p, TOKEN_RPAREN);
+        }
         catch_block = parse_block(p);
     }
     if (parse_peek_kind(p) == TOKEN_FINALLY) {
@@ -612,6 +684,7 @@ func parse_try_stmt(p: *Parser) -> *AstNode {
 
     var lowered_stmts: *Vec<*AstNode> = new Vec<*AstNode>(6);
     lowered_stmts.push((*AstNode)ast_var_decl(flag_name.ptr, flag_name.len, TYPE_U64, 0, (*AstNode)ast_literal(0)));
+    lowered_stmts.push((*AstNode)ast_var_decl(value_name.ptr, value_name.len, TYPE_U64, 0, (*AstNode)ast_literal(0)));
 
     var while_body_stmts: *Vec<*AstNode> = new Vec<*AstNode>(8);
     parse_try_stmt_append_block_stmts_with_guard(while_body_stmts, try_block, flag_name.ptr, flag_name.len);
@@ -620,6 +693,23 @@ func parse_try_stmt(p: *Parser) -> *AstNode {
     lowered_stmts.push((*AstNode)ast_while((*AstNode)ast_literal(1), while_body));
 
     if (catch_block != 0) {
+        if (catch_name_ptr != 0 && catch_name_len != 0) {
+            var catch_wrapped: *Vec<*AstNode> = new Vec<*AstNode>(4);
+            catch_wrapped.push((*AstNode)ast_var_decl(catch_name_ptr, catch_name_len, TYPE_U64, 0, (*AstNode)ast_ident(value_name.ptr, value_name.len)));
+            if (ast_kind(catch_block) == AST_BLOCK) {
+                var cblk: *AstBlock = (*AstBlock)catch_block;
+                if (cblk.stmts_vec != 0) {
+                    var cn: u64 = cblk.stmts_vec.len();
+                    for (var ci: u64 = 0; ci < cn; ci++) {
+                        catch_wrapped.push(cblk.stmts_vec.get(ci));
+                    }
+                }
+                catch_block = (*AstNode)ast_block(catch_wrapped);
+            } else {
+                catch_wrapped.push(catch_block);
+                catch_block = (*AstNode)ast_block(catch_wrapped);
+            }
+        }
         var thrown_ident: *AstNode = (*AstNode)ast_ident(flag_name.ptr, flag_name.len);
         var thrown_cond: *AstNode = (*AstNode)ast_binary(TOKEN_BANGEQ, thrown_ident, (*AstNode)ast_literal(0));
         lowered_stmts.push((*AstNode)ast_if(thrown_cond, catch_block, 0));

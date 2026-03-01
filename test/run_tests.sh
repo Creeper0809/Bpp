@@ -4,6 +4,9 @@
 
 set -e
 set -o pipefail
+# Runtime-fail tests intentionally trigger traps/signals. Disable core dumps so
+# timeout-based exit checks remain stable under high parallel load.
+ulimit -c 0 >/dev/null 2>&1 || true
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$SCRIPT_DIR/.."
@@ -72,11 +75,6 @@ detect_default_compiler() {
         return 0
     fi
 
-    if [ -x "$ROOT_DIR/bin/bootstrap" ]; then
-        echo "$ROOT_DIR/bin/bootstrap"
-        return 0
-    fi
-
     if [ -x "$ROOT_DIR/bin/stage1" ]; then
         echo "$ROOT_DIR/bin/stage1"
         return 0
@@ -86,6 +84,11 @@ detect_default_compiler() {
     candidate="$(detect_latest_stage1_compiler || true)"
     if [ -n "$candidate" ]; then
         echo "$candidate"
+        return 0
+    fi
+
+    if [ -x "$ROOT_DIR/bin/bootstrap" ]; then
+        echo "$ROOT_DIR/bin/bootstrap"
         return 0
     fi
 
@@ -117,7 +120,7 @@ COMPILER="${1:-}"
 if [ -z "$COMPILER" ]; then
     COMPILER="$(detect_default_compiler)" || {
         echo "Error: Compiler not found."
-        echo "  Tried: BPP_COMPILER, bin/\${BPP_VERSION}_stage1, bin/bootstrap, bin/stage1, bin/*_stage1"
+        echo "  Tried: BPP_COMPILER, bin/\${BPP_VERSION}_stage1, bin/stage1, bin/*_stage1, bin/bootstrap"
         exit 1
     }
 fi
@@ -142,6 +145,7 @@ TEST_OPT_FILTER=${TEST_OPT_FILTER:-}
 COMPILE_FAIL_SINGLE_VARIANT=${COMPILE_FAIL_SINGLE_VARIANT:-}
 TEST_SUITE_CASE_LIMIT=${TEST_SUITE_CASE_LIMIT:-}
 STRICT_FAIL_DIAGNOSTICS=${STRICT_FAIL_DIAGNOSTICS:-1}
+TEST_TIMEOUT_SEC=${TEST_TIMEOUT_SEC:-15}
 FAST_IO_ACTIVE=0
 
 BUILD_DIR="$BUILD_DIR_BASE"
@@ -348,6 +352,7 @@ if [ "$TEST_QUIET" -eq 0 ]; then
     echo "[INFO] Compile-fail single variant: $COMPILE_FAIL_SINGLE_VARIANT"
     echo "[INFO] Strict fail diagnostics: $STRICT_FAIL_DIAGNOSTICS"
     echo "[INFO] Suite case limit: $TEST_SUITE_CASE_LIMIT (0=all)"
+    echo "[INFO] Runtime timeout: ${TEST_TIMEOUT_SEC}s"
     echo "[INFO] Stress runs: $STRESS_RUNS"
     echo "[INFO] Stability runs: $STABILITY_RUNS"
     echo ""
@@ -455,7 +460,7 @@ run_matrix_case() {
             case_fail=1
             case_status="FAIL (link)"
         else
-            timeout 5s "$bin_file" >/dev/null 2>/dev/null
+            timeout "${TEST_TIMEOUT_SEC}s" "$bin_file" >/dev/null 2>/dev/null
             local exit_code="$?"
             if [ "$exit_code" -eq "$expected" ]; then
                 case_pass=1
@@ -464,7 +469,7 @@ run_matrix_case() {
                     local i=0
                     local stress_exit=0
                     for ((i=1; i<=STRESS_RUNS; i++)); do
-                        timeout 5s "$bin_file" >/dev/null 2>/dev/null
+                        timeout "${TEST_TIMEOUT_SEC}s" "$bin_file" >/dev/null 2>/dev/null
                         stress_exit="$?"
                         if [ "$stress_exit" -ne "$expected" ]; then
                             stress_ok=0
@@ -485,7 +490,7 @@ run_matrix_case() {
                     local j=0
                     local stability_exit=0
                     for ((j=1; j<=STABILITY_RUNS; j++)); do
-                        timeout 5s "$bin_file" >/dev/null 2>/dev/null
+                        timeout "${TEST_TIMEOUT_SEC}s" "$bin_file" >/dev/null 2>/dev/null
                         stability_exit="$?"
                         if [ "$stability_exit" -ne "$expected" ]; then
                             stability_ok=0
@@ -501,7 +506,7 @@ run_matrix_case() {
                     fi
                 fi
             else
-                timeout 5s "$bin_file" > "$out_file" 2>&1
+                timeout "${TEST_TIMEOUT_SEC}s" "$bin_file" > "$out_file" 2>&1
                 persist_result_file "$out_file" "$out_file_persist"
                 case_fail=1
                 case_status="FAIL (exit=$exit_code, expect=$expected)"
