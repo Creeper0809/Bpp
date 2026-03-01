@@ -24,6 +24,7 @@ const COMPILER_SAFE_RECV_INVALID = 0;
 const COMPILER_SAFE_RECV_STRUCT_PTR = 1;
 const COMPILER_SAFE_RECV_TRAIT_PTR = 2;
 const COMPILER_INHERIT_DIST_NOT_FOUND = 9223372036854775807;
+const COMPILER_MAX_DIAGNOSTICS = 64;
 
 struct CompilerCtx {
     // Module and symbol tables
@@ -197,8 +198,13 @@ impl CompilerCtx {
 }
 
 var g_compiler_ctx: CompilerCtx;
+var g_compiler_diag_count: u64 = 0;
+var g_compiler_diag_limit_reached: u64 = 0;
 
 func compiler_ctx_reset_state() -> u64 {
+    g_compiler_diag_count = 0;
+    g_compiler_diag_limit_reached = 0;
+
     // Module and symbol tables
     g_compiler_ctx.loaded_modules = new HashMap<u64, u64>(64);
     g_compiler_ctx.loaded_modules_pass1 = new HashMap<u64, u64>(64);
@@ -747,6 +753,46 @@ func compiler_resolve_parent_def(parent_desc: *ParentDesc, panic_context: u64) -
 
 func compiler_is_not_found_u64(value: u64) -> u64 {
     if (value == COMPILER_NOT_FOUND_U64) { return 1; }
+    return 0;
+}
+
+func compiler_diag_note_error() -> u64 {
+    if (g_compiler_diag_limit_reached != 0) { return g_compiler_diag_count; }
+    g_compiler_diag_count = g_compiler_diag_count + 1;
+    if (g_compiler_diag_count >= COMPILER_MAX_DIAGNOSTICS) {
+        g_compiler_diag_limit_reached = 1;
+        emit_stderr("[ERROR] compiler diagnostic limit reached (");
+        emit_u64_stderr(COMPILER_MAX_DIAGNOSTICS);
+        emit_stderr("), stopping current pass early\n");
+    }
+    return g_compiler_diag_count;
+}
+
+func compiler_diag_reset() -> u64 {
+    g_compiler_diag_count = 0;
+    g_compiler_diag_limit_reached = 0;
+    return 0;
+}
+
+func compiler_diag_count() -> u64 {
+    return g_compiler_diag_count;
+}
+
+func compiler_diag_has_errors() -> u64 {
+    if (g_compiler_diag_count != 0) { return 1; }
+    return 0;
+}
+
+func compiler_diag_should_stop_pass() -> u64 {
+    if (g_compiler_diag_limit_reached != 0) { return 1; }
+    return 0;
+}
+
+func compiler_trait_diag_error(prefix: u64, method_ptr: u64, method_len: u64) -> u64 {
+    emit_stderr(prefix);
+    emit_stderr_len(method_ptr, method_len);
+    emit_stderr("\n");
+    compiler_diag_note_error();
     return 0;
 }
 
@@ -1589,6 +1635,107 @@ func compiler_get_enum_variant_payload_struct(enum_ptr: u64, enum_len: u64, vari
     return g_compiler_ctx.enum_variant_payload_struct.get(key.ptr, key.len);
 }
 
+func compiler_sizeof_typeinfo_internal(ti: *TypeInfo, depth: u64) -> u64 {
+    if (ti == 0) { return 0; }
+    if (depth > 64) { return 0; }
+    if (ti.ptr_depth > 0) { return 8; }
+    switch (ti.type_kind) {
+        case TYPE_BOOL: return 1;
+        case TYPE_U8: return 1;
+        case TYPE_U16: return 2;
+        case TYPE_U32: return 4;
+        case TYPE_U64: return 8;
+        case TYPE_I8: return 1;
+        case TYPE_I16: return 2;
+        case TYPE_I32: return 4;
+        case TYPE_I64: return 8;
+        case TYPE_F64: return 8;
+        case TYPE_SLICE: return 16;
+        case TYPE_TRAIT: return 8;
+        case TYPE_FUNC: return 8;
+        case TYPE_ARRAY:
+            var elem_size: u64 = 0;
+            if (ti.elem_typeinfo != 0) {
+                elem_size = compiler_sizeof_typeinfo_internal(ti.elem_typeinfo, depth + 1);
+            } else {
+                var elem_ti: *TypeInfo = new TypeInfo(ti.elem_type_kind, ti.elem_ptr_depth);
+                elem_ti.struct_name_ptr = ti.struct_name_ptr;
+                elem_ti.struct_name_len = ti.struct_name_len;
+                elem_size = compiler_sizeof_typeinfo_internal(elem_ti, depth + 1);
+            }
+            return elem_size * ti.array_len;
+        case TYPE_STRUCT:
+            var sd: *AstStructDef = get_struct_def(ti.struct_name_ptr, ti.struct_name_len);
+            if (sd == 0) { return 8; }
+            return compiler_sizeof_struct_internal(sd, depth + 1);
+    }
+    return 8;
+}
+
+func compiler_sizeof_field_desc_internal(field: *FieldDesc, depth: u64) -> u64 {
+    if (field == 0) { return 0; }
+    if (field.bit_width > 0) { return (field.bit_width + 7) / 8; }
+    if (field.type_kind == TYPE_ARRAY) {
+        if (field.elem_typeinfo != 0) {
+            return compiler_sizeof_typeinfo_internal(field.elem_typeinfo, depth + 1) * field.array_len;
+        }
+        var elem_ti: *TypeInfo = new TypeInfo(field.elem_type_kind, field.elem_ptr_depth);
+        elem_ti.struct_name_ptr = field.struct_name_ptr;
+        elem_ti.struct_name_len = field.struct_name_len;
+        return compiler_sizeof_typeinfo_internal(elem_ti, depth + 1) * field.array_len;
+    }
+    if (field.type_kind == TYPE_SLICE) { return 16; }
+    var field_ti: *TypeInfo = new TypeInfo(field.type_kind, field.ptr_depth);
+    field_ti.struct_name_ptr = field.struct_name_ptr;
+    field_ti.struct_name_len = field.struct_name_len;
+    return compiler_sizeof_typeinfo_internal(field_ti, depth + 1);
+}
+
+func compiler_sizeof_struct_internal(sd: *AstStructDef, depth: u64) -> u64 {
+    if (sd == 0) { return 0; }
+    if (depth > 64) { return 0; }
+    if (sd.is_union != 0) {
+        var max_size: u64 = 0;
+        if (sd.fields_vec == 0) { return 0; }
+        var fn: u64 = sd.fields_vec.len();
+        for (var fi: u64 = 0; fi < fn; fi++) {
+            var fs: u64 = compiler_sizeof_field_desc_internal(sd.fields_vec.get(fi), depth + 1);
+            if (fs > max_size) { max_size = fs; }
+        }
+        return max_size;
+    }
+    var total: u64 = 0;
+    if (sd.parents_vec != 0) {
+        var pn: u64 = sd.parents_vec.len();
+        for (var pi: u64 = 0; pi < pn; pi++) {
+            var parent_desc: *ParentDesc = sd.parents_vec.get(pi);
+            if (parent_desc == 0) { continue; }
+            var parent_def: *AstStructDef = parent_desc.struct_def;
+            if (parent_def == 0) {
+                parent_def = get_struct_def(parent_desc.name_ptr, parent_desc.name_len);
+            }
+            total = total + compiler_sizeof_struct_internal(parent_def, depth + 1);
+        }
+    }
+    if (sd.fields_vec == 0) { return total; }
+    var n: u64 = sd.fields_vec.len();
+    for (var i: u64 = 0; i < n; i++) {
+        total = total + compiler_sizeof_field_desc_internal(sd.fields_vec.get(i), depth + 1);
+    }
+    return total;
+}
+
+func compiler_calc_payload_slots_for_struct(struct_ptr: u64, struct_len: u64) -> u64 {
+    if (struct_ptr == 0 || struct_len == 0) { return 0; }
+    var sd: *AstStructDef = get_struct_def(struct_ptr, struct_len);
+    // During parsing, payload helper structs may not yet be registered in compiler tables.
+    // Use a conservative fallback to avoid under-allocation in enum inline payload storage.
+    if (sd == 0) { return 8; }
+    var bytes: u64 = compiler_sizeof_struct_internal(sd, 0);
+    if (bytes == 0) { return 8; }
+    return (bytes + 7) / 8;
+}
+
 func compiler_register_enum_payload_slots(enum_ptr: u64, enum_len: u64, slots: u64) -> u64 {
     if (enum_ptr == 0 || enum_len == 0) { return 0; }
     if (g_compiler_ctx.enum_payload_slots == 0) {
@@ -2207,6 +2354,7 @@ func compiler_register_trait_def(trait_def: *TraitDef) -> u64 {
         existing.name_ptr = name_ptr;
         existing.name_len = name_len;
         existing.methods_vec = trait_def.methods_vec;
+        existing.assoc_types_vec = trait_def.assoc_types_vec;
         return 0;
     }
     if (g_compiler_ctx.all_structs != 0) {
@@ -2241,6 +2389,9 @@ func compiler_register_trait_impl(trait_impl: *TraitImpl) -> u64 {
     }
     var existing: *TraitImpl = compiler_find_trait_impl(trait_impl.trait_ptr, trait_impl.trait_len, trait_impl.struct_ptr, trait_impl.struct_len);
     if (existing != 0) {
+        if (trait_impl.assoc_bindings_vec != 0 && trait_impl.assoc_bindings_vec.len() != 0) {
+            existing.assoc_bindings_vec = trait_impl.assoc_bindings_vec;
+        }
         if (trait_impl.methods_vec != 0) {
             if (existing.methods_vec == 0) {
                 existing.methods_vec = trait_impl.methods_vec;
@@ -4735,6 +4886,139 @@ func compiler_generic_bound_extract_struct_name(arg_ti: *TypeInfo, out_ptr: *u64
     return 0;
 }
 
+func compiler_typeinfo_equal_assoc(lhs: *TypeInfo, rhs: *TypeInfo) -> u64 {
+    if (lhs == 0 || rhs == 0) {
+        if (lhs == 0 && rhs == 0) { return 1; }
+        return 0;
+    }
+    if (generic_type_equal(lhs, rhs) == 0) { return 0; }
+    if (lhs.type_kind == TYPE_STRUCT || lhs.type_kind == TYPE_TRAIT || lhs.type_kind == TYPE_GENERIC || lhs.type_kind == TYPE_ARRAY || lhs.type_kind == TYPE_SLICE) {
+        if (str_eq(lhs.struct_name_ptr, lhs.struct_name_len, rhs.struct_name_ptr, rhs.struct_name_len) == 0) {
+            return 0;
+        }
+    }
+    if (lhs.is_tagged != rhs.is_tagged) { return 0; }
+    if (lhs.is_tagged != 0) {
+        if (str_eq(lhs.tag_layout_ptr, lhs.tag_layout_len, rhs.tag_layout_ptr, rhs.tag_layout_len) == 0) {
+            return 0;
+        }
+    }
+    if (lhs.array_len_is_param != rhs.array_len_is_param) { return 0; }
+    if (lhs.array_len_is_param != 0) {
+        if (str_eq(lhs.array_len_param_ptr, lhs.array_len_param_len, rhs.array_len_param_ptr, rhs.array_len_param_len) == 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+func compiler_trait_assoc_decl_exists(trait_def: *TraitDef, name_ptr: u64, name_len: u64) -> u64 {
+    if (trait_def == 0 || trait_def.assoc_types_vec == 0) { return 0; }
+    var n: u64 = trait_def.assoc_types_vec.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var assoc: *TraitAssocType = trait_def.assoc_types_vec.get(i);
+        if (assoc == 0) { continue; }
+        if (str_eq(assoc.name_ptr, assoc.name_len, name_ptr, name_len) != 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+func compiler_trait_impl_find_assoc_binding(impl_info: *TraitImpl, name_ptr: u64, name_len: u64) -> *TraitAssocBinding {
+    if (impl_info == 0 || impl_info.assoc_bindings_vec == 0) { return 0; }
+    var n: u64 = impl_info.assoc_bindings_vec.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var binding: *TraitAssocBinding = impl_info.assoc_bindings_vec.get(i);
+        if (binding == 0) { continue; }
+        if (str_eq(binding.name_ptr, binding.name_len, name_ptr, name_len) != 0) {
+            return binding;
+        }
+    }
+    return 0;
+}
+
+func compiler_generic_validate_assoc_bounds(gp: *GenericParam, candidate_kind: u64, candidate_ptr: u64, candidate_len: u64, impl_info: *TraitImpl) -> u64 {
+    if (gp == 0) { return 1; }
+    var assoc_n: u64 = 0;
+    if (gp.assoc_bindings != 0) { assoc_n = gp.assoc_bindings.len(); }
+    if (assoc_n == 0 && (gp.assoc_name_ptr == 0 || gp.assoc_name_len == 0 || gp.assoc_type_ptr == 0)) {
+        return 1;
+    }
+
+    if (candidate_kind != 1) {
+        emit_stderr("[ERROR] generic associated type bound requires concrete struct argument for ");
+        emit_stderr_len(gp.name_ptr, gp.name_len);
+        emit_stderr("\n");
+        return 0;
+    }
+
+    var trait_def: *TraitDef = compiler_get_trait_def(gp.bound_trait_ptr, gp.bound_trait_len);
+    if (trait_def == 0) {
+        emit_stderr("[ERROR] trait definition missing while validating associated bound: ");
+        emit_stderr_len(gp.bound_trait_ptr, gp.bound_trait_len);
+        emit_stderr("\n");
+        return 0;
+    }
+    if (impl_info == 0) {
+        emit_stderr("[ERROR] generic associated type bound not satisfied: ");
+        emit_stderr_len(candidate_ptr, candidate_len);
+        emit_stderr(" does not provide impl metadata for ");
+        emit_stderr_len(gp.bound_trait_ptr, gp.bound_trait_len);
+        emit_stderr("\n");
+        return 0;
+    }
+
+    var checks: u64 = assoc_n;
+    if (checks == 0) { checks = 1; }
+    for (var i: u64 = 0; i < checks; i++) {
+        var assoc_name_ptr: u64 = gp.assoc_name_ptr;
+        var assoc_name_len: u64 = gp.assoc_name_len;
+        var assoc_type: *TypeInfo = gp.assoc_type_ptr;
+        if (assoc_n != 0) {
+            var req: *GenericAssocBinding = gp.assoc_bindings.get(i);
+            assoc_name_ptr = req.name_ptr;
+            assoc_name_len = req.name_len;
+            assoc_type = req.type_ptr;
+        }
+
+        if (assoc_name_ptr == 0 || assoc_name_len == 0 || assoc_type == 0) { continue; }
+
+        if (compiler_trait_assoc_decl_exists(trait_def, assoc_name_ptr, assoc_name_len) == 0) {
+            emit_stderr("[ERROR] unknown associated type in generic bound: ");
+            emit_stderr_len(gp.bound_trait_ptr, gp.bound_trait_len);
+            emit_stderr(".");
+            emit_stderr_len(assoc_name_ptr, assoc_name_len);
+            emit_stderr("\n");
+            return 0;
+        }
+
+        var impl_binding: *TraitAssocBinding = compiler_trait_impl_find_assoc_binding(impl_info, assoc_name_ptr, assoc_name_len);
+        if (impl_binding == 0 || impl_binding.type_ptr == 0) {
+            emit_stderr("[ERROR] generic associated type bound not satisfied: missing impl binding ");
+            emit_stderr_len(gp.bound_trait_ptr, gp.bound_trait_len);
+            emit_stderr(".");
+            emit_stderr_len(assoc_name_ptr, assoc_name_len);
+            emit_stderr(" for ");
+            emit_stderr_len(candidate_ptr, candidate_len);
+            emit_stderr("\n");
+            return 0;
+        }
+
+        if (compiler_typeinfo_equal_assoc(impl_binding.type_ptr, assoc_type) == 0) {
+            emit_stderr("[ERROR] generic associated type bound not satisfied: ");
+            emit_stderr_len(gp.bound_trait_ptr, gp.bound_trait_len);
+            emit_stderr(".");
+            emit_stderr_len(assoc_name_ptr, assoc_name_len);
+            emit_stderr(" mismatch for ");
+            emit_stderr_len(candidate_ptr, candidate_len);
+            emit_stderr("\n");
+            return 0;
+        }
+    }
+    return 1;
+}
+
 func compiler_generic_validate_type_bound(gp: *GenericParam, arg_ti: *TypeInfo) -> u64 {
     if (gp == 0 || arg_ti == 0) { return 1; }
     if (gp.bound_trait_ptr == 0 || gp.bound_trait_len == 0) { return 1; }
@@ -4753,6 +5037,9 @@ func compiler_generic_validate_type_bound(gp: *GenericParam, arg_ti: *TypeInfo) 
 
     if (kind == 2) {
         if (str_eq(candidate_ptr, candidate_len, gp.bound_trait_ptr, gp.bound_trait_len) != 0) {
+            if (compiler_generic_validate_assoc_bounds(gp, kind, candidate_ptr, candidate_len, 0) == 0) {
+                return 0;
+            }
             return 1;
         }
         emit_stderr("[ERROR] generic trait argument does not satisfy bound ");
@@ -4763,12 +5050,16 @@ func compiler_generic_validate_type_bound(gp: *GenericParam, arg_ti: *TypeInfo) 
         return 0;
     }
 
-    if (compiler_find_trait_impl(gp.bound_trait_ptr, gp.bound_trait_len, candidate_ptr, candidate_len) == 0) {
+    var impl_info: *TraitImpl = compiler_find_trait_impl(gp.bound_trait_ptr, gp.bound_trait_len, candidate_ptr, candidate_len);
+    if (impl_info == 0) {
         emit_stderr("[ERROR] generic bound not satisfied: ");
         emit_stderr_len(candidate_ptr, candidate_len);
         emit_stderr(" does not implement ");
         emit_stderr_len(gp.bound_trait_ptr, gp.bound_trait_len);
         emit_stderr("\n");
+        return 0;
+    }
+    if (compiler_generic_validate_assoc_bounds(gp, kind, candidate_ptr, candidate_len, impl_info) == 0) {
         return 0;
     }
     return 1;
@@ -6761,6 +7052,93 @@ func compiler_find_trait_impl_method(impl_info: *TraitImpl, name_ptr: u64, name_
     return 0;
 }
 
+func compiler_validate_trait_impl_assoc_bindings(impl_info: *TraitImpl, trait_def: *TraitDef) -> u64 {
+    if (impl_info == 0 || trait_def == 0) { return 1; }
+    var ok: u64 = 1;
+    var declared_n: u64 = 0;
+    if (trait_def.assoc_types_vec != 0) { declared_n = trait_def.assoc_types_vec.len(); }
+    var impl_n: u64 = 0;
+    if (impl_info.assoc_bindings_vec != 0) { impl_n = impl_info.assoc_bindings_vec.len(); }
+
+    if (declared_n == 0) {
+        if (impl_n != 0) {
+            emit_stderr("[ERROR] trait impl provides associated type bindings, but trait has none: ");
+            emit_stderr_len(impl_info.trait_ptr, impl_info.trait_len);
+            emit_stderr(" for ");
+            emit_stderr_len(impl_info.struct_ptr, impl_info.struct_len);
+            emit_stderr("\n");
+            compiler_diag_note_error();
+            return 0;
+        }
+        return 1;
+    }
+
+    if (impl_n == 0) {
+        emit_stderr("[ERROR] trait impl is missing associated type bindings: ");
+        emit_stderr_len(impl_info.trait_ptr, impl_info.trait_len);
+        emit_stderr(" for ");
+        emit_stderr_len(impl_info.struct_ptr, impl_info.struct_len);
+        emit_stderr("\n");
+        compiler_diag_note_error();
+        return 0;
+    }
+
+    for (var i: u64 = 0; i < impl_n; i++) {
+        if (compiler_diag_should_stop_pass() != 0) { break; }
+        var binding: *TraitAssocBinding = impl_info.assoc_bindings_vec.get(i);
+        if (binding == 0 || binding.name_ptr == 0 || binding.name_len == 0 || binding.type_ptr == 0) {
+            emit_stderr("[ERROR] invalid associated type binding in trait impl: ");
+            emit_stderr_len(impl_info.trait_ptr, impl_info.trait_len);
+            emit_stderr(" for ");
+            emit_stderr_len(impl_info.struct_ptr, impl_info.struct_len);
+            emit_stderr("\n");
+            compiler_diag_note_error();
+            ok = 0;
+            continue;
+        }
+        if (compiler_trait_assoc_decl_exists(trait_def, binding.name_ptr, binding.name_len) == 0) {
+            emit_stderr("[ERROR] unknown associated type binding in trait impl: ");
+            emit_stderr_len(impl_info.trait_ptr, impl_info.trait_len);
+            emit_stderr(".");
+            emit_stderr_len(binding.name_ptr, binding.name_len);
+            emit_stderr("\n");
+            compiler_diag_note_error();
+            ok = 0;
+        }
+        for (var j: u64 = i + 1; j < impl_n; j++) {
+            var other: *TraitAssocBinding = impl_info.assoc_bindings_vec.get(j);
+            if (other == 0) { continue; }
+            if (str_eq(other.name_ptr, other.name_len, binding.name_ptr, binding.name_len) != 0) {
+                emit_stderr("[ERROR] duplicate associated type binding in trait impl: ");
+                emit_stderr_len(impl_info.trait_ptr, impl_info.trait_len);
+                emit_stderr(".");
+                emit_stderr_len(binding.name_ptr, binding.name_len);
+                emit_stderr("\n");
+                compiler_diag_note_error();
+                ok = 0;
+            }
+        }
+    }
+
+    for (var ai: u64 = 0; ai < declared_n; ai++) {
+        if (compiler_diag_should_stop_pass() != 0) { break; }
+        var assoc_decl: *TraitAssocType = trait_def.assoc_types_vec.get(ai);
+        if (assoc_decl == 0) { continue; }
+        if (compiler_trait_impl_find_assoc_binding(impl_info, assoc_decl.name_ptr, assoc_decl.name_len) == 0) {
+            emit_stderr("[ERROR] missing associated type binding in trait impl: ");
+            emit_stderr_len(impl_info.trait_ptr, impl_info.trait_len);
+            emit_stderr(".");
+            emit_stderr_len(assoc_decl.name_ptr, assoc_decl.name_len);
+            emit_stderr(" for ");
+            emit_stderr_len(impl_info.struct_ptr, impl_info.struct_len);
+            emit_stderr("\n");
+            compiler_diag_note_error();
+            ok = 0;
+        }
+    }
+    return ok;
+}
+
 func compiler_find_trait_method_index(trait_ptr: u64, trait_len: u64, name_ptr: u64, name_len: u64) -> u64 {
     var td: *TraitDef = compiler_get_trait_def(trait_ptr, trait_len);
     if (td == 0 || td.methods_vec == 0) {
@@ -7086,22 +7464,27 @@ func compiler_build_trait_thunk_func(thunk_name_ptr: u64, thunk_name_len: u64, t
 }
 
 func compiler_validate_struct_trait_inheritance(sd: *AstStructDef) -> u64 {
-    if (sd == 0 || sd.traits_vec == 0) { return 0; }
+    if (sd == 0 || sd.traits_vec == 0) { return 1; }
+    var ok: u64 = 1;
     if (sd.is_union == 1) {
         emit_stderr("[ERROR] union cannot use trait inheritance: ");
         emit_stderr_len(sd.name_ptr, sd.name_len);
         emit_stderr("\n");
-        compiler_panic("Compilation failed");
+        compiler_diag_note_error();
+        ok = 0;
     }
     var tn: u64 = sd.traits_vec.len();
     for (var ti: u64 = 0; ti < tn; ti++) {
+        if (compiler_diag_should_stop_pass() != 0) { break; }
         var tref: *TraitRef = sd.traits_vec.get(ti);
         var tdef: *TraitDef = compiler_get_trait_def(tref.name_ptr, tref.name_len);
         if (tdef == 0) {
             emit_stderr("[ERROR] Trait not found for struct inheritance: ");
             emit_stderr_len(tref.name_ptr, tref.name_len);
             emit_stderr("\n");
-            compiler_panic("Compilation failed");
+            compiler_diag_note_error();
+            ok = 0;
+            continue;
         }
         var impl_info: *TraitImpl = compiler_find_trait_impl(tref.name_ptr, tref.name_len, sd.name_ptr, sd.name_len);
         if (impl_info == 0) {
@@ -7110,33 +7493,40 @@ func compiler_validate_struct_trait_inheritance(sd: *AstStructDef) -> u64 {
             emit_stderr(" -> ");
             emit_stderr_len(tref.name_ptr, tref.name_len);
             emit_stderr("\n");
-            compiler_panic("Compilation failed");
+            compiler_diag_note_error();
+            ok = 0;
         }
     }
-    return 0;
+    return ok;
 }
 
 func compiler_validate_all_struct_trait_inheritance() -> u64 {
-    if (g_compiler_ctx.all_structs_vec == 0) { return 0; }
+    if (g_compiler_ctx.all_structs_vec == 0) { return 1; }
+    var ok: u64 = 1;
     var sn: u64 = g_compiler_ctx.all_structs_vec.len();
     for (var si: u64 = 0; si < sn; si++) {
+        if (compiler_diag_should_stop_pass() != 0) { break; }
         var sd: *AstStructDef = g_compiler_ctx.all_structs_vec.get(si);
-        compiler_validate_struct_trait_inheritance(sd);
+        if (compiler_validate_struct_trait_inheritance(sd) == 0) {
+            ok = 0;
+        }
     }
-    return 0;
+    return ok;
 }
 
 func compiler_get_impl_trait_and_struct(impl_info: *TraitImpl) -> CompilerImplTraitStruct {
     var pair: CompilerImplTraitStruct;
     pair.trait_def = 0;
     pair.struct_def = 0;
+    if (impl_info == 0) { return pair; }
 
     var trait_def: *TraitDef = compiler_get_trait_def(impl_info.trait_ptr, impl_info.trait_len);
     if (trait_def == 0) {
         emit_stderr("[ERROR] Trait not found for impl: ");
         emit_stderr_len(impl_info.trait_ptr, impl_info.trait_len);
         emit_stderr("\n");
-        compiler_panic("Compilation failed");
+        compiler_diag_note_error();
+        return pair;
     }
 
     var struct_def: *AstStructDef = get_struct_def(impl_info.struct_ptr, impl_info.struct_len);
@@ -7144,15 +7534,18 @@ func compiler_get_impl_trait_and_struct(impl_info: *TraitImpl) -> CompilerImplTr
         emit_stderr("[ERROR] Struct not found for trait impl: ");
         emit_stderr_len(impl_info.struct_ptr, impl_info.struct_len);
         emit_stderr("\n");
-        compiler_panic("Compilation failed");
+        compiler_diag_note_error();
+        return pair;
     }
     if (struct_def.is_union == 1) {
         emit_stderr("[ERROR] union cannot implement traits\n");
-        compiler_panic("Compilation failed");
+        compiler_diag_note_error();
+        return pair;
     }
     if (struct_def.is_packed == 1) {
         emit_stderr("[ERROR] packed struct cannot implement traits\n");
-        compiler_panic("Compilation failed");
+        compiler_diag_note_error();
+        return pair;
     }
 
     pair.trait_def = trait_def;
@@ -7214,43 +7607,59 @@ func compiler_get_trait_impl_vptr_offset(impl_info: *TraitImpl, struct_def: *Ast
         emit_stderr("[ERROR] vptr field not found for trait impl: ");
         emit_stderr_len(impl_info.struct_ptr, impl_info.struct_len);
         emit_stderr("\n");
-        compiler_panic("Compilation failed");
+        compiler_diag_note_error();
+        return COMPILER_NOT_FOUND_U64;
     }
     return vptr_offset;
 }
 
 func compiler_validate_trait_signature_method(trait_ptr: u64, trait_len: u64, trait_method: *TraitMethod, trait_sig: *AstFunc) -> u64 {
+    if (trait_method == 0 || trait_sig == 0) { return 0; }
+    var ok: u64 = 1;
     if (trait_sig.params_vec == 0 || trait_sig.params_vec.len() == 0) {
-        module_util_trait_method_error("[ERROR] Trait method must have self parameter: ", trait_method.name_ptr, trait_method.name_len);
+        compiler_trait_diag_error("[ERROR] Trait method must have self parameter: ", trait_method.name_ptr, trait_method.name_len);
+        return 0;
     }
     var self_param: *Param = trait_sig.params_vec.get(0);
     var is_virtual_trait: u64 = compiler_is_virtual_trait_name(trait_ptr, trait_len);
     if (module_util_is_self_type(self_param.type_kind, self_param.struct_name_ptr, self_param.struct_name_len) == 0 || self_param.ptr_depth == 0) {
-        module_util_trait_method_error("[ERROR] Trait method self must be *Self: ", trait_method.name_ptr, trait_method.name_len);
+        compiler_trait_diag_error("[ERROR] Trait method self must be *Self: ", trait_method.name_ptr, trait_method.name_len);
+        ok = 0;
     }
     if (is_virtual_trait == 0 && trait_sig.ret_type == TYPE_STRUCT && trait_sig.ret_ptr_depth == 0) {
-        module_util_trait_method_error("[ERROR] Trait method cannot return struct by value: ", trait_method.name_ptr, trait_method.name_len);
+        compiler_trait_diag_error("[ERROR] Trait method cannot return struct by value: ", trait_method.name_ptr, trait_method.name_len);
+        ok = 0;
     }
     if (is_virtual_trait == 0 && module_util_is_self_type(trait_sig.ret_type, trait_sig.ret_struct_name_ptr, trait_sig.ret_struct_name_len) != 0) {
-        module_util_trait_method_error("[ERROR] Trait method cannot return Self type: ", trait_method.name_ptr, trait_method.name_len);
+        compiler_trait_diag_error("[ERROR] Trait method cannot return Self type: ", trait_method.name_ptr, trait_method.name_len);
+        ok = 0;
     }
-    return 0;
+    return ok;
 }
 
 func compiler_validate_trait_impl_signature(trait_method: *TraitMethod, trait_sig: *AstFunc, impl_sig: *AstFunc, impl_info: *TraitImpl) -> u64 {
+    if (trait_method == 0 || trait_sig == 0 || impl_sig == 0 || impl_info == 0) { return 0; }
+    if (trait_sig.params_vec == 0 || impl_sig.params_vec == 0 || trait_sig.params_vec.len() == 0 || impl_sig.params_vec.len() == 0) {
+        compiler_trait_diag_error("[ERROR] Trait impl method signature is missing self parameter: ", trait_method.name_ptr, trait_method.name_len);
+        return 0;
+    }
+    var ok: u64 = 1;
     if (impl_sig.params_vec.len() != trait_sig.params_vec.len()) {
-        module_util_trait_method_error("[ERROR] Trait method param count mismatch: ", trait_method.name_ptr, trait_method.name_len);
+        compiler_trait_diag_error("[ERROR] Trait method param count mismatch: ", trait_method.name_ptr, trait_method.name_len);
+        ok = 0;
     }
 
     var impl_self: *Param = impl_sig.params_vec.get(0);
     if (impl_self.ptr_depth == 0 || impl_self.type_kind != TYPE_STRUCT) {
-        module_util_trait_method_error("[ERROR] Trait impl self must be struct pointer: ", trait_method.name_ptr, trait_method.name_len);
+        compiler_trait_diag_error("[ERROR] Trait impl self must be struct pointer: ", trait_method.name_ptr, trait_method.name_len);
+        ok = 0;
     }
     var is_virtual_trait: u64 = compiler_is_virtual_trait_name(impl_info.trait_ptr, impl_info.trait_len);
     if (is_virtual_trait == 0) {
         if (!(str_eq(impl_self.struct_name_ptr, impl_self.struct_name_len, impl_info.struct_ptr, impl_info.struct_len) ||
               module_util_is_self_type(impl_self.type_kind, impl_self.struct_name_ptr, impl_self.struct_name_len) != 0)) {
-            module_util_trait_method_error("[ERROR] Trait impl self type mismatch: ", trait_method.name_ptr, trait_method.name_len);
+            compiler_trait_diag_error("[ERROR] Trait impl self type mismatch: ", trait_method.name_ptr, trait_method.name_len);
+            ok = 0;
         }
     } else {
         var self_ok: u64 = 0;
@@ -7260,35 +7669,43 @@ func compiler_validate_trait_impl_signature(trait_method: *TraitMethod, trait_si
             self_ok = 1;
         }
         if (self_ok == 0) {
-            module_util_trait_method_error("[ERROR] Virtual impl self type mismatch: ", trait_method.name_ptr, trait_method.name_len);
+            compiler_trait_diag_error("[ERROR] Virtual impl self type mismatch: ", trait_method.name_ptr, trait_method.name_len);
+            ok = 0;
         }
     }
 
-    for (var pi: u64 = 1; pi < trait_sig.params_vec.len(); pi++) {
+    var check_n: u64 = trait_sig.params_vec.len();
+    if (impl_sig.params_vec.len() < check_n) { check_n = impl_sig.params_vec.len(); }
+    for (var pi: u64 = 1; pi < check_n; pi++) {
         var tp: *Param = trait_sig.params_vec.get(pi);
         if (is_virtual_trait == 0 && module_util_is_self_type(tp.type_kind, tp.struct_name_ptr, tp.struct_name_len) != 0) {
-            module_util_trait_method_error("[ERROR] Trait method params cannot use Self type: ", trait_method.name_ptr, trait_method.name_len);
+            compiler_trait_diag_error("[ERROR] Trait method params cannot use Self type: ", trait_method.name_ptr, trait_method.name_len);
+            ok = 0;
         }
         var ip: *Param = impl_sig.params_vec.get(pi);
         if (tp.type_kind != ip.type_kind || tp.ptr_depth != ip.ptr_depth) {
-            module_util_trait_method_error("[ERROR] Trait impl param type mismatch: ", trait_method.name_ptr, trait_method.name_len);
+            compiler_trait_diag_error("[ERROR] Trait impl param type mismatch: ", trait_method.name_ptr, trait_method.name_len);
+            ok = 0;
         }
         if (tp.type_kind == TYPE_STRUCT) {
             if (!str_eq(tp.struct_name_ptr, tp.struct_name_len, ip.struct_name_ptr, ip.struct_name_len)) {
-                module_util_trait_method_error("[ERROR] Trait impl struct param mismatch: ", trait_method.name_ptr, trait_method.name_len);
+                compiler_trait_diag_error("[ERROR] Trait impl struct param mismatch: ", trait_method.name_ptr, trait_method.name_len);
+                ok = 0;
             }
         }
     }
 
     if (trait_sig.ret_type != impl_sig.ret_type || trait_sig.ret_ptr_depth != impl_sig.ret_ptr_depth) {
-        module_util_trait_method_error("[ERROR] Trait impl return type mismatch: ", trait_method.name_ptr, trait_method.name_len);
+        compiler_trait_diag_error("[ERROR] Trait impl return type mismatch: ", trait_method.name_ptr, trait_method.name_len);
+        ok = 0;
     }
     if (trait_sig.ret_type == TYPE_STRUCT) {
         if (!str_eq(trait_sig.ret_struct_name_ptr, trait_sig.ret_struct_name_len, impl_sig.ret_struct_name_ptr, impl_sig.ret_struct_name_len)) {
-            module_util_trait_method_error("[ERROR] Trait impl return struct mismatch: ", trait_method.name_ptr, trait_method.name_len);
+            compiler_trait_diag_error("[ERROR] Trait impl return struct mismatch: ", trait_method.name_ptr, trait_method.name_len);
+            ok = 0;
         }
     }
-    return 0;
+    return ok;
 }
 
 func compiler_register_trait_thunk(impl_info: *TraitImpl, trait_def: *TraitDef, trait_method: *TraitMethod, impl_method: *TraitImplMethod, vptr_offset: u64, values: *Vec<*AstNode>) -> u64 {
@@ -7374,22 +7791,41 @@ func compiler_register_trait_default_impl_method(impl_info: *TraitImpl, trait_me
 }
 
 func compiler_finalize_single_trait_impl(impl_info: *TraitImpl) -> u64 {
+    if (impl_info == 0) { return 0; }
     var impl_types: CompilerImplTraitStruct = compiler_get_impl_trait_and_struct(impl_info);
     var trait_def: *TraitDef = impl_types.trait_def;
     var struct_def: *AstStructDef = impl_types.struct_def;
+    if (trait_def == 0 || struct_def == 0) { return 0; }
+    compiler_validate_trait_impl_assoc_bindings(impl_info, trait_def);
 
     var vtable_info: CompilerVtableStructInfo = compiler_get_or_create_vtable_struct(trait_def, impl_info.trait_ptr, impl_info.trait_len);
     var vtable_name_ptr: u64 = vtable_info.vtable_name_ptr;
     var vtable_name_len: u64 = vtable_info.vtable_name_len;
     var vtable_struct_def: *AstStructDef = vtable_info.vtable_struct_def;
+    if (vtable_struct_def == 0) {
+        emit_stderr("[ERROR] failed to build trait vtable struct: ");
+        emit_stderr_len(impl_info.trait_ptr, impl_info.trait_len);
+        emit_stderr("\n");
+        compiler_diag_note_error();
+        return 0;
+    }
     impl_info.vtable_struct_def = vtable_struct_def;
 
     var vptr_offset: u64 = compiler_get_trait_impl_vptr_offset(impl_info, struct_def, vtable_name_ptr, vtable_name_len);
+    if (compiler_is_not_found_u64(vptr_offset) != 0) { return 0; }
 
     var method_count: u64 = trait_def.methods_vec.len();
     var values: *Vec<*AstNode> = new Vec<*AstNode>(method_count);
     for (var m: u64 = 0; m < method_count; m++) {
+        if (compiler_diag_should_stop_pass() != 0) { break; }
         var trait_method: *TraitMethod = trait_def.methods_vec.get(m);
+        if (trait_method == 0 || trait_method.sig == 0) {
+            emit_stderr("[ERROR] invalid trait method metadata in trait impl finalization: ");
+            emit_stderr_len(impl_info.trait_ptr, impl_info.trait_len);
+            emit_stderr("\n");
+            compiler_diag_note_error();
+            continue;
+        }
         var trait_sig: *AstFunc = trait_method.sig;
         compiler_validate_trait_signature_method(impl_info.trait_ptr, impl_info.trait_len, trait_method, trait_sig);
 
@@ -7400,10 +7836,15 @@ func compiler_finalize_single_trait_impl(impl_info: *TraitImpl) -> u64 {
             }
         }
         if (impl_method == 0) {
-            module_util_trait_method_error("[ERROR] Trait method not implemented: ", trait_method.name_ptr, trait_method.name_len);
+            compiler_trait_diag_error("[ERROR] Trait method not implemented: ", trait_method.name_ptr, trait_method.name_len);
+            continue;
         }
 
         var impl_sig: *AstFunc = impl_method.func_def;
+        if (impl_sig == 0) {
+            compiler_trait_diag_error("[ERROR] Trait impl method is missing function body: ", trait_method.name_ptr, trait_method.name_len);
+            continue;
+        }
         compiler_validate_trait_impl_signature(trait_method, trait_sig, impl_sig, impl_info);
         compiler_register_trait_thunk(impl_info, trait_def, trait_method, impl_method, vptr_offset, values);
     }
@@ -7414,10 +7855,12 @@ func compiler_finalize_single_trait_impl(impl_info: *TraitImpl) -> u64 {
 
 func compiler_finalize_traits() -> u64 {
     compiler_validate_all_struct_trait_inheritance();
+    if (compiler_diag_should_stop_pass() != 0) { return 0; }
     if (g_compiler_ctx.all_trait_impls_vec == 0 || g_compiler_ctx.all_trait_impls_vec.len() == 0) { return 0; }
 
     var num_impls: u64 = g_compiler_ctx.all_trait_impls_vec.len();
     for (var ii: u64 = 0; ii < num_impls; ii++) {
+        if (compiler_diag_should_stop_pass() != 0) { break; }
         var impl_info: *TraitImpl = g_compiler_ctx.all_trait_impls_vec.get(ii);
         compiler_finalize_single_trait_impl(impl_info);
     }
@@ -7505,7 +7948,8 @@ func _compiler_find_abst_decl_in_hierarchy(struct_def: *AstStructDef, method_ptr
         emit_stderr(".");
         emit_stderr_len(method_ptr, method_len);
         emit_stderr("\n");
-        panic("Compiler error");
+        compiler_diag_note_error();
+        return compiler_decl_lookup_none(ACCESS_PRIVATE);
     }
     if (found == 0) { return lookup; }
     return first_hit;
@@ -7524,7 +7968,8 @@ func compiler_build_virtual_trait_method_sig(abst_sig: *AstFunc, method_ptr: u64
         emit_stderr("[ERROR] abstract method requires self parameter for virtual dispatch: ");
         emit_stderr_len(method_ptr, method_len);
         emit_stderr("\n");
-        compiler_panic("Compilation failed");
+        compiler_diag_note_error();
+        return 0;
     }
 
     var params_out: *Vec<*Param> = new Vec<*Param>(abst_sig.params_vec.len());
@@ -7573,13 +8018,15 @@ func compiler_setup_single_virtual_dispatch_trait(base_def: *AstStructDef) -> u6
                 emit_stderr(".");
                 emit_stderr_len(mi.ptr, mi.len);
                 emit_stderr("\n");
-                compiler_panic("Compilation failed");
+                compiler_diag_note_error();
+                continue;
             }
 
             var tm: *TraitMethod = new TraitMethod();
             tm.name_ptr = mi.ptr;
             tm.name_len = mi.len;
             tm.sig = compiler_build_virtual_trait_method_sig(abst_lookup.sig, mi.ptr, mi.len);
+            if (tm.sig == 0) { continue; }
             tm.index = methods.len();
             methods.push(tm);
         }
@@ -7588,6 +8035,7 @@ func compiler_setup_single_virtual_dispatch_trait(base_def: *AstStructDef) -> u6
         trait_def.name_ptr = trait_name.ptr;
         trait_def.name_len = trait_name.len;
         trait_def.methods_vec = methods;
+        trait_def.assoc_types_vec = 0;
         compiler_register_trait_def(trait_def);
     }
 
@@ -7597,7 +8045,8 @@ func compiler_setup_single_virtual_dispatch_trait(base_def: *AstStructDef) -> u6
     var vtable_struct_def: *AstStructDef = vtable_info2.vtable_struct_def;
     if (vtable_struct_def == 0) {
         emit_stderr("[ERROR] failed to build virtual vtable struct\n");
-        compiler_panic("Compilation failed");
+        compiler_diag_note_error();
+        return 0;
     }
 
     var sn: u64 = g_compiler_ctx.all_structs_vec.len();
@@ -7639,6 +8088,7 @@ func compiler_setup_single_virtual_dispatch_trait(base_def: *AstStructDef) -> u6
         impl_info.struct_ptr = sd.name_ptr;
         impl_info.struct_len = sd.name_len;
         impl_info.methods_vec = impl_methods;
+        impl_info.assoc_bindings_vec = 0;
         impl_info.vtable_struct_def = 0;
         impl_info.vtable_global_ptr = 0;
         impl_info.vtable_global_len = 0;
@@ -7680,7 +8130,8 @@ func compiler_find_parent_method_decl_for_override(struct_def: *AstStructDef, me
         emit_stderr(".");
         emit_stderr_len(method_ptr, method_len);
         emit_stderr("\n");
-        panic("Compiler error");
+        compiler_diag_note_error();
+        return compiler_decl_lookup_none(ACCESS_PUBLIC);
     }
     if (found == 0) { return lookup; }
     return first_hit;
@@ -7729,7 +8180,8 @@ func compiler_validate_single_impl_override(fn: *AstFunc) -> u64 {
             emit_stderr(".");
             emit_stderr_len(method_ptr, method_len);
             emit_stderr("\n");
-            compiler_panic("Compilation failed");
+            compiler_diag_note_error();
+            return 0;
         }
         return 0;
     }
@@ -7751,7 +8203,8 @@ func compiler_validate_single_impl_override(fn: *AstFunc) -> u64 {
             emit_stderr(".");
             emit_stderr_len(method_ptr, method_len);
             emit_stderr("\n");
-            compiler_panic("Compilation failed");
+            compiler_diag_note_error();
+            return 0;
         }
         return 0;
     }
@@ -7762,7 +8215,7 @@ func compiler_validate_single_impl_override(fn: *AstFunc) -> u64 {
         emit_stderr(".");
         emit_stderr_len(method_ptr, method_len);
         emit_stderr("\n");
-        compiler_panic("Compilation failed");
+        compiler_diag_note_error();
     }
     return 0;
 }
@@ -7771,9 +8224,378 @@ func compiler_validate_impl_overrides() -> u64 {
     if (g_compiler_ctx.all_func_sigs == 0) { return 0; }
     var n: u64 = g_compiler_ctx.all_func_sigs.len();
     for (var i: u64 = 0; i < n; i++) {
+        if (compiler_diag_should_stop_pass() != 0) { break; }
         compiler_validate_single_impl_override(g_compiler_ctx.all_func_sigs.get(i));
     }
     return 0;
+}
+
+const COMPILER_ANN_ARG_INVALID = 0;
+const COMPILER_ANN_ARG_IDENT = 1;
+const COMPILER_ANN_ARG_INT = 2;
+const COMPILER_ANN_ARG_STRING = 3;
+const COMPILER_ANN_ARG_BOOL = 4;
+
+struct CompilerAnnotationArg {
+    public key_ptr: u64;
+    public key_len: u64;
+    public kind: u64;
+    public ident_ptr: u64;
+    public ident_len: u64;
+    public int_value: u64;
+    public bool_value: u64;
+    public string_ptr: u64;
+    public string_len: u64;
+}
+
+impl CompilerAnnotationArg {
+    public constructor() {
+        self.key_ptr = 0;
+        self.key_len = 0;
+        self.kind = COMPILER_ANN_ARG_INVALID;
+        self.ident_ptr = 0;
+        self.ident_len = 0;
+        self.int_value = 0;
+        self.bool_value = 0;
+        self.string_ptr = 0;
+        self.string_len = 0;
+    }
+}
+
+struct CompilerAnnotationParsed {
+    public raw_ptr: u64;
+    public raw_len: u64;
+    public name_ptr: u64;
+    public name_len: u64;
+    public args_vec: *Vec<*CompilerAnnotationArg>;
+    public parse_ok: u64;
+}
+
+impl CompilerAnnotationParsed {
+    public constructor() {
+        self.raw_ptr = 0;
+        self.raw_len = 0;
+        self.name_ptr = 0;
+        self.name_len = 0;
+        self.args_vec = 0;
+        self.parse_ok = 0;
+    }
+}
+
+func compiler_annotation_is_space(ch: u64) -> u64 {
+    if (ch == 32 || ch == 9 || ch == 10 || ch == 13) { return 1; }
+    return 0;
+}
+
+func compiler_annotation_is_ident_start(ch: u64) -> u64 {
+    if ((ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122) || ch == 95) { return 1; }
+    return 0;
+}
+
+func compiler_annotation_is_ident_continue(ch: u64) -> u64 {
+    if (compiler_annotation_is_ident_start(ch) != 0) { return 1; }
+    if (ch >= 48 && ch <= 57) { return 1; }
+    return 0;
+}
+
+func compiler_annotation_skip_ws(src_ptr: u64, src_len: u64, pos: *u64) -> u64 {
+    if (pos == 0) { return 0; }
+    var p: u64 = *pos;
+    var s: []u8 = slice(src_ptr, src_len);
+    while (p < src_len && compiler_annotation_is_space(s[p]) != 0) {
+        p = p + 1;
+    }
+    *pos = p;
+    return 0;
+}
+
+func compiler_annotation_parse_ident(src_ptr: u64, src_len: u64, pos: *u64, out_ptr: *u64, out_len: *u64) -> u64 {
+    if (pos == 0 || out_ptr == 0 || out_len == 0) { return 0; }
+    compiler_annotation_skip_ws(src_ptr, src_len, pos);
+    var p: u64 = *pos;
+    if (p >= src_len) { return 0; }
+    var s: []u8 = slice(src_ptr, src_len);
+    if (compiler_annotation_is_ident_start(s[p]) == 0) { return 0; }
+    var start: u64 = p;
+    p = p + 1;
+    while (p < src_len && compiler_annotation_is_ident_continue(s[p]) != 0) {
+        p = p + 1;
+    }
+    *out_ptr = src_ptr + start;
+    *out_len = p - start;
+    *pos = p;
+    return 1;
+}
+
+func compiler_annotation_parse_uint(src_ptr: u64, src_len: u64, pos: *u64, out_value: *u64) -> u64 {
+    if (pos == 0 || out_value == 0) { return 0; }
+    compiler_annotation_skip_ws(src_ptr, src_len, pos);
+    var p: u64 = *pos;
+    if (p >= src_len) { return 0; }
+    var s: []u8 = slice(src_ptr, src_len);
+    if (s[p] < 48 || s[p] > 57) { return 0; }
+    var v: u64 = 0;
+    while (p < src_len) {
+        var ch: u64 = s[p];
+        if (ch < 48 || ch > 57) { break; }
+        var d: u64 = ch - 48;
+        v = v * 10 + d;
+        p = p + 1;
+    }
+    *out_value = v;
+    *pos = p;
+    return 1;
+}
+
+func compiler_annotation_parse_string(src_ptr: u64, src_len: u64, pos: *u64, out_ptr: *u64, out_len: *u64) -> u64 {
+    if (pos == 0 || out_ptr == 0 || out_len == 0) { return 0; }
+    compiler_annotation_skip_ws(src_ptr, src_len, pos);
+    var p: u64 = *pos;
+    if (p >= src_len) { return 0; }
+    var s: []u8 = slice(src_ptr, src_len);
+    if (s[p] != 34) { return 0; }
+    p = p + 1;
+    var start: u64 = p;
+    while (p < src_len) {
+        var ch: u64 = s[p];
+        if (ch == 34) {
+            *out_ptr = src_ptr + start;
+            *out_len = p - start;
+            *pos = p + 1;
+            return 1;
+        }
+        // Minimal string parser: backslash escapes are currently not supported in annotation args.
+        if (ch == 92) { return 0; }
+        p = p + 1;
+    }
+    return 0;
+}
+
+func compiler_annotation_parse_arg_value(src_ptr: u64, src_len: u64, pos: *u64, arg: *CompilerAnnotationArg) -> u64 {
+    if (arg == 0) { return 0; }
+
+    var str_ptr: u64 = 0;
+    var str_len: u64 = 0;
+    if (compiler_annotation_parse_string(src_ptr, src_len, pos, &str_ptr, &str_len) != 0) {
+        arg.kind = COMPILER_ANN_ARG_STRING;
+        arg.string_ptr = str_ptr;
+        arg.string_len = str_len;
+        return 1;
+    }
+
+    var int_value: u64 = 0;
+    if (compiler_annotation_parse_uint(src_ptr, src_len, pos, &int_value) != 0) {
+        arg.kind = COMPILER_ANN_ARG_INT;
+        arg.int_value = int_value;
+        return 1;
+    }
+
+    var id_ptr: u64 = 0;
+    var id_len: u64 = 0;
+    if (compiler_annotation_parse_ident(src_ptr, src_len, pos, &id_ptr, &id_len) != 0) {
+        if (id_len == 4 && str_eq(id_ptr, id_len, "true", 4) != 0) {
+            arg.kind = COMPILER_ANN_ARG_BOOL;
+            arg.bool_value = 1;
+            return 1;
+        }
+        if (id_len == 5 && str_eq(id_ptr, id_len, "false", 5) != 0) {
+            arg.kind = COMPILER_ANN_ARG_BOOL;
+            arg.bool_value = 0;
+            return 1;
+        }
+        arg.kind = COMPILER_ANN_ARG_IDENT;
+        arg.ident_ptr = id_ptr;
+        arg.ident_len = id_len;
+        return 1;
+    }
+    return 0;
+}
+
+func compiler_annotation_parse_arg_entry(src_ptr: u64, src_len: u64, pos: *u64, arg: *CompilerAnnotationArg) -> u64 {
+    if (arg == 0 || pos == 0) { return 0; }
+    compiler_annotation_skip_ws(src_ptr, src_len, pos);
+    var save: u64 = *pos;
+
+    var key_ptr: u64 = 0;
+    var key_len: u64 = 0;
+    if (compiler_annotation_parse_ident(src_ptr, src_len, pos, &key_ptr, &key_len) != 0) {
+        compiler_annotation_skip_ws(src_ptr, src_len, pos);
+        var p: u64 = *pos;
+        var s: []u8 = slice(src_ptr, src_len);
+        if (p < src_len && s[p] == 61) { // '='
+            *pos = p + 1;
+            arg.key_ptr = key_ptr;
+            arg.key_len = key_len;
+            if (compiler_annotation_parse_arg_value(src_ptr, src_len, pos, arg) == 0) {
+                return 0;
+            }
+            return 1;
+        }
+    }
+
+    *pos = save;
+    return compiler_annotation_parse_arg_value(src_ptr, src_len, pos, arg);
+}
+
+func compiler_annotation_parse(info: *NameInfo) -> *CompilerAnnotationParsed {
+    var parsed: *CompilerAnnotationParsed = new CompilerAnnotationParsed();
+    if (info == 0 || info.ptr == 0 || info.len == 0) { return parsed; }
+
+    parsed.raw_ptr = info.ptr;
+    parsed.raw_len = info.len;
+    parsed.name_ptr = info.ptr;
+    parsed.name_len = compiler_annotation_base_len(info.ptr, info.len);
+    parsed.parse_ok = 1;
+
+    if (parsed.name_len == info.len) {
+        parsed.args_vec = new Vec<*CompilerAnnotationArg>(0);
+        return parsed;
+    }
+    if (parsed.name_len == 0 || parsed.name_len + 1 >= info.len) {
+        parsed.parse_ok = 0;
+        return parsed;
+    }
+
+    var s: []u8 = slice(info.ptr, info.len);
+    if (s[parsed.name_len] != 40 || s[info.len - 1] != 41) {
+        parsed.parse_ok = 0;
+        return parsed;
+    }
+
+    var args: *Vec<*CompilerAnnotationArg> = new Vec<*CompilerAnnotationArg>(2);
+    var pos: u64 = parsed.name_len + 1;
+    var args_end: u64 = info.len - 1;
+    compiler_annotation_skip_ws(info.ptr, info.len, &pos);
+    if (pos >= args_end) {
+        parsed.args_vec = args;
+        return parsed;
+    }
+
+    while (pos < args_end) {
+        var arg: *CompilerAnnotationArg = new CompilerAnnotationArg();
+        if (compiler_annotation_parse_arg_entry(info.ptr, info.len, &pos, arg) == 0) {
+            parsed.parse_ok = 0;
+            parsed.args_vec = args;
+            return parsed;
+        }
+        args.push(arg);
+        compiler_annotation_skip_ws(info.ptr, info.len, &pos);
+        if (pos >= args_end) { break; }
+        var s2: []u8 = slice(info.ptr, info.len);
+        if (s2[pos] != 44) { // ','
+            parsed.parse_ok = 0;
+            parsed.args_vec = args;
+            return parsed;
+        }
+        pos = pos + 1;
+        compiler_annotation_skip_ws(info.ptr, info.len, &pos);
+        if (pos >= args_end) {
+            parsed.parse_ok = 0;
+            parsed.args_vec = args;
+            return parsed;
+        }
+    }
+
+    parsed.args_vec = args;
+    return parsed;
+}
+
+func compiler_annotation_emit_invalid_args(fn: *AstFunc, ann: *CompilerAnnotationParsed, detail: u64) -> u64 {
+    emit_stderr("[ERROR] invalid annotation arguments on function ");
+    if (fn != 0) {
+        emit_stderr_len(fn.name_ptr, fn.name_len);
+    } else {
+        emit_stderr("<unknown>");
+    }
+    emit_stderr(": ");
+    if (ann != 0) {
+        emit_stderr_len(ann.name_ptr, ann.name_len);
+    } else {
+        emit_stderr("<annotation>");
+    }
+    emit_stderr(" - ");
+    emit_stderr(detail);
+    emit_stderr("\n");
+    compiler_diag_note_error();
+    return 0;
+}
+
+func compiler_annotation_validate_builtin_args(fn: *AstFunc, ann: *CompilerAnnotationParsed) -> u64 {
+    if (ann == 0) { return 0; }
+    var args_n: u64 = 0;
+    if (ann.args_vec != 0) { args_n = ann.args_vec.len(); }
+
+    if (str_eq(ann.name_ptr, ann.name_len, "trace", 5) != 0) {
+        for (var i: u64 = 0; i < args_n; i++) {
+            var arg: *CompilerAnnotationArg = ann.args_vec.get(i);
+            if (arg == 0) { return compiler_annotation_emit_invalid_args(fn, ann, "trace only accepts bool/int scalar arguments"); }
+            if (arg.key_ptr != 0) {
+                if (str_eq(arg.key_ptr, arg.key_len, "enabled", 7) == 0 &&
+                    str_eq(arg.key_ptr, arg.key_len, "level", 5) == 0) {
+                    return compiler_annotation_emit_invalid_args(fn, ann, "trace supports named args: enabled=bool, level=int");
+                }
+            }
+            if (arg.kind != COMPILER_ANN_ARG_BOOL && arg.kind != COMPILER_ANN_ARG_INT) {
+                return compiler_annotation_emit_invalid_args(fn, ann, "trace only accepts bool/int scalar arguments");
+            }
+        }
+        return 1;
+    }
+
+    if (str_eq(ann.name_ptr, ann.name_len, "config", 6) != 0) {
+        if (args_n == 0) {
+            return compiler_annotation_emit_invalid_args(fn, ann, "config requires at least one key=value argument");
+        }
+        for (var i2: u64 = 0; i2 < args_n; i2++) {
+            var arg2: *CompilerAnnotationArg = ann.args_vec.get(i2);
+            if (arg2 == 0 || arg2.key_ptr == 0 || arg2.key_len == 0) {
+                return compiler_annotation_emit_invalid_args(fn, ann, "config arguments must be key=value pairs");
+            }
+            if (arg2.kind != COMPILER_ANN_ARG_STRING && arg2.kind != COMPILER_ANN_ARG_INT && arg2.kind != COMPILER_ANN_ARG_BOOL) {
+                return compiler_annotation_emit_invalid_args(fn, ann, "config values must be string/int/bool");
+            }
+        }
+        return 1;
+    }
+
+    if (args_n != 0) {
+        return compiler_annotation_emit_invalid_args(fn, ann, "this built-in annotation does not take arguments");
+    }
+    return 1;
+}
+
+func compiler_annotation_validate_function_annotations(fn: *AstFunc) -> u64 {
+    if (fn == 0 || fn.annotations_vec == 0) { return 1; }
+    var ok: u64 = 1;
+    var n: u64 = fn.annotations_vec.len();
+    for (var i: u64 = 0; i < n; i++) {
+        if (compiler_diag_should_stop_pass() != 0) { break; }
+        var info: *NameInfo = fn.annotations_vec.get(i);
+        var ann: *CompilerAnnotationParsed = compiler_annotation_parse(info);
+        if (ann.parse_ok == 0 || ann.name_ptr == 0 || ann.name_len == 0) {
+            emit_stderr("[ERROR] malformed annotation on function ");
+            emit_stderr_len(fn.name_ptr, fn.name_len);
+            emit_stderr(": ");
+            if (info != 0) { emit_stderr_len(info.ptr, info.len); }
+            emit_stderr("\n");
+            compiler_diag_note_error();
+            ok = 0;
+            continue;
+        }
+        if (compiler_annotation_is_builtin_name(ann.name_ptr, ann.name_len) != 0) {
+            if (compiler_annotation_validate_builtin_args(fn, ann) == 0) {
+                ok = 0;
+            }
+        } else {
+            var args_n: u64 = 0;
+            if (ann.args_vec != 0) { args_n = ann.args_vec.len(); }
+            if (args_n != 0) {
+                compiler_annotation_emit_invalid_args(fn, ann, "decorator annotations currently do not accept arguments");
+                ok = 0;
+            }
+        }
+    }
+    return ok;
 }
 
 func compiler_annotation_base_len(name_ptr: u64, name_len: u64) -> u64 {
@@ -7907,11 +8729,26 @@ func compiler_annotation_collect_decorators(fn: *AstFunc) -> *Vec<*NameInfo> {
     var n: u64 = annotations.len();
     var out: *Vec<*NameInfo> = 0;
     for (var i: u64 = 0; i < n; i++) {
-        var ann: *NameInfo = annotations.get(i);
-        if (compiler_annotation_is_builtin_name(ann.ptr, ann.len) != 0) { continue; }
-        var base_len: u64 = compiler_annotation_base_len(ann.ptr, ann.len);
-        if (base_len == 0) { continue; }
-        var deco_name: *NameInfo = new NameInfo{ann.ptr, base_len};
+        if (compiler_diag_should_stop_pass() != 0) { break; }
+        var ann_info: *NameInfo = annotations.get(i);
+        var ann: *CompilerAnnotationParsed = compiler_annotation_parse(ann_info);
+        if (ann.parse_ok == 0 || ann.name_ptr == 0 || ann.name_len == 0) {
+            emit_stderr("[ERROR] malformed decorator annotation on function ");
+            emit_stderr_len(fn.name_ptr, fn.name_len);
+            emit_stderr(": ");
+            if (ann_info != 0) { emit_stderr_len(ann_info.ptr, ann_info.len); }
+            emit_stderr("\n");
+            compiler_diag_note_error();
+            continue;
+        }
+        if (compiler_annotation_is_builtin_name(ann.name_ptr, ann.name_len) != 0) { continue; }
+        var args_n: u64 = 0;
+        if (ann.args_vec != 0) { args_n = ann.args_vec.len(); }
+        if (args_n != 0) {
+            compiler_annotation_emit_invalid_args(fn, ann, "decorator annotations currently do not accept arguments");
+            continue;
+        }
+        var deco_name: *NameInfo = new NameInfo{ann.name_ptr, ann.name_len};
 
         var deco_sig: *AstFunc = compiler_find_func_signature_for_call(deco_name.ptr, deco_name.len);
         if (deco_sig == 0) { continue; }
@@ -7919,7 +8756,8 @@ func compiler_annotation_collect_decorators(fn: *AstFunc) -> *Vec<*NameInfo> {
             emit_stderr("[ERROR] function cannot decorate itself: ");
             emit_stderr_len(fn.name_ptr, fn.name_len);
             emit_stderr("\n");
-            compiler_panic("Compilation failed");
+            compiler_diag_note_error();
+            continue;
         }
 
         if (out == 0) {
@@ -7942,16 +8780,19 @@ func compiler_annotation_collect_decorators(fn: *AstFunc) -> *Vec<*NameInfo> {
 }
 
 func compiler_annotation_validate_decorator_signature(deco_sig: *AstFunc, target: *AstFunc, deco_ptr: u64, deco_len: u64) -> u64 {
+    var ok: u64 = 1;
     if (deco_sig == 0 || target == 0) {
         emit_stderr("[ERROR] internal: decorator signature validation received null function\n");
-        compiler_panic("Compilation failed");
+        compiler_diag_note_error();
+        return 0;
     }
 
     if (compiler_annotation_return_shape_equal(deco_sig, target) == 0) {
         emit_stderr("[ERROR] decorator return type must match target function: ");
         emit_stderr_len(deco_ptr, deco_len);
         emit_stderr("\n");
-        compiler_panic("Compilation failed");
+        compiler_diag_note_error();
+        ok = 0;
     }
 
     var target_params: *Vec<*Param> = target.params_vec;
@@ -7963,7 +8804,8 @@ func compiler_annotation_validate_decorator_signature(deco_sig: *AstFunc, target
         emit_stderr("[ERROR] decorator must have signature: (next: u64, <target params...>) -> <target return>: ");
         emit_stderr_len(deco_ptr, deco_len);
         emit_stderr("\n");
-        compiler_panic("Compilation failed");
+        compiler_diag_note_error();
+        return 0;
     }
 
     var next_param: *Param = deco_params.get(0);
@@ -7971,7 +8813,8 @@ func compiler_annotation_validate_decorator_signature(deco_sig: *AstFunc, target
         emit_stderr("[ERROR] decorator first parameter must be plain u64 function pointer: ");
         emit_stderr_len(deco_ptr, deco_len);
         emit_stderr("\n");
-        compiler_panic("Compilation failed");
+        compiler_diag_note_error();
+        ok = 0;
     }
 
     for (var i: u64 = 0; i < target_n; i++) {
@@ -7981,22 +8824,25 @@ func compiler_annotation_validate_decorator_signature(deco_sig: *AstFunc, target
             emit_stderr("[ERROR] decorated target cannot use variadic/default parameters: ");
             emit_stderr_len(target.name_ptr, target.name_len);
             emit_stderr("\n");
-            compiler_panic("Compilation failed");
+            compiler_diag_note_error();
+            ok = 0;
         }
         if (dp.is_variadic != 0 || dp.has_default != 0) {
             emit_stderr("[ERROR] decorator cannot use variadic/default parameters: ");
             emit_stderr_len(deco_ptr, deco_len);
             emit_stderr("\n");
-            compiler_panic("Compilation failed");
+            compiler_diag_note_error();
+            ok = 0;
         }
         if (compiler_annotation_param_shape_equal(tp, dp) == 0) {
             emit_stderr("[ERROR] decorator parameter list must match target function after the first parameter: ");
             emit_stderr_len(deco_ptr, deco_len);
             emit_stderr("\n");
-            compiler_panic("Compilation failed");
+            compiler_diag_note_error();
+            ok = 0;
         }
     }
-    return 0;
+    return ok;
 }
 
 func compiler_annotation_build_wrapper_body(template: *AstFunc, decorator_ptr: u64, decorator_len: u64, callee_ptr: u64, callee_len: u64, wrapper_params: *Vec<*Param>) -> *AstNode {
@@ -8098,14 +8944,19 @@ func compiler_apply_annotations() -> u64 {
     var entry_len: u64 = 0;
 
     for (var i: u64 = 0; i < original_count; i++) {
+        if (compiler_diag_should_stop_pass() != 0) { break; }
         var fn: *AstFunc = g_compiler_ctx.all_funcs.get(i);
         if (fn == 0) { continue; }
+        if (compiler_annotation_validate_function_annotations(fn) == 0) {
+            continue;
+        }
 
         var entry_count: u64 = compiler_annotation_count_name(fn.annotations_vec, "entry", 5);
         if (entry_count > 0) {
             if (fn.impl_owner_ptr != 0 && fn.impl_owner_len != 0) {
                 emit_stderr("[ERROR] @[entry] is only allowed on top-level functions\n");
-                compiler_panic("Compilation failed");
+                compiler_diag_note_error();
+                continue;
             }
             var entry_param_n: u64 = 0;
             if (fn.params_vec != 0) { entry_param_n = fn.params_vec.len(); }
@@ -8113,13 +8964,15 @@ func compiler_apply_annotations() -> u64 {
                 emit_stderr("[ERROR] @[entry] function must not declare parameters: ");
                 emit_stderr_len(fn.name_ptr, fn.name_len);
                 emit_stderr("\n");
-                compiler_panic("Compilation failed");
+                compiler_diag_note_error();
+                continue;
             }
             if (entry_count > 1) {
                 emit_stderr("[ERROR] duplicate @[entry] annotation on function: ");
                 emit_stderr_len(fn.name_ptr, fn.name_len);
                 emit_stderr("\n");
-                compiler_panic("Compilation failed");
+                compiler_diag_note_error();
+                continue;
             }
             if (entry_ptr != 0 && str_eq(entry_ptr, entry_len, fn.name_ptr, fn.name_len) == 0) {
                 emit_stderr("[ERROR] multiple @[entry] functions are not allowed: ");
@@ -8127,7 +8980,8 @@ func compiler_apply_annotations() -> u64 {
                 emit_stderr(" and ");
                 emit_stderr_len(fn.name_ptr, fn.name_len);
                 emit_stderr("\n");
-                compiler_panic("Compilation failed");
+                compiler_diag_note_error();
+                continue;
             }
             entry_ptr = fn.name_ptr;
             entry_len = fn.name_len;
@@ -8143,20 +8997,41 @@ func compiler_apply_annotations() -> u64 {
                 emit_stderr("[ERROR] decorators are not supported on trait impl methods: ");
                 emit_stderr_len(fn.name_ptr, fn.name_len);
                 emit_stderr("\n");
-                compiler_panic("Compilation failed");
+                compiler_diag_note_error();
+                continue;
             }
         }
         if (fn.body == 0) {
             emit_stderr("[ERROR] function decorator requires a function body: ");
             emit_stderr_len(fn.name_ptr, fn.name_len);
             emit_stderr("\n");
-            compiler_panic("Compilation failed");
+            compiler_diag_note_error();
+            continue;
         }
         if (compiler_is_generic_template(fn) != 0) {
             // Generic templates are expanded later into concrete instances.
             // Decorators are applied to concrete instantiations only.
             continue;
         }
+
+        var decorators_valid: u64 = 1;
+        var deco_n0: u64 = decorators.len();
+        for (var di0: u64 = 0; di0 < deco_n0; di0++) {
+            var deco0: *NameInfo = decorators.get(di0);
+            var sig0: *AstFunc = compiler_find_func_signature_for_call(deco0.ptr, deco0.len);
+            if (sig0 == 0) {
+                emit_stderr("[ERROR] unresolved decorator function: ");
+                emit_stderr_len(deco0.ptr, deco0.len);
+                emit_stderr("\n");
+                compiler_diag_note_error();
+                decorators_valid = 0;
+                continue;
+            }
+            if (compiler_annotation_validate_decorator_signature(sig0, fn, deco0.ptr, deco0.len) == 0) {
+                decorators_valid = 0;
+            }
+        }
+        if (decorators_valid == 0) { continue; }
 
         var public_name_ptr: u64 = fn.name_ptr;
         var public_name_len: u64 = fn.name_len;
@@ -8205,9 +9080,12 @@ func compiler_apply_annotations() -> u64 {
                 emit_stderr("[ERROR] unresolved decorator function: ");
                 emit_stderr_len(deco.ptr, deco.len);
                 emit_stderr("\n");
-                compiler_panic("Compilation failed");
+                compiler_diag_note_error();
+                break;
             }
-            compiler_annotation_validate_decorator_signature(deco_sig, fn, deco.ptr, deco.len);
+            if (compiler_annotation_validate_decorator_signature(deco_sig, fn, deco.ptr, deco.len) == 0) {
+                break;
+            }
 
             var wrapper_name_ptr: u64 = 0;
             var wrapper_name_len: u64 = 0;
@@ -8263,7 +9141,7 @@ func compiler_validate_child_implements_abst_method(sd: *AstStructDef, mi: *Name
         emit_stderr(".");
         emit_stderr_len(mi.ptr, mi.len);
         emit_stderr("\n");
-        compiler_panic("Compilation failed");
+        compiler_diag_note_error();
     }
     return 0;
 }
@@ -8272,12 +9150,14 @@ func compiler_finalize_abst_methods() -> u64 {
     if (g_compiler_ctx.all_structs_vec == 0) { return 0; }
     var sn: u64 = g_compiler_ctx.all_structs_vec.len();
     for (var si: u64 = 0; si < sn; si++) {
+        if (compiler_diag_should_stop_pass() != 0) { break; }
         var sd: *AstStructDef = g_compiler_ctx.all_structs_vec.get(si);
         if (sd == 0 || sd.parents_vec == 0) { continue; }
         var required: *Vec<*NameInfo> = new Vec<*NameInfo>(8);
         compiler_collect_abst_methods_recursive(sd, required);
         var rn: u64 = required.len();
         for (var ri: u64 = 0; ri < rn; ri++) {
+            if (compiler_diag_should_stop_pass() != 0) { break; }
             var mi: *NameInfo = required.get(ri);
             compiler_validate_child_implements_abst_method(sd, mi);
         }

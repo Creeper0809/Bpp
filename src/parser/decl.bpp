@@ -305,6 +305,12 @@ func parse_is_impl_trait_block(p: *Parser) -> u64 {
     }
     parse_adv(p);
     var k: u64 = parse_peek_kind(p);
+    if (k == TOKEN_LT) {
+        var has_assoc_bindings: u64 = parse_scan_generic_list_followed_by(p, TOKEN_FOR, 1, 0);
+        parser_set_pos(p, saved);
+        if (has_assoc_bindings != 0) { return true; }
+        return false;
+    }
     parser_set_pos(p, saved);
     if (k == TOKEN_FOR) { return true; }
     return false;
@@ -344,6 +350,17 @@ func parse_generic_parse_assoc_bindings(p: *Parser, gp: *GenericParam) -> u64 {
         binding.name_ptr = assoc_tok.ptr;
         binding.name_len = assoc_tok.len;
         binding.type_ptr = assoc_ti;
+        var bn: u64 = gp.assoc_bindings.len();
+        for (var bi: u64 = 0; bi < bn; bi++) {
+            var prev: *GenericAssocBinding = gp.assoc_bindings.get(bi);
+            if (prev == 0) { continue; }
+            if (str_eq(prev.name_ptr, prev.name_len, binding.name_ptr, binding.name_len) != 0) {
+                emit_stderr("[ERROR] duplicate associated type binding in generic bound: ");
+                emit_stderr_len(binding.name_ptr, binding.name_len);
+                emit_stderr("\n");
+                parse_panic_here(p, "Syntax error");
+            }
+        }
         gp.assoc_bindings.push(binding);
         if (parsed_any == 0) {
             gp.assoc_name_ptr = assoc_tok.ptr;
@@ -355,6 +372,68 @@ func parse_generic_parse_assoc_bindings(p: *Parser, gp: *GenericParam) -> u64 {
     }
 
     parse_consume_generic_gt(p);
+    return 0;
+}
+
+func parse_trait_assoc_bindings(p: *Parser) -> *Vec<*TraitAssocBinding> {
+    if (parse_match(p, TOKEN_LT) == 0) { return 0; }
+    var bindings: *Vec<*TraitAssocBinding> = new Vec<*TraitAssocBinding>(2);
+    while (1) {
+        if (parse_peek_kind(p) != TOKEN_IDENTIFIER) {
+            emit_stderr("[ERROR] Expected associated type name in impl trait bindings\n");
+            parse_panic_here(p, "Syntax error");
+        }
+        var name_tok: *Token = parse_peek(p);
+        parse_consume(p, TOKEN_IDENTIFIER);
+        parse_consume(p, TOKEN_EQ);
+        var ty: *TypeInfo = parse_type_ex(p);
+        var binding: *TraitAssocBinding = new TraitAssocBinding();
+        binding.name_ptr = name_tok.ptr;
+        binding.name_len = name_tok.len;
+        binding.type_ptr = ty;
+        var bn: u64 = bindings.len();
+        for (var bi: u64 = 0; bi < bn; bi++) {
+            var prev: *TraitAssocBinding = bindings.get(bi);
+            if (prev == 0) { continue; }
+            if (str_eq(prev.name_ptr, prev.name_len, binding.name_ptr, binding.name_len) != 0) {
+                emit_stderr("[ERROR] duplicate associated type binding in impl header: ");
+                emit_stderr_len(binding.name_ptr, binding.name_len);
+                emit_stderr("\n");
+                parse_panic_here(p, "Syntax error");
+            }
+        }
+        bindings.push(binding);
+        if (parse_match(p, TOKEN_COMMA) == 0) { break; }
+    }
+    parse_consume_generic_gt(p);
+    return bindings;
+}
+
+func parse_trait_assoc_decl(p: *Parser, assoc_types: *Vec<*TraitAssocType>) -> u64 {
+    parse_consume(p, TOKEN_ALIAS);
+    if (parse_peek_kind(p) != TOKEN_IDENTIFIER) {
+        emit_stderr("[ERROR] trait associated type declaration expects identifier\n");
+        parse_panic_here(p, "Syntax error");
+    }
+    var name_tok: *Token = parse_peek(p);
+    parse_consume(p, TOKEN_IDENTIFIER);
+    parse_consume(p, TOKEN_SEMICOLON);
+    if (assoc_types == 0) { return 0; }
+    var n: u64 = assoc_types.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var prev: *TraitAssocType = assoc_types.get(i);
+        if (prev == 0) { continue; }
+        if (str_eq(prev.name_ptr, prev.name_len, name_tok.ptr, name_tok.len) != 0) {
+            emit_stderr("[ERROR] duplicate trait associated type declaration: ");
+            emit_stderr_len(name_tok.ptr, name_tok.len);
+            emit_stderr("\n");
+            parse_panic_here(p, "Syntax error");
+        }
+    }
+    var assoc: *TraitAssocType = new TraitAssocType();
+    assoc.name_ptr = name_tok.ptr;
+    assoc.name_len = name_tok.len;
+    assoc_types.push(assoc);
     return 0;
 }
 
@@ -726,7 +805,9 @@ func parse_func_decl(p: *Parser) -> *AstFunc {
     var name_tok: *Token = parsed.name_tok;
     var generic_params: *Vec<*GenericParam> = parsed.generic_params;
 
+    parser_push_function_param_scope(p, parsed.params);
     var body: *AstNode = parse_block(p);
+    parser_pop_function_param_scope(p);
 
     var func_node: *AstFunc = parse_func_from_header(parsed, body);
     parse_register_generic_func(p, name_tok, generic_params, func_node, 1);
@@ -768,7 +849,9 @@ func parse_func_decl_top_level(p: *Parser) -> *AstFunc {
         return 0;
     }
 
+    parser_push_function_param_scope(p, parsed.params);
     var body: *AstNode = parse_block(p);
+    parser_pop_function_param_scope(p);
     var func_node: *AstFunc = parse_func_from_header(parsed, body);
     parse_register_generic_func(p, name_tok, generic_params, func_node, 1);
     return func_node;
@@ -1160,6 +1243,23 @@ func parse_enum_build_payload_param_name(idx: u64) -> *NameInfo {
     return new NameInfo{out_ptr, out_len};
 }
 
+func parse_enum_build_payload_slot_name(slot_idx: u64) -> *NameInfo {
+    if (slot_idx == 0) {
+        return new NameInfo{(u64)"__payload", 9};
+    }
+    var prefix_ptr: u64 = (u64)"__payload";
+    var prefix_len: u64 = 9;
+    var idx_buf: u64 = heap_alloc(32 * sizeof(u8));
+    var idx_len: u64 = io_u64_to_ascii(idx_buf, slot_idx);
+    var out_len: u64 = prefix_len + idx_len;
+    var out_ptr: u64 = heap_alloc((out_len + 1) * sizeof(u8));
+    var out_u8: []u8 = slice(out_ptr, out_len + 1);
+    str_copy(out_ptr, prefix_ptr, prefix_len);
+    str_copy(out_ptr + prefix_len, idx_buf, idx_len);
+    out_u8[out_len] = 0;
+    return new NameInfo{out_ptr, out_len};
+}
+
 func parse_enum_parse_payload_params(p: *Parser) -> *Vec<*Param> {
     parse_consume(p, TOKEN_LPAREN);
     var params: *Vec<*Param> = new Vec<*Param>(4);
@@ -1248,8 +1348,9 @@ func parse_enum_build_payload_struct(enum_ptr: u64, enum_len: u64, variant_ptr: 
     return ast_struct_def(payload_name.ptr, payload_name.len, 0, fields, 0, 0, 0);
 }
 
-func parse_enum_build_struct(enum_name_ptr: u64, enum_name_len: u64) -> *AstStructDef {
-    var fields: *Vec<*FieldDesc> = new Vec<*FieldDesc>(2);
+func parse_enum_build_struct(enum_name_ptr: u64, enum_name_len: u64, payload_slots: u64) -> *AstStructDef {
+    if (payload_slots == 0) { payload_slots = 1; }
+    var fields: *Vec<*FieldDesc> = new Vec<*FieldDesc>(payload_slots + 1);
 
     var tag_field: *FieldDesc = new FieldDesc();
     tag_field.name_ptr = (u64)"__tag";
@@ -1261,15 +1362,18 @@ func parse_enum_build_struct(enum_name_ptr: u64, enum_name_len: u64) -> *AstStru
     tag_field.owner_struct_len = enum_name_len;
     fields.push(tag_field);
 
-    var payload_field: *FieldDesc = new FieldDesc();
-    payload_field.name_ptr = (u64)"__payload";
-    payload_field.name_len = 9;
-    payload_field.type_kind = TYPE_U64;
-    payload_field.ptr_depth = 0;
-    payload_field.access = ACCESS_PUBLIC;
-    payload_field.owner_struct_ptr = enum_name_ptr;
-    payload_field.owner_struct_len = enum_name_len;
-    fields.push(payload_field);
+    for (var i: u64 = 0; i < payload_slots; i++) {
+        var slot_name: *NameInfo = parse_enum_build_payload_slot_name(i);
+        var payload_field: *FieldDesc = new FieldDesc();
+        payload_field.name_ptr = slot_name.ptr;
+        payload_field.name_len = slot_name.len;
+        payload_field.type_kind = TYPE_U64;
+        payload_field.ptr_depth = 0;
+        payload_field.access = ACCESS_PUBLIC;
+        payload_field.owner_struct_ptr = enum_name_ptr;
+        payload_field.owner_struct_len = enum_name_len;
+        fields.push(payload_field);
+    }
 
     return ast_struct_def(enum_name_ptr, enum_name_len, 0, fields, 0, 0, 0);
 }
@@ -1292,12 +1396,26 @@ func parse_enum_build_ctor_func(enum_struct: *AstStructDef, enum_ptr: u64, enum_
         params.push(sig_param);
     }
 
+    var payload_slots: u64 = compiler_get_enum_payload_slots(enum_ptr, enum_len);
+    if (payload_slots == 0) { payload_slots = 1; }
+    var values: *Vec<*AstNode> = new Vec<*AstNode>(payload_slots + 1);
+    values.push((*AstNode)ast_ident(tag_const.ptr, tag_const.len));
+    for (var si: u64 = 0; si < payload_slots; si++) {
+        values.push((*AstNode)ast_literal(0));
+    }
+    var lit: *AstStructLiteral = ast_struct_literal(enum_struct, values);
+
     var body_stmts: *Vec<*AstNode> = new Vec<*AstNode>(8);
-    var payload_expr: *AstNode = (*AstNode)ast_literal(0);
     if (variant.payload_struct_ptr != 0 && variant.payload_struct_len != 0) {
-        var payload_alloc: *AstNode = (*AstNode)ast_new(TYPE_STRUCT, 0, 0, variant.payload_struct_ptr, variant.payload_struct_len,
-                                                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
-        var payload_decl: *AstVarDecl = ast_var_decl("__payload", 9, TYPE_STRUCT, 1, payload_alloc);
+        var out_decl: *AstVarDecl = ast_var_decl("__out", 5, TYPE_STRUCT, 0, (*AstNode)lit);
+        out_decl.struct_name_ptr = enum_ptr;
+        out_decl.struct_name_len = enum_len;
+        body_stmts.push((*AstNode)out_decl);
+
+        var payload_slot_expr: *AstNode = (*AstNode)ast_member_access((*AstNode)ast_ident("__out", 5), "__payload", 9);
+        var payload_addr: *AstNode = (*AstNode)ast_addr_of(payload_slot_expr);
+        var payload_ptr_expr: *AstNode = (*AstNode)ast_cast_ex(payload_addr, TYPE_STRUCT, 1, 0, variant.payload_struct_ptr, variant.payload_struct_len, 0, 0);
+        var payload_decl: *AstVarDecl = ast_var_decl("__payload_ptr", 13, TYPE_STRUCT, 1, payload_ptr_expr);
         payload_decl.struct_name_ptr = variant.payload_struct_ptr;
         payload_decl.struct_name_len = variant.payload_struct_len;
         body_stmts.push((*AstNode)payload_decl);
@@ -1305,19 +1423,15 @@ func parse_enum_build_ctor_func(enum_struct: *AstStructDef, enum_ptr: u64, enum_
         var payload_n: u64 = payload_params.len();
         for (var i: u64 = 0; i < payload_n; i++) {
             var field_name: *NameInfo = parse_enum_build_payload_param_name(i);
-            var target: *AstNode = (*AstNode)ast_member_access((*AstNode)ast_deref((*AstNode)ast_ident("__payload", 9)), field_name.ptr, field_name.len);
+            var target: *AstNode = (*AstNode)ast_member_access((*AstNode)ast_deref((*AstNode)ast_ident("__payload_ptr", 13)), field_name.ptr, field_name.len);
             var source: *AstNode = (*AstNode)ast_ident(params.get(i).name_ptr, params.get(i).name_len);
             body_stmts.push((*AstNode)ast_assign(target, source));
         }
-        payload_expr = (*AstNode)ast_cast_ex((*AstNode)ast_ident("__payload", 9), TYPE_U64, 0, 0, 0, 0, 0, 0);
+        body_stmts.push((*AstNode)ast_return((*AstNode)ast_ident("__out", 5)));
+    } else {
+        body_stmts.push((*AstNode)ast_return((*AstNode)lit));
     }
 
-    var values: *Vec<*AstNode> = new Vec<*AstNode>(2);
-    values.push((*AstNode)ast_ident(tag_const.ptr, tag_const.len));
-    values.push(payload_expr);
-
-    var lit: *AstStructLiteral = ast_struct_literal(enum_struct, values);
-    body_stmts.push((*AstNode)ast_return((*AstNode)lit));
     var body: *AstNode = (*AstNode)ast_block(body_stmts);
     return ast_func_ex(ctor_name.ptr, ctor_name.len, params, TYPE_STRUCT, 0, 0, enum_ptr, enum_len, 0, 0, body);
 }
@@ -1335,6 +1449,7 @@ func parse_enum_def(p: *Parser) -> *ParseEnumResult {
     var variants: *Vec<*ParseEnumVariant> = new Vec<*ParseEnumVariant>(8);
     var consts: *Vec<*AstConstDecl> = new Vec<*AstConstDecl>(16);
     var payload_structs: *Vec<*AstStructDef> = new Vec<*AstStructDef>(8);
+    var max_payload_slots: u64 = 1;
     var current_value: u64 = 0;
     
     while (parse_peek_kind(p) != TOKEN_RBRACE) {
@@ -1377,6 +1492,8 @@ func parse_enum_def(p: *Parser) -> *ParseEnumResult {
             payload_struct_len = payload_struct.name_len;
             payload_structs.push(payload_struct);
             compiler_register_enum_variant_payload_struct(enum_name_ptr, enum_name_len, member_ptr, member_len, payload_struct_ptr, payload_struct_len);
+            var slots_for_variant: u64 = compiler_calc_payload_slots_for_struct(payload_struct_ptr, payload_struct_len);
+            if (slots_for_variant > max_payload_slots) { max_payload_slots = slots_for_variant; }
         }
         compiler_register_enum_variant(enum_name_ptr, enum_name_len, member_ptr, member_len, payload_arity, ctor_name.ptr, ctor_name.len);
 
@@ -1399,7 +1516,8 @@ func parse_enum_def(p: *Parser) -> *ParseEnumResult {
     
     parse_consume(p, TOKEN_RBRACE);
 
-    var enum_struct: *AstStructDef = parse_enum_build_struct(enum_name_ptr, enum_name_len);
+    compiler_register_enum_payload_slots(enum_name_ptr, enum_name_len, max_payload_slots);
+    var enum_struct: *AstStructDef = parse_enum_build_struct(enum_name_ptr, enum_name_len, max_payload_slots);
 
     var ctor_funcs: *Vec<*AstFunc> = new Vec<*AstFunc>(variants.len());
     var vn: u64 = variants.len();
@@ -1482,7 +1600,9 @@ func parse_trait_method_signature(p: *Parser, mode: u64) -> *AstFunc {
     } else if (parse_peek_kind(p) == TOKEN_LBRACE) {
         // parse_program full mode is encoded as 0.
         if (mode == 0) {
+            parser_push_function_param_scope(p, params);
             body = parse_block(p);
+            parser_pop_function_param_scope(p);
         } else {
             parse_skip_block(p);
         }
@@ -1504,10 +1624,15 @@ func parse_trait_def(p: *Parser, mode: u64) -> *TraitDef {
     parse_consume(p, TOKEN_LBRACE);
 
     var methods: *Vec<*TraitMethod> = new Vec<*TraitMethod>(8);
+    var assoc_types: *Vec<*TraitAssocType> = new Vec<*TraitAssocType>(2);
     while (parse_peek_kind(p) != TOKEN_RBRACE) {
         if (parse_peek_kind(p) == TOKEN_EOF) { break; }
+        if (parse_peek_kind(p) == TOKEN_ALIAS) {
+            parse_trait_assoc_decl(p, assoc_types);
+            continue;
+        }
         if (parse_peek_kind(p) != TOKEN_FUNC) {
-            emit_stderr("[ERROR] trait block can only contain methods\n");
+            emit_stderr("[ERROR] trait block can only contain methods or alias declarations\n");
             parse_panic_here(p, "Syntax error");
         }
         var sig: *AstFunc = parse_trait_method_signature(p, mode);
@@ -1525,6 +1650,7 @@ func parse_trait_def(p: *Parser, mode: u64) -> *TraitDef {
     td.name_ptr = name_ptr;
     td.name_len = name_len;
     td.methods_vec = methods;
+    td.assoc_types_vec = assoc_types;
     compiler_register_trait_def(td);
     return td;
 }
@@ -1570,7 +1696,9 @@ func parse_constructor_decl(p: *Parser, struct_name_ptr: u64, struct_name_len: u
         return sig_node;
     }
 
+    parser_push_function_param_scope(p, params_out);
     var body: *AstNode = parse_block(p);
+    parser_pop_function_param_scope(p);
     var func_node: *AstFunc = ast_func_ex(name_tok.ptr, name_tok.len, params_out, TYPE_VOID, 0, 0, 0, 0, 0, 0, body);
     compiler_register_generic_func_def(name_tok.ptr, name_tok.len, 0, func_node);
     return func_node;
@@ -1599,7 +1727,9 @@ func parse_destructor_decl(p: *Parser, struct_name_ptr: u64, struct_name_len: u6
         return ast_func_ex(name_tok.ptr, name_tok.len, params_out, TYPE_VOID, 0, 0, 0, 0, 0, 0, 0);
     }
 
+    parser_push_function_param_scope(p, params_out);
     var body: *AstNode = parse_block(p);
+    parser_pop_function_param_scope(p);
     return ast_func_ex(name_tok.ptr, name_tok.len, params_out, TYPE_VOID, 0, 0, 0, 0, 0, 0, body);
 }
 
@@ -1862,6 +1992,7 @@ func parse_impl_trait_block_impl(p: *Parser, sig_only: u64, register_trait_impl:
     var trait_ptr: u64 = trait_tok.ptr;
     var trait_len: u64 = trait_tok.len;
     parse_consume(p, TOKEN_IDENTIFIER);
+    var assoc_bindings_vec: *Vec<*TraitAssocBinding> = parse_trait_assoc_bindings(p);
 
     parse_consume(p, TOKEN_FOR);
 
@@ -1933,6 +2064,7 @@ func parse_impl_trait_block_impl(p: *Parser, sig_only: u64, register_trait_impl:
         impl_info.struct_ptr = struct_name_ptr;
         impl_info.struct_len = struct_name_len;
         impl_info.methods_vec = impl_methods;
+        impl_info.assoc_bindings_vec = assoc_bindings_vec;
         impl_info.vtable_struct_def = 0;
         impl_info.vtable_global_ptr = 0;
         impl_info.vtable_global_len = 0;

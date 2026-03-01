@@ -96,6 +96,19 @@ func parse_try_build_break_guard(flag_ptr: u64, flag_len: u64) -> *AstNode {
     return (*AstNode)ast_if(cond, (*AstNode)ast_block(then_stmts), 0);
 }
 
+func parse_try_build_not_thrown_cond(flag_ptr: u64, flag_len: u64) -> *AstNode {
+    if (flag_ptr == 0 || flag_len == 0) { return (*AstNode)ast_literal(1); }
+    return (*AstNode)ast_binary(TOKEN_EQEQ, (*AstNode)ast_ident(flag_ptr, flag_len), (*AstNode)ast_literal(0));
+}
+
+func parse_try_wrap_stmt_if_not_thrown(stmt: *AstNode, flag_ptr: u64, flag_len: u64) -> *AstNode {
+    if (stmt == 0) { return 0; }
+    if (flag_ptr == 0 || flag_len == 0) { return stmt; }
+    var then_stmts: *Vec<*AstNode> = new Vec<*AstNode>(1);
+    then_stmts.push(stmt);
+    return (*AstNode)ast_if(parse_try_build_not_thrown_cond(flag_ptr, flag_len), (*AstNode)ast_block(then_stmts), 0);
+}
+
 func parse_try_wrap_loop_body_with_guard(body: *AstNode, flag_ptr: u64, flag_len: u64) -> *AstNode {
     if (body == 0) { return 0; }
     if (flag_ptr == 0 || flag_len == 0) { return body; }
@@ -792,7 +805,8 @@ func parse_switch_variant_arm_with_bindings(p: *Parser, tmp_name_ptr: u64, tmp_n
 
             var payload_tmp: *NameInfo = parse_stmt_internal_name("__match_payload_", 16, parse_next_generated_id(p));
             var payload_slot_expr: *AstNode = (*AstNode)ast_member_access((*AstNode)ast_ident(tmp_name_ptr, tmp_name_len), "__payload", 9);
-            var payload_cast: *AstNode = (*AstNode)ast_cast_ex(payload_slot_expr, TYPE_STRUCT, 1, 0, payload_info.ptr, payload_info.len, 0, 0);
+            var payload_addr_expr: *AstNode = (*AstNode)ast_addr_of(payload_slot_expr);
+            var payload_cast: *AstNode = (*AstNode)ast_cast_ex(payload_addr_expr, TYPE_STRUCT, 1, 0, payload_info.ptr, payload_info.len, 0, 0);
             var payload_decl: *AstVarDecl = ast_var_decl(payload_tmp.ptr, payload_tmp.len, TYPE_STRUCT, 1, payload_cast);
             payload_decl.struct_name_ptr = payload_info.ptr;
             payload_decl.struct_name_len = payload_info.len;
@@ -984,10 +998,9 @@ func parse_throw_stmt(p: *Parser) -> *AstNode {
     var thrown_expr: *AstNode = parse_expr(p);
     parse_consume(p, TOKEN_SEMICOLON);
 
-    var throw_stmts: *Vec<*AstNode> = new Vec<*AstNode>(3);
+    var throw_stmts: *Vec<*AstNode> = new Vec<*AstNode>(2);
     throw_stmts.push((*AstNode)ast_assign((*AstNode)ast_ident(value_ptr, value_len), thrown_expr));
     throw_stmts.push((*AstNode)ast_assign((*AstNode)ast_ident(flag_ptr, flag_len), (*AstNode)ast_literal(1)));
-    throw_stmts.push((*AstNode)ast_break());
     return (*AstNode)ast_block(throw_stmts);
 }
 
@@ -1009,16 +1022,14 @@ func parse_try_stmt_append_block_stmts(dst: *Vec<*AstNode>, block_node: *AstNode
 func parse_try_stmt_append_block_stmts_with_guard(dst: *Vec<*AstNode>, block_node: *AstNode, flag_ptr: u64, flag_len: u64) -> u64 {
     if (block_node == 0) { return 0; }
     if (ast_kind(block_node) != AST_BLOCK) {
-        dst.push(block_node);
-        dst.push(parse_try_build_break_guard(flag_ptr, flag_len));
+        dst.push(parse_try_wrap_stmt_if_not_thrown(block_node, flag_ptr, flag_len));
         return 0;
     }
     var blk: *AstBlock = (*AstBlock)block_node;
     if (blk.stmts_vec == 0) { return 0; }
     var n: u64 = blk.stmts_vec.len();
     for (var i: u64 = 0; i < n; i++) {
-        dst.push(blk.stmts_vec.get(i));
-        dst.push(parse_try_build_break_guard(flag_ptr, flag_len));
+        dst.push(parse_try_wrap_stmt_if_not_thrown(blk.stmts_vec.get(i), flag_ptr, flag_len));
     }
     return 0;
 }
@@ -1107,12 +1118,7 @@ func parse_try_stmt(p: *Parser) -> *AstNode {
     }
     lowered_stmts.push((*AstNode)value_decl);
 
-    var while_body_stmts: *Vec<*AstNode> = new Vec<*AstNode>(8);
-    parse_try_stmt_append_block_stmts_with_guard(while_body_stmts, try_block, flag_name.ptr, flag_name.len);
-    while_body_stmts.push((*AstNode)ast_break());
-
-    var while_body: *AstNode = (*AstNode)ast_block(while_body_stmts);
-    lowered_stmts.push((*AstNode)ast_while((*AstNode)ast_literal(1), while_body));
+    parse_try_stmt_append_block_stmts_with_guard(lowered_stmts, try_block, flag_name.ptr, flag_name.len);
 
     if (catch_block != 0) {
         var catch_wrapped: *Vec<*AstNode> = new Vec<*AstNode>(8);
@@ -1153,7 +1159,6 @@ func parse_try_stmt(p: *Parser) -> *AstNode {
         var propagate_stmts: *Vec<*AstNode> = new Vec<*AstNode>(3);
         propagate_stmts.push((*AstNode)ast_assign((*AstNode)ast_ident(outer_value_ptr, outer_value_len), (*AstNode)ast_ident(value_name.ptr, value_name.len)));
         propagate_stmts.push((*AstNode)ast_assign((*AstNode)ast_ident(outer_flag_ptr, outer_flag_len), (*AstNode)ast_literal(1)));
-        propagate_stmts.push((*AstNode)ast_break());
         lowered_stmts.push((*AstNode)ast_if(post_throw_cond, (*AstNode)ast_block(propagate_stmts), 0));
     } else {
         var fail_stmts: *Vec<*AstNode> = new Vec<*AstNode>(1);
@@ -1297,6 +1302,27 @@ func parse_asm_stmt(p: *Parser) -> *AstNode {
 // Block and Generic Statement
 // ============================================
 
+func parse_stmt_is_lambda_closure_decl(stmt: *AstNode) -> u64 {
+    if (stmt == 0) { return 0; }
+    if (ast_kind(stmt) != AST_VAR_DECL) { return 0; }
+    var decl: *AstVarDecl = (*AstVarDecl)stmt;
+    if (decl.init_expr == 0) { return 0; }
+    if (ast_kind(decl.init_expr) != AST_CALL) { return 0; }
+    var call: *AstCall = (*AstCall)decl.init_expr;
+    if (call.name_ptr == 0 || call.name_len < 14) { return 0; }
+    if (str_eq(call.name_ptr, 14, "__lambda_bind_", 14) == 0) { return 0; }
+    return 1;
+}
+
+func parse_block_try_append_owned_cleanup(stmts: *Vec<*AstNode>, stmt: *AstNode) -> u64 {
+    if (stmts == 0 || parse_stmt_is_lambda_closure_decl(stmt) == 0) { return 0; }
+    var decl: *AstVarDecl = (*AstVarDecl)stmt;
+    var delete_expr: *AstNode = (*AstNode)ast_ident(decl.name_ptr, decl.name_len);
+    var delete_stmt: *AstNode = (*AstNode)ast_delete(delete_expr);
+    stmts.push((*AstNode)ast_defer(delete_stmt));
+    return 0;
+}
+
 func parse_block(p: *Parser) -> *AstNode {
     push_trace("parse_block", "parser/stmt.b", __LINE__);
     defer pop_trace();
@@ -1307,7 +1333,9 @@ func parse_block(p: *Parser) -> *AstNode {
     
     while (parse_peek_kind(p) != TOKEN_RBRACE) {
         if (parse_peek_kind(p) == TOKEN_EOF) { break; }
-        stmts.push(parse_stmt(p));
+        var stmt: *AstNode = parse_stmt(p);
+        stmts.push(stmt);
+        parse_block_try_append_owned_cleanup(stmts, stmt);
     }
     
     parse_consume(p, TOKEN_RBRACE);

@@ -61,6 +61,33 @@ func cg_defer_emit_to(marker: u64, pop_after_emit: u64) -> u64 {
     return 0;
 }
 
+func cg_defer_emit_for_return(skip_delete_name_ptr: u64, skip_delete_name_len: u64) -> u64 {
+    var stack: *Vec<*AstNode> = emitter_get_defer_stack();
+    if (stack == 0 || stack.len() == 0) { return 0; }
+    var idx: i64 = (i64)stack.len() - 1;
+    while (idx >= 0) {
+        var stmt: *AstNode = stack.get((u64)idx);
+        var skip_stmt: u64 = 0;
+        if (skip_delete_name_ptr != 0 && skip_delete_name_len != 0 && stmt != 0 && ast_kind((u64)stmt) == AST_DELETE) {
+            var del: *AstDelete = (*AstDelete)stmt;
+            if (del.expr != 0 && ast_kind((u64)del.expr) == AST_IDENT) {
+                var idn: *AstIdent = (*AstIdent)del.expr;
+                if (str_eq(idn.name_ptr, idn.name_len, skip_delete_name_ptr, skip_delete_name_len) != 0) {
+                    skip_stmt = 1;
+                }
+            }
+        }
+        if (skip_stmt == 0) {
+            var prev_mode: u64 = g_defer_emit_mode;
+            g_defer_emit_mode = 1;
+            cg_stmt((u64)stmt);
+            g_defer_emit_mode = prev_mode;
+        }
+        idx = idx - 1;
+    }
+    return 0;
+}
+
 func cg_defer_mark_block_end() -> u64 {
     var markers: *Vec<u64> = emitter_get_defer_markers();
     if (markers.len() == 0) { return 0; }
@@ -547,10 +574,18 @@ func cg_return_slice(expr: u64, symtab: *Symtab) -> u64 {
 func cg_return_stmt(node: u64, symtab: *Symtab) -> u64 {
     var ret: *AstReturn = (*AstReturn)node;
     var expr: u64 = ret.expr;
-
-    cg_defer_emit_to(0, 0);
+    var skip_delete_name_ptr: u64 = 0;
+    var skip_delete_name_len: u64 = 0;
+    if (expr != 0 && ast_kind(expr) == AST_IDENT) {
+        var ret_ident: *AstIdent = (*AstIdent)expr;
+        if (emitter_is_closure_handle(ret_ident.name_ptr, ret_ident.name_len) != 0) {
+            skip_delete_name_ptr = ret_ident.name_ptr;
+            skip_delete_name_len = ret_ident.name_len;
+        }
+    }
 
     if (expr == 0) {
+        cg_defer_emit_for_return(0, 0);
         emit("    xor eax, eax\n");
         cg_return_emit_epilogue();
         return 0;
@@ -562,6 +597,7 @@ func cg_return_stmt(node: u64, symtab: *Symtab) -> u64 {
     var ret_struct_name_len: u64 = emitter_get_ret_struct_name_len();
 
     if (ret_type == TYPE_STRUCT && ret_ptr_depth == 0) {
+        cg_defer_emit_for_return(0, 0);
         var expr_kind: u64 = ast_kind(expr);
         var struct_size: u64 = sizeof_type(ret_type, 0, ret_struct_name_ptr, ret_struct_name_len);
         if (struct_size > 16) {
@@ -575,11 +611,26 @@ func cg_return_stmt(node: u64, symtab: *Symtab) -> u64 {
 
     if (ret_type == TYPE_SLICE && ret_ptr_depth == 0) {
         cg_return_slice(expr, symtab);
+        emit("    push rax\n");
+        emit("    push rdx\n");
+        cg_defer_emit_for_return(skip_delete_name_ptr, skip_delete_name_len);
+        emit("    pop rdx\n");
+        emit("    pop rax\n");
+        cg_return_emit_epilogue();
+        return 0;
+    }
+
+    if (ast_kind(expr) == AST_IDENT && skip_delete_name_ptr == 0 && skip_delete_name_len == 0) {
+        cg_defer_emit_for_return(0, 0);
+        cg_expr(expr);
         cg_return_emit_epilogue();
         return 0;
     }
 
     cg_expr(expr);
+    emit("    push rax\n");
+    cg_defer_emit_for_return(skip_delete_name_ptr, skip_delete_name_len);
+    emit("    pop rax\n");
     cg_return_emit_epilogue();
     return 0;
 }
@@ -918,6 +969,13 @@ func cg_var_decl_stmt(node: u64, symtab: *Symtab, g_structs_vec: *Vec<*AstStruct
     cg_var_decl_setup_typeinfo(symtab, name_ptr, name_len, spec, g_structs_vec);
     
     if (init != 0) {
+        if (ast_kind(init) == AST_IDENT) {
+            var src_ident: *AstIdent = (*AstIdent)init;
+            if (emitter_is_closure_handle(src_ident.name_ptr, src_ident.name_len) != 0) {
+                emit_stderr("[ERROR] closure handle copy in variable initialization is not supported\n");
+                panic("Codegen error");
+            }
+        }
         if (cg_var_decl_init_value(decl, init, spec, offset, symtab) != 0) {
             return;
         }
@@ -1399,6 +1457,19 @@ func cg_assign_stmt(node: u64, symtab: *Symtab) -> u64 {
     var value_kind: u64 = ast_kind(value);
     if (target_kind == AST_IDENT) {
         var idn_tgt: *AstIdent = (*AstIdent)target;
+        var target_is_closure_owner: u64 = emitter_is_closure_handle(idn_tgt.name_ptr, idn_tgt.name_len);
+        var value_is_closure_handle: u64 = emitter_expr_is_lambda_closure_handle(value);
+        if (target_is_closure_owner != 0 || value_is_closure_handle != 0) {
+            var allow_clear: u64 = 0;
+            if (target_is_closure_owner != 0 && value_kind == AST_LITERAL) {
+                var litv: *AstLiteral = (*AstLiteral)value;
+                if (litv.value == 0) { allow_clear = 1; }
+            }
+            if (allow_clear == 0) {
+                emit_stderr("[ERROR] closure handle is move-only; assignment is not supported (except clear-to-0)\n");
+                panic("Codegen error");
+            }
+        }
         emitter_track_closure_handle_from_expr(idn_tgt.name_ptr, idn_tgt.name_len, value);
     }
     if (target_kind == AST_SAFE_MEMBER_ACCESS) {
@@ -1455,7 +1526,20 @@ func cg_delete_stmt(node: u64, symtab: *Symtab) -> u64 {
     var dl: *AstDelete = (*AstDelete)node;
     var expr: u64 = dl.expr;
     if (expr == 0) { return 0; }
+    var ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)expr, symtab);
 
+    var free_ptr: u64 = (u64)"free";
+    var free_len: u64 = 4;
+    var free_res: *NameInfo = resolve_name(free_ptr, free_len);
+    if (free_res != 0) {
+        free_ptr = free_res.ptr;
+        free_len = free_res.len;
+    }
+
+    var closure_handle_delete: u64 = emitter_expr_is_lambda_closure_handle(expr);
+    if (closure_handle_delete == 0 && ti != 0 && ti.type_kind == TYPE_U64 && ti.ptr_depth == 0) {
+        closure_handle_delete = 1;
+    }
     cg_expr(expr);
     emit("    test rax, rax\n");
     var label_end: u64 = new_label();
@@ -1463,9 +1547,41 @@ func cg_delete_stmt(node: u64, symtab: *Symtab) -> u64 {
     emit_label(label_end);
     emit_nl();
 
-    emit("    mov rbx, rax\n");
+    if (closure_handle_delete != 0) {
+        var label_closure_done: u64 = new_label();
+        emit("    mov r10, 9223372036854775808\n");
+        emit("    test rax, r10\n");
+        emit("    jz ");
+        emit_label(label_end);
+        emit_nl();
 
-    var ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)expr, symtab);
+        emit("    mov r11, 9223372036854775807\n");
+        emit("    and rax, r11\n");
+        emit("    mov rbx, [rax+8]\n");
+        emit("    test rbx, rbx\n");
+        emit("    je ");
+        emit_label(label_closure_done);
+        emit_nl();
+        emit("    mov rdi, rbx\n");
+        emit("    call ");
+        emit_len(free_ptr, free_len);
+        emit_nl();
+
+        emit_label_def(label_closure_done);
+        emit("    mov rdi, rax\n");
+        emit("    call ");
+        emit_len(free_ptr, free_len);
+        emit_nl();
+        emit("    jmp ");
+        emit_label(label_end);
+        emit_nl();
+    }
+
+    emit("    mov rbx, rax\n");
+    if (closure_handle_delete == 0 && ti != 0 && ti.ptr_depth == 0) {
+        emit_stderr("[ERROR] delete expects pointer type or lambda closure handle\n");
+        panic("Codegen error");
+    }
     if (ti != 0 && ti.type_kind == TYPE_STRUCT && ti.ptr_depth > 0) {
         var method_ptr: u64 = (u64)"destructor";
         var method_len: u64 = 10;
@@ -1490,14 +1606,6 @@ func cg_delete_stmt(node: u64, symtab: *Symtab) -> u64 {
                 emit_nl();
             }
         }
-    }
-
-    var free_ptr: u64 = (u64)"free";
-    var free_len: u64 = 4;
-    var free_res: *NameInfo = resolve_name(free_ptr, free_len);
-    if (free_res != 0) {
-        free_ptr = free_res.ptr;
-        free_len = free_res.len;
     }
 
     emit("    mov rdi, rbx\n");
