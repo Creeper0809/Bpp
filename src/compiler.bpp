@@ -535,6 +535,7 @@ func compiler_report_module_open_error(file_path: u64, file_path_len: u64) -> u6
         emit_char(file_path_u8[i]);
     }
     emit_nl();
+    compiler_diag_note_error();
     return 0;
 }
 
@@ -588,6 +589,7 @@ func compiler_get_cached_module_tokens(file_path: u64, file_path_len: u64) -> *V
         emit_stderr(" (");
         emit_u64_stderr(lex_error_count());
         emit_stderr(" error(s))\n");
+        compiler_diag_note_error();
         return 0;
     }
     g_compiler_ctx.module_tokens_cache.put(file_path, file_path_len, tokens);
@@ -758,14 +760,7 @@ func compiler_is_not_found_u64(value: u64) -> u64 {
 }
 
 func compiler_diag_note_error() -> u64 {
-    if (g_compiler_diag_limit_reached != 0) { return g_compiler_diag_count; }
     g_compiler_diag_count = g_compiler_diag_count + 1;
-    if (g_compiler_diag_count >= COMPILER_MAX_DIAGNOSTICS) {
-        g_compiler_diag_limit_reached = 1;
-        emit_stderr("[ERROR] compiler diagnostic limit reached (");
-        emit_u64_stderr(COMPILER_MAX_DIAGNOSTICS);
-        emit_stderr("), stopping current pass early\n");
-    }
     return g_compiler_diag_count;
 }
 
@@ -785,13 +780,12 @@ func compiler_diag_has_errors() -> u64 {
 }
 
 func compiler_diag_should_stop_pass() -> u64 {
-    if (g_compiler_diag_limit_reached != 0) { return 1; }
+    // Non fail-fast mode: always allow pass traversal to continue.
     return 0;
 }
 
 func compiler_diag_force_stop_pass() -> u64 {
     compiler_diag_note_error();
-    g_compiler_diag_limit_reached = 1;
     return g_compiler_diag_count;
 }
 
@@ -809,11 +803,9 @@ func compiler_panic(msg: u64) -> u64 {
 
     begin_error_capture();
     set_error_context(panic_msg, str_len(panic_msg));
-    if (str_eq(panic_msg, str_len(panic_msg), "Compilation failed", 18) != 0) {
-        emit_stderr("[ERROR] compilation aborted (see diagnostics above for the root cause)");
-        emit_stderr_nl();
-    } else {
-        emit_stderr("[ERROR] compilation aborted: ");
+    // Keep panic as a diagnostic emitter (non fail-fast) so callers can continue collecting errors.
+    if (str_eq(panic_msg, str_len(panic_msg), "Compilation failed", 18) == 0) {
+        emit_stderr("[ERROR] ");
         emit_stderr_len(panic_msg, str_len(panic_msg));
         emit_stderr_nl();
     }
@@ -822,7 +814,7 @@ func compiler_panic(msg: u64) -> u64 {
         emit_stderr_len(g_compiler_ctx.current_module_ptr, g_compiler_ctx.current_module_len);
         emit_stderr_nl();
     }
-    compiler_diag_force_stop_pass();
+    compiler_diag_note_error();
     return 0;
 }
 
@@ -834,7 +826,7 @@ func compiler_panic_callsite(msg: u64, call_name_ptr: u64, call_name_len: u64) -
         emit_stderr_len(call_name_ptr, call_name_len);
     }
     emit_stderr("\n");
-    compiler_diag_force_stop_pass();
+    compiler_diag_note_error();
     return 0;
 }
 
@@ -1013,6 +1005,7 @@ func add_import_alias(module_ptr: u64, module_len: u64, alias_ptr: u64, alias_le
         emit_stderr_len(alias_ptr, alias_len);
         emit_stderr_nl();
         compiler_panic("Compilation failed");
+        return 0;
     }
     var info: *NameInfo = new NameInfo{mangled_ptr, mangled_len};
     alias_map.put(alias_ptr, alias_len, info);
@@ -1035,6 +1028,7 @@ func add_prelude_alias(alias_ptr: u64, alias_len: u64, mangled_ptr: u64, mangled
         emit_stderr_len(alias_ptr, alias_len);
         emit_stderr_nl();
         compiler_panic("Compilation failed");
+        return 0;
     }
     var info: *NameInfo = new NameInfo{mangled_ptr, mangled_len};
     g_compiler_ctx.prelude_aliases.put(alias_ptr, alias_len, info);
@@ -2018,21 +2012,27 @@ func compiler_import_is_module_ident_tok(tok: *Token) -> u64 {
 func compiler_import_expect_module_tok(tokens: *Vec<*Token>, idx: *u64, n: u64) -> *Token {
     if (*idx >= n) {
         compiler_import_panic_missing_module();
+        return 0;
     }
     var tok: *Token = tokens.get(*idx);
     if (compiler_import_is_module_ident_tok(tok) == 0) {
         compiler_import_panic_missing_module();
+        return 0;
     }
     *idx = *idx + 1;
     return tok;
 }
 
 func compiler_import_parse_path_suffix(tokens: *Vec<*Token>, idx: *u64, n: u64, start_tok: *Token) -> *NameInfo {
+    if (start_tok == 0) { return new NameInfo{0, 0}; }
     var path_ptr: u64 = start_tok.ptr;
     var path_len: u64 = start_tok.len;
     while (*idx < n && tokens.get(*idx).kind == TOKEN_DOT) {
         *idx = *idx + 1;
         var next_tok: *Token = compiler_import_expect_module_tok(tokens, idx, n);
+        if (next_tok == 0) {
+            return new NameInfo{0, 0};
+        }
         var joined_path: u64 = str_concat(path_ptr, path_len, "/", 1);
         path_ptr = str_concat(joined_path, path_len + 1, next_tok.ptr, next_tok.len);
         path_len = path_len + 1 + next_tok.len;
@@ -2044,8 +2044,19 @@ func compiler_import_expect_semicolon(tokens: *Vec<*Token>, idx: *u64, n: u64) -
     if (*idx >= n || tokens.get(*idx).kind != TOKEN_SEMICOLON) {
         emit_stderr("[ERROR] Expected ';' after import\n");
         compiler_panic("Compilation failed");
+        return 0;
     }
     *idx = *idx + 1;
+    return 1;
+}
+
+func compiler_import_recover_to_semicolon(tokens: *Vec<*Token>, idx: *u64, n: u64) -> u64 {
+    while (*idx < n && tokens.get(*idx).kind != TOKEN_SEMICOLON) {
+        *idx = *idx + 1;
+    }
+    if (*idx < n && tokens.get(*idx).kind == TOKEN_SEMICOLON) {
+        *idx = *idx + 1;
+    }
     return 0;
 }
 
@@ -2065,6 +2076,10 @@ func compiler_scan_imports_from_tokens(tokens: *Vec<*Token>) -> *Vec<*AstImport>
         if (i >= n) { break; }
 
         var first_tok: *Token = compiler_import_expect_module_tok(tokens, &i, n);
+        if (first_tok == 0) {
+            compiler_import_recover_to_semicolon(tokens, &i, n);
+            continue;
+        }
 
         if (i < n && (tokens.get(i).kind == TOKEN_AS || tokens.get(i).kind == TOKEN_FROM)) {
             var symbol_ptr: u64 = first_tok.ptr;
@@ -2077,6 +2092,8 @@ func compiler_scan_imports_from_tokens(tokens: *Vec<*Token>) -> *Vec<*AstImport>
                 if (i >= n || tokens.get(i).kind != TOKEN_IDENTIFIER) {
                     emit_stderr("[ERROR] Expected alias identifier in import\n");
                     compiler_panic("Compilation failed");
+                    compiler_import_recover_to_semicolon(tokens, &i, n);
+                    continue;
                 }
                 var alias_tok: *Token = tokens.get(i);
                 alias_ptr = alias_tok.ptr;
@@ -2087,19 +2104,39 @@ func compiler_scan_imports_from_tokens(tokens: *Vec<*Token>) -> *Vec<*AstImport>
             if (i >= n || tokens.get(i).kind != TOKEN_FROM) {
                 emit_stderr("[ERROR] Expected 'from' in import\n");
                 compiler_panic("Compilation failed");
+                compiler_import_recover_to_semicolon(tokens, &i, n);
+                continue;
             }
             i = i + 1;
 
             var mod_tok: *Token = compiler_import_expect_module_tok(tokens, &i, n);
+            if (mod_tok == 0) {
+                compiler_import_recover_to_semicolon(tokens, &i, n);
+                continue;
+            }
             var path_info: *NameInfo = compiler_import_parse_path_suffix(tokens, &i, n, mod_tok);
-            compiler_import_expect_semicolon(tokens, &i, n);
+            if (path_info == 0 || path_info.ptr == 0 || path_info.len == 0) {
+                compiler_import_recover_to_semicolon(tokens, &i, n);
+                continue;
+            }
+            if (compiler_import_expect_semicolon(tokens, &i, n) == 0) {
+                compiler_import_recover_to_semicolon(tokens, &i, n);
+                continue;
+            }
 
             imports.push(ast_import(path_info.ptr, path_info.len, symbol_ptr, symbol_len, alias_ptr, alias_len));
             continue;
         }
 
         var path_info2: *NameInfo = compiler_import_parse_path_suffix(tokens, &i, n, first_tok);
-        compiler_import_expect_semicolon(tokens, &i, n);
+        if (path_info2 == 0 || path_info2.ptr == 0 || path_info2.len == 0) {
+            compiler_import_recover_to_semicolon(tokens, &i, n);
+            continue;
+        }
+        if (compiler_import_expect_semicolon(tokens, &i, n) == 0) {
+            compiler_import_recover_to_semicolon(tokens, &i, n);
+            continue;
+        }
         imports.push(ast_import(path_info2.ptr, path_info2.len, 0, 0, 0, 0));
     }
 
@@ -2108,15 +2145,17 @@ func compiler_scan_imports_from_tokens(tokens: *Vec<*Token>) -> *Vec<*AstImport>
 
 func compiler_pass1_load_imports_recursive(imports_copy: *Vec<*AstImport>) -> u64 {
     if (imports_copy == 0) { return true; }
+    var had_error: u64 = 0;
     var num_imports: u64 = imports_copy.len();
     for (var i: u64 = 0; i < num_imports; i++) {
         var imp: *AstImport = imports_copy.get(i);
         var resolved: u64 = resolve_module_path(imp.path_ptr, imp.path_len);
         var resolved_len: u64 = str_len(resolved);
         if (!load_module_pass1(resolved, resolved_len)) {
-            return false;
+            had_error = 1;
         }
     }
+    if (had_error != 0) { return false; }
     return true;
 }
 
@@ -2133,6 +2172,10 @@ func compiler_pass1_register_func_sigs(prog_sig: *AstProgram) -> u64 {
 
 // Pass1: scan signatures and register generic templates before full parse.
 func load_module_pass1(file_path: u64, file_path_len: u64) -> u64 {
+    if (file_path == 0 || file_path_len == 0) {
+        compiler_panic("Compilation failed");
+        return false;
+    }
     if (g_compiler_ctx.loaded_modules_pass1.has(file_path, file_path_len)) {
         return true;
     }
@@ -2148,7 +2191,7 @@ func load_module_pass1(file_path: u64, file_path_len: u64) -> u64 {
     var imports_copy: *Vec<*AstImport> = compiler_scan_imports_from_tokens(tokens);
     g_compiler_ctx.module_imports_pass1.put(file_path, file_path_len, imports_copy);
 
-    if (!compiler_pass1_load_imports_recursive(imports_copy)) { return false; }
+    compiler_pass1_load_imports_recursive(imports_copy);
 
     if (compiler_set_current_source(file_path, file_path_len) == 0) {
         compiler_report_module_open_error(file_path, file_path_len);
@@ -2157,6 +2200,9 @@ func load_module_pass1(file_path: u64, file_path_len: u64) -> u64 {
     var p1: *Parser = parse_new(tokens);
     var prog_sig: *AstProgram = parse_program_pass1(p1);
     if (prog_sig == 0 || parse_has_errors(p1) != 0) {
+        if (parse_has_errors(p1) == 0) {
+            compiler_diag_note_error();
+        }
         return false;
     }
     compiler_pass1_register_func_sigs(prog_sig);
@@ -2168,15 +2214,22 @@ func load_std_prelude() -> u64 {
     g_compiler_ctx.prelude_miss_cache = new HashMap<u64, u64>(256);
     compiler_invalidate_resolve_name_cache();
 
+    var had_error: u64 = 0;
     for (var i: u64 = 0; i < PRELUDE_MODULE_COUNT; i++) {
         var prelude_info: ModulePreludeInfo = module_util_prelude_module_info(i);
         if (prelude_info.found == 0) { continue; }
-        if (!load_module_by_name(prelude_info.ptr, prelude_info.len)) { return false; }
+        if (!load_module_by_name(prelude_info.ptr, prelude_info.len)) {
+            had_error = 1;
+            continue;
+        }
         var module_id: *NameInfo = module_util_module_id_from_import(prelude_info.ptr, prelude_info.len);
         prelude_import_all_from_module(module_id.ptr, module_id.len);
     }
-    g_compiler_ctx.prelude_loaded = 1;
-    return true;
+    if (had_error == 0) {
+        g_compiler_ctx.prelude_loaded = 1;
+        return true;
+    }
+    return false;
 }
 
 func compiler_mark_module_loaded(file_path: u64, file_path_len: u64) -> u64 {
@@ -2191,15 +2244,17 @@ func compiler_load_module_import_deps_pass1(file_path: u64, file_path_len: u64) 
     var imports_p1: *Vec<*AstImport> = g_compiler_ctx.module_imports_pass1.get(file_path, file_path_len);
     if (imports_p1 == 0) { return true; }
 
+    var had_error: u64 = 0;
     var num_imports_p1: u64 = imports_p1.len();
     for (var pi: u64 = 0; pi < num_imports_p1; pi++) {
         var imp_p1: *AstImport = imports_p1.get(pi);
         var resolved_p1: u64 = resolve_module_path(imp_p1.path_ptr, imp_p1.path_len);
         var resolved_len_p1: u64 = str_len(resolved_p1);
         if (!load_module(resolved_p1, resolved_len_p1)) {
-            return false;
+            had_error = 1;
         }
     }
+    if (had_error != 0) { return false; }
     return true;
 }
 
@@ -2271,39 +2326,48 @@ func compiler_merge_module_program(file_path: u64, file_path_len: u64, prog: *As
 }
 
 func load_module(file_path: u64, file_path_len: u64) -> u64 {
+    if (file_path == 0 || file_path_len == 0) {
+        compiler_panic("Compilation failed");
+        return false;
+    }
     if (g_compiler_ctx.loaded_modules.has(file_path, file_path_len)) {
         return true;
     }
 
-    if (!load_module_pass1(file_path, file_path_len)) {
-        return false;
-    }
-
     compiler_mark_module_loaded(file_path, file_path_len);
-    if (!compiler_load_module_import_deps_pass1(file_path, file_path_len)) { return false; }
+    var ok: u64 = 1;
+
+    if (!load_module_pass1(file_path, file_path_len)) {
+        ok = 0;
+    }
+    if (!compiler_load_module_import_deps_pass1(file_path, file_path_len)) {
+        ok = 0;
+    }
 
     var tokens: *Vec<*Token> = compiler_get_cached_module_tokens(file_path, file_path_len);
     if (tokens == 0) {
         compiler_report_module_open_error(file_path, file_path_len);
-        return false;
-    }
-    if (compiler_set_current_source(file_path, file_path_len) == 0) {
+        ok = 0;
+    } else if (compiler_set_current_source(file_path, file_path_len) == 0) {
         compiler_report_module_open_error(file_path, file_path_len);
-        return false;
-    }
-    
-    // Module identity for mangling
-    var module_identity: CompilerModuleIdentity = compiler_module_identity(file_path, file_path_len);
-    
-    // Pass 2: full parse with bodies
-    var p: *Parser = parse_new(tokens);
-    var prog: *AstProgram = parse_program(p);
-    if (prog == 0 || parse_has_errors(p) != 0) {
-        return false;
-    }
-    compiler_merge_module_program(file_path, file_path_len, prog, module_identity.module_ptr, module_identity.module_len, module_identity.prefix_ptr, module_identity.prefix_len);
+        ok = 0;
+    } else {
+        // Module identity for mangling
+        var module_identity: CompilerModuleIdentity = compiler_module_identity(file_path, file_path_len);
 
-    return true;
+        // Pass 2: full parse with bodies
+        var p: *Parser = parse_new(tokens);
+        var prog: *AstProgram = parse_program(p);
+        if (prog == 0 || parse_has_errors(p) != 0) {
+            if (parse_has_errors(p) == 0) {
+                compiler_diag_note_error();
+            }
+            ok = 0;
+        } else {
+            compiler_merge_module_program(file_path, file_path_len, prog, module_identity.module_ptr, module_identity.module_len, module_identity.prefix_ptr, module_identity.prefix_len);
+        }
+    }
+    return ok;
 }
 
 // ============================================
@@ -2338,6 +2402,7 @@ func register_struct_type(struct_def: *AstStructDef) -> u64 {
         emit_stderr_len(struct_name_ptr, struct_name_len);
         emit_stderr("\n");
         compiler_panic("Compilation failed");
+        return 0;
     }
     g_compiler_ctx.all_structs.put(struct_name_ptr, struct_name_len, struct_info);
     g_compiler_ctx.all_structs_vec.push(struct_info);
@@ -2372,6 +2437,7 @@ func compiler_register_trait_def(trait_def: *TraitDef) -> u64 {
             emit_stderr_len(name_ptr, name_len);
             emit_stderr("\n");
             compiler_panic("Compilation failed");
+            return 0;
         }
     }
     g_compiler_ctx.all_traits.put(name_ptr, name_len, trait_def);
@@ -3126,6 +3192,7 @@ func compiler_register_finalized_impl_method(fn: *AstFunc) -> u64 {
                 emit_stderr_len(fn_method_ptr, fn_method_len);
                 emit_stderr("\n");
                 compiler_panic("Compilation failed");
+                return 0;
             }
 
             // Prefer keeping the definition node over a signature-only placeholder.
@@ -3139,6 +3206,7 @@ func compiler_register_finalized_impl_method(fn: *AstFunc) -> u64 {
             emit_stderr_len(fn_method_ptr, fn_method_len);
             emit_stderr("\n");
             compiler_panic("Compilation failed");
+            return 0;
         }
     }
     compiler_register_impl_method_ex(fn.name_ptr, fn.name_len, fn.impl_owner_ptr, fn.impl_owner_len, fn.impl_method_access);
@@ -3540,6 +3608,9 @@ func generic_subst_typeinfo(type_kind: u64, ptr_depth: u64, is_tagged: u64, stru
             print_u64(struct_name_ptr);
             emit_stderr("\n");
             compiler_panic("Compilation failed");
+            var generic_unknown2: *TypeInfo = generic_make_typeinfo_from_fields(TYPE_GENERIC, ptr_depth, is_tagged, struct_name_ptr, struct_name_len, tag_layout_ptr, tag_layout_len, elem_type_kind, elem_ptr_depth, array_len, array_len_is_param, array_len_param_ptr, array_len_param_len);
+            generic_unknown2.elem_typeinfo = elem_typeinfo;
+            return generic_unknown2;
         }
         var bt: *TypeInfo = b_ptr.type;
         var merged_ptr_depth: u64 = bt.ptr_depth + ptr_depth;
@@ -3573,6 +3644,12 @@ func generic_subst_typeinfo(type_kind: u64, ptr_depth: u64, is_tagged: u64, stru
             var tpl_ptr: *GenericStructTemplate = compiler_find_generic_struct_template_by_name(struct_name_ptr, base_len);
             if (tpl_ptr != 0) {
                 var name_info: *NameInfo = generic_struct_get_or_create_instance(tpl_ptr, bindings);
+                if (name_info == 0) {
+                    compiler_panic("Compilation failed");
+                    var fallback_ti: *TypeInfo = generic_make_typeinfo_from_fields(type_kind, ptr_depth, is_tagged, struct_name_ptr, struct_name_len, tag_layout_ptr, tag_layout_len, elem_type_kind, elem_ptr_depth, array_len, array_len_is_param, array_len_param_ptr, array_len_param_len);
+                    fallback_ti.elem_typeinfo = elem_typeinfo;
+                    return fallback_ti;
+                }
                 var instantiated_struct_ti: *TypeInfo = generic_make_typeinfo_from_fields(type_kind, ptr_depth, is_tagged, name_info.ptr, name_info.len, tag_layout_ptr, tag_layout_len, elem_type_kind, elem_ptr_depth, array_len, array_len_is_param, array_len_param_ptr, array_len_param_len);
                 instantiated_struct_ti.elem_typeinfo = elem_typeinfo;
                 return instantiated_struct_ti;
@@ -3590,11 +3667,12 @@ func generic_subst_typeinfo(type_kind: u64, ptr_depth: u64, is_tagged: u64, stru
             if (vb_ptr == 0) {
                 emit_stderr("[ERROR] Missing generic value binding\n");
                 compiler_panic("Compilation failed");
+            } else {
+                new_array_len = vb_ptr.value;
+                new_array_len_is_param = 0;
+                new_array_param_ptr = 0;
+                new_array_param_len = 0;
             }
-            new_array_len = vb_ptr.value;
-            new_array_len_is_param = 0;
-            new_array_param_ptr = 0;
-            new_array_param_len = 0;
         }
 
         var et: *TypeInfo = generic_subst_typeinfo(elem_type_kind, elem_ptr_depth, 0, struct_name_ptr, struct_name_len, 0, 0, 0, 0, 0, 0, 0, 0, elem_typeinfo, bindings);
@@ -3719,6 +3797,7 @@ func generic_mangle_name(base_ptr: u64, base_len: u64, params_vec: *Vec<*Generic
             if (b_ptr == 0) {
                 emit_stderr("[ERROR] Missing generic type binding\n");
                 compiler_panic("Compilation failed");
+                return new NameInfo{base_ptr, base_len};
             }
             generic_append_type_repr(v, b_ptr.type);
         } else {
@@ -3728,6 +3807,7 @@ func generic_mangle_name(base_ptr: u64, base_len: u64, params_vec: *Vec<*Generic
             if (b2_ptr == 0) {
                 emit_stderr("[ERROR] Missing generic value binding\n");
                 compiler_panic("Compilation failed");
+                return new NameInfo{base_ptr, base_len};
             }
             generic_vec_append_u64(v, b2_ptr.value);
         }
@@ -4863,6 +4943,7 @@ func generic_get_or_create_instance(tpl_ptr: *GenericFuncTemplate, bindings: *Ve
     if (def_src == 0) {
         emit_stderr("[ERROR] Missing generic function body\n");
         compiler_panic("Compilation failed");
+        return 0;
     }
 
     var fn_new: *AstFunc = generic_clone_func(def_src, bindings, inst_ptr, inst_len);
@@ -5091,6 +5172,7 @@ func generic_build_bindings_core(params_vec: *Vec<*GenericParam>, gargs: *Vec<*G
     if (params_vec == 0 || gargs == 0) {
         emit_stderr("[ERROR] Missing generic params/args\n");
         compiler_panic("Compilation failed");
+        return 0;
     }
     var bindings: *Vec<*GenericBinding> = new Vec<*GenericBinding>(4);
     var pn: u64 = params_vec.len();
@@ -5098,6 +5180,7 @@ func generic_build_bindings_core(params_vec: *Vec<*GenericParam>, gargs: *Vec<*G
     if (pn != an) {
         emit_stderr("[ERROR] Generic argument count mismatch\n");
         compiler_panic("Compilation failed");
+        return 0;
     }
     for (var i: u64 = 0; i < pn; i++) {
         var gp: *GenericParam = params_vec.get(i);
@@ -5106,22 +5189,27 @@ func generic_build_bindings_core(params_vec: *Vec<*GenericParam>, gargs: *Vec<*G
             if (ga.kind != GENERIC_KIND_TYPE) {
                 emit_stderr("[ERROR] Expected type generic argument\n");
                 compiler_panic("Compilation failed");
+                return 0;
             }
             if (generic_bind_type(bindings, gp.name_ptr, gp.name_len, ga.type_ptr) != 0) {
                 emit_stderr("[ERROR] Conflicting generic type bindings\n");
                 compiler_panic("Compilation failed");
+                return 0;
             }
             if (compiler_generic_validate_type_bound(gp, ga.type_ptr) == 0) {
                 compiler_panic("Compilation failed");
+                return 0;
             }
         } else {
             if (ga.kind != GENERIC_KIND_VALUE) {
                 emit_stderr("[ERROR] Expected value generic argument\n");
                 compiler_panic("Compilation failed");
+                return 0;
             }
             if (generic_bind_value(bindings, gp.name_ptr, gp.name_len, ga.value) != 0) {
                 emit_stderr("[ERROR] Conflicting generic value bindings\n");
                 compiler_panic("Compilation failed");
+                return 0;
             }
         }
     }
@@ -5219,6 +5307,7 @@ func generic_struct_get_or_create_instance(tpl_ptr: *GenericStructTemplate, bind
     if (def_src == 0) {
         emit_stderr("[ERROR] Missing generic struct template\n");
         compiler_panic("Compilation failed");
+        return 0;
     }
 
     var struct_new: *AstStructDef = generic_clone_struct(def_src, bindings, inst_ptr, inst_len);
@@ -5238,6 +5327,7 @@ func generic_build_bindings_by_infer(tpl_ptr: *GenericFuncTemplate, call_args: *
     if (def_src == 0) {
         emit_stderr("[ERROR] Missing generic signature for inference\n");
         compiler_panic("Compilation failed");
+        return 0;
     }
     var fn: *AstFunc = def_src;
     var params: *Vec<*Param> = fn.params_vec;
@@ -5246,6 +5336,7 @@ func generic_build_bindings_by_infer(tpl_ptr: *GenericFuncTemplate, call_args: *
     if (pn != an) {
         emit_stderr("[ERROR] Generic inference arg count mismatch\n");
         compiler_panic("Compilation failed");
+        return 0;
     }
 
     for (var i: u64 = 0; i < pn; i++) {
@@ -5269,9 +5360,11 @@ func generic_build_bindings_by_infer(tpl_ptr: *GenericFuncTemplate, call_args: *
                 emit_stderr_len(gp.name_ptr, gp.name_len);
                 emit_stderr("\n");
                 compiler_panic("Compilation failed");
+                return 0;
             }
             if (compiler_generic_validate_type_bound(gp, bound.type) == 0) {
                 compiler_panic("Compilation failed");
+                return 0;
             }
         }
     }
@@ -5407,9 +5500,19 @@ func generic_process_generic_call_expr_visitor(gc: *AstGenericCall, visitor: *Ge
     if (tpl_ptr == 0) {
         emit_stderr("[ERROR] Generic function not found\n");
         compiler_panic("Compilation failed");
+        var args_fallback0: *Vec<*AstNode> = generic_ast_visitor_walk_args(visitor, gc.args_vec);
+        return ast_call_with_origin(gc.name_ptr, gc.name_len, args_fallback0, gc.origin);
     }
     var bindings: *Vec<*GenericBinding> = generic_build_bindings_for_explicit(tpl_ptr, gc.generic_args_vec);
+    if (bindings == 0) {
+        var args_fallback1: *Vec<*AstNode> = generic_ast_visitor_walk_args(visitor, gc.args_vec);
+        return ast_call_with_origin(gc.name_ptr, gc.name_len, args_fallback1, gc.origin);
+    }
     var name_info: *NameInfo = generic_get_or_create_instance(tpl_ptr, bindings);
+    if (name_info == 0) {
+        var args_fallback2: *Vec<*AstNode> = generic_ast_visitor_walk_args(visitor, gc.args_vec);
+        return ast_call_with_origin(gc.name_ptr, gc.name_len, args_fallback2, gc.origin);
+    }
     var args_new: *Vec<*AstNode> = generic_ast_visitor_walk_args(visitor, gc.args_vec);
     return ast_call_with_origin(name_info.ptr, name_info.len, args_new, gc.origin);
 }
@@ -5426,6 +5529,10 @@ func generic_process_call_expr_visitor(call: *AstCall, visitor: *GenericAstVisit
         return ast_call_with_origin(call.name_ptr, call.name_len, args_fallback, call.origin);
     }
     var name_info2: *NameInfo = generic_get_or_create_instance(tpl_ptr, bindings2);
+    if (name_info2 == 0) {
+        var args_fallback3: *Vec<*AstNode> = generic_ast_visitor_walk_args(visitor, call.args_vec);
+        return ast_call_with_origin(call.name_ptr, call.name_len, args_fallback3, call.origin);
+    }
     var args_new3: *Vec<*AstNode> = generic_ast_visitor_walk_args(visitor, call.args_vec);
     return ast_call_with_origin(name_info2.ptr, name_info2.len, args_new3, call.origin);
 }
@@ -7425,6 +7532,7 @@ func compiler_insert_vptr_field(struct_def: *AstStructDef, trait_ptr: u64, trait
         emit_stderr_len(struct_def.name_ptr, struct_def.name_len);
         emit_stderr("\n");
         compiler_panic("Compilation failed");
+        return 0;
     }
     var vptr_name: *NameInfo = compiler_build_vptr_field_name(trait_ptr, trait_len);
     var existing_off: u64 = compiler_struct_find_field_offset(struct_def, vptr_name.ptr, vptr_name.len);
@@ -9366,6 +9474,7 @@ func compiler_insert_global_init_func() -> u64 {
         if (init_expr == 0) {
             emit_stderr("[ERROR] runtime global init expr missing\n");
             compiler_panic("Compilation failed");
+            continue;
         }
         var target: *AstNode = (*AstNode)ast_ident(ginfo.name_ptr, ginfo.name_len);
         var assign: *AstAssign = ast_assign(target, init_expr);
