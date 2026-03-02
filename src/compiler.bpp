@@ -6328,7 +6328,6 @@ struct CompilerExceptionLowerCtx {
     public flag_len_stack: *Vec<u64>;
     public value_ptr_stack: *Vec<u64>;
     public value_len_stack: *Vec<u64>;
-    public allowed_depth_stack: *Vec<u64>;
     public counter: u64;
 }
 
@@ -6338,7 +6337,6 @@ func compiler_exc_ctx_new() -> CompilerExceptionLowerCtx {
     ctx.flag_len_stack = 0;
     ctx.value_ptr_stack = 0;
     ctx.value_len_stack = 0;
-    ctx.allowed_depth_stack = 0;
     ctx.counter = 0;
     return ctx;
 }
@@ -6386,19 +6384,17 @@ func compiler_exc_ensure_context_struct() -> *AstStructDef {
     return ctx_def;
 }
 
-func compiler_exc_ctx_push(ctx: *CompilerExceptionLowerCtx, flag_ptr: u64, flag_len: u64, value_ptr: u64, value_len: u64, allowed_depth: u64) -> u64 {
+func compiler_exc_ctx_push(ctx: *CompilerExceptionLowerCtx, flag_ptr: u64, flag_len: u64, value_ptr: u64, value_len: u64) -> u64 {
     if (ctx.flag_ptr_stack == 0) {
         ctx.flag_ptr_stack = new Vec<u64>(8);
         ctx.flag_len_stack = new Vec<u64>(8);
         ctx.value_ptr_stack = new Vec<u64>(8);
         ctx.value_len_stack = new Vec<u64>(8);
-        ctx.allowed_depth_stack = new Vec<u64>(8);
     }
     ctx.flag_ptr_stack.push(flag_ptr);
     ctx.flag_len_stack.push(flag_len);
     ctx.value_ptr_stack.push(value_ptr);
     ctx.value_len_stack.push(value_len);
-    ctx.allowed_depth_stack.push(allowed_depth);
     return 0;
 }
 
@@ -6408,7 +6404,6 @@ func compiler_exc_ctx_pop(ctx: *CompilerExceptionLowerCtx) -> u64 {
     ctx.flag_len_stack.pop();
     ctx.value_ptr_stack.pop();
     ctx.value_len_stack.pop();
-    ctx.allowed_depth_stack.pop();
     return 0;
 }
 
@@ -6496,22 +6491,48 @@ func compiler_exc_build_unhandled_throw_stmt() -> *AstNode {
     return ast_expr_stmt((*AstNode)call);
 }
 
-func compiler_exc_append_block_stmts(dst: *Vec<*AstNode>, block_node: *AstNode) -> u64 {
-    if (block_node == 0) { return 0; }
-    if (ast_kind(block_node) != AST_BLOCK) {
-        dst.push(block_node);
-        return 0;
-    }
-    var blk: *AstBlock = (*AstBlock)block_node;
-    if (blk.stmts_vec == 0) { return 0; }
-    var n: u64 = blk.stmts_vec.len();
-    for (var i: u64 = 0; i < n; i++) {
-        dst.push(blk.stmts_vec.get(i));
+func compiler_exc_apply_typeinfo_to_vardecl(decl: *AstVarDecl, ti: *TypeInfo) -> u64 {
+    if (decl == 0 || ti == 0) { return 0; }
+    decl.type_kind = ti.type_kind;
+    decl.ptr_depth = ti.ptr_depth;
+    decl.is_tagged = ti.is_tagged;
+    decl.struct_name_ptr = ti.struct_name_ptr;
+    decl.struct_name_len = ti.struct_name_len;
+    decl.tag_layout_ptr = ti.tag_layout_ptr;
+    decl.tag_layout_len = ti.tag_layout_len;
+    decl.elem_type_kind = ti.elem_type_kind;
+    decl.elem_ptr_depth = ti.elem_ptr_depth;
+    decl.array_len = ti.array_len;
+    decl.array_len_is_param = ti.array_len_is_param;
+    decl.array_len_param_ptr = ti.array_len_param_ptr;
+    decl.array_len_param_len = ti.array_len_param_len;
+    if (ti.type_kind == TYPE_FUNC) {
+        decl.elem_typeinfo = ti;
+    } else {
+        decl.elem_typeinfo = ti.elem_typeinfo;
     }
     return 0;
 }
 
-func compiler_lower_exception_stmt(ctx: *CompilerExceptionLowerCtx, stmt: *AstNode, breakable_depth: u64) -> *AstNode {
+func compiler_exc_append_lowered_wrapped_stmts(ctx: *CompilerExceptionLowerCtx, dst: *Vec<*AstNode>, block_node: *AstNode, ctx_ptr: u64, ctx_len: u64) -> u64 {
+    if (block_node == 0) { return 0; }
+    if (ast_kind(block_node) == AST_BLOCK) {
+        var blk: *AstBlock = (*AstBlock)block_node;
+        if (blk.stmts_vec == 0) { return 0; }
+        var n: u64 = blk.stmts_vec.len();
+        for (var i: u64 = 0; i < n; i++) {
+            var lowered_stmt: *AstNode = compiler_lower_exception_stmt(ctx, blk.stmts_vec.get(i));
+            dst.push(compiler_exc_wrap_stmt_if_not_thrown(lowered_stmt, ctx_ptr, ctx_len));
+        }
+        return 0;
+    }
+
+    var lowered_single: *AstNode = compiler_lower_exception_stmt(ctx, block_node);
+    dst.push(compiler_exc_wrap_stmt_if_not_thrown(lowered_single, ctx_ptr, ctx_len));
+    return 0;
+}
+
+func compiler_lower_exception_stmt(ctx: *CompilerExceptionLowerCtx, stmt: *AstNode) -> *AstNode {
     if (stmt == 0) { return 0; }
 
     var kind: u64 = ast_kind(stmt);
@@ -6521,26 +6542,26 @@ func compiler_lower_exception_stmt(ctx: *CompilerExceptionLowerCtx, stmt: *AstNo
             if (blk.stmts_vec != 0) {
                 var n: u64 = blk.stmts_vec.len();
                 for (var i: u64 = 0; i < n; i++) {
-                    blk.stmts_vec.set(i, compiler_lower_exception_stmt(ctx, blk.stmts_vec.get(i), breakable_depth));
+                    blk.stmts_vec.set(i, compiler_lower_exception_stmt(ctx, blk.stmts_vec.get(i)));
                 }
             }
             return stmt;
         case AST_IF:
             var ifs: *AstIf = (*AstIf)stmt;
-            ifs.then_block = compiler_lower_exception_stmt(ctx, ifs.then_block, breakable_depth);
-            ifs.else_block = compiler_lower_exception_stmt(ctx, ifs.else_block, breakable_depth);
+            ifs.then_block = compiler_lower_exception_stmt(ctx, ifs.then_block);
+            ifs.else_block = compiler_lower_exception_stmt(ctx, ifs.else_block);
             return stmt;
         case AST_WHILE:
             var wl: *AstWhile = (*AstWhile)stmt;
-            wl.body = compiler_lower_exception_stmt(ctx, wl.body, breakable_depth + 1);
+            wl.body = compiler_lower_exception_stmt(ctx, wl.body);
             if (compiler_exc_ctx_active(ctx) != 0) {
                 wl.body = compiler_exc_wrap_loop_body_with_guard(wl.body, compiler_exc_ctx_current_flag_ptr(ctx), compiler_exc_ctx_current_flag_len(ctx));
             }
             return stmt;
         case AST_FOR:
             var fr: *AstFor = (*AstFor)stmt;
-            fr.init = compiler_lower_exception_stmt(ctx, fr.init, breakable_depth);
-            fr.body = compiler_lower_exception_stmt(ctx, fr.body, breakable_depth + 1);
+            fr.init = compiler_lower_exception_stmt(ctx, fr.init);
+            fr.body = compiler_lower_exception_stmt(ctx, fr.body);
             if (compiler_exc_ctx_active(ctx) != 0) {
                 fr.body = compiler_exc_wrap_loop_body_with_guard(fr.body, compiler_exc_ctx_current_flag_ptr(ctx), compiler_exc_ctx_current_flag_len(ctx));
             }
@@ -6551,17 +6572,17 @@ func compiler_lower_exception_stmt(ctx: *CompilerExceptionLowerCtx, stmt: *AstNo
             if (sw.cases_vec != 0) {
                 var cn: u64 = sw.cases_vec.len();
                 for (var ci: u64 = 0; ci < cn; ci++) {
-                    sw.cases_vec.set(ci, compiler_lower_exception_stmt(ctx, sw.cases_vec.get(ci), breakable_depth + 1));
+                    sw.cases_vec.set(ci, compiler_lower_exception_stmt(ctx, sw.cases_vec.get(ci)));
                 }
             }
             return stmt;
         case AST_CASE:
             var cs: *AstCase = (*AstCase)stmt;
-            cs.body = compiler_lower_exception_stmt(ctx, cs.body, breakable_depth);
+            cs.body = compiler_lower_exception_stmt(ctx, cs.body);
             return stmt;
         case AST_DEFER:
             var df: *AstDefer = (*AstDefer)stmt;
-            df.stmt = compiler_lower_exception_stmt(ctx, df.stmt, breakable_depth);
+            df.stmt = compiler_lower_exception_stmt(ctx, df.stmt);
             return stmt;
         case AST_TRY_STMT:
             var tr: *AstTryStmt = (*AstTryStmt)stmt;
@@ -6600,38 +6621,11 @@ func compiler_lower_exception_stmt(ctx: *CompilerExceptionLowerCtx, stmt: *AstNo
                 thrown_value_type = new TypeInfo(TYPE_U64, 0);
             }
             var value_decl: *AstVarDecl = ast_var_decl(value_name.ptr, value_name.len, thrown_value_type.type_kind, thrown_value_type.ptr_depth, (*AstNode)ast_literal(0));
-            value_decl.is_tagged = thrown_value_type.is_tagged;
-            value_decl.struct_name_ptr = thrown_value_type.struct_name_ptr;
-            value_decl.struct_name_len = thrown_value_type.struct_name_len;
-            value_decl.tag_layout_ptr = thrown_value_type.tag_layout_ptr;
-            value_decl.tag_layout_len = thrown_value_type.tag_layout_len;
-            value_decl.elem_type_kind = thrown_value_type.elem_type_kind;
-            value_decl.elem_ptr_depth = thrown_value_type.elem_ptr_depth;
-            value_decl.array_len = thrown_value_type.array_len;
-            value_decl.array_len_is_param = thrown_value_type.array_len_is_param;
-            value_decl.array_len_param_ptr = thrown_value_type.array_len_param_ptr;
-            value_decl.array_len_param_len = thrown_value_type.array_len_param_len;
-            if (thrown_value_type.type_kind == TYPE_FUNC) {
-                value_decl.elem_typeinfo = thrown_value_type;
-            } else {
-                value_decl.elem_typeinfo = thrown_value_type.elem_typeinfo;
-            }
+            compiler_exc_apply_typeinfo_to_vardecl(value_decl, thrown_value_type);
             lowered_stmts.push((*AstNode)value_decl);
 
-            compiler_exc_ctx_push(ctx, ctx_name.ptr, ctx_name.len, value_name.ptr, value_name.len, breakable_depth);
-            if (tr.try_block != 0 && ast_kind(tr.try_block) == AST_BLOCK) {
-                var try_blk: *AstBlock = (*AstBlock)tr.try_block;
-                if (try_blk.stmts_vec != 0) {
-                    var tn: u64 = try_blk.stmts_vec.len();
-                    for (var ti: u64 = 0; ti < tn; ti++) {
-                        var lowered_try_stmt: *AstNode = compiler_lower_exception_stmt(ctx, try_blk.stmts_vec.get(ti), breakable_depth);
-                        lowered_stmts.push(compiler_exc_wrap_stmt_if_not_thrown(lowered_try_stmt, ctx_name.ptr, ctx_name.len));
-                    }
-                }
-            } else {
-                var lowered_try_single: *AstNode = compiler_lower_exception_stmt(ctx, tr.try_block, breakable_depth);
-                lowered_stmts.push(compiler_exc_wrap_stmt_if_not_thrown(lowered_try_single, ctx_name.ptr, ctx_name.len));
-            }
+            compiler_exc_ctx_push(ctx, ctx_name.ptr, ctx_name.len, value_name.ptr, value_name.len);
+            compiler_exc_append_lowered_wrapped_stmts(ctx, lowered_stmts, tr.try_block, ctx_name.ptr, ctx_name.len);
             compiler_exc_ctx_pop(ctx);
 
             if (tr.catch_block != 0) {
@@ -6640,38 +6634,11 @@ func compiler_lower_exception_stmt(ctx: *CompilerExceptionLowerCtx, stmt: *AstNo
 
                 if (tr.catch_name_ptr != 0 && tr.catch_name_len != 0) {
                     var catch_decl: *AstVarDecl = ast_var_decl(tr.catch_name_ptr, tr.catch_name_len, thrown_value_type.type_kind, thrown_value_type.ptr_depth, (*AstNode)ast_ident(value_name.ptr, value_name.len));
-                    catch_decl.is_tagged = thrown_value_type.is_tagged;
-                    catch_decl.struct_name_ptr = thrown_value_type.struct_name_ptr;
-                    catch_decl.struct_name_len = thrown_value_type.struct_name_len;
-                    catch_decl.tag_layout_ptr = thrown_value_type.tag_layout_ptr;
-                    catch_decl.tag_layout_len = thrown_value_type.tag_layout_len;
-                    catch_decl.elem_type_kind = thrown_value_type.elem_type_kind;
-                    catch_decl.elem_ptr_depth = thrown_value_type.elem_ptr_depth;
-                    catch_decl.array_len = thrown_value_type.array_len;
-                    catch_decl.array_len_is_param = thrown_value_type.array_len_is_param;
-                    catch_decl.array_len_param_ptr = thrown_value_type.array_len_param_ptr;
-                    catch_decl.array_len_param_len = thrown_value_type.array_len_param_len;
-                    if (thrown_value_type.type_kind == TYPE_FUNC) {
-                        catch_decl.elem_typeinfo = thrown_value_type;
-                    } else {
-                        catch_decl.elem_typeinfo = thrown_value_type.elem_typeinfo;
-                    }
+                    compiler_exc_apply_typeinfo_to_vardecl(catch_decl, thrown_value_type);
                     catch_wrapped.push((*AstNode)catch_decl);
                 }
 
-                if (ast_kind(tr.catch_block) == AST_BLOCK) {
-                    var catch_blk: *AstBlock = (*AstBlock)tr.catch_block;
-                    if (catch_blk.stmts_vec != 0) {
-                        var cn2: u64 = catch_blk.stmts_vec.len();
-                        for (var ci2: u64 = 0; ci2 < cn2; ci2++) {
-                            var lowered_catch_stmt: *AstNode = compiler_lower_exception_stmt(ctx, catch_blk.stmts_vec.get(ci2), breakable_depth);
-                            catch_wrapped.push(compiler_exc_wrap_stmt_if_not_thrown(lowered_catch_stmt, ctx_name.ptr, ctx_name.len));
-                        }
-                    }
-                } else {
-                    var lowered_catch_single: *AstNode = compiler_lower_exception_stmt(ctx, tr.catch_block, breakable_depth);
-                    catch_wrapped.push(compiler_exc_wrap_stmt_if_not_thrown(lowered_catch_single, ctx_name.ptr, ctx_name.len));
-                }
+                compiler_exc_append_lowered_wrapped_stmts(ctx, catch_wrapped, tr.catch_block, ctx_name.ptr, ctx_name.len);
 
                 var thrown_cond2: *AstNode = (*AstNode)ast_binary(TOKEN_BANGEQ, compiler_exc_state_expr(ctx_name.ptr, ctx_name.len), (*AstNode)ast_literal(COMPILER_EXC_STATE_NONE));
                 lowered_stmts.push((*AstNode)ast_if(thrown_cond2, (*AstNode)ast_block(catch_wrapped), 0));
@@ -6682,19 +6649,7 @@ func compiler_lower_exception_stmt(ctx: *CompilerExceptionLowerCtx, stmt: *AstNo
                 lowered_stmts.push((*AstNode)ast_var_decl(pending_name.ptr, pending_name.len, TYPE_U64, 0, compiler_exc_state_expr(ctx_name.ptr, ctx_name.len)));
                 lowered_stmts.push((*AstNode)ast_assign(compiler_exc_state_expr(ctx_name.ptr, ctx_name.len), (*AstNode)ast_literal(COMPILER_EXC_STATE_NONE)));
 
-                if (ast_kind(tr.finally_block) == AST_BLOCK) {
-                    var finally_blk: *AstBlock = (*AstBlock)tr.finally_block;
-                    if (finally_blk.stmts_vec != 0) {
-                        var fnn: u64 = finally_blk.stmts_vec.len();
-                        for (var fi: u64 = 0; fi < fnn; fi++) {
-                            var lowered_finally_stmt: *AstNode = compiler_lower_exception_stmt(ctx, finally_blk.stmts_vec.get(fi), breakable_depth);
-                            lowered_stmts.push(compiler_exc_wrap_stmt_if_not_thrown(lowered_finally_stmt, ctx_name.ptr, ctx_name.len));
-                        }
-                    }
-                } else {
-                    var lowered_finally_single: *AstNode = compiler_lower_exception_stmt(ctx, tr.finally_block, breakable_depth);
-                    lowered_stmts.push(compiler_exc_wrap_stmt_if_not_thrown(lowered_finally_single, ctx_name.ptr, ctx_name.len));
-                }
+                compiler_exc_append_lowered_wrapped_stmts(ctx, lowered_stmts, tr.finally_block, ctx_name.ptr, ctx_name.len);
 
                 var restore_stmts: *Vec<*AstNode> = new Vec<*AstNode>(1);
                 restore_stmts.push((*AstNode)ast_assign(compiler_exc_state_expr(ctx_name.ptr, ctx_name.len), (*AstNode)ast_ident(pending_name.ptr, pending_name.len)));
@@ -6734,7 +6689,7 @@ func compiler_lower_exception_stmt(ctx: *CompilerExceptionLowerCtx, stmt: *AstNo
 
 func compiler_lower_exceptions_stmt(stmt: *AstNode) -> u64 {
     var ctx: CompilerExceptionLowerCtx = compiler_exc_ctx_new();
-    compiler_lower_exception_stmt(&ctx, stmt, 0);
+    compiler_lower_exception_stmt(&ctx, stmt);
     return 0;
 }
 
