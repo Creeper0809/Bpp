@@ -142,6 +142,7 @@ TEST_JOBS=${TEST_JOBS:-0}
 TEST_PROFILE=${TEST_PROFILE:-full}
 TEST_MODE_FILTER=${TEST_MODE_FILTER:-}
 TEST_OPT_FILTER=${TEST_OPT_FILTER:-}
+TEST_NAME_FILTER=${TEST_NAME_FILTER:-}
 COMPILE_FAIL_SINGLE_VARIANT=${COMPILE_FAIL_SINGLE_VARIANT:-}
 TEST_SUITE_CASE_LIMIT=${TEST_SUITE_CASE_LIMIT:-}
 STRICT_FAIL_DIAGNOSTICS=${STRICT_FAIL_DIAGNOSTICS:-1}
@@ -349,6 +350,7 @@ if [ "$TEST_QUIET" -eq 0 ]; then
     echo "[INFO] Profile: $TEST_PROFILE"
     echo "[INFO] Mode filter: $GLOBAL_MODES_CSV"
     echo "[INFO] Opt filter: $GLOBAL_OPTS_CSV"
+    echo "[INFO] Name filter: ${TEST_NAME_FILTER:-<none>}"
     echo "[INFO] Compile-fail single variant: $COMPILE_FAIL_SINGLE_VARIANT"
     echo "[INFO] Strict fail diagnostics: $STRICT_FAIL_DIAGNOSTICS"
     echo "[INFO] Suite case limit: $TEST_SUITE_CASE_LIMIT (0=all)"
@@ -715,6 +717,11 @@ fi
 for TEST_FILE in "${TEST_FILES[@]}"; do
     TEST_NAME=$(basename "$TEST_FILE" .bpp)
     TEST_LABEL="${TEST_DISPLAY_NAME[$TEST_FILE]:-$TEST_NAME}"
+    if [ -n "$TEST_NAME_FILTER" ]; then
+        if [[ ! "$TEST_LABEL" =~ $TEST_NAME_FILTER ]] && [[ ! "$TEST_NAME" =~ $TEST_NAME_FILTER ]]; then
+            continue
+        fi
+    fi
     CONTENT_HASH=$(awk '{if ($0 !~ /^\/\/ (Covers:|Mode:|Opt:|Expect exit code:|Expect compile fail:|Expect error contains:)/) print}' "$TEST_FILE" | md5sum | awk '{print $1}')
     if [ -n "${SEEN_HASH[$CONTENT_HASH]}" ]; then
         if [ "$TEST_QUIET" -eq 0 ]; then

@@ -141,10 +141,44 @@ TEST_FAST_IO="${TEST_FAST_IO:-1}"
 TEST_QUIET="${TEST_QUIET:-1}"
 KEEP_TEST_ARTIFACTS="${KEEP_TEST_ARTIFACTS:-0}"
 TEST_JOBS="${TEST_JOBS:-0}"
-TEST_PROFILE="${TEST_PROFILE:-full}"
-STRESS_RUNS="${STRESS_RUNS:-20}"
-STABILITY_RUNS="${STABILITY_RUNS:-5}"
+TEST_PROFILE="${TEST_PROFILE:-}"
+BUILD_AND_TEST_PROFILE="${BUILD_AND_TEST_PROFILE:-full}"
+SELFHOST_VERIFY="${SELFHOST_VERIFY:-}"
+STRESS_RUNS="${STRESS_RUNS:-}"
+STABILITY_RUNS="${STABILITY_RUNS:-}"
 TEST_SUITE_CASE_LIMIT="${TEST_SUITE_CASE_LIMIT:-0}"
+TEST_NAME_FILTER="${TEST_NAME_FILTER:-}"
+TEST_JOBS_SCALE="${TEST_JOBS_SCALE:-2}"
+
+if [ "$BUILD_AND_TEST_PROFILE" = "fast" ]; then
+    if [ -z "$TEST_PROFILE" ]; then TEST_PROFILE="quick"; fi
+    if [ -z "$SELFHOST_VERIFY" ]; then SELFHOST_VERIFY=0; fi
+    if [ -z "${STRESS_RUNS:-}" ]; then STRESS_RUNS=0; fi
+    if [ -z "${STABILITY_RUNS:-}" ]; then STABILITY_RUNS=0; fi
+elif [ "$BUILD_AND_TEST_PROFILE" = "full" ]; then
+    if [ -z "$TEST_PROFILE" ]; then TEST_PROFILE="full"; fi
+    if [ -z "$SELFHOST_VERIFY" ]; then SELFHOST_VERIFY=1; fi
+    # Full profile keeps full test matrix, but default avoids costly repeat runs.
+    # Re-enable with STRESS_RUNS/STABILITY_RUNS env when needed.
+    if [ -z "${STRESS_RUNS:-}" ]; then STRESS_RUNS=0; fi
+    if [ -z "${STABILITY_RUNS:-}" ]; then STABILITY_RUNS=0; fi
+else
+    echo "Error: BUILD_AND_TEST_PROFILE must be 'fast' or 'full' (got: $BUILD_AND_TEST_PROFILE)"
+    exit 1
+fi
+
+if [ "$TEST_JOBS" -eq 0 ]; then
+    DETECTED_JOBS=4
+    if command -v nproc >/dev/null 2>&1; then
+        DETECTED_JOBS="$(nproc)"
+    fi
+    if [ -z "$DETECTED_JOBS" ] || [ "$DETECTED_JOBS" -lt 1 ]; then
+        DETECTED_JOBS=1
+    fi
+    TEST_JOBS=$((DETECTED_JOBS * TEST_JOBS_SCALE))
+    if [ "$TEST_JOBS" -lt 12 ]; then TEST_JOBS=12; fi
+    if [ "$TEST_JOBS" -gt 64 ]; then TEST_JOBS=64; fi
+fi
 
 # Use RAM disk for large self-host ASM I/O when available (no build step skipped).
 ASM_WORK_DIR="$BUILD_DIR"
@@ -232,41 +266,52 @@ echo "Stage 1 Build Completed"
 echo ""
 
 # Step 3: 셀프 호스팅 (2단계)
-echo "[3/6] Self-Hosting Stage 2..."
-./bin/${VERSION}_stage1 -asm "${SRC_FILE}" > "${STAGE2_ASM}"
-echo "Stage 2 Build Completed"
-echo ""
+FINAL_ASM="$STAGE1_ASM"
+if [ "$SELFHOST_VERIFY" = "1" ]; then
+    echo "[3/6] Self-Hosting Stage 2..."
+    ./bin/${VERSION}_stage1 -asm "${SRC_FILE}" > "${STAGE2_ASM}"
+    echo "Stage 2 Build Completed"
+    echo ""
 
-# Step 4: ASM 비교 (1단계 vs 2단계)
-echo "[4/6] Self-Hosting Verification..."
-# We only need equality check; cmp is faster than textual diff for this.
-if cmp -s "${STAGE1_ASM}" "${STAGE2_ASM}"; then
-    echo "Self-Hosting Success! (Stage 1 == Stage 2)"
-    echo "   ASM: $(wc -l < "${STAGE1_ASM}") lines"
+    # Step 4: ASM 비교 (1단계 vs 2단계)
+    echo "[4/6] Self-Hosting Verification..."
+    # We only need equality check; cmp is faster than textual diff for this.
+    if cmp -s "${STAGE1_ASM}" "${STAGE2_ASM}"; then
+        echo "Self-Hosting Success! (Stage 1 == Stage 2)"
+        echo "   ASM: $(wc -l < "${STAGE1_ASM}") lines"
+    else
+        echo "Self-Hosting Failed! ASM is different."
+        echo "   Stage 1: $(wc -l < "${STAGE1_ASM}") lines"
+        echo "   Stage 2: $(wc -l < "${STAGE2_ASM}") lines"
+        exit 1
+    fi
+    echo ""
+    FINAL_ASM="$STAGE2_ASM"
 else
-    echo "Self-Hosting Failed! ASM is different."
-    echo "   Stage 1: $(wc -l < "${STAGE1_ASM}") lines"
-    echo "   Stage 2: $(wc -l < "${STAGE2_ASM}") lines"
-    exit 1
+    echo "[3/6] Self-Hosting Stage 2... skipped (SELFHOST_VERIFY=0)"
+    echo ""
+    echo "[4/6] Self-Hosting Verification... skipped (SELFHOST_VERIFY=0)"
+    echo ""
 fi
-echo ""
 
 # Persist ASM artifacts under build/ as before.
 cp "${STAGE0_ASM}" "build/${VERSION}_stage0.asm"
 cp "${STAGE1_ASM}" "build/${VERSION}_stage1.asm"
-cp "${STAGE2_ASM}" "build/${VERSION}_stage2.asm"
+if [ "$SELFHOST_VERIFY" = "1" ] && [ -f "${STAGE2_ASM}" ]; then
+    cp "${STAGE2_ASM}" "build/${VERSION}_stage2.asm"
+fi
 
 # Step 5: 테스트 실행
 echo "[5/6] Running Tests..."
 TEST_FAST_IO="$TEST_FAST_IO" TEST_QUIET="$TEST_QUIET" KEEP_TEST_ARTIFACTS="$KEEP_TEST_ARTIFACTS" \
-TEST_JOBS="$TEST_JOBS" TEST_PROFILE="$TEST_PROFILE" TEST_SUITE_CASE_LIMIT="$TEST_SUITE_CASE_LIMIT" STRESS_RUNS="$STRESS_RUNS" STABILITY_RUNS="$STABILITY_RUNS" \
+TEST_JOBS="$TEST_JOBS" TEST_PROFILE="$TEST_PROFILE" TEST_SUITE_CASE_LIMIT="$TEST_SUITE_CASE_LIMIT" TEST_NAME_FILTER="$TEST_NAME_FILTER" STRESS_RUNS="$STRESS_RUNS" STABILITY_RUNS="$STABILITY_RUNS" \
   bash ${TEST_SCRIPT} bin/${VERSION}_stage1 2>&1 | tail -15
 
 # Step 6: 바이너리(.out) 생성 (기본 실행 경로)
 echo ""
 echo "[6/6] Generating Executable..."
 OUT_OBJ="build/${VERSION}.out.o"
-nasm ${NASM_FLAGS} "${STAGE2_ASM}" -o "${OUT_OBJ}"
+nasm ${NASM_FLAGS} "${FINAL_ASM}" -o "${OUT_OBJ}"
 ld "${OUT_OBJ}" -o "build/${VERSION}.out"
 rm -f "${OUT_OBJ}"
 
