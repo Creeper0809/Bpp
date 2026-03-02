@@ -609,12 +609,16 @@ struct BuilderCtx {
     public func_ptr_map: *HashMap<u64, *PtrLen>;    // hashmap: name -> [func_name_ptr, func_name_len]
     public closure_handle_map: *HashMap<u64, u64>;  // hashmap: name -> 1 if tagged lambda closure handle
     public addr_taken_map: *HashMap<u64, u64>;  // hashmap: name -> 1
+    public defer_stack: *Vec<*AstNode>;
+    public defer_markers: *Vec<u64>;
+    public defer_loop_markers: *Vec<u64>;
     public symtab: *Symtab;           // symtab for type/offset lookup
     public next_reg: u64;
     public next_var_id: u64;
     public sret_addr_reg: u64;
     public debug_mode: u64;
     public build_failed: u64;
+    public defer_emit_mode: u64;
 }
 
 impl BuilderCtx {
@@ -629,12 +633,16 @@ impl BuilderCtx {
         self.func_ptr_map = 0;
         self.closure_handle_map = 0;
         self.addr_taken_map = 0;
+        self.defer_stack = 0;
+        self.defer_markers = 0;
+        self.defer_loop_markers = 0;
         self.symtab = 0;
         self.next_reg = 0;
         self.next_var_id = 0;
         self.sret_addr_reg = 0;
         self.debug_mode = 0;
         self.build_failed = 0;
+        self.defer_emit_mode = 0;
     }
 }
 
@@ -648,6 +656,9 @@ func builder_ctx_new(ssa_ctx: *SSAContext) -> *BuilderCtx {
     ctx.next_reg = 1;
     ctx.next_var_id = 1;
     ctx.debug_mode = SSA_BUILDER_DEBUG;
+    ctx.defer_stack = new Vec<*AstNode>(16);
+    ctx.defer_markers = new Vec<u64>(16);
+    ctx.defer_loop_markers = new Vec<u64>(8);
     return ctx;
 }
 
@@ -685,6 +696,9 @@ func builder_reset_func(ctx: *BuilderCtx) -> u64 {
     ctx.func_ptr_map = 0;
     ctx.closure_handle_map = new HashMap<u64, u64>(16);
     ctx.addr_taken_map = new HashMap<u64, u64>(16);
+    ctx.defer_stack = new Vec<*AstNode>(16);
+    ctx.defer_markers = new Vec<u64>(16);
+    ctx.defer_loop_markers = new Vec<u64>(8);
     ctx.symtab = symtab_new();
     ctx.next_reg = 1;
     ctx.next_var_id = 1;
@@ -698,6 +712,7 @@ func builder_reset_func(ctx: *BuilderCtx) -> u64 {
     }
     compiler_reg_alias_reset();
     ctx.build_failed = 0;
+    ctx.defer_emit_mode = 0;
     return 0;
 }
 
@@ -4165,11 +4180,13 @@ func build_block(ctx: *BuilderCtx, block_node: u64) -> u64 {
     if (block_node == 0) { return 0; }
     var blk: *AstBlock = (*AstBlock)block_node;
     var stmts: *Vec<u64> = blk.stmts_vec;
+    builder_defer_mark_block_begin(ctx);
     var n: u64 = stmts.len();
     for (var i: u64 = 0; i < n; i++) {
         var stmt: u64 = stmts.get(i);
         build_stmt(ctx, stmt);
     }
+    builder_defer_mark_block_end(ctx);
     return 0;
 }
 
@@ -4204,6 +4221,7 @@ func build_for(ctx: *BuilderCtx, node: u64) -> u64 {
     ssa_add_edge(ctx.cur_block, exit_bb);
 
     builder_push_loop(ctx, exit_bb, update_bb);
+    builder_defer_push_loop_marker(ctx);
     ctx.cur_block = body_bb;
     build_block(ctx, f.body);
     if (builder_block_is_reachable(ctx.cur_block) != 0 && builder_block_is_terminated(ctx.cur_block) == 0) {
@@ -4211,6 +4229,7 @@ func build_for(ctx: *BuilderCtx, node: u64) -> u64 {
         ssa_inst_append(ctx.cur_block, jmp_ptr2);
         ssa_add_edge(ctx.cur_block, update_bb);
     }
+    builder_defer_pop_loop_marker(ctx);
     builder_pop_loop(ctx);
 
     ctx.cur_block = update_bb;
@@ -4284,6 +4303,7 @@ func build_switch(ctx: *BuilderCtx, node: u64) -> u64 {
     ssa_add_edge(ctx.cur_block, default_bb);
 
     builder_push_loop(ctx, exit_bb, 0);
+    builder_defer_push_loop_marker(ctx);
     for (var i: u64 = 0; i < count; i++) {
         var case_bb3: *SSABlock = case_blocks.get(i);
         var c3: *AstCase = case_nodes.get(i);
@@ -4300,6 +4320,7 @@ func build_switch(ctx: *BuilderCtx, node: u64) -> u64 {
             ssa_add_edge(ctx.cur_block, next_bb2);
         }
     }
+    builder_defer_pop_loop_marker(ctx);
     builder_pop_loop(ctx);
 
     ctx.cur_block = exit_bb;
@@ -4381,11 +4402,13 @@ func build_while(ctx: *BuilderCtx, node: u64) -> u64 {
     ssa_add_edge(ctx.cur_block, exit_bb);
 
     builder_push_loop(ctx, exit_bb, cond_bb);
+    builder_defer_push_loop_marker(ctx);
     ctx.cur_block = body_bb;
     build_block(ctx, w.body);
     var jmp_ptr2: *SSAInstruction = ssa_new_inst(ctx.ssa_ctx, SSA_OP_JMP, 0, ssa_operand_const(cond_bb.id), 0);
     ssa_inst_append(ctx.cur_block, jmp_ptr2);
     ssa_add_edge(ctx.cur_block, cond_bb);
+    builder_defer_pop_loop_marker(ctx);
     builder_pop_loop(ctx);
 
     ctx.cur_block = exit_bb;
@@ -5191,6 +5214,7 @@ func builder_stmt_return_emit_struct(ctx: *BuilderCtx, expr: u64, struct_name_pt
 
 func builder_stmt_return(ctx: *BuilderCtx, node: u64) -> u64 {
     var ret: *AstReturn = (*AstReturn)node;
+    builder_defer_emit_for_return(ctx);
     if (ret.expr == 0) {
         builder_emit_return_void_inst(ctx);
         return 0;
@@ -5251,6 +5275,143 @@ func builder_stmt_const_decl(ctx: *BuilderCtx, node: u64) -> u64 {
     return 0;
 }
 
+func builder_defer_stack_len(ctx: *BuilderCtx) -> u64 {
+    if (ctx == 0 || ctx.defer_stack == 0) { return 0; }
+    return ctx.defer_stack.len();
+}
+
+func builder_defer_mark_block_begin(ctx: *BuilderCtx) -> u64 {
+    if (ctx == 0) { return 0; }
+    if (ctx.defer_markers == 0) { ctx.defer_markers = new Vec<u64>(16); }
+    ctx.defer_markers.push(builder_defer_stack_len(ctx));
+    return 0;
+}
+
+func builder_defer_emit_to(ctx: *BuilderCtx, marker: u64, pop_after_emit: u64) -> u64 {
+    if (ctx == 0 || ctx.defer_stack == 0) { return 0; }
+    var stack: *Vec<*AstNode> = ctx.defer_stack;
+    if (marker > stack.len()) { marker = stack.len(); }
+    var i: u64 = stack.len();
+    while (i > marker) {
+        var idx: u64 = i - 1;
+        var stmt: *AstNode = stack.get(idx);
+        var prev_mode: u64 = ctx.defer_emit_mode;
+        ctx.defer_emit_mode = 1;
+        build_stmt(ctx, stmt);
+        ctx.defer_emit_mode = prev_mode;
+        if (pop_after_emit != 0) {
+            stack.pop();
+        }
+        i = idx;
+    }
+    return 0;
+}
+
+func builder_defer_mark_block_end(ctx: *BuilderCtx) -> u64 {
+    if (ctx == 0 || ctx.defer_markers == 0 || ctx.defer_markers.len() == 0) { return 0; }
+    var marker: u64 = ctx.defer_markers.get(ctx.defer_markers.len() - 1);
+    ctx.defer_markers.pop();
+    builder_defer_emit_to(ctx, marker, 1);
+    return 0;
+}
+
+func builder_defer_push_loop_marker(ctx: *BuilderCtx) -> u64 {
+    if (ctx == 0) { return 0; }
+    if (ctx.defer_loop_markers == 0) { ctx.defer_loop_markers = new Vec<u64>(8); }
+    ctx.defer_loop_markers.push(builder_defer_stack_len(ctx));
+    return 0;
+}
+
+func builder_defer_pop_loop_marker(ctx: *BuilderCtx) -> u64 {
+    if (ctx == 0 || ctx.defer_loop_markers == 0 || ctx.defer_loop_markers.len() == 0) { return 0; }
+    ctx.defer_loop_markers.pop();
+    return 0;
+}
+
+func builder_defer_emit_to_loop_marker(ctx: *BuilderCtx) -> u64 {
+    if (ctx == 0 || ctx.defer_loop_markers == 0 || ctx.defer_loop_markers.len() == 0) { return 0; }
+    var marker: u64 = ctx.defer_loop_markers.get(ctx.defer_loop_markers.len() - 1);
+    builder_defer_emit_to(ctx, marker, 0);
+    return 0;
+}
+
+func builder_defer_emit_for_return(ctx: *BuilderCtx) -> u64 {
+    builder_defer_emit_to(ctx, 0, 0);
+    return 0;
+}
+
+func builder_stmt_delete(ctx: *BuilderCtx, node: u64) -> u64 {
+    var dl: *AstDelete = (*AstDelete)node;
+    if (dl == 0 || dl.expr == 0) { return 0; }
+
+    var ptr_reg: u64 = build_expr(ctx, dl.expr);
+    var cond_reg: u64 = build_bool_from_reg(ctx, ptr_reg);
+
+    var do_bb: *SSABlock = ssa_new_block(ctx.ssa_ctx, ctx.cur_func);
+    var end_bb: *SSABlock = ssa_new_block(ctx.ssa_ctx, ctx.cur_func);
+
+    var br_ptr: *SSAInstruction = ssa_new_inst(
+        ctx.ssa_ctx,
+        SSA_OP_BR,
+        ssa_operand_const(end_bb.id),
+        ssa_operand_reg(cond_reg),
+        ssa_operand_const(do_bb.id)
+    );
+    ssa_inst_append(ctx.cur_block, br_ptr);
+    ssa_add_edge(ctx.cur_block, do_bb);
+    ssa_add_edge(ctx.cur_block, end_bb);
+
+    ctx.cur_block = do_bb;
+    var ti: *TypeInfo = get_expr_type_with_symtab(dl.expr, ctx.symtab);
+    if (ti != 0 && ti.ptr_depth == 0) {
+        emit_stderr("[ERROR] delete expects pointer type\n");
+        compiler_error("SSA build error");
+    }
+
+    if (ti != 0 && ti.type_kind == TYPE_STRUCT && ti.ptr_depth > 0) {
+        var method_ptr: u64 = (u64)"destructor";
+        var method_len: u64 = 10;
+        var name_info: *NameInfo = compiler_build_method_name(ti.struct_name_ptr, ti.struct_name_len, method_ptr, method_len);
+
+        var resolved_ptr: u64 = name_info.ptr;
+        var resolved_len: u64 = name_info.len;
+        var resolved: *NameInfo = resolve_name(name_info.ptr, name_info.len);
+        if (resolved != 0) {
+            resolved_ptr = resolved.ptr;
+            resolved_len = resolved.len;
+        }
+
+        var has_dtor: u64 = 0;
+        if (compiler_func_exists(name_info.ptr, name_info.len) != 0) {
+            has_dtor = 1;
+        } else if (resolved != 0 && compiler_func_exists(resolved_ptr, resolved_len) != 0) {
+            has_dtor = 1;
+        }
+
+        if (has_dtor != 0) {
+            var dtor_args: *Vec<u64> = builder_make_args1(ptr_reg);
+            builder_emit_call_name_raw(ctx, resolved_ptr, resolved_len, dtor_args, 0, 0, TYPE_VOID, 0, 0);
+        }
+    }
+
+    var free_ptr: u64 = (u64)"free";
+    var free_len: u64 = 4;
+    var free_res: *NameInfo = resolve_name(free_ptr, free_len);
+    if (free_res != 0) {
+        free_ptr = free_res.ptr;
+        free_len = free_res.len;
+    }
+    var free_args: *Vec<u64> = builder_make_args1(ptr_reg);
+    builder_emit_call_name_raw(ctx, free_ptr, free_len, free_args, 0, 0, TYPE_I64, 0, 0);
+
+    var jmp_ptr: *SSAInstruction = ssa_new_inst(ctx.ssa_ctx, SSA_OP_JMP, 0, ssa_operand_const(end_bb.id), 0);
+    ssa_inst_append(ctx.cur_block, jmp_ptr);
+    ssa_add_edge(ctx.cur_block, end_bb);
+
+    ctx.cur_block = end_bb;
+    return 0;
+}
+
 func builder_stmt_emit_loop_jump(ctx: *BuilderCtx, target_bb: *SSABlock) -> u64 {
     if (target_bb != 0) {
         var jmp_ptr: *SSAInstruction = ssa_new_inst(ctx.ssa_ctx, SSA_OP_JMP, 0, ssa_operand_const(target_bb.id), 0);
@@ -5305,17 +5466,20 @@ func builder_stmt_dispatch_structural(ctx: *BuilderCtx, node: u64, kind: u64) ->
         return result;
     }
     if (kind == AST_DEFER) {
-        if (ctx.debug_mode != 0) {
-            emit("[DEBUG] defer skipped in SSA builder\n");
+        var df: *AstDefer = (*AstDefer)node;
+        if (ctx.defer_emit_mode != 0) {
+            if (df != 0 && df.stmt != 0) {
+                result.result = build_stmt(ctx, df.stmt);
+            }
+        } else if (ctx.defer_stack != 0 && df != 0 && df.stmt != 0) {
+            ctx.defer_stack.push(df.stmt);
         }
         result.matched = 1;
         return result;
     }
     if (kind == AST_DELETE) {
-        if (ctx.debug_mode != 0) {
-            emit("[DEBUG] delete skipped in SSA builder\n");
-        }
         result.matched = 1;
+        result.result = builder_stmt_delete(ctx, node);
         return result;
     }
     if (kind == AST_ASM) {
@@ -5327,11 +5491,13 @@ func builder_stmt_dispatch_structural(ctx: *BuilderCtx, node: u64, kind: u64) ->
     }
     if (kind == AST_BREAK) {
         result.matched = 1;
+        builder_defer_emit_to_loop_marker(ctx);
         result.result = builder_stmt_emit_loop_jump(ctx, builder_top_break(ctx));
         return result;
     }
     if (kind == AST_CONTINUE) {
         result.matched = 1;
+        builder_defer_emit_to_loop_marker(ctx);
         result.result = builder_stmt_emit_loop_jump(ctx, builder_top_continue(ctx));
         return result;
     }
