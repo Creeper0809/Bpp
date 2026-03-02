@@ -17,11 +17,12 @@ fuzz_norm_err() {
         return 0
     fi
 
-    sed -E \
+    var_norm="$(sed -E \
         -e 's/[0-9]+/N/g' \
         -e 's#/[^ ]+#<PATH>#g' \
         -e 's/[[:space:]]+/ /g' \
-        "$err_file" | head -c 4096
+        "$err_file" || true)"
+    printf '%s' "$var_norm" | head -c 4096
 }
 
 fuzz_hash_str() {
