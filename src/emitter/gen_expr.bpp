@@ -851,11 +851,31 @@ func cg_try_materialize_operand(operand: u64, op_kind: u64, struct_size: u64, tm
     return;
 }
 
-func cg_try_emit_fail_return(tmp_offset: u64, check_off: u64, ret_struct_name_ptr: u64, ret_struct_name_len: u64, label_ok: u64) -> u64 {
+func cg_try_emit_fail_return(tmp_offset: u64, check_desc: *FieldDesc, check_off: u64, ret_struct_name_ptr: u64, ret_struct_name_len: u64, label_ok: u64) -> u64 {
     emit("    lea rbx, [rbp");
     emit_signed_disp(tmp_offset);
     emit("]\n");
-    emit("    mov rax, [rbx");
+    var check_type_kind: u64 = TYPE_U64;
+    var check_ptr_depth: u64 = 0;
+    if (check_desc != 0) {
+        check_type_kind = check_desc.type_kind;
+        check_ptr_depth = check_desc.ptr_depth;
+    }
+    if (check_ptr_depth == 0 && (check_type_kind == TYPE_BOOL || check_type_kind == TYPE_U8)) {
+        emit("    movzx rax, byte [rbx");
+    } else if (check_ptr_depth == 0 && check_type_kind == TYPE_U16) {
+        emit("    movzx rax, word [rbx");
+    } else if (check_ptr_depth == 0 && check_type_kind == TYPE_U32) {
+        emit("    mov eax, [rbx");
+    } else if (check_ptr_depth == 0 && check_type_kind == TYPE_I8) {
+        emit("    movsx rax, byte [rbx");
+    } else if (check_ptr_depth == 0 && check_type_kind == TYPE_I16) {
+        emit("    movsx rax, word [rbx");
+    } else if (check_ptr_depth == 0 && check_type_kind == TYPE_I32) {
+        emit("    movsxd rax, dword [rbx");
+    } else {
+        emit("    mov rax, [rbx");
+    }
     if (check_off != 0) { emit("+"); emit_u64(check_off); }
     emit("]\n");
     emit("    test rax, rax\n");
@@ -936,12 +956,12 @@ func cg_try_expr(node: u64, symtab: *Symtab) -> u64 {
         compiler_diag_force_stop_pass();
         return 0;
     }
-    var try_kind: u64 = compiler_try_kind_from_typeinfo(opt_ti);
-    if (try_kind == COMPILER_TRY_KIND_INVALID) {
+    var try_fields: CompilerTryFieldNames = compiler_try_field_names_from_typeinfo(opt_ti);
+    if (try_fields.found == 0) {
         if (opt_ti.type_kind != TYPE_STRUCT || opt_ti.ptr_depth != 0) {
-            emit_stderr("[ERROR] try operator requires Option/Result value\n");
+            emit_stderr("[ERROR] try operator requires try-compatible struct value\n");
         } else {
-            emit_stderr("[ERROR] try operator requires Option or Result\n");
+            emit_stderr("[ERROR] try operator requires try-compatible check/value fields\n");
         }
         compiler_diag_force_stop_pass();
         return 0;
@@ -953,7 +973,7 @@ func cg_try_expr(node: u64, symtab: *Symtab) -> u64 {
     var ret_struct_name_len: u64 = emitter_get_ret_struct_name_len();
     if (compiler_try_return_matches_type(opt_ti, ret_type, ret_ptr_depth, ret_struct_name_ptr, ret_struct_name_len) == 0) {
         if (ret_type != TYPE_STRUCT || ret_ptr_depth != 0) {
-            emit_stderr("[ERROR] try operator requires Option/Result return type\n");
+            emit_stderr("[ERROR] try operator requires try-compatible return type\n");
         } else {
             emit_stderr("[ERROR] try operand type must match function return type\n");
         }
@@ -968,12 +988,6 @@ func cg_try_expr(node: u64, symtab: *Symtab) -> u64 {
         return 0;
     }
 
-    var try_fields: CompilerTryFieldNames = compiler_try_field_names(try_kind);
-    if (try_fields.found == 0) {
-        emit_stderr("[ERROR] invalid try kind\n");
-        compiler_diag_force_stop_pass();
-        return 0;
-    }
     var check_ptr: u64 = try_fields.check_ptr;
     var check_len: u64 = try_fields.check_len;
     var value_ptr: u64 = try_fields.value_ptr;
@@ -986,6 +1000,12 @@ func cg_try_expr(node: u64, symtab: *Symtab) -> u64 {
         return 0;
     }
 
+    var check_desc: *FieldDesc = get_field_desc(struct_def, check_ptr, check_len);
+    if (check_desc == 0) {
+        emit_stderr("[ERROR] try check field not found\n");
+        compiler_diag_force_stop_pass();
+        return 0;
+    }
     var check_off: u64 = get_field_offset(struct_def, check_ptr, check_len);
     var value_off: u64 = get_field_offset(struct_def, value_ptr, value_len);
 
@@ -996,7 +1016,7 @@ func cg_try_expr(node: u64, symtab: *Symtab) -> u64 {
     cg_try_materialize_operand(operand, op_kind, struct_size, tmp_offset, symtab);
 
     var label_ok: u64 = new_label();
-    cg_try_emit_fail_return(tmp_offset, check_off, ret_struct_name_ptr, ret_struct_name_len, label_ok);
+    cg_try_emit_fail_return(tmp_offset, check_desc, check_off, ret_struct_name_ptr, ret_struct_name_len, label_ok);
 
     emit_label_def(label_ok);
     cg_try_emit_value_load(value_desc, value_off);
@@ -1733,6 +1753,83 @@ func cg_expr_index(node: u64, symtab: *Symtab) -> u64 {
     return;
 }
 
+func cg_expr_safe_index(node: u64, symtab: *Symtab) -> u64 {
+    var idx: *AstIndex = (*AstIndex)node;
+    var base: u64 = idx.base;
+    var index: u64 = idx.index;
+
+    var bt: *TypeInfo = get_expr_type_with_symtab((*AstNode)base, symtab);
+    if (bt == 0) {
+        emit_stderr("[ERROR] Safe index access type not found\n");
+        compiler_diag_force_stop_pass();
+        return 0;
+    }
+    if (bt.ptr_depth == 0) {
+        emit_stderr("[ERROR] Safe index access requires pointer receiver\n");
+        compiler_diag_force_stop_pass();
+        return 0;
+    }
+
+    var elem_size: u64 = get_pointee_size(bt.type_kind, bt.ptr_depth);
+    if (bt.ptr_depth == 1 && bt.type_kind == TYPE_STRUCT) {
+        elem_size = sizeof_type(bt.type_kind, 0, bt.struct_name_ptr, bt.struct_name_len);
+    }
+
+    var label_null: u64 = new_label();
+    var label_end: u64 = new_label();
+
+    cg_expr(base);
+    if (bt.is_tagged == 1) {
+        emit_tagged_mask();
+    }
+    emit("    mov rbx, rax\n");
+    emit("    test rbx, rbx\n");
+    emit("    je ");
+    emit_label(label_null);
+    emit_nl();
+
+    cg_expr(index);
+    if (elem_size != 1) {
+        emit("    imul rax, ");
+        emit_u64(elem_size);
+        emit_nl();
+    }
+    emit("    add rax, rbx\n");
+
+    var et: *TypeInfo = get_expr_type_with_symtab((*AstNode)node, symtab);
+    if (et != 0) {
+        if (et.ptr_depth == 0) {
+            if (et.type_kind == TYPE_BOOL || et.type_kind == TYPE_U8) {
+                emit("    movzx rax, byte [rax]\n");
+            } else if (et.type_kind == TYPE_U16) {
+                emit("    movzx rax, word [rax]\n");
+            } else if (et.type_kind == TYPE_U32) {
+                emit("    mov eax, [rax]\n");
+            } else if (et.type_kind == TYPE_I8) {
+                emit("    movsx rax, byte [rax]\n");
+            } else if (et.type_kind == TYPE_I16) {
+                emit("    movsx rax, word [rax]\n");
+            } else if (et.type_kind == TYPE_I32) {
+                emit("    movsxd rax, dword [rax]\n");
+            } else {
+                emit("    mov rax, [rax]\n");
+            }
+        } else {
+            emit("    mov rax, [rax]\n");
+        }
+    } else {
+        emit("    mov rax, [rax]\n");
+    }
+    emit("    jmp ");
+    emit_label(label_end);
+    emit_nl();
+
+    emit_label_def(label_null);
+    emit("    xor eax, eax\n");
+    emit_label_def(label_end);
+    return 0;
+}
+
 func cg_emit_adjust_rax_add(offset: u64) -> u64 {
     if (offset == 0) { return 0; }
     emit("    add rax, ");
@@ -2241,6 +2338,7 @@ func cg_expr_dispatch_with_symtab(kind: u64, node: u64, symtab: *Symtab) -> u64 
     if (kind == AST_DEREF) { cg_expr_deref(node, symtab); return 1; }
     if (kind == AST_DEREF8) { cg_expr_deref8(node, symtab); return 1; }
     if (kind == AST_INDEX) { cg_expr_index(node, symtab); return 1; }
+    if (kind == AST_SAFE_INDEX) { cg_expr_safe_index(node, symtab); return 1; }
     if (kind == AST_CAST) { cg_expr_cast(node, symtab); return 1; }
     if (kind == AST_SIZEOF) { cg_expr_sizeof(node); return 1; }
     if (kind == AST_SIZEOF_EXPR) { cg_expr_sizeof_expr(node, symtab); return 1; }
@@ -3145,6 +3243,11 @@ func cg_lvalue(node: u64) -> u64 {
 
     if (kind == AST_INDEX) {
         cg_index_addr(node, symtab);
+        return;
+    }
+
+    if (kind == AST_SAFE_INDEX) {
+        emit_stderr("[ERROR] Safe index access cannot be used as lvalue\n");
         return;
     }
     
