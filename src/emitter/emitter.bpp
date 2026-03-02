@@ -784,14 +784,6 @@ func _global_emit_struct_literal_label(ginfo: *GlobalInfo) -> u64 {
 }
 
 func _global_emit_struct_literal_field_size_or_panic(f: *FieldDesc) -> u64 {
-    if (f.type_kind == TYPE_STRUCT && f.ptr_depth == 0) {
-        emit_stderr("[ERROR] Nested struct init not supported\n");
-        compiler_error("Syntax error");
-    }
-    if (f.type_kind == TYPE_ARRAY || f.type_kind == TYPE_SLICE) {
-        emit_stderr("[ERROR] Array/slice struct init not supported\n");
-        compiler_error("Syntax error");
-    }
     var field_size: u64 = sizeof_field_desc(f);
     if (field_size == 0) {
         emit_stderr("[ERROR] Global struct field size invalid\n");
@@ -824,6 +816,251 @@ func _global_emit_struct_literal_vptr_or_panic(struct_def: *AstStructDef, f: *Fi
         compiler_error("Syntax error");
     }
     return 0;
+}
+
+func _global_find_global_info_by_name(name_ptr: u64, name_len: u64) -> *GlobalInfo {
+    if (g_globals == 0) { return 0; }
+    var n: u64 = g_globals.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var ginfo: *GlobalInfo = g_globals.get(i);
+        if (str_eq(ginfo.name_ptr, ginfo.name_len, name_ptr, name_len)) {
+            return ginfo;
+        }
+    }
+    return 0;
+}
+
+func _global_emit_qword_symbol(symbol_ptr: u64, symbol_len: u64, is_global_var: u64) -> u64 {
+    emit("    dq ");
+    if (is_global_var != 0) {
+        emit("_gvar_");
+    }
+    emit_len(symbol_ptr, symbol_len);
+    emit_nl();
+    return 0;
+}
+
+func _global_emit_ident_pointer_value_or_panic(id: *AstIdent) -> u64 {
+    var resolved_ptr: u64 = id.name_ptr;
+    var resolved_len: u64 = id.name_len;
+    var resolved: *NameInfo = resolve_name(id.name_ptr, id.name_len);
+    if (resolved != 0) {
+        resolved_ptr = resolved.ptr;
+        resolved_len = resolved.len;
+    }
+
+    if (compiler_func_exists(resolved_ptr, resolved_len) != 0 || compiler_func_exists(id.name_ptr, id.name_len) != 0) {
+        _global_emit_qword_symbol(resolved_ptr, resolved_len, 0);
+        return 0;
+    }
+
+    var ginfo_resolved: *GlobalInfo = _global_find_global_info_by_name(resolved_ptr, resolved_len);
+    if (ginfo_resolved != 0) {
+        _global_emit_qword_symbol(ginfo_resolved.name_ptr, ginfo_resolved.name_len, 1);
+        return 0;
+    }
+
+    var ginfo_raw: *GlobalInfo = _global_find_global_info_by_name(id.name_ptr, id.name_len);
+    if (ginfo_raw != 0) {
+        _global_emit_qword_symbol(ginfo_raw.name_ptr, ginfo_raw.name_len, 1);
+        return 0;
+    }
+
+    var value: u64 = 0;
+    if (_global_eval_scalar_expr((*AstNode)id, &value) != 0) {
+        _global_emit_scalar_value(8, value);
+        return 0;
+    }
+
+    emit_stderr("[ERROR] Unsupported global pointer initializer symbol: ");
+    emit_stderr_len(id.name_ptr, id.name_len);
+    emit_stderr("\n");
+    compiler_error("Syntax error");
+}
+
+func _global_emit_pointer_value_or_panic(expr: *AstNode) -> u64 {
+    if (expr == 0) {
+        emit_stderr("[ERROR] Missing global pointer initializer expression\n");
+        compiler_error("Syntax error");
+    }
+    var kind: u64 = ast_kind(expr);
+    if (kind == AST_STRING) {
+        var str: *AstString = (*AstString)expr;
+        var label_id: u64 = string_get_label(str.str_ptr, str.str_len);
+        emit("    dq _str");
+        emit_u64(label_id);
+        emit_nl();
+        return 0;
+    }
+    if (kind == AST_IDENT) {
+        _global_emit_ident_pointer_value_or_panic((*AstIdent)expr);
+        return 0;
+    }
+    if (kind == AST_ADDR_OF) {
+        var addrof: *AstAddrOf = (*AstAddrOf)expr;
+        if (addrof.operand != 0 && ast_kind(addrof.operand) == AST_IDENT) {
+            _global_emit_ident_pointer_value_or_panic((*AstIdent)addrof.operand);
+            return 0;
+        }
+    }
+
+    var value: u64 = 0;
+    if (_global_eval_scalar_expr(expr, &value) != 0) {
+        _global_emit_scalar_value(8, value);
+        return 0;
+    }
+
+    emit_stderr("[ERROR] Unsupported global pointer initializer expression\n");
+    compiler_error("Syntax error");
+}
+
+func _global_emit_u8_array_from_string_or_panic(array_len: u64, str_expr: *AstString) -> u64 {
+    if (str_expr == 0 || str_expr.str_len < 2) {
+        emit_stderr("[ERROR] Invalid string literal for global array initializer\n");
+        compiler_error("Syntax error");
+    }
+    var raw_u8: []u8 = slice(str_expr.str_ptr, str_expr.str_len);
+    var emitted: u64 = 0;
+    for (var j: u64 = 1; j < str_expr.str_len - 1; j++) {
+        if (emitted >= array_len) {
+            emit_stderr("[ERROR] String literal too large for global array initializer\n");
+            compiler_error("Syntax error");
+        }
+        var out_b: u64 = raw_u8[j];
+        if (out_b == 92) {
+            j = j + 1;
+            if (j >= str_expr.str_len - 1) {
+                emit_stderr("[ERROR] Unterminated escape in global array string initializer\n");
+                compiler_error("Syntax error");
+            }
+            var ec: u64 = raw_u8[j];
+            if (ec == 110) { out_b = 10; }      // \n
+            else if (ec == 116) { out_b = 9; }  // \t
+            else if (ec == 48) { out_b = 0; }   // \0
+            else if (ec == 92) { out_b = 92; }  // \\
+            else if (ec == 34) { out_b = 34; }  // \"
+            else { out_b = ec; }
+        }
+        emit("    db ");
+        emit_u64(out_b & 255);
+        emit_nl();
+        emitted = emitted + 1;
+    }
+    if (emitted < array_len) {
+        _global_emit_padding(array_len - emitted);
+    }
+    return 0;
+}
+
+func _global_emit_array_field_value_or_panic(f: *FieldDesc, val_expr: *AstNode) -> u64 {
+    var field_size: u64 = sizeof_field_desc(f);
+    if (val_expr != 0 && ast_kind(val_expr) == AST_STRING && f.elem_type_kind == TYPE_U8 && f.elem_ptr_depth == 0) {
+        _global_emit_u8_array_from_string_or_panic(f.array_len, (*AstString)val_expr);
+        return 0;
+    }
+    if (field_size <= 8) {
+        _global_emit_struct_literal_value_or_panic(field_size, val_expr);
+        return 0;
+    }
+    emit_stderr("[ERROR] Unsupported global array field initializer\n");
+    compiler_error("Syntax error");
+}
+
+func _global_emit_slice_field_value_or_panic(val_expr: *AstNode) -> u64 {
+    if (val_expr == 0) {
+        _global_emit_scalar_value(8, 0);
+        _global_emit_scalar_value(8, 0);
+        return 0;
+    }
+    if (ast_kind(val_expr) == AST_SLICE) {
+        var sl: *AstSlice = (*AstSlice)val_expr;
+        _global_emit_pointer_value_or_panic(sl.ptr_expr);
+        var len_value: u64 = 0;
+        if (_global_eval_scalar_expr(sl.len_expr, &len_value) == 0) {
+            emit_stderr("[ERROR] Global slice length must be compile-time scalar\n");
+            compiler_error("Syntax error");
+        }
+        _global_emit_scalar_value(8, len_value);
+        return 0;
+    }
+    var zero_value: u64 = 1;
+    if (_global_eval_scalar_expr(val_expr, &zero_value) != 0 && zero_value == 0) {
+        _global_emit_scalar_value(8, 0);
+        _global_emit_scalar_value(8, 0);
+        return 0;
+    }
+    emit_stderr("[ERROR] Unsupported global slice field initializer\n");
+    compiler_error("Syntax error");
+}
+
+func _global_emit_struct_literal_body_or_panic(struct_def: *AstStructDef, values: *Vec<*AstNode>) -> u64 {
+    if (struct_def == 0) {
+        emit_stderr("[ERROR] Missing struct def for global init\n");
+        compiler_error("Syntax error");
+    }
+    var fields: *Vec<*FieldDesc> = struct_def.fields_vec;
+    if (fields == 0) {
+        emit_stderr("[ERROR] Global struct literal missing fields\n");
+        compiler_error("Syntax error");
+    }
+    var fn: u64 = fields.len();
+    var vn: u64 = 0;
+    if (values != 0) { vn = values.len(); }
+
+    var cursor: u64 = 0;
+    var value_index: u64 = 0;
+    for (var i: u64 = 0; i < fn; i++) {
+        var f: *FieldDesc = fields.get(i);
+        var field_size: u64 = _global_emit_struct_literal_field_size_or_panic(f);
+
+        if (compiler_is_vptr_field_name(f.name_ptr, f.name_len) != 0) {
+            _global_emit_struct_literal_vptr_or_panic(struct_def, f);
+            cursor = cursor + field_size;
+            continue;
+        }
+
+        if (value_index >= vn) {
+            _global_emit_padding(field_size);
+            cursor = cursor + field_size;
+            continue;
+        }
+
+        var val_expr: *AstNode = values.get(value_index);
+        if (f.type_kind == TYPE_STRUCT && f.ptr_depth == 0) {
+            if (val_expr == 0 || ast_kind(val_expr) != AST_STRUCT_LITERAL) {
+                emit_stderr("[ERROR] Global nested struct field requires struct literal initializer\n");
+                compiler_error("Syntax error");
+            }
+            var nested_lit: *AstStructLiteral = (*AstStructLiteral)val_expr;
+            var nested_def: *AstStructDef = nested_lit.struct_def;
+            if (nested_def == 0) {
+                nested_def = get_struct_def(f.struct_name_ptr, f.struct_name_len);
+            }
+            if (nested_def == 0) {
+                emit_stderr("[ERROR] Nested struct definition not found for global initializer\n");
+                compiler_error("Syntax error");
+            }
+            _global_emit_struct_literal_body_or_panic(nested_def, nested_lit.values_vec);
+        } else if (f.type_kind == TYPE_ARRAY && f.ptr_depth == 0) {
+            _global_emit_array_field_value_or_panic(f, val_expr);
+        } else if (f.type_kind == TYPE_SLICE && f.ptr_depth == 0) {
+            _global_emit_slice_field_value_or_panic(val_expr);
+        } else if (field_size == 8 && (f.ptr_depth > 0 || f.type_kind == TYPE_FUNC || f.type_kind == TYPE_TRAIT)) {
+            _global_emit_pointer_value_or_panic(val_expr);
+        } else {
+            _global_emit_struct_literal_value_or_panic(field_size, val_expr);
+        }
+
+        cursor = cursor + field_size;
+        value_index = value_index + 1;
+    }
+
+    var struct_size: u64 = sizeof_type(TYPE_STRUCT, 0, struct_def.name_ptr, struct_def.name_len);
+    if (cursor < struct_size) {
+        _global_emit_padding(struct_size - cursor);
+        cursor = struct_size;
+    }
+    return cursor;
 }
 
 func _global_emit_struct_literal_value_or_panic(field_size: u64, val_expr: *AstNode) -> u64 {
@@ -863,35 +1100,8 @@ func _global_emit_struct_literal(ginfo: *GlobalInfo, lit: *AstStructLiteral) -> 
         compiler_error("Syntax error");
     }
 
-    var fields: *Vec<*FieldDesc> = struct_def.fields_vec;
-    var values: *Vec<*AstNode> = lit.values_vec;
-    if (fields == 0 || values == 0) {
-        emit_stderr("[ERROR] Global struct literal missing fields\n");
-        compiler_error("Syntax error");
-    }
-    var fn: u64 = fields.len();
-    var vn: u64 = values.len();
-
     _global_emit_struct_literal_label(ginfo);
-
-    var cursor: u64 = 0;
-    var value_index: u64 = 0;
-    for (var i: u64 = 0; i < fn; i++) {
-        var f: *FieldDesc = fields.get(i);
-        var field_size: u64 = _global_emit_struct_literal_field_size_or_panic(f);
-
-        if (compiler_is_vptr_field_name(f.name_ptr, f.name_len) != 0) {
-            _global_emit_struct_literal_vptr_or_panic(struct_def, f);
-            cursor = cursor + field_size;
-            continue;
-        }
-
-        if (value_index >= vn) { break; }
-        var val_expr: *AstNode = values.get(value_index);
-        _global_emit_struct_literal_value_or_panic(field_size, val_expr);
-        cursor = cursor + field_size;
-        value_index = value_index + 1;
-    }
+    var cursor: u64 = _global_emit_struct_literal_body_or_panic(struct_def, lit.values_vec);
 
     if (ginfo.typeinfo_ptr != 0) {
         var struct_size: u64 = sizeof_type_ex(ginfo.typeinfo_ptr);

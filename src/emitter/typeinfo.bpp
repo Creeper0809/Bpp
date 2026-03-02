@@ -564,6 +564,52 @@ func _typeinfo_packed_struct_size(struct_info: *AstStructDef) -> u64 {
     return (total_bits + 7) / 8;
 }
 
+struct TypeInfoPackedFieldLookup {
+    public found: u64;
+    public offset: u64;
+    public desc: *FieldDesc;
+}
+
+func _typeinfo_find_packed_field(struct_info: *AstStructDef, field_ptr: u64, field_len: u64) -> TypeInfoPackedFieldLookup {
+    var lookup: TypeInfoPackedFieldLookup;
+    lookup.found = 0;
+    lookup.offset = 0;
+    lookup.desc = 0;
+    if (struct_info == 0 || struct_info.fields_vec == 0) { return lookup; }
+
+    var fields: *Vec<*FieldDesc> = struct_info.fields_vec;
+    var n: u64 = fields.len();
+    var bit_cursor: u64 = 0;
+    for (var i: u64 = 0; i < n; i++) {
+        var f: *FieldDesc = fields.get(i);
+        var width_bits: u64 = 0;
+        if (f.bit_width > 0) {
+            width_bits = f.bit_width;
+        } else {
+            width_bits = sizeof_field_desc(f) * 8;
+        }
+
+        if (str_eq(f.name_ptr, f.name_len, field_ptr, field_len)) {
+            if (f.bit_width > 0) {
+                if ((bit_cursor % 8) != 0 || (f.bit_width % 8) != 0) {
+                    emit_stderr("[ERROR] packed bit-field address requires byte alignment: ");
+                    emit_stderr_len(struct_info.name_ptr, struct_info.name_len);
+                    emit_stderr(".");
+                    emit_stderr_len(field_ptr, field_len);
+                    emit_stderr("\n");
+                    compiler_error("TypeInfo error");
+                }
+            }
+            lookup.found = 1;
+            lookup.offset = bit_cursor / 8;
+            lookup.desc = f;
+            return lookup;
+        }
+        bit_cursor = bit_cursor + width_bits;
+    }
+    return lookup;
+}
+
 func _typeinfo_struct_size(struct_info: *AstStructDef) -> u64 {
     return _typeinfo_struct_size_internal(struct_info, 0);
 }
@@ -611,10 +657,6 @@ func _typeinfo_struct_size_internal(struct_info: *AstStructDef, depth: u64) -> u
         compiler_error("TypeInfo error");
     }
     if (struct_info.is_union == 1) {
-        if (struct_info.is_packed == 1) {
-            emit_stderr("[ERROR] packed union is not supported\n");
-            compiler_error("TypeInfo error");
-        }
         if ((struct_info.parents_vec != 0 && struct_info.parents_vec.len() > 0) ||
             (struct_info.traits_vec != 0 && struct_info.traits_vec.len() > 0)) {
             emit_stderr("[ERROR] union cannot use inheritance or traits\n");
@@ -787,8 +829,11 @@ func _typeinfo_struct_find_field_internal(struct_info: *AstStructDef, field_ptr:
         return _typeinfo_struct_find_field_local(struct_info, field_ptr, field_len, 0, out_offset, out_desc);
     }
     if (struct_info.is_packed == 1) {
-        emit_stderr("[ERROR] Packed struct field address is not supported\n");
-        compiler_error("TypeInfo error");
+        var packed_lookup: TypeInfoPackedFieldLookup = _typeinfo_find_packed_field(struct_info, field_ptr, field_len);
+        if (packed_lookup.found == 0) { return 0; }
+        *out_offset = packed_lookup.offset;
+        *out_desc = packed_lookup.desc;
+        return 1;
     }
 
     var parent_total: u64 = _typeinfo_struct_parent_total_size(struct_info, depth);
@@ -1013,6 +1058,40 @@ func typeinfo_try_value_type(tr: *AstTry, symtab: *Symtab) -> *TypeInfo {
     return typeinfo_from_field_desc(field, 0);
 }
 
+func typeinfo_safe_field_decay_data_ptr(field: *FieldDesc) -> *TypeInfo {
+    if (field == 0) { return 0; }
+    if (field.type_kind == TYPE_STRUCT && field.ptr_depth == 0) {
+        var field_struct_def: *AstStructDef = get_struct_def(field.struct_name_ptr, field.struct_name_len);
+        var out_struct_ptr: *TypeInfo = typeinfo_make_struct(1, field.struct_name_ptr, field.struct_name_len, field_struct_def);
+        out_struct_ptr.is_tagged = field.is_tagged;
+        out_struct_ptr.tag_layout_ptr = field.tag_layout_ptr;
+        out_struct_ptr.tag_layout_len = field.tag_layout_len;
+        return out_struct_ptr;
+    }
+    if ((field.type_kind == TYPE_ARRAY || field.type_kind == TYPE_SLICE) && field.ptr_depth == 0) {
+        if (field.elem_type_kind == TYPE_STRUCT) {
+            var elem_struct_def: *AstStructDef = 0;
+            if (field.elem_typeinfo != 0 && field.elem_typeinfo.struct_def != 0) {
+                elem_struct_def = field.elem_typeinfo.struct_def;
+            }
+            if (elem_struct_def == 0) {
+                elem_struct_def = get_struct_def(field.struct_name_ptr, field.struct_name_len);
+            }
+            return typeinfo_make_struct(field.elem_ptr_depth + 1, field.struct_name_ptr, field.struct_name_len, elem_struct_def);
+        }
+        var out_ptr: *TypeInfo = typeinfo_make(field.elem_type_kind, field.elem_ptr_depth + 1);
+        if (field.elem_typeinfo != 0) {
+            out_ptr.struct_name_ptr = field.elem_typeinfo.struct_name_ptr;
+            out_ptr.struct_name_len = field.elem_typeinfo.struct_name_len;
+            out_ptr.is_tagged = field.elem_typeinfo.is_tagged;
+            out_ptr.tag_layout_ptr = field.elem_typeinfo.tag_layout_ptr;
+            out_ptr.tag_layout_len = field.elem_typeinfo.tag_layout_len;
+        }
+        return out_ptr;
+    }
+    return 0;
+}
+
 func typeinfo_safe_member_access_type(sm: *AstMemberAccess, symtab: *Symtab) -> *TypeInfo {
     var sobj_ti: *TypeInfo = get_expr_type_with_symtab(sm.object, symtab);
     if (sobj_ti == 0) { return 0; }
@@ -1037,12 +1116,8 @@ func typeinfo_safe_member_access_type(sm: *AstMemberAccess, symtab: *Symtab) -> 
         emit_stderr("\n");
         return 0;
     }
-    var sfield_type: u64 = sfield.type_kind;
-    var sfield_ptr_depth: u64 = sfield.ptr_depth;
-    if (sfield_type == TYPE_STRUCT && sfield_ptr_depth == 0) {
-        emit_stderr("[ERROR] Safe member access on struct value is not supported\n");
-        return 0;
-    }
+    var decayed_ptr: *TypeInfo = typeinfo_safe_field_decay_data_ptr(sfield);
+    if (decayed_ptr != 0) { return decayed_ptr; }
     return typeinfo_from_field_desc(sfield, 0);
 }
 

@@ -3015,16 +3015,48 @@ func builder_expr_binary(ctx: *BuilderCtx, node: u64) -> u64 {
     if (bin.op == TOKEN_ANDAND || bin.op == TOKEN_OROR) {
         return build_short_circuit(ctx, bin.op, bin.left, bin.right);
     }
+    var left_ti: *TypeInfo = get_expr_type_with_symtab(bin.left, ctx.symtab);
+    var right_ti: *TypeInfo = get_expr_type_with_symtab(bin.right, ctx.symtab);
     var l_is_f: u64 = builder_is_f64_expr(ctx, bin.left);
     var r_is_f: u64 = builder_is_f64_expr(ctx, bin.right);
-    if (l_is_f != r_is_f) {
-        emit_stderr("[ERROR] Mixed float/integer binary operation is not supported\n");
-        ctx.build_failed = 1;
-        return build_const(ctx, 0);
-    }
     var lhs_reg: u64 = build_expr(ctx, bin.left);
     var rhs_reg: u64 = build_expr(ctx, bin.right);
-    if (l_is_f != 0) {
+    if (l_is_f != 0 || r_is_f != 0) {
+        if (l_is_f == 0) {
+            if (left_ti == 0 || left_ti.ptr_depth != 0 || builder_cast_is_int_scalar(left_ti.type_kind) == 0) {
+                emit_stderr("[ERROR] Float/integer binary operation does not support pointer operands\n");
+                ctx.build_failed = 1;
+                return build_const(ctx, 0);
+            }
+            var left_unsigned: u64 = 0;
+            if (left_ti.type_kind == TYPE_BOOL || left_ti.type_kind == TYPE_U8 || left_ti.type_kind == TYPE_U16 ||
+                left_ti.type_kind == TYPE_U32 || left_ti.type_kind == TYPE_U64) {
+                left_unsigned = 1;
+            }
+            var left_norm: u64 = lhs_reg;
+            if (left_ti.type_kind != TYPE_I64 && left_ti.type_kind != TYPE_U64) {
+                left_norm = builder_cast_int_truncate(ctx, lhs_reg, left_ti.type_kind);
+            }
+            lhs_reg = builder_cast_emit_i2f(ctx, left_norm, left_unsigned);
+        }
+        if (r_is_f == 0) {
+            if (right_ti == 0 || right_ti.ptr_depth != 0 || builder_cast_is_int_scalar(right_ti.type_kind) == 0) {
+                emit_stderr("[ERROR] Float/integer binary operation does not support pointer operands\n");
+                ctx.build_failed = 1;
+                return build_const(ctx, 0);
+            }
+            var right_unsigned: u64 = 0;
+            if (right_ti.type_kind == TYPE_BOOL || right_ti.type_kind == TYPE_U8 || right_ti.type_kind == TYPE_U16 ||
+                right_ti.type_kind == TYPE_U32 || right_ti.type_kind == TYPE_U64) {
+                right_unsigned = 1;
+            }
+            var right_norm: u64 = rhs_reg;
+            if (right_ti.type_kind != TYPE_I64 && right_ti.type_kind != TYPE_U64) {
+                right_norm = builder_cast_int_truncate(ctx, rhs_reg, right_ti.type_kind);
+            }
+            rhs_reg = builder_cast_emit_i2f(ctx, right_norm, right_unsigned);
+        }
+
         var fop: u64 = SSA_OP_NOP;
         if (bin.op == TOKEN_PLUS) { fop = SSA_OP_FADD; }
         else if (bin.op == TOKEN_MINUS) { fop = SSA_OP_FSUB; }
@@ -3084,11 +3116,6 @@ func builder_expr_unary(ctx: *BuilderCtx, node: u64) -> u64 {
     }
 
     if (op == TOKEN_BANG) {
-        if (builder_is_f64_expr(ctx, un.operand) != 0) {
-            emit_stderr("[ERROR] '!' on float is not supported in SSA builder\n");
-            ctx.build_failed = 1;
-            return build_const(ctx, 0);
-        }
         var zero_reg2: u64 = build_const(ctx, 0);
         var dst2: u64 = builder_new_reg(ctx);
         var inst_ptr4: *SSAInstruction = ssa_new_inst(ctx.ssa_ctx, SSA_OP_EQ, dst2, ssa_operand_reg(val_reg), ssa_operand_reg(zero_reg2));
@@ -3097,11 +3124,6 @@ func builder_expr_unary(ctx: *BuilderCtx, node: u64) -> u64 {
     }
 
     if (op == TOKEN_TILDE) {
-        if (builder_is_f64_expr(ctx, un.operand) != 0) {
-            emit_stderr("[ERROR] '~' on float is not supported in SSA builder\n");
-            ctx.build_failed = 1;
-            return build_const(ctx, 0);
-        }
         var all_ones_reg: u64 = build_const(ctx, -1);
         var dst3: u64 = builder_new_reg(ctx);
         var inst_ptr5: *SSAInstruction = ssa_new_inst(ctx.ssa_ctx, SSA_OP_XOR, dst3, ssa_operand_reg(val_reg), ssa_operand_reg(all_ones_reg));
@@ -3164,14 +3186,6 @@ func builder_safe_member_struct_value(ctx: *BuilderCtx, m_safe: *AstMemberAccess
     var found2: u64 = struct_find_field_desc_scoped(struct_def2, m_safe.parent_ptr, m_safe.parent_len, m_safe.member_ptr, m_safe.member_len, &field_offset2, &field_desc);
     if (found2 == 0 || field_desc == 0) { return 0; }
     var fd: *FieldDesc = field_desc;
-    if (fd.type_kind == TYPE_STRUCT && fd.ptr_depth == 0) {
-        emit_stderr("[ERROR] Safe member access cannot return struct by value\n");
-        return 0;
-    }
-    if (fd.type_kind == TYPE_ARRAY) {
-        emit_stderr("[ERROR] Safe member access cannot return array by value\n");
-        return 0;
-    }
     var field_addr: u64 = obj_reg;
     if (field_offset2 != 0) {
         var off_reg3: u64 = build_const(ctx, field_offset2);
@@ -3179,6 +3193,12 @@ func builder_safe_member_struct_value(ctx: *BuilderCtx, m_safe: *AstMemberAccess
         var add_ptr4: *SSAInstruction = ssa_new_inst(ctx.ssa_ctx, SSA_OP_ADD, addr5, ssa_operand_reg(obj_reg), ssa_operand_reg(off_reg3));
         ssa_inst_append(ctx.cur_block, add_ptr4);
         field_addr = addr5;
+    }
+    if (fd.type_kind == TYPE_STRUCT && fd.ptr_depth == 0) {
+        return field_addr;
+    }
+    if (fd.type_kind == TYPE_ARRAY) {
+        return field_addr;
     }
     if (fd.type_kind == TYPE_SLICE && fd.ptr_depth == 0) {
         return builder_load_by_size(ctx, field_addr, 8);
@@ -3981,7 +4001,7 @@ func builder_expr_cast(ctx: *BuilderCtx, node: u64) -> u64 {
         if (src_ti != 0 && src_ti.type_kind == TYPE_TRAIT && src_ti.ptr_depth > 0) {
             var impl2: *TraitImpl = compiler_find_trait_impl(src_ti.struct_name_ptr, src_ti.struct_name_len, cast.struct_name_ptr, cast.struct_name_len);
             if (impl2 == 0) {
-                emit_stderr("[ERROR] Trait cast target struct not implemented: ");
+                emit_stderr("[ERROR] Trait cast target struct does not implement trait: ");
                 emit_stderr_len(cast.struct_name_ptr, cast.struct_name_len);
                 emit_stderr("\n");
                 compiler_error("SSA build error");
