@@ -17,12 +17,17 @@ fuzz_norm_err() {
         return 0
     fi
 
+    local var_norm
     var_norm="$(sed -E \
         -e 's/[0-9]+/N/g' \
         -e 's#/[^ ]+#<PATH>#g' \
         -e 's/[[:space:]]+/ /g' \
         "$err_file" || true)"
-    printf '%s' "$var_norm" | head -c 4096
+    if (( ${#var_norm} > 4096 )); then
+        printf '%s' "${var_norm:0:4096}"
+        return 0
+    fi
+    printf '%s' "$var_norm"
 }
 
 fuzz_hash_str() {

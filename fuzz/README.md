@@ -47,6 +47,7 @@ FUZZ_MAX_BYTES=16384 \
 - `FUZZ_ITERS` (default: `2000`)
 - `FUZZ_JOBS` (default: `nproc`, min `1`)
 - `FUZZ_TIMEOUT_SEC` (default: `4`)
+- `FUZZ_HANG_CONFIRM_SEC` (default: `FUZZ_TIMEOUT_SEC * 3`, used to confirm real hangs and reduce load-induced timeout false positives)
 - `FUZZ_MAX_BYTES` (default: `8192`)
 - `FUZZ_SEED` (default: current epoch)
 - `FUZZ_ROOT` (default: `<repo>/fuzz`)

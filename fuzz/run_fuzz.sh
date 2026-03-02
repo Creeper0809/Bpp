@@ -13,6 +13,7 @@ FUZZ_WORK="${FUZZ_WORK:-$FUZZ_ROOT/work}"
 FUZZ_FINDINGS="${FUZZ_FINDINGS:-$FUZZ_ROOT/findings}"
 FUZZ_ITERS="${FUZZ_ITERS:-2000}"
 FUZZ_TIMEOUT_SEC="${FUZZ_TIMEOUT_SEC:-4}"
+FUZZ_HANG_CONFIRM_SEC="${FUZZ_HANG_CONFIRM_SEC:-$((FUZZ_TIMEOUT_SEC * 3))}"
 FUZZ_MAX_BYTES="${FUZZ_MAX_BYTES:-8192}"
 FUZZ_SEED="${FUZZ_SEED:-$(date +%s)}"
 
@@ -27,6 +28,9 @@ if (( FUZZ_JOBS < 1 )); then FUZZ_JOBS=1; fi
 if (( FUZZ_ITERS < 1 )); then
     echo "[ERROR] FUZZ_ITERS must be >= 1"
     exit 1
+fi
+if (( FUZZ_HANG_CONFIRM_SEC < FUZZ_TIMEOUT_SEC )); then
+    FUZZ_HANG_CONFIRM_SEC=$FUZZ_TIMEOUT_SEC
 fi
 
 COMPILER="$(fuzz_pick_compiler "$REPO_ROOT" || true)"
@@ -49,7 +53,7 @@ if ! command -v timeout >/dev/null 2>&1; then
 fi
 
 fuzz_log "compiler=$COMPILER"
-fuzz_log "iters=$FUZZ_ITERS jobs=$FUZZ_JOBS timeout=${FUZZ_TIMEOUT_SEC}s max_bytes=$FUZZ_MAX_BYTES seed=$FUZZ_SEED"
+fuzz_log "iters=$FUZZ_ITERS jobs=$FUZZ_JOBS timeout=${FUZZ_TIMEOUT_SEC}s hang_confirm=${FUZZ_HANG_CONFIRM_SEC}s max_bytes=$FUZZ_MAX_BYTES seed=$FUZZ_SEED"
 
 pick_seed_file() {
     local files=()
@@ -207,6 +211,32 @@ run_variant() {
     return 0
 }
 
+confirm_hang_variant() {
+    local variant="$1"
+    local input_file="$2"
+    local err_file="$3"
+
+    case "$variant" in
+        nossa.O0)
+            timeout "$FUZZ_HANG_CONFIRM_SEC" "$COMPILER" -asm "$input_file" >/dev/null 2>"$err_file" || return "$?"
+            ;;
+        nossa.O1)
+            timeout "$FUZZ_HANG_CONFIRM_SEC" "$COMPILER" -O1 -asm "$input_file" >/dev/null 2>"$err_file" || return "$?"
+            ;;
+        ssa.O0)
+            timeout "$FUZZ_HANG_CONFIRM_SEC" "$COMPILER" -dump-ssa -asm "$input_file" >/dev/null 2>"$err_file" || return "$?"
+            ;;
+        ssa.O1)
+            timeout "$FUZZ_HANG_CONFIRM_SEC" "$COMPILER" -O1 -dump-ssa -asm "$input_file" >/dev/null 2>"$err_file" || return "$?"
+            ;;
+        *)
+            return 200
+            ;;
+    esac
+
+    return 0
+}
+
 store_finding() {
     local type="$1"
     local input_file="$2"
@@ -280,8 +310,22 @@ worker_loop() {
             if (( rc == 0 )); then
                 ok=1
             elif (( rc == 124 )); then
-                abnormal="hang"
-                had_abnormal=1
+                local confirm_err_file="$result_dir/${v}.confirm.err"
+                local confirm_rc=0
+                if confirm_hang_variant "$v" "$case_file" "$confirm_err_file"; then
+                    confirm_rc=0
+                else
+                    confirm_rc=$?
+                fi
+                if (( confirm_rc == 124 )); then
+                    abnormal="hang"
+                    had_abnormal=1
+                elif (( confirm_rc >= 128 )); then
+                    abnormal="crash"
+                    had_abnormal=1
+                else
+                    abnormal="slow"
+                fi
             elif (( rc >= 128 )); then
                 abnormal="crash"
                 had_abnormal=1
