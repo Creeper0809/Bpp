@@ -3594,6 +3594,56 @@ func generic_bind_value(bindings: *Vec<*GenericBinding>, name_ptr: u64, name_len
     return false;
 }
 
+func generic_value_arg_fits_declared_type(value: u64, type_kind: u64) -> u64 {
+    switch (type_kind) {
+        case TYPE_BOOL:
+            if (value == 0 || value == 1) { return 1; }
+            return 0;
+        case TYPE_U8:
+            if (value <= 255) { return 1; }
+            return 0;
+        case TYPE_U16:
+            if (value <= 65535) { return 1; }
+            return 0;
+        case TYPE_U32:
+            if (value <= 4294967295) { return 1; }
+            return 0;
+        case TYPE_U64:
+            return 1;
+        case TYPE_I8:
+            if (value <= 127) { return 1; }
+            if (value >= (0 - 128)) { return 1; }
+            return 0;
+        case TYPE_I16:
+            if (value <= 32767) { return 1; }
+            if (value >= (0 - 32768)) { return 1; }
+            return 0;
+        case TYPE_I32:
+            if (value <= 2147483647) { return 1; }
+            if (value >= (0 - 2147483648)) { return 1; }
+            return 0;
+        case TYPE_I64:
+            return 1;
+    }
+    return 0;
+}
+
+func generic_emit_value_type_name(type_kind: u64) -> u64 {
+    switch (type_kind) {
+        case TYPE_BOOL: emit_stderr("bool"); return 0;
+        case TYPE_U8: emit_stderr("u8"); return 0;
+        case TYPE_U16: emit_stderr("u16"); return 0;
+        case TYPE_U32: emit_stderr("u32"); return 0;
+        case TYPE_U64: emit_stderr("u64"); return 0;
+        case TYPE_I8: emit_stderr("i8"); return 0;
+        case TYPE_I16: emit_stderr("i16"); return 0;
+        case TYPE_I32: emit_stderr("i32"); return 0;
+        case TYPE_I64: emit_stderr("i64"); return 0;
+    }
+    emit_stderr("<unknown>");
+    return 0;
+}
+
 func generic_make_typeinfo_from_fields(type_kind: u64, ptr_depth: u64, is_tagged: u64, struct_name_ptr: u64, struct_name_len: u64, tag_layout_ptr: u64, tag_layout_len: u64, elem_type_kind: u64, elem_ptr_depth: u64, array_len: u64, array_len_is_param: u64, array_len_param_ptr: u64, array_len_param_len: u64) -> *TypeInfo {
     var ti: *TypeInfo = new TypeInfo(type_kind, ptr_depth);
     ti.is_tagged = is_tagged;
@@ -5226,6 +5276,17 @@ func generic_build_bindings_core(params_vec: *Vec<*GenericParam>, gargs: *Vec<*G
                 compiler_error("Compilation failed");
                 return 0;
             }
+            if (generic_value_arg_fits_declared_type(ga.value, gp.value_type_kind) == 0) {
+                emit_stderr("[ERROR] value generic argument out of range for type ");
+                generic_emit_value_type_name(gp.value_type_kind);
+                emit_stderr(": ");
+                emit_stderr_len(gp.name_ptr, gp.name_len);
+                emit_stderr(" = ");
+                emit_u64_stderr(ga.value);
+                emit_stderr("\n");
+                compiler_error("Compilation failed");
+                return 0;
+            }
             if (generic_bind_value(bindings, gp.name_ptr, gp.name_len, ga.value) != 0) {
                 emit_stderr("[ERROR] Conflicting generic value bindings\n");
                 compiler_error("Compilation failed");
@@ -6257,6 +6318,436 @@ func compiler_lower_parse_sugar_static_method_call(mc: *AstMethodCall, is_safe: 
     var lowered_call: *AstCall = ast_call_with_origin_named(lowered_name.ptr, lowered_name.len, mc.args_vec, mc.arg_names_vec, AST_CALL_ORIGIN_MEMBER_LOWERED);
     compiler_normalize_direct_call_args(lowered_call);
     return (*AstNode)lowered_call;
+}
+
+const COMPILER_EXC_STATE_NONE = 0;
+const COMPILER_EXC_STATE_THROWN = 1;
+
+struct CompilerExceptionLowerCtx {
+    public flag_ptr_stack: *Vec<u64>;
+    public flag_len_stack: *Vec<u64>;
+    public value_ptr_stack: *Vec<u64>;
+    public value_len_stack: *Vec<u64>;
+    public allowed_depth_stack: *Vec<u64>;
+    public counter: u64;
+}
+
+func compiler_exc_ctx_new() -> CompilerExceptionLowerCtx {
+    var ctx: CompilerExceptionLowerCtx;
+    ctx.flag_ptr_stack = 0;
+    ctx.flag_len_stack = 0;
+    ctx.value_ptr_stack = 0;
+    ctx.value_len_stack = 0;
+    ctx.allowed_depth_stack = 0;
+    ctx.counter = 0;
+    return ctx;
+}
+
+func compiler_exc_build_internal_name(prefix_ptr: u64, prefix_len: u64, id: u64) -> *NameInfo {
+    var id_buf: u64 = heap_alloc(32 * sizeof(u8));
+    var id_len: u64 = io_u64_to_ascii(id_buf, id);
+    var total_len: u64 = prefix_len + id_len;
+    var out_ptr: u64 = heap_alloc((total_len + 1) * sizeof(u8));
+    var out_u8: []u8 = slice(out_ptr, total_len + 1);
+    str_copy(out_ptr, prefix_ptr, prefix_len);
+    str_copy(out_ptr + prefix_len, id_buf, id_len);
+    out_u8[total_len] = 0;
+    return new NameInfo{out_ptr, total_len};
+}
+
+func compiler_exc_ensure_context_struct() -> *AstStructDef {
+    var existing: *AstStructDef = get_struct_def("__BppTryContext", 15);
+    if (existing != 0) { return existing; }
+
+    var fields: *Vec<*FieldDesc> = new Vec<*FieldDesc>(1);
+    var state_field: *FieldDesc = new FieldDesc();
+    state_field.name_ptr = (u64)"state";
+    state_field.name_len = 5;
+    state_field.type_kind = TYPE_U64;
+    state_field.ptr_depth = 0;
+    state_field.is_tagged = 0;
+    state_field.struct_name_ptr = 0;
+    state_field.struct_name_len = 0;
+    state_field.tag_layout_ptr = 0;
+    state_field.tag_layout_len = 0;
+    state_field.bit_width = 0;
+    state_field.offset = 0;
+    state_field.elem_type_kind = 0;
+    state_field.elem_ptr_depth = 0;
+    state_field.array_len = 0;
+    state_field.elem_typeinfo = 0;
+    state_field.access = ACCESS_PUBLIC;
+    state_field.owner_struct_ptr = (u64)"__BppTryContext";
+    state_field.owner_struct_len = 15;
+    fields.push(state_field);
+
+    var ctx_def: *AstStructDef = ast_struct_def("__BppTryContext", 15, 0, fields, 0, 0, 0);
+    register_struct_type(ctx_def);
+    return ctx_def;
+}
+
+func compiler_exc_ctx_push(ctx: *CompilerExceptionLowerCtx, flag_ptr: u64, flag_len: u64, value_ptr: u64, value_len: u64, allowed_depth: u64) -> u64 {
+    if (ctx.flag_ptr_stack == 0) {
+        ctx.flag_ptr_stack = new Vec<u64>(8);
+        ctx.flag_len_stack = new Vec<u64>(8);
+        ctx.value_ptr_stack = new Vec<u64>(8);
+        ctx.value_len_stack = new Vec<u64>(8);
+        ctx.allowed_depth_stack = new Vec<u64>(8);
+    }
+    ctx.flag_ptr_stack.push(flag_ptr);
+    ctx.flag_len_stack.push(flag_len);
+    ctx.value_ptr_stack.push(value_ptr);
+    ctx.value_len_stack.push(value_len);
+    ctx.allowed_depth_stack.push(allowed_depth);
+    return 0;
+}
+
+func compiler_exc_ctx_pop(ctx: *CompilerExceptionLowerCtx) -> u64 {
+    if (ctx.flag_ptr_stack == 0 || ctx.flag_ptr_stack.len() == 0) { return 0; }
+    ctx.flag_ptr_stack.pop();
+    ctx.flag_len_stack.pop();
+    ctx.value_ptr_stack.pop();
+    ctx.value_len_stack.pop();
+    ctx.allowed_depth_stack.pop();
+    return 0;
+}
+
+func compiler_exc_ctx_active(ctx: *CompilerExceptionLowerCtx) -> u64 {
+    if (ctx == 0 || ctx.flag_ptr_stack == 0) { return 0; }
+    if (ctx.flag_ptr_stack.len() == 0) { return 0; }
+    return 1;
+}
+
+func compiler_exc_ctx_current_flag_ptr(ctx: *CompilerExceptionLowerCtx) -> u64 {
+    if (compiler_exc_ctx_active(ctx) == 0) { return 0; }
+    var top_idx: u64 = ctx.flag_ptr_stack.len() - 1;
+    return ctx.flag_ptr_stack.get(top_idx);
+}
+
+func compiler_exc_ctx_current_flag_len(ctx: *CompilerExceptionLowerCtx) -> u64 {
+    if (compiler_exc_ctx_active(ctx) == 0) { return 0; }
+    var top_idx: u64 = ctx.flag_len_stack.len() - 1;
+    return ctx.flag_len_stack.get(top_idx);
+}
+
+func compiler_exc_ctx_current_value_ptr(ctx: *CompilerExceptionLowerCtx) -> u64 {
+    if (compiler_exc_ctx_active(ctx) == 0) { return 0; }
+    var top_idx: u64 = ctx.value_ptr_stack.len() - 1;
+    return ctx.value_ptr_stack.get(top_idx);
+}
+
+func compiler_exc_ctx_current_value_len(ctx: *CompilerExceptionLowerCtx) -> u64 {
+    if (compiler_exc_ctx_active(ctx) == 0) { return 0; }
+    var top_idx: u64 = ctx.value_len_stack.len() - 1;
+    return ctx.value_len_stack.get(top_idx);
+}
+
+func compiler_exc_state_expr(ctx_ptr: u64, ctx_len: u64) -> *AstNode {
+    return (*AstNode)ast_member_access((*AstNode)ast_ident(ctx_ptr, ctx_len), "state", 5);
+}
+
+func compiler_exc_build_not_thrown_cond(ctx_ptr: u64, ctx_len: u64) -> *AstNode {
+    if (ctx_ptr == 0 || ctx_len == 0) { return (*AstNode)ast_literal(1); }
+    return (*AstNode)ast_binary(TOKEN_EQEQ, compiler_exc_state_expr(ctx_ptr, ctx_len), (*AstNode)ast_literal(COMPILER_EXC_STATE_NONE));
+}
+
+func compiler_exc_build_break_guard(ctx_ptr: u64, ctx_len: u64) -> *AstNode {
+    if (ctx_ptr == 0 || ctx_len == 0) { return 0; }
+    var cond: *AstNode = (*AstNode)ast_binary(TOKEN_BANGEQ, compiler_exc_state_expr(ctx_ptr, ctx_len), (*AstNode)ast_literal(COMPILER_EXC_STATE_NONE));
+    var then_stmts: *Vec<*AstNode> = new Vec<*AstNode>(1);
+    then_stmts.push((*AstNode)ast_break());
+    return (*AstNode)ast_if(cond, (*AstNode)ast_block(then_stmts), 0);
+}
+
+func compiler_exc_wrap_stmt_if_not_thrown(stmt: *AstNode, ctx_ptr: u64, ctx_len: u64) -> *AstNode {
+    if (stmt == 0) { return 0; }
+    if (ctx_ptr == 0 || ctx_len == 0) { return stmt; }
+    var then_stmts: *Vec<*AstNode> = new Vec<*AstNode>(1);
+    then_stmts.push(stmt);
+    return (*AstNode)ast_if(compiler_exc_build_not_thrown_cond(ctx_ptr, ctx_len), (*AstNode)ast_block(then_stmts), 0);
+}
+
+func compiler_exc_wrap_loop_body_with_guard(body: *AstNode, ctx_ptr: u64, ctx_len: u64) -> *AstNode {
+    if (body == 0) { return 0; }
+    if (ctx_ptr == 0 || ctx_len == 0) { return body; }
+
+    var wrapped: *Vec<*AstNode> = new Vec<*AstNode>(8);
+    if (ast_kind(body) == AST_BLOCK) {
+        var blk: *AstBlock = (*AstBlock)body;
+        if (blk.stmts_vec != 0) {
+            var n: u64 = blk.stmts_vec.len();
+            for (var i: u64 = 0; i < n; i++) {
+                wrapped.push(compiler_exc_wrap_stmt_if_not_thrown(blk.stmts_vec.get(i), ctx_ptr, ctx_len));
+            }
+        }
+    } else {
+        wrapped.push(compiler_exc_wrap_stmt_if_not_thrown(body, ctx_ptr, ctx_len));
+    }
+    wrapped.push(compiler_exc_build_break_guard(ctx_ptr, ctx_len));
+    return (*AstNode)ast_block(wrapped);
+}
+
+func compiler_exc_build_unhandled_throw_stmt() -> *AstNode {
+    var args: *Vec<*AstNode> = new Vec<*AstNode>(3);
+    args.push((*AstNode)ast_string("unhandled throw", 15));
+    args.push((*AstNode)ast_literal(15));
+    args.push((*AstNode)ast_literal(0));
+    var call: *AstCall = ast_call("debug_fail", 10, args);
+    return ast_expr_stmt((*AstNode)call);
+}
+
+func compiler_exc_append_block_stmts(dst: *Vec<*AstNode>, block_node: *AstNode) -> u64 {
+    if (block_node == 0) { return 0; }
+    if (ast_kind(block_node) != AST_BLOCK) {
+        dst.push(block_node);
+        return 0;
+    }
+    var blk: *AstBlock = (*AstBlock)block_node;
+    if (blk.stmts_vec == 0) { return 0; }
+    var n: u64 = blk.stmts_vec.len();
+    for (var i: u64 = 0; i < n; i++) {
+        dst.push(blk.stmts_vec.get(i));
+    }
+    return 0;
+}
+
+func compiler_lower_exception_stmt(ctx: *CompilerExceptionLowerCtx, stmt: *AstNode, breakable_depth: u64) -> *AstNode {
+    if (stmt == 0) { return 0; }
+
+    var kind: u64 = ast_kind(stmt);
+    switch (kind) {
+        case AST_BLOCK:
+            var blk: *AstBlock = (*AstBlock)stmt;
+            if (blk.stmts_vec != 0) {
+                var n: u64 = blk.stmts_vec.len();
+                for (var i: u64 = 0; i < n; i++) {
+                    blk.stmts_vec.set(i, compiler_lower_exception_stmt(ctx, blk.stmts_vec.get(i), breakable_depth));
+                }
+            }
+            return stmt;
+        case AST_IF:
+            var ifs: *AstIf = (*AstIf)stmt;
+            ifs.then_block = compiler_lower_exception_stmt(ctx, ifs.then_block, breakable_depth);
+            ifs.else_block = compiler_lower_exception_stmt(ctx, ifs.else_block, breakable_depth);
+            return stmt;
+        case AST_WHILE:
+            var wl: *AstWhile = (*AstWhile)stmt;
+            wl.body = compiler_lower_exception_stmt(ctx, wl.body, breakable_depth + 1);
+            if (compiler_exc_ctx_active(ctx) != 0) {
+                wl.body = compiler_exc_wrap_loop_body_with_guard(wl.body, compiler_exc_ctx_current_flag_ptr(ctx), compiler_exc_ctx_current_flag_len(ctx));
+            }
+            return stmt;
+        case AST_FOR:
+            var fr: *AstFor = (*AstFor)stmt;
+            fr.init = compiler_lower_exception_stmt(ctx, fr.init, breakable_depth);
+            fr.body = compiler_lower_exception_stmt(ctx, fr.body, breakable_depth + 1);
+            if (compiler_exc_ctx_active(ctx) != 0) {
+                fr.body = compiler_exc_wrap_loop_body_with_guard(fr.body, compiler_exc_ctx_current_flag_ptr(ctx), compiler_exc_ctx_current_flag_len(ctx));
+            }
+            return stmt;
+        case AST_SWITCH:
+        case AST_MATCH:
+            var sw: *AstSwitch = (*AstSwitch)stmt;
+            if (sw.cases_vec != 0) {
+                var cn: u64 = sw.cases_vec.len();
+                for (var ci: u64 = 0; ci < cn; ci++) {
+                    sw.cases_vec.set(ci, compiler_lower_exception_stmt(ctx, sw.cases_vec.get(ci), breakable_depth + 1));
+                }
+            }
+            return stmt;
+        case AST_CASE:
+            var cs: *AstCase = (*AstCase)stmt;
+            cs.body = compiler_lower_exception_stmt(ctx, cs.body, breakable_depth);
+            return stmt;
+        case AST_DEFER:
+            var df: *AstDefer = (*AstDefer)stmt;
+            df.stmt = compiler_lower_exception_stmt(ctx, df.stmt, breakable_depth);
+            return stmt;
+        case AST_TRY_STMT:
+            var tr: *AstTryStmt = (*AstTryStmt)stmt;
+
+            if (tr.catch_block == 0 && tr.finally_block == 0) {
+                emit_stderr("[ERROR] try statement requires catch and/or finally block\n");
+                compiler_error("Compilation failed");
+                return stmt;
+            }
+
+            ctx.counter = ctx.counter + 1;
+            var ctx_name: *NameInfo = compiler_exc_build_internal_name("__try_ctx_", 10, ctx.counter);
+            var value_name: *NameInfo = compiler_exc_build_internal_name("__try_payload_", 14, ctx.counter);
+
+            var outer_ctx_ptr: u64 = 0;
+            var outer_ctx_len: u64 = 0;
+            var outer_value_ptr: u64 = 0;
+            var outer_value_len: u64 = 0;
+            if (compiler_exc_ctx_active(ctx) != 0) {
+                outer_ctx_ptr = compiler_exc_ctx_current_flag_ptr(ctx);
+                outer_ctx_len = compiler_exc_ctx_current_flag_len(ctx);
+                outer_value_ptr = compiler_exc_ctx_current_value_ptr(ctx);
+                outer_value_len = compiler_exc_ctx_current_value_len(ctx);
+            }
+
+            var lowered_stmts: *Vec<*AstNode> = new Vec<*AstNode>(6);
+            var ctx_struct: *AstStructDef = compiler_exc_ensure_context_struct();
+            var ctx_decl: *AstVarDecl = ast_var_decl(ctx_name.ptr, ctx_name.len, TYPE_STRUCT, 0, 0);
+            ctx_decl.struct_name_ptr = ctx_struct.name_ptr;
+            ctx_decl.struct_name_len = ctx_struct.name_len;
+            lowered_stmts.push((*AstNode)ctx_decl);
+            lowered_stmts.push((*AstNode)ast_assign(compiler_exc_state_expr(ctx_name.ptr, ctx_name.len), (*AstNode)ast_literal(COMPILER_EXC_STATE_NONE)));
+
+            var thrown_value_type: *TypeInfo = tr.catch_value_type;
+            if (thrown_value_type == 0) {
+                thrown_value_type = new TypeInfo(TYPE_U64, 0);
+            }
+            var value_decl: *AstVarDecl = ast_var_decl(value_name.ptr, value_name.len, thrown_value_type.type_kind, thrown_value_type.ptr_depth, (*AstNode)ast_literal(0));
+            value_decl.is_tagged = thrown_value_type.is_tagged;
+            value_decl.struct_name_ptr = thrown_value_type.struct_name_ptr;
+            value_decl.struct_name_len = thrown_value_type.struct_name_len;
+            value_decl.tag_layout_ptr = thrown_value_type.tag_layout_ptr;
+            value_decl.tag_layout_len = thrown_value_type.tag_layout_len;
+            value_decl.elem_type_kind = thrown_value_type.elem_type_kind;
+            value_decl.elem_ptr_depth = thrown_value_type.elem_ptr_depth;
+            value_decl.array_len = thrown_value_type.array_len;
+            value_decl.array_len_is_param = thrown_value_type.array_len_is_param;
+            value_decl.array_len_param_ptr = thrown_value_type.array_len_param_ptr;
+            value_decl.array_len_param_len = thrown_value_type.array_len_param_len;
+            if (thrown_value_type.type_kind == TYPE_FUNC) {
+                value_decl.elem_typeinfo = thrown_value_type;
+            } else {
+                value_decl.elem_typeinfo = thrown_value_type.elem_typeinfo;
+            }
+            lowered_stmts.push((*AstNode)value_decl);
+
+            compiler_exc_ctx_push(ctx, ctx_name.ptr, ctx_name.len, value_name.ptr, value_name.len, breakable_depth);
+            if (tr.try_block != 0 && ast_kind(tr.try_block) == AST_BLOCK) {
+                var try_blk: *AstBlock = (*AstBlock)tr.try_block;
+                if (try_blk.stmts_vec != 0) {
+                    var tn: u64 = try_blk.stmts_vec.len();
+                    for (var ti: u64 = 0; ti < tn; ti++) {
+                        var lowered_try_stmt: *AstNode = compiler_lower_exception_stmt(ctx, try_blk.stmts_vec.get(ti), breakable_depth);
+                        lowered_stmts.push(compiler_exc_wrap_stmt_if_not_thrown(lowered_try_stmt, ctx_name.ptr, ctx_name.len));
+                    }
+                }
+            } else {
+                var lowered_try_single: *AstNode = compiler_lower_exception_stmt(ctx, tr.try_block, breakable_depth);
+                lowered_stmts.push(compiler_exc_wrap_stmt_if_not_thrown(lowered_try_single, ctx_name.ptr, ctx_name.len));
+            }
+            compiler_exc_ctx_pop(ctx);
+
+            if (tr.catch_block != 0) {
+                var catch_wrapped: *Vec<*AstNode> = new Vec<*AstNode>(8);
+                catch_wrapped.push((*AstNode)ast_assign(compiler_exc_state_expr(ctx_name.ptr, ctx_name.len), (*AstNode)ast_literal(COMPILER_EXC_STATE_NONE)));
+
+                if (tr.catch_name_ptr != 0 && tr.catch_name_len != 0) {
+                    var catch_decl: *AstVarDecl = ast_var_decl(tr.catch_name_ptr, tr.catch_name_len, thrown_value_type.type_kind, thrown_value_type.ptr_depth, (*AstNode)ast_ident(value_name.ptr, value_name.len));
+                    catch_decl.is_tagged = thrown_value_type.is_tagged;
+                    catch_decl.struct_name_ptr = thrown_value_type.struct_name_ptr;
+                    catch_decl.struct_name_len = thrown_value_type.struct_name_len;
+                    catch_decl.tag_layout_ptr = thrown_value_type.tag_layout_ptr;
+                    catch_decl.tag_layout_len = thrown_value_type.tag_layout_len;
+                    catch_decl.elem_type_kind = thrown_value_type.elem_type_kind;
+                    catch_decl.elem_ptr_depth = thrown_value_type.elem_ptr_depth;
+                    catch_decl.array_len = thrown_value_type.array_len;
+                    catch_decl.array_len_is_param = thrown_value_type.array_len_is_param;
+                    catch_decl.array_len_param_ptr = thrown_value_type.array_len_param_ptr;
+                    catch_decl.array_len_param_len = thrown_value_type.array_len_param_len;
+                    if (thrown_value_type.type_kind == TYPE_FUNC) {
+                        catch_decl.elem_typeinfo = thrown_value_type;
+                    } else {
+                        catch_decl.elem_typeinfo = thrown_value_type.elem_typeinfo;
+                    }
+                    catch_wrapped.push((*AstNode)catch_decl);
+                }
+
+                if (ast_kind(tr.catch_block) == AST_BLOCK) {
+                    var catch_blk: *AstBlock = (*AstBlock)tr.catch_block;
+                    if (catch_blk.stmts_vec != 0) {
+                        var cn2: u64 = catch_blk.stmts_vec.len();
+                        for (var ci2: u64 = 0; ci2 < cn2; ci2++) {
+                            var lowered_catch_stmt: *AstNode = compiler_lower_exception_stmt(ctx, catch_blk.stmts_vec.get(ci2), breakable_depth);
+                            catch_wrapped.push(compiler_exc_wrap_stmt_if_not_thrown(lowered_catch_stmt, ctx_name.ptr, ctx_name.len));
+                        }
+                    }
+                } else {
+                    var lowered_catch_single: *AstNode = compiler_lower_exception_stmt(ctx, tr.catch_block, breakable_depth);
+                    catch_wrapped.push(compiler_exc_wrap_stmt_if_not_thrown(lowered_catch_single, ctx_name.ptr, ctx_name.len));
+                }
+
+                var thrown_cond2: *AstNode = (*AstNode)ast_binary(TOKEN_BANGEQ, compiler_exc_state_expr(ctx_name.ptr, ctx_name.len), (*AstNode)ast_literal(COMPILER_EXC_STATE_NONE));
+                lowered_stmts.push((*AstNode)ast_if(thrown_cond2, (*AstNode)ast_block(catch_wrapped), 0));
+            }
+
+            if (tr.finally_block != 0) {
+                var pending_name: *NameInfo = compiler_exc_build_internal_name("__try_pending_", 14, ctx.counter);
+                lowered_stmts.push((*AstNode)ast_var_decl(pending_name.ptr, pending_name.len, TYPE_U64, 0, compiler_exc_state_expr(ctx_name.ptr, ctx_name.len)));
+                lowered_stmts.push((*AstNode)ast_assign(compiler_exc_state_expr(ctx_name.ptr, ctx_name.len), (*AstNode)ast_literal(COMPILER_EXC_STATE_NONE)));
+
+                if (ast_kind(tr.finally_block) == AST_BLOCK) {
+                    var finally_blk: *AstBlock = (*AstBlock)tr.finally_block;
+                    if (finally_blk.stmts_vec != 0) {
+                        var fnn: u64 = finally_blk.stmts_vec.len();
+                        for (var fi: u64 = 0; fi < fnn; fi++) {
+                            var lowered_finally_stmt: *AstNode = compiler_lower_exception_stmt(ctx, finally_blk.stmts_vec.get(fi), breakable_depth);
+                            lowered_stmts.push(compiler_exc_wrap_stmt_if_not_thrown(lowered_finally_stmt, ctx_name.ptr, ctx_name.len));
+                        }
+                    }
+                } else {
+                    var lowered_finally_single: *AstNode = compiler_lower_exception_stmt(ctx, tr.finally_block, breakable_depth);
+                    lowered_stmts.push(compiler_exc_wrap_stmt_if_not_thrown(lowered_finally_single, ctx_name.ptr, ctx_name.len));
+                }
+
+                var restore_stmts: *Vec<*AstNode> = new Vec<*AstNode>(1);
+                restore_stmts.push((*AstNode)ast_assign(compiler_exc_state_expr(ctx_name.ptr, ctx_name.len), (*AstNode)ast_ident(pending_name.ptr, pending_name.len)));
+                var restore_cond: *AstNode = (*AstNode)ast_binary(TOKEN_EQEQ, compiler_exc_state_expr(ctx_name.ptr, ctx_name.len), (*AstNode)ast_literal(COMPILER_EXC_STATE_NONE));
+                lowered_stmts.push((*AstNode)ast_if(restore_cond, (*AstNode)ast_block(restore_stmts), 0));
+            }
+
+            var post_throw_cond: *AstNode = (*AstNode)ast_binary(TOKEN_BANGEQ, compiler_exc_state_expr(ctx_name.ptr, ctx_name.len), (*AstNode)ast_literal(COMPILER_EXC_STATE_NONE));
+            if (outer_ctx_ptr != 0 && outer_ctx_len != 0 && outer_value_ptr != 0 && outer_value_len != 0) {
+                var propagate_stmts: *Vec<*AstNode> = new Vec<*AstNode>(3);
+                propagate_stmts.push((*AstNode)ast_assign((*AstNode)ast_ident(outer_value_ptr, outer_value_len), (*AstNode)ast_ident(value_name.ptr, value_name.len)));
+                propagate_stmts.push((*AstNode)ast_assign(compiler_exc_state_expr(outer_ctx_ptr, outer_ctx_len), (*AstNode)ast_literal(COMPILER_EXC_STATE_THROWN)));
+                lowered_stmts.push((*AstNode)ast_if(post_throw_cond, (*AstNode)ast_block(propagate_stmts), 0));
+            } else {
+                var fail_stmts: *Vec<*AstNode> = new Vec<*AstNode>(1);
+                fail_stmts.push(compiler_exc_build_unhandled_throw_stmt());
+                lowered_stmts.push((*AstNode)ast_if(post_throw_cond, (*AstNode)ast_block(fail_stmts), 0));
+            }
+
+            return (*AstNode)ast_block(lowered_stmts);
+        case AST_THROW_STMT:
+            var th: *AstThrowStmt = (*AstThrowStmt)stmt;
+            if (compiler_exc_ctx_active(ctx) == 0) {
+                var unhandled_stmts: *Vec<*AstNode> = new Vec<*AstNode>(2);
+                unhandled_stmts.push(ast_expr_stmt(th.expr));
+                unhandled_stmts.push(compiler_exc_build_unhandled_throw_stmt());
+                return (*AstNode)ast_block(unhandled_stmts);
+            }
+            var throw_stmts: *Vec<*AstNode> = new Vec<*AstNode>(2);
+            throw_stmts.push((*AstNode)ast_assign((*AstNode)ast_ident(compiler_exc_ctx_current_value_ptr(ctx), compiler_exc_ctx_current_value_len(ctx)), th.expr));
+            throw_stmts.push((*AstNode)ast_assign(compiler_exc_state_expr(compiler_exc_ctx_current_flag_ptr(ctx), compiler_exc_ctx_current_flag_len(ctx)), (*AstNode)ast_literal(COMPILER_EXC_STATE_THROWN)));
+            return (*AstNode)ast_block(throw_stmts);
+        default:
+            return stmt;
+    }
+}
+
+func compiler_lower_exceptions_stmt(stmt: *AstNode) -> u64 {
+    var ctx: CompilerExceptionLowerCtx = compiler_exc_ctx_new();
+    compiler_lower_exception_stmt(&ctx, stmt, 0);
+    return 0;
+}
+
+func compiler_lower_exceptions() -> u64 {
+    if (g_compiler_ctx.all_funcs != 0) {
+        var fn_count: u64 = g_compiler_ctx.all_funcs.len();
+        for (var i: u64 = 0; i < fn_count; i++) {
+            var fn: *AstFunc = g_compiler_ctx.all_funcs.get(i);
+            if (fn == 0 || fn.body == 0) { continue; }
+            compiler_lower_exceptions_stmt(fn.body);
+        }
+    }
+    return 0;
 }
 
 const COMPILER_AST_WALK_LOWER_PARSE_SUGAR = 1;
