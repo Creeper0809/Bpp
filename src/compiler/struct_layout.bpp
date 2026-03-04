@@ -1,0 +1,238 @@
+// compiler_struct_layout.b - Struct layout/sizeof/field-offset helpers
+
+import compiler;
+import compiler.symbol_runtime;
+import compiler.core_utils;
+import std.io;
+import std.str;
+import std.vec;
+import ast;
+import types;
+
+func compiler_sizeof_type(type_kind: u64, ptr_depth: u64, struct_name_ptr: u64, struct_name_len: u64) -> u64 {
+    if (ptr_depth > 0) { return 8; }
+    switch (type_kind) {
+        case TYPE_BOOL: return 1;
+        case TYPE_U8: return 1;
+        case TYPE_U16: return 2;
+        case TYPE_U32: return 4;
+        case TYPE_U64: return 8;
+        case TYPE_I8: return 1;
+        case TYPE_I16: return 2;
+        case TYPE_I32: return 4;
+        case TYPE_I64: return 8;
+        case TYPE_F64: return 8;
+        case TYPE_SLICE: return 16;
+        case TYPE_FUNC: return 8;
+        case TYPE_STRUCT:
+            var sd: *AstStructDef = get_struct_def(struct_name_ptr, struct_name_len);
+            if (sd == 0) { return 8; }
+            return compiler_struct_size_internal(sd, 0);
+        case TYPE_TRAIT:
+            return 8;
+    }
+    return 8;
+}
+
+func compiler_sizeof_typeinfo(info: *TypeInfo) -> u64 {
+    if (info == 0) { return 8; }
+    if (info.ptr_depth > 0) { return 8; }
+    if (info.type_kind == TYPE_ARRAY) {
+        var elem_size: u64 = 0;
+        if (info.elem_typeinfo != 0) {
+            elem_size = compiler_sizeof_typeinfo(info.elem_typeinfo);
+        } else {
+            elem_size = compiler_sizeof_type(info.elem_type_kind, info.elem_ptr_depth, info.struct_name_ptr, info.struct_name_len);
+        }
+        return elem_size * info.array_len;
+    }
+    if (info.type_kind == TYPE_SLICE) { return 16; }
+    return compiler_sizeof_type(info.type_kind, info.ptr_depth, info.struct_name_ptr, info.struct_name_len);
+}
+
+func compiler_sizeof_field_desc(field: *FieldDesc) -> u64 {
+    if (field.bit_width > 0) {
+        return (field.bit_width + 7) / 8;
+    }
+    if (field.type_kind == TYPE_ARRAY) {
+        var elem_size: u64 = 0;
+        if (field.elem_typeinfo != 0) {
+            elem_size = compiler_sizeof_typeinfo(field.elem_typeinfo);
+        } else {
+            elem_size = compiler_sizeof_type(field.elem_type_kind, field.elem_ptr_depth, field.struct_name_ptr, field.struct_name_len);
+        }
+        return elem_size * field.array_len;
+    }
+    if (field.type_kind == TYPE_SLICE) { return 16; }
+    return compiler_sizeof_type(field.type_kind, field.ptr_depth, field.struct_name_ptr, field.struct_name_len);
+}
+
+func compiler_struct_size_internal(struct_info: *AstStructDef, depth: u64) -> u64 {
+    if (struct_info == 0) { return 0; }
+    if (depth > 64) {
+        emit_stderr("[ERROR] Inheritance depth exceeded\n");
+        compiler_error("TypeInfo error");
+        return 0;
+    }
+    if (struct_info.is_union == 1) {
+        if ((struct_info.parents_vec != 0 && struct_info.parents_vec.len() > 0) ||
+            (struct_info.traits_vec != 0 && struct_info.traits_vec.len() > 0)) {
+            emit_stderr("[ERROR] union cannot use inheritance or traits\n");
+            compiler_error("TypeInfo error");
+            return 0;
+        }
+        var max_size: u64 = 0;
+        var fields_u: *Vec<*FieldDesc> = struct_info.fields_vec;
+        var num_fields_u: u64 = fields_u.len();
+        for (var ui: u64 = 0; ui < num_fields_u; ui++) {
+            var field_u: *FieldDesc = fields_u.get(ui);
+            var size_u: u64 = compiler_sizeof_field_desc(field_u);
+            if (size_u > max_size) { max_size = size_u; }
+        }
+        return max_size;
+    }
+    if (struct_info.is_packed == 1) {
+        emit_stderr("[ERROR] packed struct cannot use trait vptr layout\n");
+        compiler_error("TypeInfo error");
+        return 0;
+    }
+    var total_size: u64 = 0;
+    if (struct_info.parents_vec != 0) {
+        var parents: *Vec<*ParentDesc> = struct_info.parents_vec;
+        var pn: u64 = parents.len();
+        for (var pi: u64 = 0; pi < pn; pi++) {
+            var parent_desc: *ParentDesc = parents.get(pi);
+            var parent_def: *AstStructDef = compiler_resolve_parent_def(parent_desc, "TypeInfo error");
+            total_size = total_size + compiler_struct_size_internal(parent_def, depth + 1);
+        }
+    }
+    var fields: *Vec<*FieldDesc> = struct_info.fields_vec;
+    var num_fields: u64 = fields.len();
+    for (var i: u64 = 0; i < num_fields; i++) {
+        var field: *FieldDesc = fields.get(i);
+        total_size = total_size + compiler_sizeof_field_desc(field);
+    }
+    return total_size;
+}
+
+func _compiler_struct_find_field_offset_hier(struct_def: *AstStructDef, field_ptr: u64, field_len: u64, depth: u64) -> u64 {
+    if (struct_def == 0) { return COMPILER_NOT_FOUND_U64; }
+    if (depth > 64) {
+        emit_stderr("[ERROR] Inheritance depth exceeded\n");
+        compiler_error("TypeInfo error");
+        return 0;
+    }
+    if (struct_def.is_union == 1) {
+        var ufields: *Vec<*FieldDesc> = struct_def.fields_vec;
+        var un: u64 = ufields.len();
+        for (var ui: u64 = 0; ui < un; ui++) {
+            var uf: *FieldDesc = ufields.get(ui);
+            if (str_eq(uf.name_ptr, uf.name_len, field_ptr, field_len)) {
+                return 0;
+            }
+        }
+        return COMPILER_NOT_FOUND_U64;
+    }
+
+    var parent_total: u64 = 0;
+    if (struct_def.parents_vec != 0) {
+        var parents0: *Vec<*ParentDesc> = struct_def.parents_vec;
+        var pn0: u64 = parents0.len();
+        for (var p0: u64 = 0; p0 < pn0; p0++) {
+            var pd0: *ParentDesc = parents0.get(p0);
+            var pdef0: *AstStructDef = compiler_resolve_parent_def(pd0, "TypeInfo error");
+            parent_total = parent_total + compiler_struct_size_internal(pdef0, depth + 1);
+        }
+    }
+
+    var fields: *Vec<*FieldDesc> = struct_def.fields_vec;
+    var n: u64 = fields.len();
+    var local_off: u64 = parent_total;
+    for (var i: u64 = 0; i < n; i++) {
+        var f: *FieldDesc = fields.get(i);
+        if (str_eq(f.name_ptr, f.name_len, field_ptr, field_len)) {
+            return local_off;
+        }
+        local_off = local_off + compiler_sizeof_field_desc(f);
+    }
+
+    if (struct_def.parents_vec == 0) { return COMPILER_NOT_FOUND_U64; }
+    var parents: *Vec<*ParentDesc> = struct_def.parents_vec;
+    var pn: u64 = parents.len();
+    var run_off: u64 = 0;
+    var found_count: u64 = 0;
+    var found_off: u64 = COMPILER_NOT_FOUND_U64;
+    for (var pi: u64 = 0; pi < pn; pi++) {
+        var pd: *ParentDesc = parents.get(pi);
+        var pdef: *AstStructDef = compiler_resolve_parent_def(pd, "TypeInfo error");
+        var cand_off: u64 = _compiler_struct_find_field_offset_hier(pdef, field_ptr, field_len, depth + 1);
+        if (compiler_is_not_found_u64(cand_off) == 0) {
+            found_count = found_count + 1;
+            if (found_count == 1) {
+                found_off = run_off + cand_off;
+            }
+        }
+        run_off = run_off + compiler_struct_size_internal(pdef, depth + 1);
+    }
+    if (found_count > 1) {
+        emit_stderr("[ERROR] Ambiguous field offset in inheritance: ");
+        emit_stderr_len(struct_def.name_ptr, struct_def.name_len);
+        emit_stderr(".");
+        emit_stderr_len(field_ptr, field_len);
+        emit_stderr("\n");
+        compiler_error("TypeInfo error");
+        return 0;
+    }
+    return found_off;
+}
+
+func compiler_struct_find_field_offset(struct_def: *AstStructDef, field_ptr: u64, field_len: u64) -> u64 {
+    return _compiler_struct_find_field_offset_hier(struct_def, field_ptr, field_len, 0);
+}
+
+func compiler_insert_vptr_field(struct_def: *AstStructDef, trait_ptr: u64, trait_len: u64, vtable_struct_ptr: u64, vtable_struct_len: u64) -> u64 {
+    if (struct_def == 0) { return 0; }
+    if (struct_def.is_union == 1) {
+        emit_stderr("[ERROR] union cannot contain vptr field: ");
+        emit_stderr_len(struct_def.name_ptr, struct_def.name_len);
+        emit_stderr("\n");
+        compiler_error("Compilation failed");
+        return 0;
+    }
+    var vptr_name: *NameInfo = compiler_build_vptr_field_name(trait_ptr, trait_len);
+    var existing_off: u64 = compiler_struct_find_field_offset(struct_def, vptr_name.ptr, vptr_name.len);
+    if (compiler_is_not_found_u64(existing_off) == 0) {
+        return 0;
+    }
+    if (struct_def.fields_vec == 0) {
+        struct_def.fields_vec = new Vec<*FieldDesc>(1);
+    }
+    var fields: *Vec<*FieldDesc> = struct_def.fields_vec;
+    var n: u64 = fields.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var f: *FieldDesc = fields.get(i);
+        if (str_eq(f.name_ptr, f.name_len, vptr_name.ptr, vptr_name.len)) { return 0; }
+    }
+    var new_field: *FieldDesc = new FieldDesc();
+    new_field.name_ptr = vptr_name.ptr;
+    new_field.name_len = vptr_name.len;
+    new_field.type_kind = TYPE_STRUCT;
+    new_field.struct_name_ptr = vtable_struct_ptr;
+    new_field.struct_name_len = vtable_struct_len;
+    new_field.ptr_depth = 1;
+    new_field.is_tagged = 0;
+    new_field.tag_layout_ptr = 0;
+    new_field.tag_layout_len = 0;
+    new_field.bit_width = 0;
+    new_field.elem_type_kind = 0;
+    new_field.elem_ptr_depth = 0;
+    new_field.array_len = 0;
+    new_field.elem_typeinfo = 0;
+    new_field.access = ACCESS_PRIVATE;
+    new_field.owner_struct_ptr = struct_def.name_ptr;
+    new_field.owner_struct_len = struct_def.name_len;
+
+    fields.push(new_field);
+    return 0;
+}
+
