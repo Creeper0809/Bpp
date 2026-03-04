@@ -1,6 +1,7 @@
 // compiler_lowering.b - Lowering pass contract
 
 import compiler;
+import std.vec;
 import ast;
 import types;
 
@@ -143,10 +144,175 @@ func compiler_finalize_global_init_kinds() -> u64 {
     return 0;
 }
 
+func compiler_insert_default_constructor(struct_name_ptr: u64, struct_name_len: u64) -> u64 {
+    if (g_compiler_ctx.all_funcs == 0 || g_compiler_ctx.all_func_sigs == 0) { return 0; }
+    var ctor_name: *NameInfo = _compiler_build_constructor_name(struct_name_ptr, struct_name_len);
+    if (compiler_func_exists(ctor_name.ptr, ctor_name.len) != 0) { return 0; }
+
+    var params: *Vec<*Param> = new Vec<*Param>(1);
+    params.push(_compiler_make_self_param(struct_name_ptr, struct_name_len));
+    var stmts: *Vec<*AstNode> = new Vec<*AstNode>(0);
+    var body: *AstNode = (*AstNode)ast_block(stmts);
+    var fn: *AstFunc = ast_func_ex(ctor_name.ptr, ctor_name.len, params, TYPE_VOID, 0, 0, 0, 0, 0, 0, body);
+    g_compiler_ctx.all_funcs.push(fn);
+    g_compiler_ctx.all_func_sigs.push(fn);
+    compiler_invalidate_func_lookup();
+    return 0;
+}
+
+func compiler_insert_default_constructors() -> u64 {
+    var n: u64 = g_compiler_ctx.all_structs_vec.?len();
+    if (n == 0) { return 0; }
+    for (var i: u64 = 0; i < n; i++) {
+        var def: *AstStructDef = g_compiler_ctx.all_structs_vec.get(i);
+        if (def == 0) { continue; }
+        if (compiler_is_generic_struct_def(def) != 0) { continue; }
+        compiler_insert_default_constructor(def.name_ptr, def.name_len);
+    }
+    return 0;
+}
+
+func compiler_expr_has_super_constructor_call(expr: *AstNode) -> u64 {
+    var walker: CompilerAstWalker = compiler_ast_walker_new(COMPILER_AST_WALK_FIND_SUPER_CTOR, 0, 0);
+    compiler_ast_walker_walk_expr(&walker, expr);
+    return walker.found;
+}
+
+func compiler_stmt_has_super_constructor_call(stmt: *AstNode) -> u64 {
+    var walker: CompilerAstWalker = compiler_ast_walker_new(COMPILER_AST_WALK_FIND_SUPER_CTOR, 0, 0);
+    compiler_ast_walker_walk_stmt(&walker, stmt);
+    return walker.found;
+}
+
+func compiler_insert_auto_super_constructor_chain_for_fn(fn: *AstFunc) -> u64 {
+    if (fn == 0) { return 0; }
+    if (fn.impl_owner_ptr == 0 || fn.impl_owner_len == 0) { return 0; }
+
+    var method_ptr: u64 = fn.impl_original_name_ptr;
+    var method_len: u64 = fn.impl_original_name_len;
+    if (method_ptr == 0 || method_len == 0) {
+        method_ptr = fn.name_ptr;
+        method_len = fn.name_len;
+    }
+    if (compiler_is_constructor_name(method_ptr, method_len) == 0) { return 0; }
+
+    var owner_def: *AstStructDef = get_struct_def(fn.impl_owner_ptr, fn.impl_owner_len);
+    if (owner_def == 0 || owner_def.parents_vec == 0 || owner_def.parents_vec.len() == 0) { return 0; }
+    if (compiler_stmt_has_super_constructor_call(fn.body) != 0) { return 0; }
+
+    if (owner_def.parents_vec.len() != 1) {
+        emit_stderr("[ERROR] automatic super constructor chaining is ambiguous with multiple parents: ");
+        emit_stderr_len(owner_def.name_ptr, owner_def.name_len);
+        emit_stderr("\n");
+        compiler_error("Compiler error");
+        return 0;
+    }
+
+    var parent_desc: *ParentDesc = owner_def.parents_vec.get(0);
+    var parent_def: *AstStructDef = compiler_resolve_parent_def(parent_desc, "Compiler error");
+    var parent_ctor: CompilerMethodResolveResult = compiler_resolve_method_overload(parent_def.name_ptr, parent_def.name_len, "constructor", 11, 0, 0);
+    if (parent_ctor.found == 0) {
+        emit_stderr("[ERROR] parent constructor() is required for automatic super chaining: ");
+        emit_stderr_len(parent_def.name_ptr, parent_def.name_len);
+        emit_stderr("\n");
+        compiler_error("Compiler error");
+        return 0;
+    }
+
+    var injected_args: *Vec<*AstNode> = new Vec<*AstNode>(0);
+    var injected_call: *AstMethodCall = ast_method_call((*AstNode)ast_super(), "constructor", 11, injected_args);
+    var injected_stmt: *AstNode = (*AstNode)ast_expr_stmt((*AstNode)injected_call);
+
+    if (fn.body == 0) {
+        var only_stmts: *Vec<*AstNode> = new Vec<*AstNode>(1);
+        only_stmts.push(injected_stmt);
+        fn.body = (*AstNode)ast_block(only_stmts);
+        return 0;
+    }
+
+    if (ast_kind(fn.body) != AST_BLOCK) {
+        var wrapped_stmts: *Vec<*AstNode> = new Vec<*AstNode>(2);
+        wrapped_stmts.push(injected_stmt);
+        wrapped_stmts.push(fn.body);
+        fn.body = (*AstNode)ast_block(wrapped_stmts);
+        return 0;
+    }
+
+    var body_block: *AstBlock = (*AstBlock)fn.body;
+    var old_stmts: *Vec<*AstNode> = body_block.stmts_vec;
+    if (old_stmts == 0) {
+        old_stmts = new Vec<*AstNode>(1);
+    }
+    var old_len: u64 = old_stmts.len();
+    var new_stmts: *Vec<*AstNode> = new Vec<*AstNode>(old_len + 1);
+    new_stmts.push(injected_stmt);
+    for (var i2: u64 = 0; i2 < old_len; i2++) {
+        new_stmts.push(old_stmts.get(i2));
+    }
+    body_block.stmts_vec = new_stmts;
+    return 0;
+}
+
+func compiler_insert_auto_super_constructor_chains() -> u64 {
+    if (g_compiler_ctx.all_funcs == 0) { return 0; }
+    var n: u64 = g_compiler_ctx.all_funcs.len();
+    for (var i: u64 = 0; i < n; i++) {
+        compiler_insert_auto_super_constructor_chain_for_fn(g_compiler_ctx.all_funcs.get(i));
+    }
+    return 0;
+}
+
+func compiler_insert_global_init_func() -> u64 {
+    if (compiler_has_runtime_global_init() == 0) { return 0; }
+    if (compiler_func_exists("__global_init", 13)) { return 0; }
+
+    var stmts: *Vec<*AstNode> = new Vec<*AstNode>(8);
+    var n: u64 = g_compiler_ctx.all_globals.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var ginfo: *GlobalInfo = g_compiler_ctx.all_globals.get(i);
+        if (ginfo.init_kind != GLOBAL_INIT_RUNTIME) { continue; }
+        var init_expr: *AstNode = (*AstNode)ginfo.init_expr;
+        if (init_expr == 0) {
+            emit_stderr("[ERROR] runtime global init expr missing\n");
+            compiler_error("Compilation failed");
+            continue;
+        }
+        var target: *AstNode = (*AstNode)ast_ident(ginfo.name_ptr, ginfo.name_len);
+        var assign: *AstAssign = ast_assign(target, init_expr);
+        stmts.push((*AstNode)assign);
+    }
+
+    if (stmts.len() == 0) { return 0; }
+
+    var block: *AstNode = (*AstNode)ast_block(stmts);
+    var params: *Vec<*Param> = new Vec<*Param>(0);
+    var fn: *AstFunc = ast_func("__global_init", 13, params, TYPE_VOID, block);
+    g_compiler_ctx.all_funcs.push(fn);
+    g_compiler_ctx.all_func_sigs.push(fn);
+    compiler_invalidate_func_lookup();
+    return 0;
+}
+
 func compiler_pass_lowering_exceptions() -> u64 {
     return compiler_lower_exceptions();
 }
 
 func compiler_pass_lowering_parse_sugar() -> u64 {
     return compiler_lower_parse_sugar();
+}
+
+func compiler_pass_lowering_finalize_global_init_kinds() -> u64 {
+    return compiler_finalize_global_init_kinds();
+}
+
+func compiler_pass_lowering_insert_default_constructors() -> u64 {
+    return compiler_insert_default_constructors();
+}
+
+func compiler_pass_lowering_insert_auto_super_constructor_chains() -> u64 {
+    return compiler_insert_auto_super_constructor_chains();
+}
+
+func compiler_pass_lowering_insert_global_init_func() -> u64 {
+    return compiler_insert_global_init_func();
 }
