@@ -12,6 +12,7 @@ import ast;
 import parser.util;
 import parser.decl;
 import module_utils;
+import compiler.loader;
 
 const GENERIC_DEBUG = 0;
 const TRAIT_LOOKUP_DEBUG = 0;
@@ -494,41 +495,7 @@ func compiler_decl_lookup_none(default_access: u64) -> CompilerDeclLookup {
 // ============================================
 
 func read_entire_file(path: u64) -> u64 {
-    var fd_i: i64 = (i64)sys_open(path, 0, 0);
-    if (fd_i < 0) { return 0; }
-    var fd: u64 = (u64)fd_i;
-
-    var statbuf_raw: u64 = heap_alloc(144 * sizeof(u8));
-    var statbuf: *Stat = (*Stat)statbuf_raw;
-    var st_res: i64 = (i64)sys_fstat(fd, statbuf_raw);
-    if (st_res < 0) {
-        sys_close(fd);
-        return 0;
-    }
-    var size: u64 = statbuf.size;
-
-    var buf: u64 = heap_alloc((size + 1) * sizeof(u8));
-
-    var total: u64 = 0;
-    for (; total < size; ) {
-        var n: i64 = (i64)sys_read(fd, buf + total, size - total);
-        if (n < 0) {
-            sys_close(fd);
-            return 0;
-        }
-        if (n == 0) { break; }
-        total = total + (u64)n;
-    }
-
-    var buf_u8: []u8 = slice(buf, size + 1);
-    buf_u8[total] = 0;
-
-    sys_close(fd);
-
-    g_compiler_ctx.file_ptr = buf;
-    g_compiler_ctx.file_len = total;
-
-    return buf;
+    return compiler_loader_read_entire_file(path, &g_compiler_ctx.file_ptr, &g_compiler_ctx.file_len);
 }
 
 func compiler_report_module_open_error(file_path: u64, file_path_len: u64) -> u64 {
@@ -546,19 +513,13 @@ func compiler_get_cached_module_source(file_path: u64, file_path_len: u64) -> *N
     if (g_compiler_ctx.module_source_cache == 0) {
         g_compiler_ctx.module_source_cache = new HashMap<u64, *NameInfo>(64);
     }
-    var cached: *NameInfo = g_compiler_ctx.module_source_cache.get(file_path, file_path_len);
-    if (cached != 0) {
-        g_compiler_ctx.file_ptr = cached.ptr;
-        g_compiler_ctx.file_len = cached.len;
-        return cached;
-    }
-
-    var content: u64 = read_entire_file(file_path);
-    if (content == 0) { return 0; }
-
-    var source_info: *NameInfo = new NameInfo{g_compiler_ctx.file_ptr, g_compiler_ctx.file_len};
-    g_compiler_ctx.module_source_cache.put(file_path, file_path_len, source_info);
-    return source_info;
+    return compiler_loader_get_cached_module_source(
+        g_compiler_ctx.module_source_cache,
+        file_path,
+        file_path_len,
+        &g_compiler_ctx.file_ptr,
+        &g_compiler_ctx.file_len
+    );
 }
 
 func compiler_set_current_source(file_path: u64, file_path_len: u64) -> u64 {
@@ -572,27 +533,29 @@ func compiler_get_cached_module_tokens(file_path: u64, file_path_len: u64) -> *V
         g_compiler_ctx.module_tokens_cache = new HashMap<u64, *Vec<*Token>>(64);
     }
 
-    var tokens_cached: *Vec<*Token> = g_compiler_ctx.module_tokens_cache.get(file_path, file_path_len);
-    if (tokens_cached != 0) { return tokens_cached; }
-
-    var source_info: *NameInfo = compiler_get_cached_module_source(file_path, file_path_len);
-    if (source_info == 0) { return 0; }
-    var lex_ptr: u64 = source_info.ptr;
-    var lex_len: u64 = source_info.len;
     if (g_compiler_ctx.lex_ctx == 0) {
         g_compiler_ctx.lex_ctx = lex_ctx_new();
     }
-    var tokens: *Vec<*Token> = lex_all_with_ctx(g_compiler_ctx.lex_ctx, lex_ptr, lex_len);
-    if (lex_error_count_ctx(g_compiler_ctx.lex_ctx) != 0) {
+    var lex_errors: u64 = 0;
+    var tokens: *Vec<*Token> = compiler_loader_get_cached_module_tokens(
+        g_compiler_ctx.module_source_cache,
+        g_compiler_ctx.module_tokens_cache,
+        g_compiler_ctx.lex_ctx,
+        file_path,
+        file_path_len,
+        &lex_errors,
+        &g_compiler_ctx.file_ptr,
+        &g_compiler_ctx.file_len
+    );
+    if (lex_errors != 0) {
         emit_stderr("[ERROR] lexing failed for module: ");
         emit_stderr_len(file_path, file_path_len);
         emit_stderr(" (");
-        emit_u64_stderr(lex_error_count_ctx(g_compiler_ctx.lex_ctx));
+        emit_u64_stderr(lex_errors);
         emit_stderr(" error(s))\n");
         compiler_diag_note_error();
         return 0;
     }
-    g_compiler_ctx.module_tokens_cache.put(file_path, file_path_len, tokens);
     return tokens;
 }
 
@@ -1814,44 +1777,6 @@ func prelude_import_all_from_module(module_ptr: u64, module_len: u64) -> u64 {
         var mangled_ptr: u64 = e.mangled_ptr;
         var mangled_len: u64 = e.mangled_len;
         add_prelude_alias(name_ptr, name_len, mangled_ptr, mangled_len);
-    }
-    return true;
-}
-
-// After all modules are loaded, resolve import aliases using stored import lists.
-func finalize_import_aliases() -> u64 {
-    if (g_compiler_ctx.loaded_modules_vec == 0) { return false; }
-    var n: u64 = g_compiler_ctx.loaded_modules_vec.len();
-    for (var i: u64 = 0; i < n; i++) {
-        var info: *NameInfo = g_compiler_ctx.loaded_modules_vec.get(i);
-        var module_path: u64 = info.ptr;
-        var module_path_len: u64 = info.len;
-        var module_id: *NameInfo = module_id_from_path(module_path, module_path_len);
-        var module_ptr: u64 = module_id.ptr;
-        var module_len: u64 = module_id.len;
-
-        var imports: *Vec<*AstImport> = g_compiler_ctx.module_imports_pass2.get(module_path, module_path_len);
-        if (imports == 0) { continue; }
-        var num_imports: u64 = imports.len();
-        for (var ii: u64 = 0; ii < num_imports; ii++) {
-            var imp: *AstImport = imports.get(ii);
-            var imp_path: u64 = imp.path_ptr;
-            var imp_len: u64 = imp.path_len;
-            var imp_sym_ptr: u64 = imp.symbol_ptr;
-            var imp_sym_len: u64 = imp.symbol_len;
-            var imp_alias_ptr: u64 = imp.alias_ptr;
-            var imp_alias_len: u64 = imp.alias_len;
-
-            var imp_mod_id: *NameInfo = module_util_module_id_from_import(imp_path, imp_len);
-            var imp_mod_ptr: u64 = imp_mod_id.ptr;
-            var imp_mod_len: u64 = imp_mod_id.len;
-
-            if (imp_sym_ptr == 0) {
-                import_all_from_module(module_ptr, module_len, imp_mod_ptr, imp_mod_len);
-            } else {
-                import_symbol_from_module(module_ptr, module_len, imp_mod_ptr, imp_mod_len, imp_sym_ptr, imp_sym_len, imp_alias_ptr, imp_alias_len);
-            }
-        }
     }
     return true;
 }
@@ -6918,17 +6843,6 @@ func compiler_lower_exceptions_stmt(stmt: *AstNode) -> u64 {
     return 0;
 }
 
-func compiler_lower_exceptions() -> u64 {
-    if (g_compiler_ctx.all_funcs != 0) {
-        var fn_count: u64 = g_compiler_ctx.all_funcs.len();
-        for (var i: u64 = 0; i < fn_count; i++) {
-            var fn: *AstFunc = g_compiler_ctx.all_funcs.get(i);
-            if (fn == 0 || fn.body == 0) { continue; }
-            compiler_lower_exceptions_stmt(fn.body);
-        }
-    }
-    return 0;
-}
 
 const COMPILER_AST_WALK_LOWER_PARSE_SUGAR = 1;
 const COMPILER_AST_WALK_VALIDATE_DIRECT_IMPL = 2;
@@ -7223,136 +7137,7 @@ func compiler_lower_parse_sugar_stmt(stmt: *AstNode) -> u64 {
     return compiler_ast_walker_walk_stmt(&walker, stmt);
 }
 
-func compiler_lower_parse_sugar() -> u64 {
-    if (g_compiler_ctx.all_funcs != 0) {
-        var fn_count: u64 = g_compiler_ctx.all_funcs.len();
-        for (var i: u64 = 0; i < fn_count; i++) {
-            var fn: *AstFunc = g_compiler_ctx.all_funcs.get(i);
-            if (fn == 0 || fn.body == 0) { continue; }
-            compiler_lower_parse_sugar_stmt(fn.body);
-        }
-    }
 
-    if (g_compiler_ctx.all_globals != 0) {
-        var gn: u64 = g_compiler_ctx.all_globals.len();
-        for (var gi: u64 = 0; gi < gn; gi++) {
-            var ginfo: *GlobalInfo = g_compiler_ctx.all_globals.get(gi);
-            if (ginfo == 0 || ginfo.init_expr == 0) { continue; }
-            ginfo.init_expr = (u64)compiler_lower_parse_sugar_expr((*AstNode)ginfo.init_expr);
-        }
-    }
-    return 0;
-}
-
-func compiler_set_global_init_none(ginfo: *GlobalInfo) -> u64 {
-    if (ginfo == 0) { return 0; }
-    ginfo.init_kind = GLOBAL_INIT_NONE;
-    ginfo.init_value = 0;
-    ginfo.init_name_ptr = 0;
-    ginfo.init_name_len = 0;
-    return 0;
-}
-
-func compiler_set_global_init_value(ginfo: *GlobalInfo, value: u64) -> u64 {
-    if (ginfo == 0) { return 0; }
-    ginfo.init_kind = GLOBAL_INIT_VALUE;
-    ginfo.init_value = value;
-    ginfo.init_name_ptr = 0;
-    ginfo.init_name_len = 0;
-    return 0;
-}
-
-func compiler_set_global_init_const_name(ginfo: *GlobalInfo, name_ptr: u64, name_len: u64) -> u64 {
-    if (ginfo == 0) { return 0; }
-    ginfo.init_kind = GLOBAL_INIT_CONST;
-    ginfo.init_value = 0;
-    ginfo.init_name_ptr = name_ptr;
-    ginfo.init_name_len = name_len;
-    return 0;
-}
-
-func compiler_set_global_init_expr(ginfo: *GlobalInfo) -> u64 {
-    if (ginfo == 0) { return 0; }
-    ginfo.init_kind = GLOBAL_INIT_EXPR;
-    ginfo.init_value = 0;
-    ginfo.init_name_ptr = 0;
-    ginfo.init_name_len = 0;
-    return 0;
-}
-
-func compiler_set_global_init_runtime(ginfo: *GlobalInfo) -> u64 {
-    if (ginfo == 0) { return 0; }
-    ginfo.init_kind = GLOBAL_INIT_RUNTIME;
-    ginfo.init_value = 0;
-    ginfo.init_name_ptr = 0;
-    ginfo.init_name_len = 0;
-    return 0;
-}
-
-func compiler_finalize_single_global_init_kind(ginfo: *GlobalInfo) -> u64 {
-    if (ginfo == 0 || ginfo.init_expr == 0) {
-        compiler_set_global_init_none(ginfo);
-        return 0;
-    }
-
-    var expr: *AstNode = (*AstNode)ginfo.init_expr;
-    var kind: u64 = ast_kind(expr);
-
-    if (kind == AST_GENERIC_STRUCT_LITERAL) {
-        var lowered: *AstNode = compiler_lower_parse_sugar_generic_struct_literal((*AstGenericStructLiteral)expr);
-        ginfo.init_expr = (u64)lowered;
-        expr = lowered;
-        kind = ast_kind(expr);
-    }
-
-    if (kind == AST_LITERAL) {
-        var lit: *AstLiteral = (*AstLiteral)expr;
-        compiler_set_global_init_value(ginfo, lit.value);
-        return 0;
-    }
-
-    if (kind == AST_IDENT) {
-        var id: *AstIdent = (*AstIdent)expr;
-        var const_res: *ConstResult = (*ConstResult)compiler_find_const(id.name_ptr, id.name_len);
-        if (const_res != 0 && const_res.found != 0) {
-            compiler_set_global_init_value(ginfo, const_res.value);
-        } else {
-            // Non-const identifier global init is resolved via runtime assignment.
-            compiler_set_global_init_runtime(ginfo);
-        }
-        return 0;
-    }
-
-    if (kind == AST_STRUCT_LITERAL) {
-        if (ginfo.typeinfo_ptr == 0 || ginfo.typeinfo_ptr.type_kind != TYPE_STRUCT || ginfo.typeinfo_ptr.ptr_depth != 0) {
-            emit_stderr("[ERROR] Global struct literal requires struct type\n");
-            compiler_error("Compiler error");
-            return 0;
-        }
-        // Keep struct literals on static data path.
-        // Runtime lowering currently cannot materialize full struct assignment for globals.
-        compiler_set_global_init_expr(ginfo);
-        return 0;
-    }
-
-    if (kind == AST_CALL || kind == AST_METHOD_CALL || kind == AST_CALL_PTR || kind == AST_GENERIC_CALL || kind == AST_STATIC_GENERIC_CALL || kind == AST_NEW || kind == AST_STACK_CTOR) {
-        compiler_set_global_init_runtime(ginfo);
-        return 0;
-    }
-
-    // Fallback: initialize in __global_init instead of hard failing at compile-time.
-    compiler_set_global_init_runtime(ginfo);
-    return 0;
-}
-
-func compiler_finalize_global_init_kinds() -> u64 {
-    if (g_compiler_ctx.all_globals == 0) { return 0; }
-    var n: u64 = g_compiler_ctx.all_globals.len();
-    for (var i: u64 = 0; i < n; i++) {
-        compiler_finalize_single_global_init_kind(g_compiler_ctx.all_globals.get(i));
-    }
-    return 0;
-}
 
 func compiler_validate_direct_impl_call_name(name_ptr: u64, name_len: u64, origin: u64, owner_ptr: u64, owner_len: u64) -> u64 {
     if (origin != AST_CALL_ORIGIN_DIRECT) { return 0; }
@@ -7377,33 +7162,6 @@ func compiler_validate_direct_impl_calls_stmt(stmt: *AstNode, owner_ptr: u64, ow
     return compiler_ast_walker_walk_stmt(&walker, stmt);
 }
 
-func compiler_validate_direct_impl_calls() -> u64 {
-    if (g_compiler_ctx.all_funcs != 0) {
-        var fn_count: u64 = g_compiler_ctx.all_funcs.len();
-        for (var i: u64 = 0; i < fn_count; i++) {
-            var fn: *AstFunc = g_compiler_ctx.all_funcs.get(i);
-            if (fn == 0 || fn.body == 0) { continue; }
-            var owner_info: *NameInfo = compiler_get_impl_method_owner(fn.name_ptr, fn.name_len);
-            var owner_ptr: u64 = 0;
-            var owner_len: u64 = 0;
-            if (owner_info != 0) {
-                owner_ptr = owner_info.ptr;
-                owner_len = owner_info.len;
-            }
-            compiler_validate_direct_impl_calls_stmt(fn.body, owner_ptr, owner_len);
-        }
-    }
-
-    if (g_compiler_ctx.all_globals != 0) {
-        var gn: u64 = g_compiler_ctx.all_globals.len();
-        for (var gi: u64 = 0; gi < gn; gi++) {
-            var ginfo: *GlobalInfo = g_compiler_ctx.all_globals.get(gi);
-            if (ginfo == 0 || ginfo.init_expr == 0) { continue; }
-            compiler_validate_direct_impl_calls_expr((*AstNode)ginfo.init_expr, 0, 0);
-        }
-    }
-    return 0;
-}
 
 func compiler_is_super_expr(expr: *AstNode) -> u64 {
     if (expr == 0) { return 0; }
@@ -7657,36 +7415,6 @@ func compiler_lower_super_stmt(stmt: *AstNode, owner_ptr: u64, owner_len: u64, s
     return compiler_ast_walker_walk_stmt(&walker, stmt);
 }
 
-func compiler_resolve_super_references() -> u64 {
-    if (g_compiler_ctx.all_funcs != 0) {
-        var fn_count: u64 = g_compiler_ctx.all_funcs.len();
-        for (var i: u64 = 0; i < fn_count; i++) {
-            var fn: *AstFunc = g_compiler_ctx.all_funcs.get(i);
-            if (fn == 0 || fn.body == 0) { continue; }
-            var super_allowed: u64 = 0;
-            if (compiler_method_param_start_index(fn) != 0) { super_allowed = 1; }
-            var owner_info: *NameInfo = compiler_get_impl_method_owner(fn.name_ptr, fn.name_len);
-            var owner_ptr: u64 = 0;
-            var owner_len: u64 = 0;
-            if (owner_info != 0) {
-                owner_ptr = owner_info.ptr;
-                owner_len = owner_info.len;
-            }
-            compiler_lower_super_stmt(fn.body, owner_ptr, owner_len, super_allowed);
-        }
-    }
-
-    if (g_compiler_ctx.all_globals != 0) {
-        var gn: u64 = g_compiler_ctx.all_globals.len();
-        for (var gi: u64 = 0; gi < gn; gi++) {
-            var ginfo: *GlobalInfo = g_compiler_ctx.all_globals.get(gi);
-            if (ginfo == 0 || ginfo.init_expr == 0) { continue; }
-            ginfo.init_expr = (u64)compiler_lower_super_expr((*AstNode)ginfo.init_expr, 0, 0, 0);
-        }
-    }
-    return 0;
-}
-
 func compiler_is_generic_template(fn: *AstFunc) -> u64 {
     if (fn == 0) { return false; }
     if (compiler_is_generic_func_ptr(fn) != 0) { return true; }
@@ -7705,33 +7433,6 @@ func compiler_is_generic_template(fn: *AstFunc) -> u64 {
     return false;
 }
 
-func compiler_monomorphize_generics_funcs() -> u64 {
-    if (g_compiler_ctx.all_funcs == 0) { return 0; }
-    for (var i: u64 = 0; i < g_compiler_ctx.all_funcs.len(); i++) {
-        var fn: *AstFunc = g_compiler_ctx.all_funcs.get(i);
-        if (compiler_is_generic_template(fn) != 0) { continue; }
-        set_current_module_for_func(fn.name_ptr, fn.name_len);
-        var symtab: *HashMap<u64, *TypeInfo> = generic_build_symtab_for_func(fn);
-        generic_process_stmt(fn.body, symtab);
-    }
-    return 0;
-}
-
-func compiler_monomorphize_generics_globals() -> u64 {
-    if (g_compiler_ctx.all_globals == 0) { return 0; }
-    var gn: u64 = g_compiler_ctx.all_globals.len();
-    for (var gi: u64 = 0; gi < gn; gi++) {
-        var ginfo: *GlobalInfo = g_compiler_ctx.all_globals.get(gi);
-        if (ginfo == 0 || ginfo.init_expr == 0) { continue; }
-        set_current_module_for_global(ginfo.name_ptr, ginfo.name_len);
-        var gsymtab: *HashMap<u64, *TypeInfo> = new HashMap<u64, *TypeInfo>(64);
-        var init_node: *AstNode = (*AstNode)ginfo.init_expr;
-        var new_init: *AstNode = generic_process_expr(init_node, gsymtab);
-        ginfo.init_expr = (u64)new_init;
-    }
-    return 0;
-}
-
 func compiler_filter_out_generic_template_funcs() -> u64 {
     if (g_compiler_ctx.all_funcs == 0) { return 0; }
     var filtered_funcs: *Vec<*AstFunc> = new Vec<*AstFunc>(g_compiler_ctx.all_funcs.len());
@@ -7742,16 +7443,6 @@ func compiler_filter_out_generic_template_funcs() -> u64 {
         filtered_funcs.push(fn2);
     }
     g_compiler_ctx.all_funcs = filtered_funcs;
-    return 0;
-}
-
-func compiler_monomorphize_generics() -> u64 {
-    if (g_compiler_ctx.generic_func_ptrs == 0 || g_compiler_ctx.generic_func_ptrs.len() == 0) {
-        return 0;
-    }
-    compiler_monomorphize_generics_funcs();
-    compiler_monomorphize_generics_globals();
-    compiler_filter_out_generic_template_funcs();
     return 0;
 }
 
@@ -8713,19 +8404,6 @@ func compiler_finalize_single_trait_impl(impl_info: *TraitImpl) -> u64 {
     return 0;
 }
 
-func compiler_finalize_traits() -> u64 {
-    compiler_validate_all_struct_trait_inheritance();
-    if (compiler_diag_should_stop_pass() != 0) { return 0; }
-    if (g_compiler_ctx.all_trait_impls_vec == 0 || g_compiler_ctx.all_trait_impls_vec.len() == 0) { return 0; }
-
-    var num_impls: u64 = g_compiler_ctx.all_trait_impls_vec.len();
-    for (var ii: u64 = 0; ii < num_impls; ii++) {
-        if (compiler_diag_should_stop_pass() != 0) { break; }
-        var impl_info: *TraitImpl = g_compiler_ctx.all_trait_impls_vec.get(ii);
-        compiler_finalize_single_trait_impl(impl_info);
-    }
-    return 0;
-}
 
 func compiler_collect_parent_abst_methods(parent_def: *AstStructDef, out: *Vec<*NameInfo>) -> u64 {
     if (parent_def == 0 || out == 0) { return 0; }
@@ -9081,15 +8759,6 @@ func compiler_validate_single_impl_override(fn: *AstFunc) -> u64 {
     return 0;
 }
 
-func compiler_validate_impl_overrides() -> u64 {
-    if (g_compiler_ctx.all_func_sigs == 0) { return 0; }
-    var n: u64 = g_compiler_ctx.all_func_sigs.len();
-    for (var i: u64 = 0; i < n; i++) {
-        if (compiler_diag_should_stop_pass() != 0) { break; }
-        compiler_validate_single_impl_override(g_compiler_ctx.all_func_sigs.get(i));
-    }
-    return 0;
-}
 
 const COMPILER_ANN_ARG_INVALID = 0;
 const COMPILER_ANN_ARG_IDENT = 1;
@@ -9811,192 +9480,6 @@ func compiler_annotation_rename_first_signature(old_ptr: u64, old_len: u64, new_
     return 0;
 }
 
-func compiler_apply_annotations() -> u64 {
-    if (g_compiler_ctx.all_funcs == 0) { return 0; }
-
-    var original_count: u64 = g_compiler_ctx.all_funcs.len();
-    var generated_id: u64 = 0;
-    var entry_ptr: u64 = 0;
-    var entry_len: u64 = 0;
-
-    for (var i: u64 = 0; i < original_count; i++) {
-        if (compiler_diag_should_stop_pass() != 0) { break; }
-        var fn: *AstFunc = g_compiler_ctx.all_funcs.get(i);
-        if (fn == 0) { continue; }
-        if (compiler_annotation_validate_function_annotations(fn) == 0) {
-            continue;
-        }
-
-        var entry_count: u64 = compiler_annotation_count_name(fn.annotations_vec, "entry", 5);
-        if (entry_count > 0) {
-            if (fn.impl_owner_ptr != 0 && fn.impl_owner_len != 0) {
-                emit_stderr("[ERROR] @[entry] is only allowed on top-level functions\n");
-                compiler_diag_note_error();
-                continue;
-            }
-            var entry_param_n: u64 = 0;
-            if (fn.params_vec != 0) { entry_param_n = fn.params_vec.len(); }
-            if (entry_param_n != 0) {
-                emit_stderr("[ERROR] @[entry] function must not declare parameters: ");
-                emit_stderr_len(fn.name_ptr, fn.name_len);
-                emit_stderr("\n");
-                compiler_diag_note_error();
-                continue;
-            }
-            if (entry_count > 1) {
-                emit_stderr("[ERROR] duplicate @[entry] annotation on function: ");
-                emit_stderr_len(fn.name_ptr, fn.name_len);
-                emit_stderr("\n");
-                compiler_diag_note_error();
-                continue;
-            }
-            if (entry_ptr != 0 && str_eq(entry_ptr, entry_len, fn.name_ptr, fn.name_len) == 0) {
-                emit_stderr("[ERROR] multiple @[entry] functions are not allowed: ");
-                emit_stderr_len(entry_ptr, entry_len);
-                emit_stderr(" and ");
-                emit_stderr_len(fn.name_ptr, fn.name_len);
-                emit_stderr("\n");
-                compiler_diag_note_error();
-                continue;
-            }
-            entry_ptr = fn.name_ptr;
-            entry_len = fn.name_len;
-        }
-
-        var decorators: *Vec<*NameInfo> = compiler_annotation_collect_decorators(fn);
-        if (decorators == 0 || decorators.len() == 0) { continue; }
-
-        var is_impl_method: u64 = 0;
-        if (fn.impl_owner_ptr != 0 && fn.impl_owner_len != 0) {
-            is_impl_method = 1;
-        }
-        if (fn.body == 0) {
-            emit_stderr("[ERROR] function decorator requires a function body: ");
-            emit_stderr_len(fn.name_ptr, fn.name_len);
-            emit_stderr("\n");
-            compiler_diag_note_error();
-            continue;
-        }
-        if (compiler_is_generic_template(fn) != 0) {
-            // Generic templates are expanded later into concrete instances.
-            // Decorators are applied to concrete instantiations only.
-            continue;
-        }
-
-        var decorators_valid: u64 = 1;
-        var deco_n0: u64 = decorators.len();
-        for (var di0: u64 = 0; di0 < deco_n0; di0++) {
-            var deco0: *NameInfo = decorators.get(di0);
-            var sig0: *AstFunc = compiler_find_func_signature_for_call(deco0.ptr, deco0.len);
-            if (sig0 == 0) {
-                emit_stderr("[ERROR] unresolved decorator function: ");
-                emit_stderr_len(deco0.ptr, deco0.len);
-                emit_stderr("\n");
-                compiler_diag_note_error();
-                decorators_valid = 0;
-                continue;
-            }
-            if (compiler_annotation_validate_decorator_signature(sig0, fn, deco0.ptr, deco0.len) == 0) {
-                decorators_valid = 0;
-            }
-        }
-        if (decorators_valid == 0) { continue; }
-
-        var public_name_ptr: u64 = fn.name_ptr;
-        var public_name_len: u64 = fn.name_len;
-        var method_owner_ptr: u64 = 0;
-        var method_owner_len: u64 = 0;
-        var method_access: u64 = ACCESS_PUBLIC;
-        var method_original_name_ptr: u64 = 0;
-        var method_original_name_len: u64 = 0;
-        var method_is_override: u64 = 0;
-        if (is_impl_method != 0) {
-            method_owner_ptr = fn.impl_owner_ptr;
-            method_owner_len = fn.impl_owner_len;
-            method_access = fn.impl_method_access;
-            method_original_name_ptr = fn.impl_original_name_ptr;
-            method_original_name_len = fn.impl_original_name_len;
-            if (method_original_name_ptr == 0 || method_original_name_len == 0) {
-                method_original_name_ptr = public_name_ptr;
-                method_original_name_len = public_name_len;
-            }
-            method_is_override = fn.impl_is_override;
-        }
-
-        generated_id = generated_id + 1;
-        var hidden_name: *NameInfo = compiler_annotation_build_generated_name("__ann_orig__", 11, public_name_ptr, public_name_len, generated_id);
-        fn.name_ptr = hidden_name.ptr;
-        fn.name_len = hidden_name.len;
-        fn.annotations_vec = 0;
-
-        if (compiler_annotation_rename_first_signature(public_name_ptr, public_name_len, hidden_name.ptr, hidden_name.len) == 0) {
-            if (g_compiler_ctx.all_func_sigs != 0) {
-                g_compiler_ctx.all_func_sigs.push(compiler_annotation_clone_sig(fn, hidden_name.ptr, hidden_name.len));
-            }
-        }
-        if (is_impl_method != 0) {
-            // Remove original method from impl lookup before installing the decorated wrapper.
-            compiler_annotation_clear_impl_metadata(fn);
-        }
-        var callee_ptr: u64 = hidden_name.ptr;
-        var callee_len: u64 = hidden_name.len;
-        var deco_n: u64 = decorators.len();
-        for (var rev: u64 = 0; rev < deco_n; rev++) {
-            var di: u64 = deco_n - rev - 1;
-            var deco: *NameInfo = decorators.get(di);
-            var deco_sig: *AstFunc = compiler_find_func_signature_for_call(deco.ptr, deco.len);
-            if (deco_sig == 0) {
-                emit_stderr("[ERROR] unresolved decorator function: ");
-                emit_stderr_len(deco.ptr, deco.len);
-                emit_stderr("\n");
-                compiler_diag_note_error();
-                break;
-            }
-            if (compiler_annotation_validate_decorator_signature(deco_sig, fn, deco.ptr, deco.len) == 0) {
-                break;
-            }
-
-            var wrapper_name_ptr: u64 = 0;
-            var wrapper_name_len: u64 = 0;
-            if (di == 0) {
-                wrapper_name_ptr = public_name_ptr;
-                wrapper_name_len = public_name_len;
-            } else {
-                generated_id = generated_id + 1;
-                var wrap_name: *NameInfo = compiler_annotation_build_generated_name("__ann_wrap__", 11, public_name_ptr, public_name_len, generated_id);
-                wrapper_name_ptr = wrap_name.ptr;
-                wrapper_name_len = wrap_name.len;
-            }
-
-            var keep_impl_metadata: u64 = 0;
-            if (is_impl_method != 0 && di == 0) { keep_impl_metadata = 1; }
-            var wrapper_fn: *AstFunc = compiler_annotation_build_wrapper_func(fn, wrapper_name_ptr, wrapper_name_len, deco.ptr, deco.len, callee_ptr, callee_len, 0);
-            if (keep_impl_metadata != 0) {
-                compiler_annotation_set_impl_metadata(wrapper_fn,
-                    method_owner_ptr, method_owner_len, method_access,
-                    method_original_name_ptr, method_original_name_len, method_is_override);
-            }
-            g_compiler_ctx.all_funcs.push(wrapper_fn);
-            if (keep_impl_metadata != 0) {
-                compiler_register_impl_method_ex(wrapper_fn.name_ptr, wrapper_fn.name_len, method_owner_ptr, method_owner_len, method_access);
-                if (g_compiler_ctx.impl_method_funcs == 0) {
-                    g_compiler_ctx.impl_method_funcs = new HashMap<u64, *AstFunc>(64);
-                }
-                g_compiler_ctx.impl_method_funcs.put(wrapper_fn.name_ptr, wrapper_fn.name_len, wrapper_fn);
-            }
-            if (g_compiler_ctx.all_func_sigs != 0) {
-                g_compiler_ctx.all_func_sigs.push(compiler_annotation_clone_sig(wrapper_fn, wrapper_name_ptr, wrapper_name_len));
-            }
-            callee_ptr = wrapper_name_ptr;
-            callee_len = wrapper_name_len;
-        }
-    }
-
-    g_compiler_ctx.entry_func_ptr = entry_ptr;
-    g_compiler_ctx.entry_func_len = entry_len;
-    compiler_invalidate_func_lookup();
-    return 0;
-}
 
 func compiler_validate_child_implements_abst_method(sd: *AstStructDef, mi: *NameInfo) -> u64 {
     if (compiler_is_abst_method(sd.name_ptr, sd.name_len, mi.ptr, mi.len) != 0) {
@@ -10015,25 +9498,6 @@ func compiler_validate_child_implements_abst_method(sd: *AstStructDef, mi: *Name
     return 0;
 }
 
-func compiler_finalize_abst_methods() -> u64 {
-    if (g_compiler_ctx.all_structs_vec == 0) { return 0; }
-    var sn: u64 = g_compiler_ctx.all_structs_vec.len();
-    for (var si: u64 = 0; si < sn; si++) {
-        if (compiler_diag_should_stop_pass() != 0) { break; }
-        var sd: *AstStructDef = g_compiler_ctx.all_structs_vec.get(si);
-        if (sd == 0 || sd.parents_vec == 0) { continue; }
-        var required: *Vec<*NameInfo> = new Vec<*NameInfo>(8);
-        compiler_collect_abst_methods_recursive(sd, required);
-        var rn: u64 = required.len();
-        for (var ri: u64 = 0; ri < rn; ri++) {
-            if (compiler_diag_should_stop_pass() != 0) { break; }
-            var mi: *NameInfo = required.get(ri);
-            compiler_validate_child_implements_abst_method(sd, mi);
-        }
-    }
-    compiler_setup_virtual_dispatch_traits();
-    return 0;
-}
 
 func compiler_insert_default_constructor(struct_name_ptr: u64, struct_name_len: u64) -> u64 {
     if (g_compiler_ctx.all_funcs == 0 || g_compiler_ctx.all_func_sigs == 0) { return 0; }
