@@ -32,6 +32,7 @@ var g_floats: *Vec<*FloatEntry>;               // Float literals table
 var g_loop_labels: *Vec<u64>;                  // Stack of loop end labels for break
 var g_loop_continue_labels: *Vec<u64>;         // Stack of loop continue labels
 var g_globals: *Vec<*GlobalInfo>;              // Global variables list
+var g_backend_globals: *Vec<*GlobalInfo>;      // Backend-owned internal globals
 var g_globals_map: *HashMap<u64, *GlobalInfo>; // Global lookup cache: name -> global info
 var g_defer_stack: *Vec<*AstNode>;              // Stack of deferred statements
 var g_defer_markers: *Vec<u64>;                 // Block scope markers for defer
@@ -52,9 +53,24 @@ func emitter_get_symtab() -> *Symtab { return g_symtab; }
 func emitter_set_symtab(s: *Symtab) -> u64 { g_symtab = s; }
 
 func emitter_get_globals() -> *Vec<*GlobalInfo> { return g_globals; }
+func emitter_get_backend_globals() -> *Vec<*GlobalInfo> { return g_backend_globals; }
 func emitter_set_globals(g: *Vec<*GlobalInfo>) -> u64 {
     g_globals = g;
+    g_backend_globals = new Vec<*GlobalInfo>(8);
     emitter_rebuild_globals_map();
+    return 0;
+}
+
+func emitter_add_backend_global(ginfo: *GlobalInfo) -> u64 {
+    if (ginfo == 0) { return 0; }
+    if (g_backend_globals == 0) {
+        g_backend_globals = new Vec<*GlobalInfo>(8);
+    }
+    if (is_global_var(ginfo.name_ptr, ginfo.name_len) != 0) { return 0; }
+    g_backend_globals.push(ginfo);
+    if (g_globals_map != 0) {
+        g_globals_map.put(ginfo.name_ptr, ginfo.name_len, ginfo);
+    }
     return 0;
 }
 
@@ -159,6 +175,7 @@ func emitter_init() -> u64 {
     g_consts = new Vec<*ConstInfo>(64);
     g_consts_map = new HashMap<u64, *ConstInfo>(128);
     g_globals_map = new HashMap<u64, *GlobalInfo>(128);
+    g_backend_globals = new Vec<*GlobalInfo>(8);
     g_defer_stack = new Vec<*AstNode>(32);
     g_defer_markers = new Vec<u64>(32);
     g_defer_loop_markers = new Vec<u64>(16);
@@ -167,18 +184,29 @@ func emitter_init() -> u64 {
 
 func emitter_rebuild_globals_map() -> u64 {
     var cap: u64 = 16;
-    if (g_globals != 0 && g_globals.len() > 0) {
-        cap = g_globals.len() * 2;
+    var user_count: u64 = 0;
+    var backend_count: u64 = 0;
+    if (g_globals != 0) { user_count = g_globals.len(); }
+    if (g_backend_globals != 0) { backend_count = g_backend_globals.len(); }
+    var total: u64 = user_count + backend_count;
+    if (total > 0) {
+        cap = total * 2;
         if (cap < 16) { cap = 16; }
     }
     g_globals_map = new HashMap<u64, *GlobalInfo>(cap);
-    if (g_globals == 0) { return 0; }
-
-    var len: u64 = g_globals.len();
-    for (var i: u64 = 0; i < len; i++) {
-        var ginfo: *GlobalInfo = g_globals.get(i);
-        if (ginfo == 0) { continue; }
-        g_globals_map.put(ginfo.name_ptr, ginfo.name_len, ginfo);
+    if (g_globals != 0) {
+        for (var i: u64 = 0; i < user_count; i++) {
+            var ginfo: *GlobalInfo = g_globals.get(i);
+            if (ginfo == 0) { continue; }
+            g_globals_map.put(ginfo.name_ptr, ginfo.name_len, ginfo);
+        }
+    }
+    if (g_backend_globals != 0) {
+        for (var j: u64 = 0; j < backend_count; j++) {
+            var bg: *GlobalInfo = g_backend_globals.get(j);
+            if (bg == 0) { continue; }
+            g_globals_map.put(bg.name_ptr, bg.name_len, bg);
+        }
     }
     return 0;
 }
@@ -207,6 +235,7 @@ func emitter_set_globals_from_prog(globals: *Vec<*GlobalInfo>) -> u64 {
     } else {
         g_globals = globals;
     }
+    g_backend_globals = new Vec<*GlobalInfo>(8);
     emitter_rebuild_globals_map();
     return 0;
 }
@@ -1122,12 +1151,12 @@ func _global_emit_struct_literal(ginfo: *GlobalInfo, lit: *AstStructLiteral) -> 
 }
 
 func globals_emit_data() -> u64 {
-    var count: u64 = g_globals.len();
-    if (count == 0) { return; }
-
     var emitted: u64 = 0;
-    for (var i: u64 = 0; i < count; i++) {
+    var count_user: u64 = 0;
+    if (g_globals != 0) { count_user = g_globals.len(); }
+    for (var i: u64 = 0; i < count_user; i++) {
         var ginfo: *GlobalInfo = g_globals.get(i);
+        if (ginfo == 0) { continue; }
         if (ginfo.init_kind == GLOBAL_INIT_NONE || ginfo.init_kind == GLOBAL_INIT_RUNTIME) { continue; }
 
         set_current_module_for_global(ginfo.name_ptr, ginfo.name_len);
@@ -1176,17 +1205,44 @@ func globals_emit_data() -> u64 {
         emit_nl();
         _global_emit_scalar_value(size, value);
     }
+
+    var count_backend: u64 = 0;
+    if (g_backend_globals != 0) { count_backend = g_backend_globals.len(); }
+    for (var bi: u64 = 0; bi < count_backend; bi++) {
+        var bginfo: *GlobalInfo = g_backend_globals.get(bi);
+        if (bginfo == 0) { continue; }
+        if (bginfo.init_kind == GLOBAL_INIT_NONE || bginfo.init_kind == GLOBAL_INIT_RUNTIME) { continue; }
+
+        if (emitted == 0) {
+            emitln("\nsection .data");
+            emitted = 1;
+        }
+
+        var bsize: u64 = 8;
+        if (bginfo.typeinfo_ptr != 0) {
+            bsize = sizeof_type_ex(bginfo.typeinfo_ptr);
+        }
+        if (bsize == 0) { bsize = 8; }
+        emit("_gvar_");
+        emit_len(bginfo.name_ptr, bginfo.name_len);
+        emit(":");
+        emit_nl();
+        _global_emit_scalar_value(bsize, bginfo.init_value);
+    }
 }
 
 func globals_emit_bss() -> u64 {
-    var count: u64 = g_globals.len();
-    
-    if (count == 0) { return; }
+    var count_user: u64 = 0;
+    var count_backend: u64 = 0;
+    if (g_globals != 0) { count_user = g_globals.len(); }
+    if (g_backend_globals != 0) { count_backend = g_backend_globals.len(); }
+    if (count_user == 0 && count_backend == 0) { return; }
     
     emitln("\nsection .bss");
     
-    for (var i: u64 = 0; i < count; i++) {
+    for (var i: u64 = 0; i < count_user; i++) {
         var ginfo: *GlobalInfo = g_globals.get(i);
+        if (ginfo == 0) { continue; }
         if (ginfo.init_kind != GLOBAL_INIT_NONE && ginfo.init_kind != GLOBAL_INIT_RUNTIME) { continue; }
         var size: u64 = 8;
         if (ginfo.typeinfo_ptr != 0) {
@@ -1199,6 +1255,21 @@ func globals_emit_bss() -> u64 {
         emit(": resb ");
         emit_u64(size);
         emit_nl();
-        
+    }
+
+    for (var bi: u64 = 0; bi < count_backend; bi++) {
+        var bginfo: *GlobalInfo = g_backend_globals.get(bi);
+        if (bginfo == 0) { continue; }
+        if (bginfo.init_kind != GLOBAL_INIT_NONE && bginfo.init_kind != GLOBAL_INIT_RUNTIME) { continue; }
+        var bsize: u64 = 8;
+        if (bginfo.typeinfo_ptr != 0) {
+            bsize = sizeof_type_ex(bginfo.typeinfo_ptr);
+        }
+        if (bsize == 0) { bsize = 8; }
+        emit("_gvar_");
+        emit_len(bginfo.name_ptr, bginfo.name_len);
+        emit(": resb ");
+        emit_u64(bsize);
+        emit_nl();
     }
 }
