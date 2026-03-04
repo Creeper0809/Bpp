@@ -1,0 +1,300 @@
+// compiler_generic_pass.b - Generic AST processing pass helpers
+
+import compiler;
+import compiler.generic_core;
+import std.hashmap;
+import std.vec;
+import ast;
+import types;
+
+const GENERIC_AST_VISIT_PROCESS = 1;
+
+struct GenericAstVisitor {
+    public mode: u64;
+    public symtab: *HashMap<u64, *TypeInfo>;
+}
+
+func generic_ast_visitor_new_process(symtab: *HashMap<u64, *TypeInfo>) -> GenericAstVisitor {
+    var visitor: GenericAstVisitor;
+    visitor.mode = GENERIC_AST_VISIT_PROCESS;
+    visitor.symtab = symtab;
+    return visitor;
+}
+
+func generic_ast_visitor_walk_args(visitor: *GenericAstVisitor, args_in: *Vec<*AstNode>) -> *Vec<*AstNode> {
+    if (args_in == 0) { return 0; }
+    var args_out: *Vec<*AstNode> = new Vec<*AstNode>(4);
+    var n: u64 = args_in.len();
+    for (var i: u64 = 0; i < n; i++) {
+        args_out.push(generic_ast_visitor_walk_expr(visitor, args_in.get(i)));
+    }
+    return args_out;
+}
+
+func generic_try_instantiate_ctor_template(type_kind: u64, struct_name_ptr: u64, struct_name_len: u64, ctor_args_vec: *Vec<*AstNode>) -> u64 {
+    if (ctor_args_vec == 0) { return 0; }
+    if (type_kind != TYPE_STRUCT) { return 0; }
+
+    var struct_base_len: u64 = compiler_find_generic_suffix_index(struct_name_ptr, struct_name_len);
+    var ctor_name: *NameInfo = _compiler_build_constructor_name(struct_name_ptr, struct_base_len);
+    var tpl_ptr: *GenericFuncTemplate = compiler_find_generic_template_by_name(ctor_name.ptr, ctor_name.len);
+    if (tpl_ptr == 0 || tpl_ptr.params_vec == 0 || tpl_ptr.params_vec.len() == 0) { return 0; }
+
+    var ctor_bindings: *Vec<*GenericBinding> = compiler_get_generic_struct_bindings(struct_name_ptr, struct_name_len);
+    if (ctor_bindings != 0) {
+        generic_get_or_create_instance(tpl_ptr, ctor_bindings);
+    }
+    return 0;
+}
+
+func generic_process_generic_call_expr_visitor(gc: *AstGenericCall, visitor: *GenericAstVisitor) -> *AstNode {
+    var tpl_ptr: *GenericFuncTemplate = generic_resolve_template(gc.name_ptr, gc.name_len);
+    if (tpl_ptr == 0) {
+        emit_stderr("[ERROR] Generic function not found\n");
+        compiler_error("Compilation failed");
+        var args_fallback0: *Vec<*AstNode> = generic_ast_visitor_walk_args(visitor, gc.args_vec);
+        return ast_call_with_origin(gc.name_ptr, gc.name_len, args_fallback0, gc.origin);
+    }
+    var bindings: *Vec<*GenericBinding> = generic_build_bindings_for_explicit(tpl_ptr, gc.generic_args_vec);
+    if (bindings == 0) {
+        var args_fallback1: *Vec<*AstNode> = generic_ast_visitor_walk_args(visitor, gc.args_vec);
+        return ast_call_with_origin(gc.name_ptr, gc.name_len, args_fallback1, gc.origin);
+    }
+    var name_info: *NameInfo = generic_get_or_create_instance(tpl_ptr, bindings);
+    if (name_info == 0) {
+        var args_fallback2: *Vec<*AstNode> = generic_ast_visitor_walk_args(visitor, gc.args_vec);
+        return ast_call_with_origin(gc.name_ptr, gc.name_len, args_fallback2, gc.origin);
+    }
+    var args_new: *Vec<*AstNode> = generic_ast_visitor_walk_args(visitor, gc.args_vec);
+    return ast_call_with_origin(name_info.ptr, name_info.len, args_new, gc.origin);
+}
+
+func generic_process_call_expr_visitor(call: *AstCall, visitor: *GenericAstVisitor) -> *AstNode {
+    var tpl_ptr: *GenericFuncTemplate = generic_resolve_template(call.name_ptr, call.name_len);
+    if (tpl_ptr == 0) {
+        var args_new2: *Vec<*AstNode> = generic_ast_visitor_walk_args(visitor, call.args_vec);
+        return ast_call_with_origin(call.name_ptr, call.name_len, args_new2, call.origin);
+    }
+    var bindings2: *Vec<*GenericBinding> = generic_build_bindings_by_infer(tpl_ptr, call.args_vec, visitor.symtab);
+    if (bindings2 == 0) {
+        var args_fallback: *Vec<*AstNode> = generic_ast_visitor_walk_args(visitor, call.args_vec);
+        return ast_call_with_origin(call.name_ptr, call.name_len, args_fallback, call.origin);
+    }
+    var name_info2: *NameInfo = generic_get_or_create_instance(tpl_ptr, bindings2);
+    if (name_info2 == 0) {
+        var args_fallback3: *Vec<*AstNode> = generic_ast_visitor_walk_args(visitor, call.args_vec);
+        return ast_call_with_origin(call.name_ptr, call.name_len, args_fallback3, call.origin);
+    }
+    var args_new3: *Vec<*AstNode> = generic_ast_visitor_walk_args(visitor, call.args_vec);
+    return ast_call_with_origin(name_info2.ptr, name_info2.len, args_new3, call.origin);
+}
+
+func generic_process_method_call_expr_visitor(mc: *AstMethodCall, visitor: *GenericAstVisitor) -> u64 {
+    mc.receiver = generic_ast_visitor_walk_expr(visitor, mc.receiver);
+    var args: *Vec<*AstNode> = generic_ast_visitor_walk_args(visitor, mc.args_vec);
+    if (args == 0) {
+        args = new Vec<*AstNode>(0);
+    }
+    mc.args_vec = args;
+    var recv_ti: *TypeInfo = generic_infer_expr_type(mc.receiver, visitor.symtab);
+    generic_try_instantiate_method_template(mc, args, recv_ti, visitor.symtab);
+    return 0;
+}
+
+func generic_process_new_expr_visitor(nw: *AstNew, visitor: *GenericAstVisitor) -> *AstNode {
+    if (nw.literal_expr != 0) {
+        nw.literal_expr = generic_ast_visitor_walk_expr(visitor, nw.literal_expr);
+    }
+    nw.ctor_args_vec = generic_ast_visitor_walk_args(visitor, nw.ctor_args_vec);
+    generic_try_instantiate_ctor_template(nw.type_kind, nw.struct_name_ptr, nw.struct_name_len, nw.ctor_args_vec);
+    return (*AstNode)nw;
+}
+
+func generic_process_stack_ctor_expr_visitor(sc2: *AstStackCtor, visitor: *GenericAstVisitor) -> *AstNode {
+    sc2.ctor_args_vec = generic_ast_visitor_walk_args(visitor, sc2.ctor_args_vec);
+    generic_try_instantiate_ctor_template(sc2.type_kind, sc2.struct_name_ptr, sc2.struct_name_len, sc2.ctor_args_vec);
+    return (*AstNode)sc2;
+}
+
+func generic_process_call_ptr_expr_visitor(cp: *AstCallPtr, visitor: *GenericAstVisitor) -> *AstNode {
+    cp.callee = generic_ast_visitor_walk_expr(visitor, cp.callee);
+    cp.args_vec = generic_ast_visitor_walk_args(visitor, cp.args_vec);
+    return (*AstNode)cp;
+}
+
+func generic_process_index_expr_visitor(ix: *AstIndex, visitor: *GenericAstVisitor) -> *AstNode {
+    ix.base = generic_ast_visitor_walk_expr(visitor, ix.base);
+    ix.index = generic_ast_visitor_walk_expr(visitor, ix.index);
+    return (*AstNode)ix;
+}
+
+func generic_process_slice_expr_visitor(sl: *AstSlice, visitor: *GenericAstVisitor) -> *AstNode {
+    sl.ptr_expr = generic_ast_visitor_walk_expr(visitor, sl.ptr_expr);
+    sl.len_expr = generic_ast_visitor_walk_expr(visitor, sl.len_expr);
+    return (*AstNode)sl;
+}
+
+func generic_ast_visitor_walk_expr(visitor: *GenericAstVisitor, expr: *AstNode) -> *AstNode {
+    if (expr == 0) { return 0; }
+    var kind: u64 = ast_kind(expr);
+    switch (kind) {
+        case AST_GENERIC_CALL:
+            return generic_process_generic_call_expr_visitor((*AstGenericCall)expr, visitor);
+        case AST_STATIC_GENERIC_CALL:
+            var sgc: *AstStaticGenericCall = (*AstStaticGenericCall)expr;
+            sgc.args_vec = generic_ast_visitor_walk_args(visitor, sgc.args_vec);
+            return generic_ast_visitor_walk_expr(visitor, compiler_lower_parse_sugar_static_generic_method_call(sgc));
+        case AST_GENERIC_STRUCT_LITERAL:
+            var gsl: *AstGenericStructLiteral = (*AstGenericStructLiteral)expr;
+            gsl.values_vec = generic_ast_visitor_walk_args(visitor, gsl.values_vec);
+            return compiler_lower_parse_sugar_generic_struct_literal(gsl);
+        case AST_CALL:
+            return generic_process_call_expr_visitor((*AstCall)expr, visitor);
+        case AST_BINARY:
+            var bin: *AstBinary = (*AstBinary)expr;
+            bin.left = generic_ast_visitor_walk_expr(visitor, bin.left);
+            bin.right = generic_ast_visitor_walk_expr(visitor, bin.right);
+            return expr;
+        case AST_UNARY:
+            var un: *AstUnary = (*AstUnary)expr;
+            un.operand = generic_ast_visitor_walk_expr(visitor, un.operand);
+            return expr;
+        case AST_ADDR_OF:
+            var ao: *AstAddrOf = (*AstAddrOf)expr;
+            ao.operand = generic_ast_visitor_walk_expr(visitor, ao.operand);
+            return expr;
+        case AST_DEREF:
+            var dr: *AstDeref = (*AstDeref)expr;
+            dr.operand = generic_ast_visitor_walk_expr(visitor, dr.operand);
+            return expr;
+        case AST_DEREF8:
+            var dr8: *AstDeref8 = (*AstDeref8)expr;
+            dr8.operand = generic_ast_visitor_walk_expr(visitor, dr8.operand);
+            return expr;
+        case AST_CAST:
+            var cs: *AstCast = (*AstCast)expr;
+            cs.expr = generic_ast_visitor_walk_expr(visitor, cs.expr);
+            return expr;
+        case AST_MEMBER_ACCESS:
+            var ma: *AstMemberAccess = (*AstMemberAccess)expr;
+            ma.object = generic_ast_visitor_walk_expr(visitor, ma.object);
+            return expr;
+        case AST_SAFE_MEMBER_ACCESS:
+            var sma: *AstMemberAccess = (*AstMemberAccess)expr;
+            sma.object = generic_ast_visitor_walk_expr(visitor, sma.object);
+            return expr;
+        case AST_TRY:
+            var tr2: *AstTry = (*AstTry)expr;
+            tr2.operand = generic_ast_visitor_walk_expr(visitor, tr2.operand);
+            return expr;
+        case AST_FLOAT:
+            return expr;
+        case AST_SUPER:
+            return expr;
+        case AST_METHOD_CALL:
+            generic_process_method_call_expr_visitor((*AstMethodCall)expr, visitor);
+            return expr;
+        case AST_SAFE_METHOD_CALL:
+            generic_process_method_call_expr_visitor((*AstMethodCall)expr, visitor);
+            return expr;
+        case AST_NEW:
+            return generic_process_new_expr_visitor((*AstNew)expr, visitor);
+        case AST_STACK_CTOR:
+            return generic_process_stack_ctor_expr_visitor((*AstStackCtor)expr, visitor);
+        case AST_INDEX:
+        case AST_SAFE_INDEX:
+            return generic_process_index_expr_visitor((*AstIndex)expr, visitor);
+        case AST_SLICE:
+            return generic_process_slice_expr_visitor((*AstSlice)expr, visitor);
+        case AST_CALL_PTR:
+            return generic_process_call_ptr_expr_visitor((*AstCallPtr)expr, visitor);
+        case AST_SIZEOF_EXPR:
+            var se: *AstSizeofExpr = (*AstSizeofExpr)expr;
+            se.expr = generic_ast_visitor_walk_expr(visitor, se.expr);
+            return expr;
+        default:
+            return expr;
+    }
+}
+
+func generic_ast_visitor_walk_stmt_block(visitor: *GenericAstVisitor, stmts: *Vec<*AstNode>) -> u64 {
+    if (stmts == 0) { return 0; }
+    var n: u64 = stmts.len();
+    for (var i: u64 = 0; i < n; i++) {
+        generic_ast_visitor_walk_stmt(visitor, stmts.get(i));
+    }
+    return 0;
+}
+
+func generic_ast_visitor_walk_stmt(visitor: *GenericAstVisitor, stmt: *AstNode) -> u64 {
+    if (stmt == 0) { return 0; }
+    var kind: u64 = ast_kind(stmt);
+    switch (kind) {
+        case AST_RETURN:
+            var r: *AstReturn = (*AstReturn)stmt;
+            r.expr = generic_ast_visitor_walk_expr(visitor, r.expr);
+            return 0;
+        case AST_VAR_DECL:
+            var vd: *AstVarDecl = (*AstVarDecl)stmt;
+            vd.init_expr = generic_ast_visitor_walk_expr(visitor, vd.init_expr);
+            return 0;
+        case AST_ASSIGN:
+            var assign_stmt: *AstAssign = (*AstAssign)stmt;
+            assign_stmt.target = generic_ast_visitor_walk_expr(visitor, assign_stmt.target);
+            assign_stmt.value = generic_ast_visitor_walk_expr(visitor, assign_stmt.value);
+            return 0;
+        case AST_EXPR_STMT:
+            var es: *AstExprStmt = (*AstExprStmt)stmt;
+            es.expr = generic_ast_visitor_walk_expr(visitor, es.expr);
+            return 0;
+        case AST_IF:
+            var ifs: *AstIf = (*AstIf)stmt;
+            ifs.cond = generic_ast_visitor_walk_expr(visitor, ifs.cond);
+            generic_ast_visitor_walk_stmt(visitor, ifs.then_block);
+            generic_ast_visitor_walk_stmt(visitor, ifs.else_block);
+            return 0;
+        case AST_WHILE:
+            var wl: *AstWhile = (*AstWhile)stmt;
+            wl.cond = generic_ast_visitor_walk_expr(visitor, wl.cond);
+            generic_ast_visitor_walk_stmt(visitor, wl.body);
+            return 0;
+        case AST_FOR:
+            var fr: *AstFor = (*AstFor)stmt;
+            generic_ast_visitor_walk_stmt(visitor, fr.init);
+            fr.cond = generic_ast_visitor_walk_expr(visitor, fr.cond);
+            fr.update = generic_ast_visitor_walk_expr(visitor, fr.update);
+            generic_ast_visitor_walk_stmt(visitor, fr.body);
+            return 0;
+        case AST_SWITCH:
+        case AST_MATCH:
+            var sw: *AstSwitch = (*AstSwitch)stmt;
+            sw.expr = generic_ast_visitor_walk_expr(visitor, sw.expr);
+            generic_ast_visitor_walk_stmt_block(visitor, sw.cases_vec);
+            return 0;
+        case AST_CASE:
+            var cs: *AstCase = (*AstCase)stmt;
+            generic_ast_visitor_walk_stmt(visitor, cs.body);
+            return 0;
+        case AST_BLOCK:
+            var blk: *AstBlock = (*AstBlock)stmt;
+            generic_ast_visitor_walk_stmt_block(visitor, blk.stmts_vec);
+            return 0;
+        default:
+            return 0;
+    }
+}
+
+func generic_process_expr(expr: *AstNode, symtab: *HashMap<u64, *TypeInfo>) -> *AstNode {
+    var visitor: GenericAstVisitor = generic_ast_visitor_new_process(symtab);
+    return generic_ast_visitor_walk_expr(&visitor, expr);
+}
+
+func generic_process_stmt_block(stmts: *Vec<*AstNode>, symtab: *HashMap<u64, *TypeInfo>) -> u64 {
+    var visitor: GenericAstVisitor = generic_ast_visitor_new_process(symtab);
+    return generic_ast_visitor_walk_stmt_block(&visitor, stmts);
+}
+
+func generic_process_stmt(stmt: *AstNode, symtab: *HashMap<u64, *TypeInfo>) -> u64 {
+    var visitor: GenericAstVisitor = generic_ast_visitor_new_process(symtab);
+    return generic_ast_visitor_walk_stmt(&visitor, stmt);
+}
