@@ -7,7 +7,6 @@ set(BPP_NASM_VERSION "2.16.03" CACHE STRING "NASM version used for Windows boots
 set(BPP_DEFAULT_VERSION "bpp")
 file(GLOB _bpp_stage1_candidates RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}/bin" "${CMAKE_CURRENT_SOURCE_DIR}/bin/*_stage1")
 if(_bpp_stage1_candidates)
-<<<<<<< HEAD
     set(_bpp_best_numeric_ver "-1")
     set(_bpp_best_numeric_tag "")
     foreach(_bpp_candidate IN LISTS _bpp_stage1_candidates)
@@ -28,11 +27,6 @@ if(_bpp_stage1_candidates)
         list(GET _bpp_stage1_candidates -1 _bpp_latest_stage1)
         string(REGEX REPLACE "_stage1$" "" BPP_DEFAULT_VERSION "${_bpp_latest_stage1}")
     endif()
-=======
-    list(SORT _bpp_stage1_candidates)
-    list(GET _bpp_stage1_candidates -1 _bpp_latest_stage1)
-    string(REGEX REPLACE "_stage1$" "" BPP_DEFAULT_VERSION "${_bpp_latest_stage1}")
->>>>>>> origin/main
 endif()
 
 set(BPP_ACTIVE_VERSION "${BPP_DEFAULT_VERSION}" CACHE STRING "Active compiler version identifier")
