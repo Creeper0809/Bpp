@@ -73,14 +73,15 @@ var out: u64 = fp(10);
 `u64` 함수 포인터는 유연하지만 타입 안정성이 약합니다.  
 시그니처가 맞는지 호출자/피호출자 양쪽에서 명시적으로 유지해야 합니다.
 
-### Lambda (Non-capturing)
+### Lambda and Closure Handle
 
 ```bpp
-var inc: u64 = func (x: u64) -> u64 { x + 1 };
-var v: u64 = inc(41);
+var base: u64 = 40;
+var inc: u64 = func (x: u64) -> u64 { x + base + 1 };
+var v: u64 = inc(1);
 ```
 
-현재 람다는 "비캡처 함수 리터럴"로 보는 것이 정확합니다.
+람다는 `u64` 클로저 핸들로 취급되며, 캡처/복사 초기화를 지원합니다.
 
 ### Method Call Notes
 
@@ -90,15 +91,15 @@ var out2: u64 = obj.instance_add(1, 2);
 ```
 
 - static/direct 호출은 named 인자 지원 경로가 있습니다.
-- instance method 호출은 현재 named 인자 미지원입니다.
+- instance method 호출도 named/default 인자를 지원합니다.
 
 ## Constraints (v11)
 
 - variadic parameter는 마지막에만 허용됩니다.
 - variadic parameter에 default 값은 금지됩니다.
 - default parameter 뒤에 non-default parameter가 오면 오류입니다.
-- 인스턴스 메서드 호출에서 named argument는 아직 미지원입니다.
-- lambda capture(외부 변수 캡처)는 미지원입니다.
+- by-ref lambda capture(`&x`)는 현재 함수 파라미터에 대해서만 허용됩니다.
+- 로컬 변수에 대한 by-ref capture는 컴파일 오류입니다.
 
 ### Invalid Examples
 
@@ -108,18 +109,19 @@ func bad(...rest: u64, x: u64) -> u64 { return x; }
 ```
 
 ```bpp
-// 잘못된 예: instance method named args
-obj.set(a: 1, b: 2);
+// 잘못된 예: by-ref 로컬 캡처
+var x: u64 = 1;
+var f: u64 = func [&x] () -> u64 { x + 1 };
 ```
 
 ## Cautions
 
 - 이름 있는 인자를 섞어 쓸 때는 중복/누락 파라미터가 발생하기 쉽습니다.
 - 함수 포인터(`u64`) 기반 호출은 타입 안전성이 약하므로 시그니처 검증을 따로 해야 합니다.
-- lambda는 현재 설탕 수준이 아니라 실질 제약(캡처 금지)이 있으므로 범용 클로저처럼 쓰면 깨집니다.
+- by-ref capture는 수명/escape 규칙 제약이 있으므로 우선 by-value capture를 기본값으로 두는 편이 안전합니다.
 
 ## Best Practices
 
 - public API 함수는 default/named를 과도하게 섞지 말고 명시 호출을 우선합니다.
 - variadic은 최소화하고 명시적 오버로드(또는 helper 함수)로 분리합니다.
-- lambda 대신 top-level helper function을 우선 고려하면 진단/디버깅이 쉽습니다.
+- 람다를 API 경계로 넘길 때는 함수 타입 시그니처를 명시해 회귀를 줄입니다.

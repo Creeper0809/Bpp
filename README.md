@@ -1,10 +1,6 @@
-## B (The Second Step of Bpp)
+## Bpp
 
 "HTML을 프로그래밍 언어라고 인정할 수 없다."
-
-B 언어는 Bpp를 만들기 위한 두 번째 단계입니다.
-
-B로 작성되었으며 부트스트래핑하여 메이저 B를 제작합니다.
 
 ## Platform Support
 
@@ -19,83 +15,37 @@ See [Windows Support Guide](docs/windows_support.md) for details.
 
 ## Why?
 
-이 세상에는 없어져야 더 행복해질 수 있는 것들이 잔뜩있습니다.
-
-- C언어의 레지스터 숨김
-
-- 클로버 리스트
-
-- 그리고... 시험 문제에 bpp 대신 html을 언어라고 적어야하는 상황
-
-그것들을 bpp의 힘으로 모두 없앨겁니다.
-
-## Core Philosophy: High-Level Assembly
-
-Basm의 철학은 단순합니다.
-
-- High-Level Assembly: 어셈블리어의 제어권 + C언어의 가독성.
-
-- Explicit Registers: rax, r8 등을 직접 제어한다.
-
-## Syntax Preview
-
-Traditional C + Inline Assembly (Painful):
-```C
-
-// GCC Style....
-int val = 10;
-__asm__ volatile (
-    "movl %1, %%eax \n\t"
-    "addl $1, %%eax \n\t"
-    : "=a"(val) : "r"(val)
-);
-```
-
-Basm (EZ & Clean):
-```C
-
-// Just do it. (Stage1 현재 구현 기준)
-// - 레지스터는 64-bit 이름(rax..r15)만 레지스터로 인식합니다.
-// - 비교 연산자는 if 조건에서만 허용됩니다.
-
-rax = 10;
-rax += 1;
-
-// 메모리 접근은 ptr8/ptr64를 통해서만 합니다.
-// (예: ptr64[var] = rax;  rdi = ptr64[var];)
-
-if (rax > 5) {
-        // 함수 호출은 ident(args...);
-        // (내장 런타임 예: print_str, print_dec)
-        print_str("ok\n");
-}
-```
-
-## 문법 문서
-
-현재 Stage1에서 실제로 지원되는 문법/제약은 아래 문서에 정리되어 있습니다.
-
-- [syntax.md](syntax.md)
-
-## Roadmap
-
-
 ## File Structure
 
-
+```text
+Bpp/
+├─ src/
+│  ├─ parser/           # 파싱 단계
+│  │  ├─ decl/          # 선언 파싱
+│  │  ├─ expr/          # 표현식 파싱
+│  │  └─ stmt/          # 문장/제어문 파싱
+│  ├─ compiler/         # 의미 분석/변환/lowering
+│  │  └─ generic/       # 제네릭 관련 보조 패스
+│  ├─ emitter/          # 출력 생성기(백엔드)
+│  │  └─ gen/           # emitter 세부 생성 루틴
+│  ├─ ssa/              # SSA 관련 중간 표현/처리
+│  └─ std/              # 표준 라이브러리(.bpp)
+├─ test/                # 자동 테스트 스위트 및 수동 테스트
+├─ docs/                # 문서 및 위키 원고
+├─ bin/                 # stage 컴파일러 바이너리
+├─ scripts/             # 보조 스크립트(배포/유틸)
+├─ cmake/               # CMake 모듈/툴체인 보조 파일
+├─ fuzz/                # 퍼징 관련 파일
+├─ old/                 # 이전 버전 백업
+├─ pages/               # 개발 로그 페이지
+├─ build_and_test.sh    # Linux 빌드+테스트 진입점
+├─ build_and_test.ps1   # Windows 빌드+테스트 진입점
+└─ CMakeLists.txt       # 프로젝트 빌드 설정
+```
 
 ## Build & Run
 
 ### Linux
-```bash
-# Install dependencies
-sudo apt-get install nasm binutils
-
-# Build + self-host + tests
-bash build_and_test.sh
-```
-
-### Linux (CMake install + bpp command)
 ```bash
 # Build stage compiler first (required once)
 bash build_and_test.sh
@@ -109,23 +59,7 @@ sudo cmake --install build-linux
 bpp hello.bpp
 ```
 
-### Package Manifest (`bpp.toml`)
-`bpp` now supports a simple project manifest discovered from the source directory upward:
-
-```toml
-version=v11
-module_root=src
-std_root=/abs/path/to/Bpp/src
-nasm_path=/usr/bin/nasm
-ld_path=/usr/bin/ld
-```
-
-- `module_root`: package import root (for non-std modules)
-- `std_root`: std library root that contains `std/*.bpp`
-- `nasm_path`, `ld_path`: optional tool overrides for default compile+run mode
-- `version`: used when deriving defaults
-
-### Windows (toolchain + smoke)
+### Windows
 ```powershell
 # Configure (auto-download NASM when missing)
 cmake -S . -B build-win -DBPP_BOOTSTRAP_NASM=ON
@@ -151,11 +85,3 @@ bash test/run_regression.sh
 # Windows
 .\test\run_tests.ps1 -CompilerPath .\bin\v11_stage1.exe
 ```
-
-## CI/CD
-
-GitHub Actions automatically runs:
-- Ubuntu (latest)
-- Windows Server 2022
-
-See `.github/workflows/ci.yml` for configuration.

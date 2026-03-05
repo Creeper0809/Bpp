@@ -63,8 +63,9 @@ match (v) {
 
 `match` 사용 시 주의:
 
-- 현재는 패턴 매칭 언어 기능이 아니라 `switch` alias 성격
-- `case _`는 default 대체 용도로 사용
+- `case 1, 2, 3` 형태의 multi-value arm을 지원합니다.
+- enum payload 바인딩(`case E.Some(x):`)을 지원합니다.
+- `match expression`은 타입 일관성을 만족해야 합니다.
 
 ### try / catch / finally / throw
 
@@ -83,7 +84,7 @@ try {
 
 1. try 블록 최소화
 2. catch/finally 중 최소 하나 명시
-3. throw는 try 내부, nested breakable 문맥 여부 확인
+3. typed catch payload가 필요한지 확인 (`catch (e: T)`)
 
 ### Invalid Examples
 
@@ -93,26 +94,28 @@ try { var x: u64 = 1; }
 ```
 
 ```bpp
-// 잘못된 예: try 바깥 throw
-throw 1;
+// 잘못된 예: wildcard와 명시 값 혼합
+match (1) {
+    case 1, _:
+        return 0;
+}
 ```
 
 ## Constraints (v11)
 
 - `try`는 `catch` 또는 `finally` 중 하나 이상이 필수입니다.
-- `throw`는 `try` 문맥 안에서만 허용됩니다.
-- `throw`는 nested loop/switch 내부에서 제한됩니다.
-- `match`는 현재 `switch` alias 성격이 강합니다(동일 AST 계열로 수렴).
+- `throw`는 try 밖에서도 파싱/의미 분석이 허용됩니다.
+- `match expression`은 기본적으로 `default` arm이 필요하지만, enum exhaustive인 경우 생략할 수 있습니다.
+- `match expression`의 각 arm은 반환 타입을 일관되게 만족해야 합니다.
+- `case _`와 명시 값을 동일 arm에 혼합할 수 없습니다.
 
 ## Cautions
 
-- `throw`를 예외 시스템처럼 일반적으로 기대하면 안 됩니다.
-  - 현재 구현은 lowering 기반 제약이 강합니다.
-- `match`를 패턴 매칭 언어 수준으로 기대하면 과한 가정입니다.
-  - 현재는 case 기반 분기와 거의 동일합니다.
+- `try`/`catch`는 payload 타입 불일치 시 즉시 컴파일 오류가 발생합니다.
+- `match expression`으로 구조체를 직접 반환할 때는 함수/표현식 타입 힌트를 명확히 주는 것이 안전합니다.
 
 ## Best Practices
 
 - 복잡한 `for` 절은 `while + 명시적 update`로 풀어 쓰면 디버깅이 쉽습니다.
-- `try/throw`는 작은 블록으로 좁혀 제약 충돌을 줄입니다.
-- `match`는 가독성 목적 정도로 사용하고, 고급 패턴은 별도 분기로 명시합니다.
+- `try`/`catch`는 payload 타입을 명시해 진단 품질을 높입니다.
+- `match expression`은 enum exhaustive 설계와 함께 사용해 `default` 의존을 줄입니다.

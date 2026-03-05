@@ -125,12 +125,14 @@ func f(x: u64) -> u64 { return x; }
   - 파라미터 없는 함수만 허용
   - 여러 개 지정 불가
 - decorator:
-  - top-level non-generic 함수만 지원
+  - top-level 함수, generic 함수, impl 메서드(일반/trait impl)에 적용 가능
   - decorator 시그니처는 엄격히 일치해야 함
   - `next` 첫 인자는 `u64` 함수 포인터
+  - decorator annotation 인수(`@[deco(...)]`)는 현재 미지원
 - `@[override]`:
   - trait impl에서는 금지
   - 부모 대상 없으면 오류
+- built-in annotation(`entry`, `override`)은 인수를 받지 않음
 
 ## Cautions
 

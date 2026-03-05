@@ -9,26 +9,46 @@
 
 ## Known Limitations (v11)
 
-1. Lambda capture 미지원
-- 외부 변수 캡처 시 컴파일 오류
+1. Lambda by-ref capture 범위 제한
+- `func [&x]`는 현재 함수 파라미터에 대해서만 허용됩니다.
+- 로컬 변수 by-ref capture는 컴파일 오류입니다.
 
-2. 인스턴스 메서드 named arguments 미지원
-- static/direct call에서는 지원되지만 instance method는 제한
+2. Lambda generic call target 제약
+- lambda 내부 generic call target은 전역 심볼이어야 합니다.
 
-3. `throw` 사용 맥락 제약
-- try 외부 금지
-- nested loop/switch 내부 throw 제한
+3. Annotation 인수 제약
+- built-in annotation(`@[entry]`, `@[override]`)은 인수를 받지 않습니다.
+- decorator annotation도 현재 인수 전달(`@[deco(...)]`)을 지원하지 않습니다.
 
-4. Decorator 적용 범위 제한
-- top-level non-generic 함수에 한정
-- 시그니처 엄격 일치 필요
+4. Decorator 시그니처 엄격 일치
+- 첫 인자 `next: u64` + 나머지 파라미터/반환 타입이 대상과 정확히 맞아야 합니다.
 
-5. `match`는 현재 switch alias 성격
-- 고급 패턴 매칭 기능(바인딩/구조 분해 등)은 미지원
+5. `try`/`catch` 정적 규칙
+- `try`는 `catch` 또는 `finally` 중 하나가 반드시 필요합니다.
+- `catch`에서 바인딩 식별자를 쓰면 타입을 명시해야 합니다 (`catch (e: T)`).
+- throw payload 타입과 typed catch payload 타입이 불일치하면 오류입니다.
 
-6. 일부 타입 조합 제약
-- tagged/복합 중첩 타입에서 제한 가능
-- union은 상속/초기화 규칙 제약이 큼
+6. `match expression` 제약
+- 기본적으로 `default` arm이 필요합니다.
+- 단, enum exhaustive arm이면 `default` 없이 허용됩니다.
+- wildcard(`_`)와 명시 값을 동일 arm에 혼합할 수 없습니다.
+
+7. Safe index와 try operator 구조 제약
+- safe index(`x?[i]`)는 포인터 receiver에서만 허용됩니다.
+- try operator(`x?`)는 try-compatible 구조(`is_some`, `value` 계열 검사)를 만족해야 합니다.
+
+8. Generic bound/assoc type 엄격 검증
+- `where` bound가 충족되지 않으면 컴파일 오류입니다.
+- trait impl에서 필요한 associated type binding 누락 시 오류입니다.
+- const generic 인자는 대상 타입 범위를 벗어나면 오류입니다(예: `bool`에 `2`).
+
+## Recently Lifted (No Longer Limited)
+
+- lambda capture 지원
+- 인스턴스 메서드 named/default arguments 지원
+- `throw`의 try 외부 문맥 파싱/의미 분석 지원
+- enum payload match와 exhaustive enum match expression 지원
+- generic 함수/impl 메서드 decorator 지원
 
 ## Cautions
 
