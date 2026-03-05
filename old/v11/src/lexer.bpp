@@ -1,0 +1,723 @@
+// lexer.b - Lexer implementation for v3.8
+
+import std.io;
+import std.str;
+import std.util;
+import types;
+import std.vec;
+import std.char;
+
+// ============================================
+// ASCII Character Constants
+// ============================================
+const CHAR_NEWLINE = 10;
+const CHAR_SPACE = 32;
+const CHAR_EXCLAIM = 33;
+const CHAR_QUOTE = 34;
+const CHAR_PERCENT = 37;
+const CHAR_AMPERSAND = 38;
+const CHAR_APOSTROPHE = 39;
+const CHAR_LPAREN = 40;
+const CHAR_RPAREN = 41;
+const CHAR_STAR = 42;
+const CHAR_PLUS = 43;
+const CHAR_COMMA = 44;
+const CHAR_MINUS = 45;
+const CHAR_DOT = 46;
+const CHAR_SLASH = 47;
+const CHAR_COLON = 58;
+const CHAR_SEMICOLON = 59;
+const CHAR_LT = 60;
+const CHAR_EQ = 61;
+const CHAR_GT = 62;
+const CHAR_QUESTION = 63;
+const CHAR_AT = 64;
+const CHAR_LBRACKET = 91;
+const CHAR_BACKSLASH = 92;
+const CHAR_RBRACKET = 93;
+const CHAR_CARET = 94;
+const CHAR_LBRACE = 123;
+const CHAR_PIPE = 124;
+const CHAR_RBRACE = 125;
+const CHAR_TILDE = 126;
+
+var g_tok_pool_ptr: u64 = 0;
+var g_tok_pool_len: u64 = 0;
+var g_tok_pool_cap: u64 = 0;
+var g_lex_error_count: u64 = 0;
+var g_lex_max_errors: u64 = 40;
+var g_lex_error_limit_reached: u64 = 0;
+
+func lex_reset_errors() -> u64 {
+    g_lex_error_count = 0;
+    g_lex_error_limit_reached = 0;
+    return 0;
+}
+
+func lex_error_count() -> u64 {
+    return g_lex_error_count;
+}
+
+func lex_record_error(msg_ptr: u64, msg_len: u64, line: u64, col: u64) -> u64 {
+    if (g_lex_error_limit_reached != 0) { return 0; }
+    end_error_capture();
+    set_error_context(msg_ptr, msg_len);
+    emit_stderr("[ERROR] ");
+    emit_stderr_len(msg_ptr, msg_len);
+    emit_stderr(" at line ");
+    emit_u64_stderr(line);
+    emit_stderr(", column ");
+    emit_u64_stderr(col);
+    emit_stderr_nl();
+    g_lex_error_count = g_lex_error_count + 1;
+    if (g_lex_error_count >= g_lex_max_errors) {
+        g_lex_error_limit_reached = 1;
+        emit_stderr("[ERROR] lexer error limit reached; stopping lexing\n");
+    }
+    return 0;
+}
+
+func tok_pool_begin(estimated_tokens: u64) -> u64 {
+    var cap: u64 = estimated_tokens;
+    if (cap < 256) { cap = 256; }
+    g_tok_pool_ptr = heap_alloc(cap * sizeof(Token));
+    g_tok_pool_cap = cap;
+    g_tok_pool_len = 0;
+    return 0;
+}
+
+func tok_pool_alloc() -> *Token {
+    if (g_tok_pool_ptr == 0 || g_tok_pool_len >= g_tok_pool_cap) {
+        var cap2: u64 = g_tok_pool_cap * 2;
+        if (cap2 < 256) { cap2 = 256; }
+        g_tok_pool_ptr = heap_alloc(cap2 * sizeof(Token));
+        g_tok_pool_cap = cap2;
+        g_tok_pool_len = 0;
+    }
+
+    var idx: u64 = g_tok_pool_len;
+    g_tok_pool_len = g_tok_pool_len + 1;
+    return (*Token)(g_tok_pool_ptr + idx * sizeof(Token));
+}
+
+// Lexer structure: [src_ptr, src_len, pos, line, col]
+
+func lex_new(src: u64, len: u64) -> *Lexer {
+    var l: *Lexer = (*Lexer)heap_alloc(sizeof(Lexer));
+    l.src_ptr = src;
+    l.src_len = len;
+    l.pos = 0;
+    l.line = 1;
+    l.col = 1;
+    return l;
+}
+
+func lex_at_end(lex: *Lexer) -> u64 {
+    if (lex.pos >= lex.src_len) { return true; }
+    return false;
+}
+
+func lex_peek(lex: *Lexer) -> u64 {
+    if (lex_at_end(lex)) { return 0; }
+    var src_u8: *u8 = (*u8)lex.src_ptr;
+    return src_u8[lex.pos];
+}
+
+func lex_peek_next(lex: *Lexer) -> u64 {
+    if (lex.pos + 1 >= lex.src_len) { return 0; }
+    var src_u8: *u8 = (*u8)lex.src_ptr;
+    return src_u8[lex.pos + 1];
+}
+
+func lex_advance(lex: *Lexer) -> u64 {
+    var c: u64 = lex_peek(lex);
+    lex.pos = lex.pos + 1;
+    if (c == CHAR_NEWLINE) {
+        lex.line = lex.line + 1;
+        lex.col = 1;
+    } else {
+        lex.col = lex.col + 1;
+    }
+    return c;
+}
+
+func lex_skip_ws(lex: *Lexer) -> u64 {
+    while (!lex_at_end(lex)) {
+        var c: u64 = lex_peek(lex);
+        if (!is_whitespace(c)) { break; }
+        lex_advance(lex);
+    }
+}
+
+func lex_skip_line_comment(lex: *Lexer) -> u64 {
+    lex_advance(lex); // /
+    lex_advance(lex); // /
+    while (!lex_at_end(lex)) {
+        var c: u64 = lex_peek(lex);
+        if (c == CHAR_NEWLINE) {
+            lex_advance(lex);
+            break;
+        }
+        lex_advance(lex);
+    }
+    return 1;
+}
+
+func lex_skip_block_comment(lex: *Lexer) -> u64 {
+    var start_line: u64 = lex.line;
+    var start_col: u64 = lex.col;
+
+    lex_advance(lex); // /
+    lex_advance(lex); // *
+
+    while (!lex_at_end(lex)) {
+        var c: u64 = lex_peek(lex);
+        if (c == CHAR_STAR && lex_peek_next(lex) == CHAR_SLASH) {
+            lex_advance(lex); // *
+            lex_advance(lex); // /
+            return 1;
+        }
+        lex_advance(lex);
+    }
+
+    lex_record_error("Unterminated block comment", 26, start_line, start_col);
+    return 0;
+}
+
+func lex_skip_comment(lex: *Lexer) -> u64 {
+    if (lex_peek(lex) != CHAR_SLASH) { return 0; }
+    var next: u64 = lex_peek_next(lex);
+    if (next == CHAR_SLASH) {
+        return lex_skip_line_comment(lex);
+    }
+    if (next == CHAR_STAR) {
+        return lex_skip_block_comment(lex);
+    }
+    return 0;
+}
+
+func lex_skip_ws_and_comments(lex: *Lexer) -> u64 {
+    while (!lex_at_end(lex)) {
+        lex_skip_ws(lex);
+        var c: u64 = lex_peek(lex);
+        if (c == CHAR_SLASH) {
+            if (lex_skip_comment(lex) != 0) { continue; }
+            break;
+        } else {
+            break;
+        }
+    }
+}
+
+// ============================================
+// Keyword Lookup Table
+// ============================================
+
+// Keyword table entry: [keyword_ptr, token_kind]
+struct KeywordEntry {
+    public word_ptr: u64;
+    public token_kind: u64;
+}
+
+struct LexCtx {
+    public tok_pool_ptr: u64;
+    public tok_pool_len: u64;
+    public tok_pool_cap: u64;
+    public lex_error_count: u64;
+    public lex_max_errors: u64;
+    public lex_error_limit_reached: u64;
+    public kw_tables_ready: u64;
+    public kw_tables: *Vec<*Vec<*KeywordEntry>>;
+}
+
+impl LexCtx {
+    public constructor() {
+        self.tok_pool_ptr = 0;
+        self.tok_pool_len = 0;
+        self.tok_pool_cap = 0;
+        self.lex_error_count = 0;
+        self.lex_max_errors = 40;
+        self.lex_error_limit_reached = 0;
+        self.kw_tables_ready = 0;
+        self.kw_tables = 0;
+    }
+}
+
+var g_kw_tables_ready: u64 = 0;
+const KEYWORD_MAX_LEN = 11;
+var g_kw_tables: *Vec<*Vec<*KeywordEntry>> = 0;
+
+func lex_kw_add(dst: *Vec<*KeywordEntry>, word_ptr: u64, token_kind: u64) -> u64 {
+    if (dst == 0) { return 0; }
+    var e: *KeywordEntry = new KeywordEntry();
+    e.word_ptr = word_ptr;
+    e.token_kind = token_kind;
+    dst.push(e);
+    return 0;
+}
+
+func lex_kw_table_get(len: u64) -> *Vec<*KeywordEntry> {
+    if (g_kw_tables == 0) { return 0; }
+    if (len >= g_kw_tables.len()) { return 0; }
+    return g_kw_tables.get(len);
+}
+
+func lex_kw_add_word(word_ptr: u64, token_kind: u64) -> u64 {
+    var len: u64 = str_len(word_ptr);
+    if (len > KEYWORD_MAX_LEN) { return 0; }
+    var table: *Vec<*KeywordEntry> = lex_kw_table_get(len);
+    if (table == 0) {
+        table = new Vec<*KeywordEntry>(4);
+        g_kw_tables.set(len, table);
+    }
+    return lex_kw_add(table, word_ptr, token_kind);
+}
+
+func lex_ctx_new() -> *LexCtx {
+    return new LexCtx();
+}
+
+func lex_ctx_bind(ctx: *LexCtx) -> u64 {
+    if (ctx == 0) { return 0; }
+    g_tok_pool_ptr = ctx.tok_pool_ptr;
+    g_tok_pool_len = ctx.tok_pool_len;
+    g_tok_pool_cap = ctx.tok_pool_cap;
+    g_lex_error_count = ctx.lex_error_count;
+    g_lex_max_errors = ctx.lex_max_errors;
+    if (g_lex_max_errors == 0) { g_lex_max_errors = 40; }
+    g_lex_error_limit_reached = ctx.lex_error_limit_reached;
+    g_kw_tables_ready = ctx.kw_tables_ready;
+    g_kw_tables = ctx.kw_tables;
+    return 0;
+}
+
+func lex_ctx_capture(ctx: *LexCtx) -> u64 {
+    if (ctx == 0) { return 0; }
+    ctx.tok_pool_ptr = g_tok_pool_ptr;
+    ctx.tok_pool_len = g_tok_pool_len;
+    ctx.tok_pool_cap = g_tok_pool_cap;
+    ctx.lex_error_count = g_lex_error_count;
+    ctx.lex_max_errors = g_lex_max_errors;
+    ctx.lex_error_limit_reached = g_lex_error_limit_reached;
+    ctx.kw_tables_ready = g_kw_tables_ready;
+    ctx.kw_tables = g_kw_tables;
+    return 0;
+}
+
+func lex_error_count_ctx(ctx: *LexCtx) -> u64 {
+    if (ctx == 0) { return 0; }
+    return ctx.lex_error_count;
+}
+
+func lex_all_with_ctx(ctx: *LexCtx, src: u64, len: u64) -> *Vec<*Token> {
+    lex_ctx_bind(ctx);
+    var tokens: *Vec<*Token> = lex_all(src, len);
+    lex_ctx_capture(ctx);
+    return tokens;
+}
+
+func lex_init_keyword_tables() -> u64 {
+    if (g_kw_tables_ready != 0) { return 0; }
+
+    g_kw_tables = new Vec<*Vec<*KeywordEntry>>(KEYWORD_MAX_LEN + 1);
+    for (var i: u64 = 0; i <= KEYWORD_MAX_LEN; i++) {
+        g_kw_tables.push(0);
+    }
+
+    lex_kw_add_word("if", TOKEN_IF);
+    lex_kw_add_word("as", TOKEN_AS);
+    lex_kw_add_word("do", TOKEN_DO);
+    lex_kw_add_word("u8", TOKEN_U8);
+    lex_kw_add_word("i8", TOKEN_I8);
+
+    lex_kw_add_word("new", TOKEN_NEW);
+    lex_kw_add_word("var", TOKEN_VAR);
+    lex_kw_add_word("for", TOKEN_FOR);
+    lex_kw_add_word("asm", TOKEN_ASM);
+    lex_kw_add_word("try", TOKEN_TRY);
+    lex_kw_add_word("u16", TOKEN_U16);
+    lex_kw_add_word("u32", TOKEN_U32);
+    lex_kw_add_word("u64", TOKEN_U64);
+    lex_kw_add_word("i16", TOKEN_I16);
+    lex_kw_add_word("i32", TOKEN_I32);
+    lex_kw_add_word("i64", TOKEN_I64);
+    lex_kw_add_word("f64", TOKEN_F64);
+
+    lex_kw_add_word("func", TOKEN_FUNC);
+    lex_kw_add_word("abst", TOKEN_ABST);
+    lex_kw_add_word("todo", TOKEN_TODO);
+    lex_kw_add_word("else", TOKEN_ELSE);
+    lex_kw_add_word("true", TOKEN_TRUE);
+    lex_kw_add_word("bool", TOKEN_BOOL);
+    lex_kw_add_word("null", TOKEN_NULL);
+    lex_kw_add_word("enum", TOKEN_ENUM);
+    lex_kw_add_word("impl", TOKEN_IMPL);
+    lex_kw_add_word("case", TOKEN_CASE);
+    lex_kw_add_word("char", TOKEN_CHAR);
+    lex_kw_add_word("from", TOKEN_FROM);
+
+    lex_kw_add_word("const", TOKEN_CONST);
+    lex_kw_add_word("false", TOKEN_FALSE);
+    lex_kw_add_word("while", TOKEN_WHILE);
+    lex_kw_add_word("break", TOKEN_BREAK);
+    lex_kw_add_word("match", TOKEN_MATCH);
+    lex_kw_add_word("catch", TOKEN_CATCH);
+    lex_kw_add_word("throw", TOKEN_THROW);
+    lex_kw_add_word("where", TOKEN_WHERE);
+    lex_kw_add_word("alias", TOKEN_ALIAS);
+    lex_kw_add_word("defer", TOKEN_DEFER);
+    lex_kw_add_word("trait", TOKEN_TRAIT);
+    lex_kw_add_word("super", TOKEN_SUPER);
+    lex_kw_add_word("union", TOKEN_UNION);
+
+    lex_kw_add_word("return", TOKEN_RETURN);
+    lex_kw_add_word("struct", TOKEN_STRUCT);
+    lex_kw_add_word("switch", TOKEN_SWITCH);
+    lex_kw_add_word("import", TOKEN_IMPORT);
+    lex_kw_add_word("sizeof", TOKEN_SIZEOF);
+    lex_kw_add_word("static", TOKEN_STATIC);
+    lex_kw_add_word("public", TOKEN_PUBLIC);
+    lex_kw_add_word("tagged", TOKEN_TAGGED);
+    lex_kw_add_word("packed", TOKEN_PACKED);
+    lex_kw_add_word("delete", TOKEN_DELETE);
+    lex_kw_add_word("assert", TOKEN_ASSERT);
+
+    lex_kw_add_word("default", TOKEN_DEFAULT);
+    lex_kw_add_word("finally", TOKEN_FINALLY);
+    lex_kw_add_word("private", TOKEN_PRIVATE);
+
+    lex_kw_add_word("continue", TOKEN_CONTINUE);
+    lex_kw_add_word("__LINE__", TOKEN_LINE_MACRO);
+
+    lex_kw_add_word("protected", TOKEN_PROTECTED);
+    lex_kw_add_word("destructor", TOKEN_DESTRUCTOR);
+    lex_kw_add_word("constructor", TOKEN_CONSTRUCTOR);
+    lex_kw_add_word("unreachable", TOKEN_UNREACHABLE);
+
+    g_kw_tables_ready = 1;
+    return 0;
+}
+
+func lex_keyword_lookup_len(s: *u8, len: u64, table: *Vec<*KeywordEntry>) -> u64 {
+    if (table == 0) { return TOKEN_IDENTIFIER; }
+    var n: u64 = table.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var e: *KeywordEntry = table.get(i);
+        if (str_eq((u64)s, len, e.word_ptr, len) != 0) {
+            return e.token_kind;
+        }
+    }
+    return TOKEN_IDENTIFIER;
+}
+
+func lex_check_keyword(ptr: u64, len: u64) -> u64 {
+    lex_init_keyword_tables();
+    if (len > KEYWORD_MAX_LEN) { return TOKEN_IDENTIFIER; }
+    var s: *u8 = (*u8)ptr;
+    return lex_keyword_lookup_len(s, len, lex_kw_table_get(len));
+}
+
+// Token structure: [kind, ptr, len, line, col]
+
+func tok_new(kind: u64, ptr: u64, len: u64, line: u64, col: u64) -> *Token {
+    var t: *Token = tok_pool_alloc();
+    t.kind = kind;
+    t.ptr = ptr;
+    t.len = len;
+    t.line = line;
+    t.col = col;
+    return t;
+}
+
+func lex_try_identifier_or_keyword(lex: *Lexer, src: u64, start: u64, c: u64, line: u64, col: u64) -> *Token {
+    if (is_alpha(c) == 0) { return 0; }
+    while (!lex_at_end(lex)) {
+        if (is_alnum(lex_peek(lex))) {
+            lex_advance(lex);
+        } else {
+            break;
+        }
+    }
+    var len: u64 = lex.pos - start;
+    var kind: u64 = lex_check_keyword(src + start, len);
+    return tok_new(kind, src + start, len, line, col);
+}
+
+func lex_try_number(lex: *Lexer, src: u64, start: u64, c: u64, line: u64, col: u64) -> *Token {
+    if (is_digit(c) == 0) { return 0; }
+    while (!lex_at_end(lex)) {
+        if (is_digit(lex_peek(lex))) {
+            lex_advance(lex);
+        } else {
+            break;
+        }
+    }
+    if (lex_peek(lex) == CHAR_DOT && is_digit(lex_peek_next(lex))) {
+        lex_advance(lex);
+        while (!lex_at_end(lex)) {
+            if (is_digit(lex_peek(lex))) {
+                lex_advance(lex);
+            } else {
+                break;
+            }
+        }
+        var f_len: u64 = lex.pos - start;
+        return tok_new(TOKEN_FLOAT, src + start, f_len, line, col);
+    }
+    var len: u64 = lex.pos - start;
+    return tok_new(TOKEN_NUMBER, src + start, len, line, col);
+}
+
+func lex_try_string(lex: *Lexer, src: u64, start: u64, c: u64, line: u64, col: u64) -> *Token {
+    if (c != CHAR_QUOTE) { return 0; }
+    var closed: u64 = 0;
+    while (!lex_at_end(lex)) {
+        var ch: u64 = lex_peek(lex);
+        if (ch == CHAR_NEWLINE) {
+            lex_record_error("Unterminated string literal", 27, line, col);
+            return tok_new(TOKEN_STRING, src + start, lex.pos - start, line, col);
+        }
+        if (ch == CHAR_QUOTE) {
+            lex_advance(lex);
+            closed = 1;
+            break;
+        }
+        if (ch == CHAR_BACKSLASH) {
+            lex_advance(lex);
+            if (!lex_at_end(lex)) {
+                lex_advance(lex);
+            }
+        } else {
+            lex_advance(lex);
+        }
+    }
+    if (closed == 0) {
+        lex_record_error("Unterminated string literal", 27, line, col);
+        return tok_new(TOKEN_STRING, src + start, lex.pos - start, line, col);
+    }
+    var len: u64 = lex.pos - start;
+    return tok_new(TOKEN_STRING, src + start, len, line, col);
+}
+
+func lex_try_char_literal(lex: *Lexer, src: u64, start: u64, c: u64, line: u64, col: u64) -> *Token {
+    if (c != CHAR_APOSTROPHE) { return 0; }
+
+    while (!lex_at_end(lex)) {
+        var ch: u64 = lex_peek(lex);
+        if (ch == CHAR_NEWLINE) {
+            lex_record_error("Unterminated char literal", 25, line, col);
+            return tok_new(TOKEN_CHAR, src + start, lex.pos - start, line, col);
+        }
+        if (ch == CHAR_APOSTROPHE) {
+            lex_advance(lex);
+            var len: u64 = lex.pos - start;
+            return tok_new(TOKEN_CHAR, src + start, len, line, col);
+        }
+        if (ch == CHAR_BACKSLASH) {
+            lex_advance(lex);
+            if (lex_at_end(lex)) { break; }
+        }
+        lex_advance(lex);
+    }
+
+    lex_record_error("Unterminated char literal", 25, line, col);
+    return tok_new(TOKEN_CHAR, src + start, lex.pos - start, line, col);
+}
+
+func lex_report_invalid_char(line: u64, col: u64, c: u64) -> u64 {
+    if (g_lex_error_limit_reached != 0) { return 0; }
+    end_error_capture();
+    set_error_context("Invalid character", 17);
+    emit_stderr("[ERROR] Invalid character at line ");
+    emit_u64_stderr(line);
+    emit_stderr(", column ");
+    emit_u64_stderr(col);
+    emit_stderr(": byte ");
+    emit_u64_stderr(c);
+    emit_stderr_nl();
+    g_lex_error_count = g_lex_error_count + 1;
+    if (g_lex_error_count >= g_lex_max_errors) {
+        g_lex_error_limit_reached = 1;
+        emit_stderr("[ERROR] lexer error limit reached; stopping lexing\n");
+    }
+    return 0;
+}
+
+func lex_try_two_char_ops(lex: *Lexer, src: u64, start: u64, c: u64, line: u64, col: u64) -> *Token {
+    if (c == CHAR_EQ) {
+        if (lex_peek(lex) == CHAR_EQ) {
+            lex_advance(lex);
+            return tok_new(TOKEN_EQEQ, src + start, 2, line, col);
+        }
+        return tok_new(TOKEN_EQ, src + start, 1, line, col);
+    }
+    if (c == CHAR_EXCLAIM) {
+        if (lex_peek(lex) == CHAR_EQ) {
+            lex_advance(lex);
+            return tok_new(TOKEN_BANGEQ, src + start, 2, line, col);
+        }
+        return tok_new(TOKEN_BANG, src + start, 1, line, col);
+    }
+    if (c == CHAR_LT) {
+        if (lex_peek(lex) == CHAR_EQ) {
+            lex_advance(lex);
+            return tok_new(TOKEN_LTEQ, src + start, 2, line, col);
+        }
+        if (lex_peek(lex) == CHAR_LT) {
+            lex_advance(lex);
+            return tok_new(TOKEN_LSHIFT, src + start, 2, line, col);
+        }
+        return tok_new(TOKEN_LT, src + start, 1, line, col);
+    }
+    if (c == CHAR_GT) {
+        if (lex_peek(lex) == CHAR_EQ) {
+            lex_advance(lex);
+            return tok_new(TOKEN_GTEQ, src + start, 2, line, col);
+        }
+        if (lex_peek(lex) == CHAR_GT) {
+            lex_advance(lex);
+            return tok_new(TOKEN_RSHIFT, src + start, 2, line, col);
+        }
+        return tok_new(TOKEN_GT, src + start, 1, line, col);
+    }
+    if (c == CHAR_AMPERSAND) {
+        if (lex_peek(lex) == CHAR_AMPERSAND) {
+            lex_advance(lex);
+            return tok_new(TOKEN_ANDAND, src + start, 2, line, col);
+        }
+        return tok_new(TOKEN_AMPERSAND, src + start, 1, line, col);
+    }
+    if (c == CHAR_PIPE) {
+        if (lex_peek(lex) == CHAR_PIPE) {
+            lex_advance(lex);
+            return tok_new(TOKEN_OROR, src + start, 2, line, col);
+        }
+        return tok_new(TOKEN_PIPE, src + start, 1, line, col);
+    }
+    return 0;
+}
+
+func lex_try_single_char_ops(lex: *Lexer, src: u64, start: u64, c: u64, line: u64, col: u64) -> *Token {
+    if (c == CHAR_LPAREN) { return tok_new(TOKEN_LPAREN, src + start, 1, line, col); }
+    if (c == CHAR_RPAREN) { return tok_new(TOKEN_RPAREN, src + start, 1, line, col); }
+    if (c == CHAR_LBRACE) { return tok_new(TOKEN_LBRACE, src + start, 1, line, col); }
+    if (c == CHAR_RBRACE) { return tok_new(TOKEN_RBRACE, src + start, 1, line, col); }
+    if (c == CHAR_LBRACKET) { return tok_new(TOKEN_LBRACKET, src + start, 1, line, col); }
+    if (c == CHAR_RBRACKET) { return tok_new(TOKEN_RBRACKET, src + start, 1, line, col); }
+    if (c == CHAR_SEMICOLON) { return tok_new(TOKEN_SEMICOLON, src + start, 1, line, col); }
+    if (c == CHAR_COLON) { return tok_new(TOKEN_COLON, src + start, 1, line, col); }
+    if (c == CHAR_COMMA) { return tok_new(TOKEN_COMMA, src + start, 1, line, col); }
+    if (c == CHAR_DOT) {
+        if (lex_peek(lex) == CHAR_QUESTION) {
+            lex_advance(lex);
+            return tok_new(TOKEN_DOT_Q, src + start, 2, line, col);
+        }
+        return tok_new(TOKEN_DOT, src + start, 1, line, col);
+    }
+    if (c == CHAR_QUESTION) { return tok_new(TOKEN_QUESTION, src + start, 1, line, col); }
+    if (c == CHAR_AT) { return tok_new(TOKEN_AT, src + start, 1, line, col); }
+    if (c == CHAR_PLUS) {
+        if (lex_peek(lex) == CHAR_PLUS) {
+            lex_advance(lex);
+            return tok_new(TOKEN_PLUSPLUS, src + start, 2, line, col);
+        }
+        if (lex_peek(lex) == CHAR_EQ) {
+            lex_advance(lex);
+            return tok_new(TOKEN_PLUS_EQ, src + start, 2, line, col);
+        }
+        return tok_new(TOKEN_PLUS, src + start, 1, line, col);
+    }
+    if (c == CHAR_MINUS) {
+        if (lex_peek(lex) == CHAR_MINUS) {
+            lex_advance(lex);
+            return tok_new(TOKEN_MINUSMINUS, src + start, 2, line, col);
+        }
+        if (lex_peek(lex) == CHAR_GT) {
+            lex_advance(lex);
+            return tok_new(TOKEN_ARROW, src + start, 2, line, col);
+        }
+        if (lex_peek(lex) == CHAR_EQ) {
+            lex_advance(lex);
+            return tok_new(TOKEN_MINUS_EQ, src + start, 2, line, col);
+        }
+        return tok_new(TOKEN_MINUS, src + start, 1, line, col);
+    }
+    if (c == CHAR_STAR) {
+        if (lex_peek(lex) == CHAR_EQ) {
+            lex_advance(lex);
+            return tok_new(TOKEN_STAR_EQ, src + start, 2, line, col);
+        }
+        return tok_new(TOKEN_STAR, src + start, 1, line, col);
+    }
+    if (c == CHAR_SLASH) {
+        if (lex_peek(lex) == CHAR_EQ) {
+            lex_advance(lex);
+            return tok_new(TOKEN_SLASH_EQ, src + start, 2, line, col);
+        }
+        return tok_new(TOKEN_SLASH, src + start, 1, line, col);
+    }
+    if (c == CHAR_PERCENT) {
+        if (lex_peek(lex) == CHAR_EQ) {
+            lex_advance(lex);
+            return tok_new(TOKEN_PERCENT_EQ, src + start, 2, line, col);
+        }
+        return tok_new(TOKEN_PERCENT, src + start, 1, line, col);
+    }
+    if (c == CHAR_TILDE) { return tok_new(TOKEN_TILDE, src + start, 1, line, col); }
+    if (c == CHAR_CARET) { return tok_new(TOKEN_CARET, src + start, 1, line, col); }
+    return 0;
+}
+
+
+
+func lex_next(lex: *Lexer) -> *Token {
+    while (1) {
+        lex_skip_ws_and_comments(lex);
+
+        var line: u64 = lex.line;
+        var col: u64 = lex.col;
+
+        if (lex_at_end(lex)) {
+            return tok_new(TOKEN_EOF, 0, 0, line, col);
+        }
+
+        var start: u64 = lex.pos;
+        var c: u64 = lex_advance(lex);
+        var src: u64 = lex.src_ptr;
+        var tok: *Token = lex_try_identifier_or_keyword(lex, src, start, c, line, col);
+        if (tok != 0) { return tok; }
+        tok = lex_try_number(lex, src, start, c, line, col);
+        if (tok != 0) { return tok; }
+        tok = lex_try_string(lex, src, start, c, line, col);
+        if (tok != 0) { return tok; }
+        tok = lex_try_char_literal(lex, src, start, c, line, col);
+        if (tok != 0) { return tok; }
+        tok = lex_try_two_char_ops(lex, src, start, c, line, col);
+        if (tok != 0) { return tok; }
+        tok = lex_try_single_char_ops(lex, src, start, c, line, col);
+        if (tok != 0) { return tok; }
+        lex_report_invalid_char(line, col, c);
+        if (g_lex_error_limit_reached != 0) {
+            return tok_new(TOKEN_EOF, 0, 0, lex.line, lex.col);
+        }
+    }
+}
+
+func lex_all(src: u64, len: u64) -> *Vec<*Token> {
+    push_trace("lex_all", "lexer.b", __LINE__);
+    defer pop_trace();
+    lex_reset_errors();
+    
+    // Approximate token count to reduce allocator churn in hot lexing path.
+    tok_pool_begin((len / 2) + 16);
+
+    var l: *Lexer = lex_new(src, len);
+    var tokens: *Vec<*Token> = new Vec<*Token>(256);
+    while (1) {
+        var tok: *Token = lex_next(l);
+        tokens.push(tok);
+        if (tok.kind == TOKEN_EOF) { break; }
+    }
+    
+    return tokens;
+}

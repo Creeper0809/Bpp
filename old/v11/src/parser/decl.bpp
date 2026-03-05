@@ -1,0 +1,669 @@
+// parse_decl.b - Declaration parsing
+//
+// Parses top-level declarations:
+// - const declarations
+// - import declarations
+// - function declarations (parameters, return types, body)
+// - struct definitions
+// - enum definitions
+// - impl blocks
+// - parse_program (entry point)
+
+import std.io;
+import std.vec;
+import std.util;
+import std.str;
+import module_utils;
+import types;
+import lexer;
+import ast;
+import compiler;
+import compiler.core_utils;
+import compiler.generic.engine;
+import compiler.enum_runtime;
+import compiler.symbol_runtime;
+import parser.util;
+import parser.type;
+import parser.expr;
+import parser.stmt;
+import parser.decl.const_decl;
+import parser.decl.generic_decl;
+import parser.decl.enum_decl;
+import parser.decl.impl_block;
+import parser.decl.import_decl;
+import parser.decl.program_pipeline;
+import parser.decl.trait_decl;
+
+// ============================================
+// Function Parsing
+// ============================================
+
+// Skip a block without parsing its contents
+func parse_skip_block(p: *Parser) -> u64 {
+    parse_consume(p, TOKEN_LBRACE);
+    var depth: u64 = 1;
+    while (depth > 0) {
+        if (p.error_limit_reached != 0) { return 0; }
+        var k: u64 = parse_peek_kind(p);
+        switch (k) {
+            case TOKEN_EOF:
+                emit_stderr("[ERROR] Unexpected EOF while skipping block\n");
+                parse_panic_here(p, "Syntax error");
+                return 0;
+            case TOKEN_LBRACE:
+                depth = depth + 1;
+                break;
+            case TOKEN_RBRACE:
+                depth = depth - 1;
+            default:
+                break;
+        }
+        parse_adv(p);
+    }
+    return 0;
+}
+
+func parse_is_generic_param_list_impl(p: *Parser, require_follow_lparen: u64) -> u64 {
+    return parse_scan_generic_list_followed_by(p, TOKEN_LPAREN, require_follow_lparen, 1);
+}
+
+func parse_is_generic_param_list(p: *Parser) -> u64 {
+    return parse_is_generic_param_list_impl(p, 1);
+}
+
+func parse_is_generic_param_list_any(p: *Parser) -> u64 {
+    return parse_is_generic_param_list_impl(p, 0);
+}
+
+func parse_is_impl_trait_block(p: *Parser) -> u64 {
+    if (parse_peek_kind(p) != TOKEN_IMPL) { return false; }
+    var saved: u64 = parser_pos(p);
+    parse_adv(p);
+    if (parse_peek_kind(p) != TOKEN_IDENTIFIER) {
+        parser_set_pos(p, saved);
+        return false;
+    }
+    parse_adv(p);
+    var k: u64 = parse_peek_kind(p);
+    if (k == TOKEN_LT) {
+        var has_assoc_bindings: u64 = parse_scan_generic_list_followed_by(p, TOKEN_FOR, 1, 0);
+        parser_set_pos(p, saved);
+        if (has_assoc_bindings != 0) { return true; }
+        return false;
+    }
+    parser_set_pos(p, saved);
+    if (k == TOKEN_FOR) { return true; }
+    return false;
+}
+
+struct ParsedFuncHeader {
+    public annotations: *Vec<*NameInfo>;
+    public name_tok: *Token;
+    public generic_params: *Vec<*GenericParam>;
+    public params: *Vec<*Param>;
+    public ret_type: u64;
+    public ret_ptr_depth: u64;
+    public ret_is_tagged: u64;
+    public ret_struct_name_ptr: u64;
+    public ret_struct_name_len: u64;
+    public ret_tag_layout_ptr: u64;
+    public ret_tag_layout_len: u64;
+}
+
+impl ParsedFuncHeader {
+    public constructor() {
+        self.annotations = 0;
+        self.name_tok = 0;
+        self.generic_params = 0;
+        self.params = 0;
+        self.ret_type = TYPE_VOID;
+        self.ret_ptr_depth = 0;
+        self.ret_is_tagged = 0;
+        self.ret_struct_name_ptr = 0;
+        self.ret_struct_name_len = 0;
+        self.ret_tag_layout_ptr = 0;
+        self.ret_tag_layout_len = 0;
+    }
+}
+
+func parse_func_header(p: *Parser) -> *ParsedFuncHeader {
+    var annotations: *Vec<*NameInfo> = parse_take_leading_annotations(p);
+    parse_consume(p, TOKEN_FUNC);
+
+    var name_tok: *Token = parse_peek(p);
+    var name_kind: u64 = parse_peek_kind(p);
+    if (name_kind != TOKEN_IDENTIFIER && name_kind != TOKEN_NEW && name_kind != TOKEN_DELETE) {
+        emit_stderr("[ERROR] Expected function name identifier\n");
+        parse_panic_here(p, "Syntax error");
+        var invalid_header: *ParsedFuncHeader = new ParsedFuncHeader();
+        invalid_header.annotations = annotations;
+        invalid_header.params = new Vec<*Param>(0);
+        return invalid_header;
+    }
+    if (name_tok == 0) {
+        var invalid_header2: *ParsedFuncHeader = new ParsedFuncHeader();
+        invalid_header2.annotations = annotations;
+        invalid_header2.params = new Vec<*Param>(0);
+        return invalid_header2;
+    }
+    parse_adv(p);
+
+    var generic_params: *Vec<*GenericParam> = parse_generic_params_any(p);
+    if (generic_params != 0) {
+        type_parser_set_generic_params(p, generic_params);
+    }
+
+    set_parsing_context(name_tok.ptr, name_tok.len, name_tok.line);
+
+    parse_consume(p, TOKEN_LPAREN);
+    var params: *Vec<*Param> = new Vec<*Param>(8);
+    if (parse_peek_kind(p) != TOKEN_RPAREN) {
+        params.push(parse_param(p));
+        while (parse_match(p, TOKEN_COMMA)) {
+            params.push(parse_param(p));
+        }
+    }
+    parse_consume(p, TOKEN_RPAREN);
+    parse_validate_params(p, params);
+
+    var ret_type: u64 = TYPE_VOID;
+    var ret_ptr_depth: u64 = 0;
+    var ret_is_tagged: u64 = 0;
+    var ret_struct_name_ptr: u64 = 0;
+    var ret_struct_name_len: u64 = 0;
+    var ret_tag_layout_ptr: u64 = 0;
+    var ret_tag_layout_len: u64 = 0;
+
+    if (parse_match(p, TOKEN_ARROW)) {
+        var ty: *TypeInfo = parse_type_ex(p);
+        ret_type = ty.type_kind;
+        ret_ptr_depth = ty.ptr_depth;
+        ret_is_tagged = ty.is_tagged;
+        ret_struct_name_ptr = ty.struct_name_ptr;
+        ret_struct_name_len = ty.struct_name_len;
+        ret_tag_layout_ptr = ty.tag_layout_ptr;
+        ret_tag_layout_len = ty.tag_layout_len;
+        if (ret_type == TYPE_ARRAY) {
+            ret_type = ty.elem_type_kind;
+            ret_ptr_depth = ty.elem_ptr_depth + 1;
+            ret_is_tagged = 0;
+            ret_struct_name_ptr = ty.struct_name_ptr;
+            ret_struct_name_len = ty.struct_name_len;
+            ret_tag_layout_ptr = 0;
+            ret_tag_layout_len = 0;
+        }
+    }
+
+    parse_generic_where_clause(p, generic_params);
+
+    var parsed: *ParsedFuncHeader = new ParsedFuncHeader();
+    parsed.annotations = annotations;
+    parsed.name_tok = name_tok;
+    parsed.generic_params = generic_params;
+    parsed.params = params;
+    parsed.ret_type = ret_type;
+    parsed.ret_ptr_depth = ret_ptr_depth;
+    parsed.ret_is_tagged = ret_is_tagged;
+    parsed.ret_struct_name_ptr = ret_struct_name_ptr;
+    parsed.ret_struct_name_len = ret_struct_name_len;
+    parsed.ret_tag_layout_ptr = ret_tag_layout_ptr;
+    parsed.ret_tag_layout_len = ret_tag_layout_len;
+    return parsed;
+}
+
+func parse_func_from_header(p: *Parser, parsed: *ParsedFuncHeader, body: *AstNode) -> *AstFunc {
+    if (parsed == 0 || parsed.name_tok == 0) {
+        emit_stderr("[ERROR] invalid function header state\n");
+        parse_panic_here(p, "Syntax error");
+        return 0;
+    }
+    var name_tok: *Token = parsed.name_tok;
+    var func_node: *AstFunc = ast_func_ex(name_tok.ptr, name_tok.len, parsed.params,
+                                          parsed.ret_type, parsed.ret_ptr_depth, parsed.ret_is_tagged,
+                                          parsed.ret_struct_name_ptr, parsed.ret_struct_name_len,
+                                          parsed.ret_tag_layout_ptr, parsed.ret_tag_layout_len, body);
+    func_node.annotations_vec = parsed.annotations;
+    return func_node;
+}
+
+func parse_register_generic_func(p: *Parser, name_tok: *Token, generic_params: *Vec<*GenericParam>, func_node: *AstFunc, is_definition: u64) -> u64 {
+    if (generic_params == 0 || name_tok == 0 || func_node == 0) { return 0; }
+    type_parser_clear_generic_params(p);
+    if (is_definition != 0) {
+        compiler_register_generic_func_def(name_tok.ptr, name_tok.len, generic_params, func_node);
+        return 0;
+    }
+    compiler_register_generic_func_sig(name_tok.ptr, name_tok.len, generic_params, func_node);
+    return 0;
+}
+
+func parse_func_decl(p: *Parser) -> *AstFunc {
+    push_trace("parse_func_decl", "parser/decl.b", __LINE__);
+    defer pop_trace();
+
+    var parsed: *ParsedFuncHeader = parse_func_header(p);
+    if (parsed == 0 || parsed.name_tok == 0) { return 0; }
+    var name_tok: *Token = parsed.name_tok;
+    var generic_params: *Vec<*GenericParam> = parsed.generic_params;
+
+    parser_push_function_param_scope(p, parsed.params);
+    var body: *AstNode = parse_block(p);
+    parser_pop_function_param_scope(p);
+
+    var func_node: *AstFunc = parse_func_from_header(p, parsed, body);
+    if (func_node == 0) { return 0; }
+    parse_register_generic_func(p, name_tok, generic_params, func_node, 1);
+    return func_node;
+}
+
+// Parse function signature only (skip body)
+func parse_func_decl_signature(p: *Parser) -> *AstFunc {
+    push_trace("parse_func_decl_signature", "parser/decl.b", __LINE__);
+    defer pop_trace();
+
+    var parsed: *ParsedFuncHeader = parse_func_header(p);
+    if (parsed == 0 || parsed.name_tok == 0) { return 0; }
+    var name_tok: *Token = parsed.name_tok;
+    var generic_params: *Vec<*GenericParam> = parsed.generic_params;
+    var is_generic_decl: u64 = 0;
+    if (generic_params != 0) { is_generic_decl = 1; }
+
+    if (parse_peek_kind(p) == TOKEN_LBRACE) {
+        parse_skip_block(p);
+    } else if (parse_match(p, TOKEN_SEMICOLON) == 0) {
+        emit_stderr("[ERROR] Function declaration must have a body or end with ';'\n");
+        parse_panic_here(p, "Syntax error");
+    }
+
+    var func_sig: *AstFunc = parse_func_from_header(p, parsed, 0);
+    if (func_sig == 0) { return 0; }
+    parse_register_generic_func(p, name_tok, generic_params, func_sig, 0);
+    if (is_generic_decl != 0) { return 0; }
+    return func_sig;
+}
+
+func parse_func_decl_top_level(p: *Parser) -> *AstFunc {
+    var parsed: *ParsedFuncHeader = parse_func_header(p);
+    if (parsed == 0 || parsed.name_tok == 0) { return 0; }
+    var name_tok: *Token = parsed.name_tok;
+    var generic_params: *Vec<*GenericParam> = parsed.generic_params;
+
+    if (parse_match(p, TOKEN_SEMICOLON)) {
+        var sig: *AstFunc = parse_func_from_header(p, parsed, 0);
+        if (sig == 0) { return 0; }
+        parse_register_generic_func(p, name_tok, generic_params, sig, 0);
+        return 0;
+    }
+
+    parser_push_function_param_scope(p, parsed.params);
+    var body: *AstNode = parse_block(p);
+    parser_pop_function_param_scope(p);
+    var func_node: *AstFunc = parse_func_from_header(p, parsed, body);
+    if (func_node == 0) { return 0; }
+    parse_register_generic_func(p, name_tok, generic_params, func_node, 1);
+    return func_node;
+}
+
+// Parse abstract function signature (no body, ends with ';')
+func parse_func_decl_abst_signature(p: *Parser) -> *AstFunc {
+    push_trace("parse_func_decl_abst_signature", "parser/decl.b", __LINE__);
+    defer pop_trace();
+
+    var parsed: *ParsedFuncHeader = parse_func_header(p);
+    if (parsed == 0 || parsed.name_tok == 0) { return 0; }
+    var name_tok: *Token = parsed.name_tok;
+    var generic_params: *Vec<*GenericParam> = parsed.generic_params;
+
+    parse_consume(p, TOKEN_SEMICOLON);
+
+    var func_sig: *AstFunc = parse_func_from_header(p, parsed, 0);
+    if (func_sig == 0) { return 0; }
+    parse_register_generic_func(p, name_tok, generic_params, func_sig, 0);
+    return func_sig;
+}
+
+// ============================================
+// Struct Parsing
+// ============================================
+
+func parse_uwidth_from_ident(ptr: u64, len: u64) -> u64 {
+    if (len < 2) { return 0; }
+    var ptr_u8: *u8 = (*u8)ptr;
+    var first: u64 = ptr_u8[0];
+    if (first != 117) { return 0; }
+    var value: u64 = 0;
+    for (var i: u64 = 1; i < len; i++) {
+        var c: u64 = ptr_u8[i];
+        if (c < 48 || c > 57) { return 0; }
+        value = value * 10 + (c - 48);
+    }
+    return value;
+}
+
+struct ParseStructInheritance {
+    public parents: *Vec<*ParentDesc>;
+    public traits: *Vec<*TraitRef>;
+}
+
+func parse_struct_parse_inheritance(p: *Parser, struct_name_ptr: u64, struct_name_len: u64) -> ParseStructInheritance {
+    var inheritance: ParseStructInheritance;
+    var parents: *Vec<*ParentDesc> = 0;
+    var traits: *Vec<*TraitRef> = 0;
+    if (parse_match(p, TOKEN_COLON)) {
+        parents = new Vec<*ParentDesc>(4);
+        while (1) {
+            var parent_tok: *Token = parse_peek(p);
+            if (parse_peek_kind(p) != TOKEN_IDENTIFIER) {
+                emit_stderr("[ERROR] Expected parent struct name after ':'\n");
+                parse_panic_here(p, "Syntax error");
+            }
+            parse_adv(p);
+            if (str_eq(parent_tok.ptr, parent_tok.len, struct_name_ptr, struct_name_len)) {
+                emit_stderr("[ERROR] Struct cannot inherit from itself\n");
+                parse_panic_here(p, "Syntax error");
+            }
+            if (compiler_is_trait_name(parent_tok.ptr, parent_tok.len) != 0) {
+                if (traits == 0) { traits = new Vec<*TraitRef>(4); }
+                var tref: *TraitRef = new TraitRef();
+                tref.name_ptr = parent_tok.ptr;
+                tref.name_len = parent_tok.len;
+                tref.trait_def = compiler_get_trait_def(parent_tok.ptr, parent_tok.len);
+                traits.push(tref);
+                if (!parse_match(p, TOKEN_COMMA)) { break; }
+                continue;
+            }
+            var parent_desc: *ParentDesc = new ParentDesc();
+            parent_desc.name_ptr = parent_tok.ptr;
+            parent_desc.name_len = parent_tok.len;
+            parents.push(parent_desc);
+            if (!parse_match(p, TOKEN_COMMA)) { break; }
+        }
+    }
+    inheritance.parents = parents;
+    inheritance.traits = traits;
+    return inheritance;
+}
+
+func parse_struct_validate_constraints(p: *Parser, is_packed: u64, is_union: u64, parents: *Vec<*ParentDesc>, traits: *Vec<*TraitRef>) -> u64 {
+    if (is_union == 1) {
+        if (parents != 0 && parents.len() > 0) {
+            emit_stderr("[ERROR] union cannot use inheritance\n");
+            parse_panic_here(p, "Syntax error");
+        }
+        if (traits != 0 && traits.len() > 0) {
+            emit_stderr("[ERROR] union cannot use trait inheritance\n");
+            parse_panic_here(p, "Syntax error");
+        }
+        return 0;
+    }
+    if (is_packed == 1 && parents != 0 && parents.len() > 0) {
+        emit_stderr("[ERROR] packed struct cannot use inheritance\n");
+        parse_panic_here(p, "Syntax error");
+    }
+    if (is_packed == 1 && traits != 0 && traits.len() > 0) {
+        emit_stderr("[ERROR] packed struct cannot use trait inheritance\n");
+        parse_panic_here(p, "Syntax error");
+    }
+    return 0;
+}
+
+struct ParsePackedFieldType {
+    public type_kind: u64;
+    public bit_width: u64;
+}
+
+func parse_struct_parse_packed_field_type(p: *Parser) -> ParsePackedFieldType {
+    var packed_type: ParsePackedFieldType;
+    packed_type.type_kind = 0;
+    packed_type.bit_width = 0;
+    var k: u64 = parse_peek_kind(p);
+    switch (k) {
+        case TOKEN_BOOL:
+            parse_adv(p);
+            packed_type.type_kind = TYPE_BOOL;
+            packed_type.bit_width = 8;
+            break;
+        case TOKEN_U8:
+            parse_adv(p);
+            packed_type.type_kind = TYPE_U8;
+            packed_type.bit_width = 8;
+            break;
+        case TOKEN_U16:
+            parse_adv(p);
+            packed_type.type_kind = TYPE_U16;
+            packed_type.bit_width = 16;
+            break;
+        case TOKEN_U32:
+            parse_adv(p);
+            packed_type.type_kind = TYPE_U32;
+            packed_type.bit_width = 32;
+            break;
+        case TOKEN_U64:
+            parse_adv(p);
+            packed_type.type_kind = TYPE_U64;
+            packed_type.bit_width = 64;
+            break;
+        case TOKEN_I8:
+            parse_adv(p);
+            packed_type.type_kind = TYPE_I8;
+            packed_type.bit_width = 8;
+            break;
+        case TOKEN_I16:
+            parse_adv(p);
+            packed_type.type_kind = TYPE_I16;
+            packed_type.bit_width = 16;
+            break;
+        case TOKEN_I32:
+            parse_adv(p);
+            packed_type.type_kind = TYPE_I32;
+            packed_type.bit_width = 32;
+            break;
+        case TOKEN_I64:
+            parse_adv(p);
+            packed_type.type_kind = TYPE_I64;
+            packed_type.bit_width = 64;
+            break;
+        case TOKEN_IDENTIFIER:
+            var bw_tok: *Token = parse_peek(p);
+            var bw_ptr: u64 = bw_tok.ptr;
+            var bw_len: u64 = bw_tok.len;
+            parse_adv(p);
+            var bw: u64 = parse_uwidth_from_ident(bw_ptr, bw_len);
+            if (bw == 0 || bw > 64) {
+                emit_stderr("[ERROR] packed field must be integer width type\n");
+                parse_panic_here(p, "Syntax error");
+            }
+            packed_type.type_kind = TYPE_U64;
+            packed_type.bit_width = bw;
+            break;
+        default:
+            emit_stderr("[ERROR] packed field must be integer width type\n");
+            parse_panic_here(p, "Syntax error");
+    }
+    return packed_type;
+}
+
+func parse_member_access_modifier(p: *Parser, default_access: u64) -> u64 {
+    if (parse_peek_kind(p) == TOKEN_PUBLIC) {
+        parse_adv(p);
+        return ACCESS_PUBLIC;
+    }
+    if (parse_peek_kind(p) == TOKEN_PRIVATE) {
+        parse_adv(p);
+        return ACCESS_PRIVATE;
+    }
+    if (parse_peek_kind(p) == TOKEN_PROTECTED) {
+        parse_adv(p);
+        return ACCESS_PROTECTED;
+    }
+    return default_access;
+}
+
+func parse_struct_parse_field(p: *Parser, is_packed: u64, struct_name_ptr: u64, struct_name_len: u64) -> *FieldDesc {
+    var access: u64 = parse_member_access_modifier(p, ACCESS_PRIVATE);
+
+    var field_name_tok: *Token = parse_peek(p);
+    var field_name_ptr: u64 = field_name_tok.ptr;
+    var field_name_len: u64 = field_name_tok.len;
+    parse_consume(p, TOKEN_IDENTIFIER);
+    parse_consume(p, TOKEN_COLON);
+
+    var field_type_kind: u64 = 0;
+    var field_ptr_depth: u64 = 0;
+    var field_struct_name_ptr: u64 = 0;
+    var field_struct_name_len: u64 = 0;
+    var field_tag_layout_ptr: u64 = 0;
+    var field_tag_layout_len: u64 = 0;
+    var field_elem_type_kind: u64 = 0;
+    var field_elem_ptr_depth: u64 = 0;
+    var field_array_len: u64 = 0;
+    var field_elem_typeinfo: *TypeInfo = 0;
+    var field_is_tagged: u64 = 0;
+    var field_bit_width: u64 = 0;
+
+    if (is_packed == 1) {
+        var packed_type: ParsePackedFieldType = parse_struct_parse_packed_field_type(p);
+        field_type_kind = packed_type.type_kind;
+        field_bit_width = packed_type.bit_width;
+    } else {
+        var field_type: *TypeInfo = parse_type_ex(p);
+        field_type_kind = field_type.type_kind;
+        field_struct_name_ptr = field_type.struct_name_ptr;
+        field_struct_name_len = field_type.struct_name_len;
+        field_tag_layout_ptr = field_type.tag_layout_ptr;
+        field_tag_layout_len = field_type.tag_layout_len;
+        field_ptr_depth = field_type.ptr_depth;
+        field_is_tagged = field_type.is_tagged;
+        field_elem_type_kind = field_type.elem_type_kind;
+        field_elem_ptr_depth = field_type.elem_ptr_depth;
+        field_array_len = field_type.array_len;
+        field_elem_typeinfo = field_type.elem_typeinfo;
+    }
+
+    parse_consume(p, TOKEN_SEMICOLON);
+
+    var field_desc: *FieldDesc = new FieldDesc();
+    field_desc.name_ptr = field_name_ptr;
+    field_desc.name_len = field_name_len;
+    field_desc.type_kind = field_type_kind;
+    field_desc.struct_name_ptr = field_struct_name_ptr;
+    field_desc.struct_name_len = field_struct_name_len;
+    field_desc.ptr_depth = field_ptr_depth;
+    field_desc.is_tagged = field_is_tagged;
+    field_desc.tag_layout_ptr = field_tag_layout_ptr;
+    field_desc.tag_layout_len = field_tag_layout_len;
+    field_desc.bit_width = field_bit_width;
+    field_desc.elem_type_kind = field_elem_type_kind;
+    field_desc.elem_ptr_depth = field_elem_ptr_depth;
+    field_desc.array_len = field_array_len;
+    field_desc.elem_typeinfo = field_elem_typeinfo;
+    field_desc.access = access;
+    field_desc.owner_struct_ptr = struct_name_ptr;
+    field_desc.owner_struct_len = struct_name_len;
+    return field_desc;
+}
+
+func parse_struct_def(p: *Parser) -> *AstStructDef {
+    push_trace("parse_struct_def", "parser/decl.b", __LINE__);
+    defer pop_trace();
+    var is_packed: u64 = 0;
+    if (parse_match(p, TOKEN_PACKED)) {
+        is_packed = 1;
+    }
+    var is_union: u64 = 0;
+    if (parse_match(p, TOKEN_STRUCT) == 0) {
+        if (parse_match(p, TOKEN_UNION) != 0) {
+            is_union = 1;
+        } else {
+            emit_stderr("[ERROR] Expected struct or union declaration\n");
+            parse_panic_here(p, "Syntax error");
+        }
+    }
+
+    var name_tok: *Token = parse_peek(p);
+    var name_ptr: u64 = name_tok.ptr;
+    var name_len: u64 = name_tok.len;
+    parse_consume(p, TOKEN_IDENTIFIER);
+
+    var generic_params: *Vec<*GenericParam> = parse_generic_params_any(p);
+    if (generic_params != 0) {
+        type_parser_set_generic_params(p, generic_params);
+    }
+    parse_generic_where_clause(p, generic_params);
+
+    var parents: *Vec<*ParentDesc> = 0;
+    var traits: *Vec<*TraitRef> = 0;
+    if (is_union == 0) {
+        var inheritance: ParseStructInheritance = parse_struct_parse_inheritance(p, name_ptr, name_len);
+        parents = inheritance.parents;
+        traits = inheritance.traits;
+    } else if (parse_peek_kind(p) == TOKEN_COLON) {
+        emit_stderr("[ERROR] union cannot declare inheritance list\n");
+        parse_panic_here(p, "Syntax error");
+    }
+    parse_struct_validate_constraints(p, is_packed, is_union, parents, traits);
+
+    parse_consume(p, TOKEN_LBRACE);
+    
+    var fields: *Vec<*FieldDesc> = new Vec<*FieldDesc>(8);
+    
+    while (parse_peek_kind(p) != TOKEN_RBRACE) {
+        if (parse_peek_kind(p) == TOKEN_EOF) { break; }
+        fields.push(parse_struct_parse_field(p, is_packed, name_ptr, name_len));
+    }
+    
+    parse_consume(p, TOKEN_RBRACE);
+    
+    var struct_def: *AstStructDef = ast_struct_def(name_ptr, name_len, parents, fields, is_packed, traits, is_union);
+    if (generic_params != 0) {
+        type_parser_clear_generic_params(p);
+        compiler_register_generic_struct_def(name_ptr, name_len, generic_params, struct_def);
+    }
+    return struct_def;
+}
+
+// ============================================
+// Enum Parsing
+// ============================================
+
+// ============================================
+// Impl Block Parsing
+// ============================================
+
+func parse_program(p: *Parser) -> *AstProgram {
+    push_trace("parse_program", "parser/decl.b", __LINE__);
+    defer pop_trace();
+    return parse_program_impl(p, PARSE_PROGRAM_MODE_FULL);
+}
+
+// ============================================
+// Program Parsing (Signature Pass)
+// ============================================
+
+func parse_program_pass1(p: *Parser) -> *AstProgram {
+    push_trace("parse_program_pass1", "parser/decl.b", __LINE__);
+    defer pop_trace();
+    return parse_program_impl(p, PARSE_PROGRAM_MODE_SIGNATURE);
+}
+
+// ============================================
+// Program Parsing (Imports Only)
+// ============================================
+
+func parse_program_imports_only(p: *Parser) -> *Vec<*AstImport> {
+    push_trace("parse_program_imports_only", "parser/decl.b", __LINE__);
+    defer pop_trace();
+
+    var imports: *Vec<*AstImport> = new Vec<*AstImport>(8);
+    clear_parsing_context();
+    while (parse_peek_kind(p) != TOKEN_EOF) {
+        if (parse_peek_kind(p) == TOKEN_IMPORT) {
+            imports.push(parse_import_decl(p));
+        } else {
+            parse_adv(p);
+        }
+    }
+
+    clear_parsing_context();
+    return imports;
+}

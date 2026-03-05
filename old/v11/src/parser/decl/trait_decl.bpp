@@ -1,0 +1,162 @@
+// parse_decl_trait.b - trait declaration parsing helpers
+
+import std.io;
+import std.vec;
+import std.util;
+import std.str;
+import module_utils;
+import types;
+import lexer;
+import ast;
+import compiler;
+import compiler.core_utils;
+import compiler.generic.engine;
+import compiler.enum_runtime;
+import compiler.symbol_runtime;
+import parser.util;
+import parser.type;
+import parser.expr;
+import parser.stmt;
+import parser.decl;
+import parser.decl.generic_decl;
+
+func parse_trait_assoc_decl(p: *Parser, assoc_types: *Vec<*TraitAssocType>) -> u64 {
+    parse_consume(p, TOKEN_ALIAS);
+    if (parse_peek_kind(p) != TOKEN_IDENTIFIER) {
+        emit_stderr("[ERROR] trait associated type declaration expects identifier\n");
+        parse_panic_here(p, "Syntax error");
+    }
+    var name_tok: *Token = parse_peek(p);
+    parse_consume(p, TOKEN_IDENTIFIER);
+    parse_consume(p, TOKEN_SEMICOLON);
+    if (assoc_types == 0) { return 0; }
+    var n: u64 = assoc_types.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var prev: *TraitAssocType = assoc_types.get(i);
+        if (prev == 0) { continue; }
+        if (str_eq(prev.name_ptr, prev.name_len, name_tok.ptr, name_tok.len) != 0) {
+            emit_stderr("[ERROR] duplicate trait associated type declaration: ");
+            emit_stderr_len(name_tok.ptr, name_tok.len);
+            emit_stderr("\n");
+            parse_panic_here(p, "Syntax error");
+        }
+    }
+    var assoc: *TraitAssocType = new TraitAssocType();
+    assoc.name_ptr = name_tok.ptr;
+    assoc.name_len = name_tok.len;
+    assoc_types.push(assoc);
+    return 0;
+}
+
+func parse_trait_method_signature(p: *Parser, mode: u64) -> *AstFunc {
+    parse_consume(p, TOKEN_FUNC);
+
+    var name_tok: *Token = parse_peek(p);
+    var name_kind: u64 = parse_peek_kind(p);
+    if (name_kind != TOKEN_IDENTIFIER) {
+        emit_stderr("[ERROR] Expected trait method name identifier\n");
+        parse_panic_here(p, "Syntax error");
+    }
+    parse_adv(p);
+
+    set_parsing_context(name_tok.ptr, name_tok.len, name_tok.line);
+
+    parse_consume(p, TOKEN_LPAREN);
+    var params: *Vec<*Param> = new Vec<*Param>(8);
+    if (parse_peek_kind(p) != TOKEN_RPAREN) {
+        params.push(parse_param(p));
+        while (parse_match(p, TOKEN_COMMA)) {
+            params.push(parse_param(p));
+        }
+    }
+    parse_consume(p, TOKEN_RPAREN);
+    parse_validate_params(p, params);
+
+    var ret_type: u64 = TYPE_VOID;
+    var ret_ptr_depth: u64 = 0;
+    var ret_is_tagged: u64 = 0;
+    var ret_struct_name_ptr: u64 = 0;
+    var ret_struct_name_len: u64 = 0;
+    var ret_tag_layout_ptr: u64 = 0;
+    var ret_tag_layout_len: u64 = 0;
+
+    if (parse_match(p, TOKEN_ARROW)) {
+        var ty: *TypeInfo = parse_type_ex(p);
+        ret_type = ty.type_kind;
+        ret_ptr_depth = ty.ptr_depth;
+        ret_is_tagged = ty.is_tagged;
+        ret_struct_name_ptr = ty.struct_name_ptr;
+        ret_struct_name_len = ty.struct_name_len;
+        ret_tag_layout_ptr = ty.tag_layout_ptr;
+        ret_tag_layout_len = ty.tag_layout_len;
+        if (ret_type == TYPE_ARRAY) {
+            ret_type = ty.elem_type_kind;
+            ret_ptr_depth = ty.elem_ptr_depth + 1;
+            ret_is_tagged = 0;
+            ret_struct_name_ptr = ty.struct_name_ptr;
+            ret_struct_name_len = ty.struct_name_len;
+            ret_tag_layout_ptr = 0;
+            ret_tag_layout_len = 0;
+        }
+    }
+
+    var body: *AstNode = 0;
+    if (parse_peek_kind(p) == TOKEN_SEMICOLON) {
+        parse_adv(p);
+    } else if (parse_peek_kind(p) == TOKEN_LBRACE) {
+        // parse_program full mode is encoded as 0.
+        if (mode == 0) {
+            parser_push_function_param_scope(p, params);
+            body = parse_block(p);
+            parser_pop_function_param_scope(p);
+        } else {
+            parse_skip_block(p);
+        }
+    } else {
+        emit_stderr("[ERROR] trait method must end with ';' or method body\n");
+        parse_panic_here(p, "Syntax error");
+    }
+    return ast_func_ex(name_tok.ptr, name_tok.len, params, ret_type, ret_ptr_depth, ret_is_tagged, ret_struct_name_ptr, ret_struct_name_len, ret_tag_layout_ptr, ret_tag_layout_len, body);
+}
+
+func parse_trait_def(p: *Parser, mode: u64) -> *TraitDef {
+    parse_consume(p, TOKEN_TRAIT);
+
+    var name_tok: *Token = parse_peek(p);
+    var name_ptr: u64 = name_tok.ptr;
+    var name_len: u64 = name_tok.len;
+    parse_consume(p, TOKEN_IDENTIFIER);
+
+    parse_consume(p, TOKEN_LBRACE);
+
+    var methods: *Vec<*TraitMethod> = new Vec<*TraitMethod>(8);
+    var assoc_types: *Vec<*TraitAssocType> = new Vec<*TraitAssocType>(2);
+    while (parse_peek_kind(p) != TOKEN_RBRACE) {
+        if (parse_peek_kind(p) == TOKEN_EOF) { break; }
+        if (parse_peek_kind(p) == TOKEN_ALIAS) {
+            parse_trait_assoc_decl(p, assoc_types);
+            continue;
+        }
+        if (parse_peek_kind(p) != TOKEN_FUNC) {
+            emit_stderr("[ERROR] trait block can only contain methods or alias declarations\n");
+            parse_panic_here(p, "Syntax error");
+        }
+        var sig: *AstFunc = parse_trait_method_signature(p, mode);
+        var tm: *TraitMethod = new TraitMethod();
+        tm.name_ptr = sig.name_ptr;
+        tm.name_len = sig.name_len;
+        tm.sig = sig;
+        tm.index = methods.len();
+        methods.push(tm);
+    }
+
+    parse_consume(p, TOKEN_RBRACE);
+
+    var td: *TraitDef = new TraitDef();
+    td.name_ptr = name_ptr;
+    td.name_len = name_len;
+    td.methods_vec = methods;
+    td.assoc_types_vec = assoc_types;
+    compiler_register_trait_def(td);
+    return td;
+}
