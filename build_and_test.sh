@@ -120,6 +120,15 @@ pick_first_existing_file() {
     return 1
 }
 
+extract_numeric_version() {
+    local token="$1"
+    if [[ "$token" =~ v([0-9]+) ]]; then
+        echo "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    return 1
+}
+
 VERSION="${BPP_VERSION:-}"
 if [ -z "$VERSION" ]; then
     VERSION="$(read_config_value VERSION)"
@@ -198,6 +207,7 @@ trap 'if [ "$ASM_WORK_DIR" != "$BUILD_DIR" ]; then rm -rf "$ASM_WORK_DIR"; fi' E
 STAGE0_ASM="$ASM_WORK_DIR/${VERSION}_stage0.asm"
 STAGE1_ASM="$ASM_WORK_DIR/${VERSION}_stage1.asm"
 STAGE2_ASM="$ASM_WORK_DIR/${VERSION}_stage2.asm"
+BRIDGE_STAGE0_ASM="$ASM_WORK_DIR/${VERSION}_bridge_stage0.asm"
 
 echo "========================================="
 echo "${VERSION} Build & Test Automation"
@@ -249,7 +259,26 @@ if [ ! -x "${BASE_BIN}" ]; then
     exit 1
 fi
 
-"${BASE_BIN}" -asm "${SRC_FILE}" > "${STAGE0_ASM}"
+BOOTSTRAP_BIN="${BASE_BIN}"
+TARGET_VER_NUM="$(extract_numeric_version "$VERSION" || true)"
+BASE_VER_NUM="$(extract_numeric_version "$(basename "$BASE_BIN")" || true)"
+LEGACY_SRC_FILE="$OLD_DIR/$VERSION/src/main.bpp"
+
+# Compatibility bridge:
+# Some transitions (ex: v11 -> current v12) can produce a crashing stage0.
+# When old/<VERSION>/ snapshot exists and base major is older than target,
+# first build bridge compiler from old snapshot, then build current stage0.
+if [ -n "${TARGET_VER_NUM:-}" ] && [ -n "${BASE_VER_NUM:-}" ] \
+   && [ "$BASE_VER_NUM" -lt "$TARGET_VER_NUM" ] \
+   && [ -f "$LEGACY_SRC_FILE" ]; then
+    echo "   (bootstrap bridge enabled: v${BASE_VER_NUM} -> old/${VERSION} -> ${VERSION})"
+    "${BASE_BIN}" -asm "${LEGACY_SRC_FILE}" > "${BRIDGE_STAGE0_ASM}"
+    nasm ${NASM_FLAGS} "${BRIDGE_STAGE0_ASM}" -o "build/${VERSION}_bridge_stage0.o"
+    ld "build/${VERSION}_bridge_stage0.o" -o "bin/${VERSION}_bridge_stage0"
+    BOOTSTRAP_BIN="./bin/${VERSION}_bridge_stage0"
+fi
+
+"${BOOTSTRAP_BIN}" -asm "${SRC_FILE}" > "${STAGE0_ASM}"
 nasm ${NASM_FLAGS} "${STAGE0_ASM}" -o "build/${VERSION}_stage0.o"
 ld build/${VERSION}_stage0.o -o bin/${VERSION}_stage0
 echo "Stage 0 Build Completed"
