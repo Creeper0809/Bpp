@@ -74,6 +74,70 @@ func module_aliases_ensure(module_ptr: u64, module_len: u64) -> *HashMap<u64, *N
     return map;
 }
 
+func module_namespaces_get(module_ptr: u64, module_len: u64) -> *HashMap<u64, *NameInfo> {
+    if (g_compiler_ctx.module_namespaces == 0) { return 0; }
+    return g_compiler_ctx.module_namespaces.get(module_ptr, module_len);
+}
+
+func module_namespaces_ensure(module_ptr: u64, module_len: u64) -> *HashMap<u64, *NameInfo> {
+    if (g_compiler_ctx.module_namespaces == 0) {
+        g_compiler_ctx.module_namespaces = new HashMap<u64, *HashMap<u64, *NameInfo>>(128);
+    }
+    var existing: *HashMap<u64, *NameInfo> = g_compiler_ctx.module_namespaces.get(module_ptr, module_len);
+    if (existing != 0) { return existing; }
+    var map: *HashMap<u64, *NameInfo> = new HashMap<u64, *NameInfo>(64);
+    g_compiler_ctx.module_namespaces.put(module_ptr, module_len, map);
+    return map;
+}
+
+func add_module_namespace_alias(importer_ptr: u64, importer_len: u64, alias_ptr: u64, alias_len: u64, module_ptr: u64, module_len: u64) -> u64 {
+    if (alias_ptr == 0 || alias_len == 0 || module_ptr == 0 || module_len == 0) { return 0; }
+    var map: *HashMap<u64, *NameInfo> = module_namespaces_ensure(importer_ptr, importer_len);
+    var existing: *NameInfo = map.get(alias_ptr, alias_len);
+    if (existing != 0) {
+        if (existing.ptr == module_ptr && existing.len == module_len) { return 0; }
+        emit_stderr("[ERROR] module namespace alias conflict: ");
+        emit_stderr_len(alias_ptr, alias_len);
+        emit_stderr_nl();
+        compiler_error("Compilation failed");
+        return 0;
+    }
+    map.put(alias_ptr, alias_len, new NameInfo{module_ptr, module_len});
+    compiler_invalidate_resolve_name_cache();
+    return 0;
+}
+
+func resolve_module_namespace_alias(importer_ptr: u64, importer_len: u64, alias_ptr: u64, alias_len: u64) -> *NameInfo {
+    var map: *HashMap<u64, *NameInfo> = module_namespaces_get(importer_ptr, importer_len);
+    return map.?get(alias_ptr, alias_len);
+}
+
+func compiler_resolve_module_scoped_symbol(scope_ptr: u64, scope_len: u64, member_ptr: u64, member_len: u64) -> *NameInfo {
+    if (scope_ptr == 0 || scope_len == 0 || member_ptr == 0 || member_len == 0) { return 0; }
+    if (g_compiler_ctx.current_module_ptr == 0 || g_compiler_ctx.current_module_len == 0) { return 0; }
+
+    var mod_info: *NameInfo = resolve_module_namespace_alias(g_compiler_ctx.current_module_ptr, g_compiler_ctx.current_module_len, scope_ptr, scope_len);
+    if (mod_info == 0) { return 0; }
+
+    var export_map: *HashMap<u64, *NameInfo> = module_export_map_get(mod_info.ptr, mod_info.len);
+    if (export_map != 0) {
+        var mapped: *NameInfo = export_map.get(member_ptr, member_len);
+        if (mapped != 0) { return mapped; }
+        return 0;
+    }
+
+    var exports: *Vec<*ExportEntry> = module_exports_get(mod_info.ptr, mod_info.len);
+    if (exports == 0) { return 0; }
+    var n: u64 = exports.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var e: *ExportEntry = exports.get(i);
+        if (e == 0) { continue; }
+        if (str_eq(e.name_ptr, e.name_len, member_ptr, member_len) == 0) { continue; }
+        return new NameInfo{e.mangled_ptr, e.mangled_len};
+    }
+    return 0;
+}
+
 func add_import_alias(module_ptr: u64, module_len: u64, alias_ptr: u64, alias_len: u64, mangled_ptr: u64, mangled_len: u64) -> u64 {
     var alias_map: *HashMap<u64, *NameInfo> = module_aliases_ensure(module_ptr, module_len);
     var existing: *NameInfo = alias_map.get(alias_ptr, alias_len);
@@ -617,6 +681,12 @@ func compiler_find_scoped_const(scope_ptr: u64, scope_len: u64, member_ptr: u64,
     var result: u64 = (u64)res;
 
     if (scope_ptr == 0 || scope_len == 0 || member_ptr == 0 || member_len == 0) { return result; }
+
+    var module_sym: *NameInfo = compiler_resolve_module_scoped_symbol(scope_ptr, scope_len, member_ptr, member_len);
+    if (module_sym != 0) {
+        var module_const: *ConstResult = (*ConstResult)compiler_find_const(module_sym.ptr, module_sym.len);
+        if (module_const != 0 && module_const.found != 0) { return result; }
+    }
 
     var resolved_scope_ptr: u64 = scope_ptr;
     var resolved_scope_len: u64 = scope_len;
