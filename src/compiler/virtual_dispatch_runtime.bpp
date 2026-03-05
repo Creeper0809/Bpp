@@ -1,0 +1,367 @@
+// vdispatch_runtime.b - abstract method collection and virtual dispatch setup
+
+import compiler;
+import compiler.core_utils;
+import compiler.symbol_runtime;
+import compiler.trait_runtime;
+import compiler.struct_layout;
+import std.io;
+import std.str;
+import std.vec;
+import ast;
+import types;
+import module_utils;
+
+func vdispatch_collect_parent_abst_methods(parent_def: *AstStructDef, out: *Vec<*NameInfo>) -> u64 {
+    if (parent_def == 0 || out == 0) { return 0; }
+    vdispatch_collect_abst_methods_recursive(parent_def, out);
+
+    var list: *Vec<*NameInfo> = sym_get_abst_methods(parent_def.name_ptr, parent_def.name_len);
+    if (list == 0) { return 0; }
+
+    var n: u64 = list.len();
+    for (var i: u64 = 0; i < n; i++) {
+        module_util_nameinfo_vec_push_unique(out, list.get(i));
+    }
+    return 0;
+}
+
+func vdispatch_collect_abst_methods_recursive(struct_def: *AstStructDef, out: *Vec<*NameInfo>) -> u64 {
+    if (struct_def == 0 || out == 0) { return 0; }
+    if (struct_def.parents_vec != 0) {
+        var pn: u64 = struct_def.parents_vec.len();
+        for (var pi: u64 = 0; pi < pn; pi++) {
+            var parent_desc: *ParentDesc = struct_def.parents_vec.get(pi);
+            var parent_def: *AstStructDef = parent_desc.struct_def;
+            if (parent_def == 0) {
+                parent_def = get_struct_def(parent_desc.name_ptr, parent_desc.name_len);
+            }
+            if (parent_def != 0) {
+                vdispatch_collect_parent_abst_methods(parent_def, out);
+            }
+        }
+    }
+    return 0;
+}
+
+func vdispatch_collect_self_and_parent_abst_methods(struct_def: *AstStructDef, out: *Vec<*NameInfo>) -> u64 {
+    if (struct_def == 0 || out == 0) { return 0; }
+    vdispatch_collect_abst_methods_recursive(struct_def, out);
+    var own: *Vec<*NameInfo> = sym_get_abst_methods(struct_def.name_ptr, struct_def.name_len);
+    if (own == 0) { return 0; }
+    var n: u64 = own.len();
+    for (var i: u64 = 0; i < n; i++) {
+        module_util_nameinfo_vec_push_unique(out, own.get(i));
+    }
+    return 0;
+}
+
+func _compiler_find_abst_decl_in_hierarchy(struct_def: *AstStructDef, method_ptr: u64, method_len: u64, depth: u64) -> CompilerDeclLookup {
+    var lookup: CompilerDeclLookup = decl_lookup_none(ACCESS_PRIVATE);
+    if (struct_def == 0) { return lookup; }
+    if (depth > 64) {
+        emit_stderr("[ERROR] Inheritance depth exceeded\n");
+        diag_error("Compiler error");
+        return lookup;
+    }
+
+    if (sym_is_abst_method(struct_def.name_ptr, struct_def.name_len, method_ptr, method_len) != 0) {
+        lookup.found = 1;
+        lookup.owner_ptr = struct_def.name_ptr;
+        lookup.owner_len = struct_def.name_len;
+        lookup.access = sym_get_abst_method_access(struct_def.name_ptr, struct_def.name_len, method_ptr, method_len);
+        lookup.sig = sym_get_abst_method_sig(struct_def.name_ptr, struct_def.name_len, method_ptr, method_len);
+        return lookup;
+    }
+
+    if (struct_def.parents_vec == 0) { return lookup; }
+    var parents: *Vec<*ParentDesc> = struct_def.parents_vec;
+    var pn: u64 = parents.len();
+    var found: u64 = 0;
+    var first_hit: CompilerDeclLookup = decl_lookup_none(ACCESS_PRIVATE);
+    for (var i: u64 = 0; i < pn; i++) {
+        var parent_desc: *ParentDesc = parents.get(i);
+        var parent_def: *AstStructDef = resolve_parent_def(parent_desc, "Compiler error");
+        var child_lookup: CompilerDeclLookup = _compiler_find_abst_decl_in_hierarchy(parent_def, method_ptr, method_len, depth + 1);
+        if (child_lookup.found != 0) {
+            found = found + 1;
+            if (found == 1) { first_hit = child_lookup; }
+        }
+    }
+    if (found > 1) {
+        emit_stderr("[ERROR] Ambiguous abstract method declaration in inheritance: ");
+        emit_stderr_len(struct_def.name_ptr, struct_def.name_len);
+        emit_stderr(".");
+        emit_stderr_len(method_ptr, method_len);
+        emit_stderr("\n");
+        diag_note_error();
+        return decl_lookup_none(ACCESS_PRIVATE);
+    }
+    if (found == 0) { return lookup; }
+    return first_hit;
+}
+
+func vdispatch_find_abst_decl_in_hierarchy(struct_def: *AstStructDef, method_ptr: u64, method_len: u64) -> CompilerDeclLookup {
+    return _compiler_find_abst_decl_in_hierarchy(struct_def, method_ptr, method_len, 0);
+}
+
+func vdispatch_build_virtual_trait_name(base_ptr: u64, base_len: u64) -> *NameInfo {
+    return module_util_name_concat2("__Virt_", 7, base_ptr, base_len);
+}
+
+func vdispatch_build_virtual_trait_method_sig(abst_sig: *AstFunc, method_ptr: u64, method_len: u64) -> *AstFunc {
+    if (abst_sig == 0 || abst_sig.params_vec == 0 || abst_sig.params_vec.len() == 0) {
+        emit_stderr("[ERROR] abstract method requires self parameter for virtual dispatch: ");
+        emit_stderr_len(method_ptr, method_len);
+        emit_stderr("\n");
+        diag_note_error();
+        return 0;
+    }
+
+    var params_out: *Vec<*Param> = new Vec<*Param>(abst_sig.params_vec.len());
+    var pn: u64 = abst_sig.params_vec.len();
+    for (var i: u64 = 0; i < pn; i++) {
+        var src: *Param = abst_sig.params_vec.get(i);
+        var dst: *Param = module_util_clone_param(src);
+        if (i == 0) {
+            dst.type_kind = TYPE_STRUCT;
+            dst.ptr_depth = 1;
+            dst.is_tagged = 0;
+            dst.struct_name_ptr = (u64)"Self";
+            dst.struct_name_len = 4;
+            dst.tag_layout_ptr = 0;
+            dst.tag_layout_len = 0;
+        }
+        params_out.push(dst);
+    }
+
+    return ast_func_ex(method_ptr, method_len, params_out,
+                       abst_sig.ret_type, abst_sig.ret_ptr_depth, abst_sig.ret_is_tagged,
+                       abst_sig.ret_struct_name_ptr, abst_sig.ret_struct_name_len,
+                       abst_sig.ret_tag_layout_ptr, abst_sig.ret_tag_layout_len, 0);
+}
+
+func vdispatch_setup_single_trait(base_def: *AstStructDef) -> u64 {
+    if (base_def == 0) { return 0; }
+    var own_abst: *Vec<*NameInfo> = sym_get_abst_methods(base_def.name_ptr, base_def.name_len);
+    if (own_abst == 0 || own_abst.len() == 0) { return 0; }
+
+    var required: *Vec<*NameInfo> = new Vec<*NameInfo>(8);
+    vdispatch_collect_self_and_parent_abst_methods(base_def, required);
+    if (required.len() == 0) { return 0; }
+
+    var trait_name: *NameInfo = vdispatch_build_virtual_trait_name(base_def.name_ptr, base_def.name_len);
+    var trait_def: *TraitDef = sym_get_trait_def(trait_name.ptr, trait_name.len);
+    if (trait_def == 0) {
+        var methods: *Vec<*TraitMethod> = new Vec<*TraitMethod>(required.len());
+        var rn: u64 = required.len();
+        for (var ri: u64 = 0; ri < rn; ri++) {
+            var mi: *NameInfo = required.get(ri);
+            var abst_lookup: CompilerDeclLookup = vdispatch_find_abst_decl_in_hierarchy(base_def, mi.ptr, mi.len);
+            if (abst_lookup.found == 0 || abst_lookup.sig == 0) {
+                emit_stderr("[ERROR] abstract signature missing for virtual dispatch: ");
+                emit_stderr_len(base_def.name_ptr, base_def.name_len);
+                emit_stderr(".");
+                emit_stderr_len(mi.ptr, mi.len);
+                emit_stderr("\n");
+                diag_note_error();
+                continue;
+            }
+
+            var tm: *TraitMethod = new TraitMethod();
+            tm.name_ptr = mi.ptr;
+            tm.name_len = mi.len;
+            tm.sig = vdispatch_build_virtual_trait_method_sig(abst_lookup.sig, mi.ptr, mi.len);
+            if (tm.sig == 0) { continue; }
+            tm.index = methods.len();
+            methods.push(tm);
+        }
+
+        trait_def = new TraitDef();
+        trait_def.name_ptr = trait_name.ptr;
+        trait_def.name_len = trait_name.len;
+        trait_def.methods_vec = methods;
+        trait_def.assoc_types_vec = 0;
+        sym_register_trait_def(trait_def);
+    }
+
+    var vtable_info2: CompilerVtableStructInfo = trait_get_or_create_vtable_struct(trait_def, trait_name.ptr, trait_name.len);
+    var vtable_name_ptr: u64 = vtable_info2.vtable_name_ptr;
+    var vtable_name_len: u64 = vtable_info2.vtable_name_len;
+    var vtable_struct_def: *AstStructDef = vtable_info2.vtable_struct_def;
+    if (vtable_struct_def == 0) {
+        emit_stderr("[ERROR] failed to build virtual vtable struct\n");
+        diag_note_error();
+        return 0;
+    }
+
+    var sn: u64 = g_compiler_ctx.all_structs_vec.len();
+    for (var si: u64 = 0; si < sn; si++) {
+        var sd: *AstStructDef = g_compiler_ctx.all_structs_vec.get(si);
+        if (sd == 0) { continue; }
+        if (struct_is_same_or_descendant(sd.name_ptr, sd.name_len, base_def.name_ptr, base_def.name_len) == 0) { continue; }
+
+        struct_insert_vptr_field(sd, trait_name.ptr, trait_name.len, vtable_name_ptr, vtable_name_len);
+
+        var rn2: u64 = required.len();
+        for (var rj: u64 = 0; rj < rn2; rj++) {
+            var mref: *NameInfo = required.get(rj);
+            vdispatch_register_trait(sd.name_ptr, sd.name_len, mref.ptr, mref.len, trait_name.ptr, trait_name.len);
+        }
+
+        if (trait_find_trait_impl(trait_name.ptr, trait_name.len, sd.name_ptr, sd.name_len) != 0) { continue; }
+
+        var impl_methods: *Vec<*TraitImplMethod> = new Vec<*TraitImplMethod>(required.len());
+        var has_all_impls: u64 = 1;
+        for (var rk: u64 = 0; rk < required.len(); rk++) {
+            var mk: *NameInfo = required.get(rk);
+            var fn: *AstFunc = find_method_func_in_hierarchy(sd, mk.ptr, mk.len);
+            if (fn == 0) {
+                has_all_impls = 0;
+                break;
+            }
+            var tim: *TraitImplMethod = new TraitImplMethod();
+            tim.name_ptr = mk.ptr;
+            tim.name_len = mk.len;
+            tim.func_def = fn;
+            impl_methods.push(tim);
+        }
+        if (has_all_impls == 0) { continue; }
+
+        var impl_info: *TraitImpl = new TraitImpl();
+        impl_info.trait_ptr = trait_name.ptr;
+        impl_info.trait_len = trait_name.len;
+        impl_info.struct_ptr = sd.name_ptr;
+        impl_info.struct_len = sd.name_len;
+        impl_info.methods_vec = impl_methods;
+        impl_info.assoc_bindings_vec = 0;
+        impl_info.vtable_struct_def = 0;
+        impl_info.vtable_global_ptr = 0;
+        impl_info.vtable_global_len = 0;
+        sym_register_trait_impl(impl_info);
+    }
+    return 0;
+}
+
+func vdispatch_setup_traits() -> u64 {
+    if (g_compiler_ctx.all_structs_vec == 0) { return 0; }
+    var sn: u64 = g_compiler_ctx.all_structs_vec.len();
+    for (var si: u64 = 0; si < sn; si++) {
+        var sd: *AstStructDef = g_compiler_ctx.all_structs_vec.get(si);
+        if (sd == 0) { continue; }
+        vdispatch_setup_single_trait(sd);
+    }
+    return 0;
+}
+
+func vdispatch_find_parent_method_decl_for_override(struct_def: *AstStructDef, method_ptr: u64, method_len: u64, arg_types: *Vec<*TypeInfo>, arg_count_hint: u64) -> CompilerDeclLookup {
+    var lookup: CompilerDeclLookup = decl_lookup_none(ACCESS_PUBLIC);
+    if (struct_def == 0 || struct_def.parents_vec == 0) { return lookup; }
+    var parents: *Vec<*ParentDesc> = struct_def.parents_vec;
+    var pn: u64 = parents.len();
+    var found: u64 = 0;
+    var first_hit: CompilerDeclLookup = decl_lookup_none(ACCESS_PUBLIC);
+    for (var i: u64 = 0; i < pn; i++) {
+        var parent_desc: *ParentDesc = parents.get(i);
+        var parent_def: *AstStructDef = resolve_parent_def(parent_desc, "Compiler error");
+        var child_lookup: CompilerDeclLookup = find_method_decl_in_hierarchy_overload(parent_def.name_ptr, parent_def.name_len, method_ptr, method_len, arg_types, arg_count_hint);
+        if (child_lookup.found != 0) {
+            found = found + 1;
+            if (found == 1) { first_hit = child_lookup; }
+        }
+    }
+    if (found > 1) {
+        emit_stderr("[ERROR] Ambiguous override target in inheritance: ");
+        emit_stderr_len(struct_def.name_ptr, struct_def.name_len);
+        emit_stderr(".");
+        emit_stderr_len(method_ptr, method_len);
+        emit_stderr("\n");
+        diag_note_error();
+        return decl_lookup_none(ACCESS_PUBLIC);
+    }
+    if (found == 0) { return lookup; }
+    return first_hit;
+}
+
+func vdispatch_is_trait_impl_func(fn: *AstFunc) -> u64 {
+    if (fn == 0 || g_compiler_ctx.all_trait_impls_vec == 0) { return 0; }
+    var inum: u64 = g_compiler_ctx.all_trait_impls_vec.len();
+    for (var ii: u64 = 0; ii < inum; ii++) {
+        var impl_info: *TraitImpl = g_compiler_ctx.all_trait_impls_vec.get(ii);
+        if (impl_info == 0 || impl_info.methods_vec == 0) { continue; }
+        var mn: u64 = impl_info.methods_vec.len();
+        for (var mi: u64 = 0; mi < mn; mi++) {
+            var method: *TraitImplMethod = impl_info.methods_vec.get(mi);
+            if (method != 0 && method.func_def == fn) { return 1; }
+        }
+    }
+    return 0;
+}
+
+func vdispatch_validate_single_impl_override(fn: *AstFunc) -> u64 {
+    if (fn == 0) { return 0; }
+    if (fn.impl_owner_ptr == 0 || fn.impl_owner_len == 0) { return 0; }
+    if (vdispatch_is_trait_impl_func(fn) != 0) { return 0; }
+
+    var owner_def: *AstStructDef = get_struct_def(fn.impl_owner_ptr, fn.impl_owner_len);
+    if (owner_def == 0 || owner_def.parents_vec == 0) { return 0; }
+
+    var method_ptr: u64 = fn.impl_original_name_ptr;
+    var method_len: u64 = fn.impl_original_name_len;
+    if (method_ptr == 0 || method_len == 0) {
+        method_ptr = fn.name_ptr;
+        method_len = fn.name_len;
+    }
+
+    var method_arg_types: *Vec<*TypeInfo> = sym_method_arg_types_from_params(fn);
+    var arg_count_hint: u64 = 0;
+    if (method_arg_types != 0) { arg_count_hint = method_arg_types.len(); }
+    var base_lookup: CompilerDeclLookup = vdispatch_find_parent_method_decl_for_override(owner_def, method_ptr, method_len, method_arg_types, arg_count_hint);
+    var require_override: u64 = 0;
+
+    if (base_lookup.found == 0) {
+        if (fn.impl_is_override != 0) {
+            emit_stderr("[ERROR] @[override] has no base method: ");
+            emit_stderr_len(fn.impl_owner_ptr, fn.impl_owner_len);
+            emit_stderr(".");
+            emit_stderr_len(method_ptr, method_len);
+            emit_stderr("\n");
+            diag_note_error();
+            return 0;
+        }
+        return 0;
+    }
+    if (base_lookup.sig != 0 && base_lookup.sig.body == 0) {
+        require_override = 1;
+    } else if (base_lookup.owner_ptr != 0 && base_lookup.owner_len != 0 &&
+               sym_is_abst_method(base_lookup.owner_ptr, base_lookup.owner_len, method_ptr, method_len) != 0) {
+        require_override = 1;
+    }
+
+    var base_access: u64 = base_lookup.access;
+    if (base_lookup.sig != 0 && base_lookup.sig.impl_method_access == ACCESS_PRIVATE) {
+        base_access = ACCESS_PRIVATE;
+    }
+    if (base_access == ACCESS_PRIVATE) {
+        if (fn.impl_is_override != 0) {
+            emit_stderr("[ERROR] cannot override private base method: ");
+            emit_stderr_len(fn.impl_owner_ptr, fn.impl_owner_len);
+            emit_stderr(".");
+            emit_stderr_len(method_ptr, method_len);
+            emit_stderr("\n");
+            diag_note_error();
+            return 0;
+        }
+        return 0;
+    }
+
+    if (require_override != 0 && fn.impl_is_override == 0) {
+        emit_stderr("[ERROR] missing @[override] on overriding method: ");
+        emit_stderr_len(fn.impl_owner_ptr, fn.impl_owner_len);
+        emit_stderr(".");
+        emit_stderr_len(method_ptr, method_len);
+        emit_stderr("\n");
+        diag_note_error();
+    }
+    return 0;
+}

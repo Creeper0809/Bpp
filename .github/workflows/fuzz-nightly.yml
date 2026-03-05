@@ -1,0 +1,115 @@
+name: Fuzz Nightly
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      fuzz_iters:
+        description: "Total fuzz iterations"
+        required: false
+        default: "12000"
+      fuzz_timeout_sec:
+        description: "Per-variant timeout seconds"
+        required: false
+        default: "2"
+      fuzz_hang_confirm_sec:
+        description: "Hang confirm timeout seconds"
+        required: false
+        default: "6"
+
+jobs:
+  nightly-fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nasm binutils coreutils
+
+      - name: Build compiler
+        run: |
+          chmod +x build_and_test.sh test/run_tests.sh
+          BUILD_AND_TEST_PROFILE=fast TEST_QUIET=1 bash build_and_test.sh
+
+      - name: Prepare fuzz output paths
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_id="nightly_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}_$(date +%Y%m%d_%H%M%S)"
+          findings_root="fuzz/findings/nightly/${run_id}"
+          log_file="build/fuzz_nightly_${run_id}.log"
+          mkdir -p "${findings_root}" "build"
+          echo "run_id=${run_id}" >> "$GITHUB_OUTPUT"
+          echo "findings_root=${findings_root}" >> "$GITHUB_OUTPUT"
+          echo "log_file=${log_file}" >> "$GITHUB_OUTPUT"
+
+      - name: Run nightly fuzz campaign
+        id: fuzz
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          fuzz_iters="${{ github.event.inputs.fuzz_iters || '12000' }}"
+          fuzz_timeout_sec="${{ github.event.inputs.fuzz_timeout_sec || '2' }}"
+          fuzz_hang_confirm_sec="${{ github.event.inputs.fuzz_hang_confirm_sec || '6' }}"
+
+          FUZZ_COMPILER=bin/stage1 \
+          FUZZ_ITERS="$fuzz_iters" \
+          FUZZ_JOBS="$(nproc)" \
+          FUZZ_TIMEOUT_SEC="$fuzz_timeout_sec" \
+          FUZZ_HANG_CONFIRM_SEC="$fuzz_hang_confirm_sec" \
+          FUZZ_MAX_BYTES=16384 \
+          FUZZ_FINDINGS="${{ steps.prep.outputs.findings_root }}" \
+          ./fuzz/run_fuzz.sh | tee "${{ steps.prep.outputs.log_file }}"
+
+      - name: Summarize finding counts
+        id: summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          findings_root="${{ steps.prep.outputs.findings_root }}"
+          crash_count="$(find "$findings_root/crash" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')"
+          hang_count="$(find "$findings_root/hang" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')"
+          diff_count="$(find "$findings_root/diff" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')"
+
+          echo "crash_count=$crash_count" >> "$GITHUB_OUTPUT"
+          echo "hang_count=$hang_count" >> "$GITHUB_OUTPUT"
+          echo "diff_count=$diff_count" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Nightly Fuzz Summary"
+            echo ""
+            echo "- run_id: ${{ steps.prep.outputs.run_id }}"
+            echo "- crash: $crash_count"
+            echo "- hang: $hang_count"
+            echo "- diff: $diff_count"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload nightly artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-fuzz-${{ steps.prep.outputs.run_id }}
+          path: |
+            ${{ steps.prep.outputs.findings_root }}
+            ${{ steps.prep.outputs.log_file }}
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Enforce crash-free nightly
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          crash_count="${{ steps.summary.outputs.crash_count || '0' }}"
+          if [ "$crash_count" -gt 0 ]; then
+            echo "Nightly fuzz detected crashes: $crash_count"
+            exit 1
+          fi

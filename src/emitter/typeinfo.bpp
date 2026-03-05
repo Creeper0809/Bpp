@@ -14,9 +14,22 @@ import std.hashmap;
 import types;
 import ast;
 import compiler;
+import compiler.try_runtime;
+import compiler.core_utils;
+import compiler.generic.engine;
+import compiler.symbol_runtime;
 
 func typeinfo_make(base_type: u64, ptr_depth: u64) -> *TypeInfo {
     return new TypeInfo(base_type, ptr_depth);
+}
+
+func typeinfo_func_signature(ti: *TypeInfo) -> *TypeInfo {
+    if (ti == 0) { return 0; }
+    if (ti.type_kind != TYPE_FUNC) { return 0; }
+    if (ti.elem_typeinfo != 0 && ti.elem_typeinfo.type_kind == TYPE_FUNC) {
+        return ti.elem_typeinfo;
+    }
+    return ti;
 }
 
 func typeinfo_make_struct(ptr_depth: u64, struct_name_ptr: u64, struct_name_len: u64, struct_def: *AstStructDef) -> *TypeInfo {
@@ -61,6 +74,20 @@ func typeinfo_resolve_struct_defs_recursive(ti: *TypeInfo) -> u64 {
             typeinfo_resolve_struct_defs_recursive(ti.elem_typeinfo);
         }
     }
+    if (ti.type_kind == TYPE_FUNC) {
+        var sig: *TypeInfo = typeinfo_func_signature(ti);
+        if (sig != 0) {
+            if (sig.fn_params_vec != 0) {
+                var n: u64 = sig.fn_params_vec.len();
+                for (var i: u64 = 0; i < n; i++) {
+                    typeinfo_resolve_struct_defs_recursive(sig.fn_params_vec.get(i));
+                }
+            }
+            if (sig.fn_ret_typeinfo != 0) {
+                typeinfo_resolve_struct_defs_recursive(sig.fn_ret_typeinfo);
+            }
+        }
+    }
     return 0;
 }
 
@@ -95,7 +122,7 @@ func typeinfo_elem_size_from_container(container: *TypeInfo) -> u64 {
     if (elem_ti != 0) {
         return sizeof_type_ex(elem_ti);
     }
-    return sizeof_type(container.elem_type_kind, container.elem_ptr_depth, container.struct_name_ptr, container.struct_name_len);
+    return layout_type_sizeof(container.elem_type_kind, container.elem_ptr_depth, container.struct_name_ptr, container.struct_name_len);
 }
 
 func typeinfo_make_trait(ptr_depth: u64, trait_ptr: u64, trait_len: u64) -> *TypeInfo {
@@ -111,18 +138,70 @@ var g_structs_vec: *Vec<*AstStructDef>;
 var g_funcs_vec: *Vec<*AstFunc>;
 var g_funcs_map: *HashMap<u64, *AstFunc>;
 
+struct TypeInfoCtx {
+    public structs_vec: *Vec<*AstStructDef>;
+    public funcs_vec: *Vec<*AstFunc>;
+    public funcs_map: *HashMap<u64, *AstFunc>;
+}
+
+impl TypeInfoCtx {
+    public constructor() {
+        self.structs_vec = 0;
+        self.funcs_vec = 0;
+        self.funcs_map = 0;
+    }
+}
+
+var g_typeinfo_ctx: *TypeInfoCtx;
+
+func typeinfo_ctx_current() -> *TypeInfoCtx {
+    if (g_typeinfo_ctx == 0) {
+        g_typeinfo_ctx = new TypeInfoCtx();
+        g_typeinfo_ctx.structs_vec = g_structs_vec;
+        g_typeinfo_ctx.funcs_vec = g_funcs_vec;
+        g_typeinfo_ctx.funcs_map = g_funcs_map;
+    }
+    return g_typeinfo_ctx;
+}
+
+func typeinfo_ctx_sync_from_globals() -> u64 {
+    var ctx: *TypeInfoCtx = typeinfo_ctx_current();
+    ctx.structs_vec = g_structs_vec;
+    ctx.funcs_vec = g_funcs_vec;
+    ctx.funcs_map = g_funcs_map;
+    return 0;
+}
+
 func typeinfo_set_structs(structs: *Vec<*AstStructDef>) -> u64 {
+    return typeinfo_set_structs_with_ctx(typeinfo_ctx_current(), structs);
+}
+
+func typeinfo_set_structs_with_ctx(ctx: *TypeInfoCtx, structs: *Vec<*AstStructDef>) -> u64 {
+    if (ctx == 0) { return 0; }
     g_structs_vec = structs;
+    ctx.structs_vec = structs;
     return 0;
 }
 
 func typeinfo_get_structs() -> *Vec<*AstStructDef> {
-    return g_structs_vec;
+    return typeinfo_get_structs_with_ctx(typeinfo_ctx_current());
+}
+
+func typeinfo_get_structs_with_ctx(ctx: *TypeInfoCtx) -> *Vec<*AstStructDef> {
+    if (ctx == 0) { return g_structs_vec; }
+    return ctx.structs_vec;
 }
 
 func typeinfo_set_funcs(funcs: *Vec<*AstFunc>) -> u64 {
+    return typeinfo_set_funcs_with_ctx(typeinfo_ctx_current(), funcs);
+}
+
+func typeinfo_set_funcs_with_ctx(ctx: *TypeInfoCtx, funcs: *Vec<*AstFunc>) -> u64 {
+    if (ctx == 0) { return 0; }
     g_funcs_vec = funcs;
     g_funcs_map = 0;
+    ctx.funcs_vec = funcs;
+    ctx.funcs_map = 0;
     if (funcs != 0) {
         var n: u64 = funcs.len();
         var cap: u64 = n * 2;
@@ -135,11 +214,17 @@ func typeinfo_set_funcs(funcs: *Vec<*AstFunc>) -> u64 {
             }
         }
     }
+    ctx.funcs_map = g_funcs_map;
     return 0;
 }
 
 func typeinfo_find_func(name_ptr: u64, name_len: u64) -> *AstFunc {
-    if (g_funcs_vec == 0) { return 0; }
+    return typeinfo_find_func_with_ctx(typeinfo_ctx_current(), name_ptr, name_len);
+}
+
+func typeinfo_find_func_with_ctx(ctx: *TypeInfoCtx, name_ptr: u64, name_len: u64) -> *AstFunc {
+    if (ctx == 0) { return 0; }
+    if (ctx.funcs_vec == 0) { return 0; }
     var resolved_ptr: u64 = name_ptr;
     var resolved_len: u64 = name_len;
     var resolved: *NameInfo = resolve_name(name_ptr, name_len);
@@ -147,15 +232,15 @@ func typeinfo_find_func(name_ptr: u64, name_len: u64) -> *AstFunc {
         resolved_ptr = resolved.ptr;
         resolved_len = resolved.len;
     }
-    if (g_funcs_map != 0) {
-        var mfn_resolved: *AstFunc = g_funcs_map.get(resolved_ptr, resolved_len);
+    if (ctx.funcs_map != 0) {
+        var mfn_resolved: *AstFunc = ctx.funcs_map.get(resolved_ptr, resolved_len);
         if (mfn_resolved != 0) { return mfn_resolved; }
-        var mfn_raw: *AstFunc = g_funcs_map.get(name_ptr, name_len);
+        var mfn_raw: *AstFunc = ctx.funcs_map.get(name_ptr, name_len);
         if (mfn_raw != 0) { return mfn_raw; }
     }
-    var num_funcs: u64 = g_funcs_vec.len();
+    var num_funcs: u64 = ctx.funcs_vec.len();
     for (var i: u64 = 0; i < num_funcs; i++) {
-        var fn: *AstFunc = g_funcs_vec.get(i);
+        var fn: *AstFunc = ctx.funcs_vec.get(i);
         if (str_eq(fn.name_ptr, fn.name_len, resolved_ptr, resolved_len)) {
             return fn;
         }
@@ -193,8 +278,55 @@ func typeinfo_from_func_ret(fn: *AstFunc, disallow_struct_value: u64) -> *TypeIn
     return rb;
 }
 
+func typeinfo_from_func_decl(fn: *AstFunc) -> *TypeInfo {
+    if (fn == 0) { return typeinfo_make(TYPE_FUNC, 0); }
+    var params_sig: *Vec<*TypeInfo> = new Vec<*TypeInfo>(4);
+    var variadic: u64 = 0;
+    if (fn.params_vec != 0) {
+        var n: u64 = fn.params_vec.len();
+        for (var i: u64 = 0; i < n; i++) {
+            var p: *Param = fn.params_vec.get(i);
+            var pti: *TypeInfo = typeinfo_make(p.type_kind, p.ptr_depth);
+            pti.is_tagged = p.is_tagged;
+            pti.struct_name_ptr = p.struct_name_ptr;
+            pti.struct_name_len = p.struct_name_len;
+            pti.tag_layout_ptr = p.tag_layout_ptr;
+            pti.tag_layout_len = p.tag_layout_len;
+            pti.elem_type_kind = p.elem_type_kind;
+            pti.elem_ptr_depth = p.elem_ptr_depth;
+            pti.array_len = p.array_len;
+            pti.array_len_is_param = p.array_len_is_param;
+            pti.array_len_param_ptr = p.array_len_param_ptr;
+            pti.array_len_param_len = p.array_len_param_len;
+            pti.elem_typeinfo = p.elem_typeinfo;
+            params_sig.push(pti);
+            if (p.is_variadic != 0) { variadic = 1; }
+        }
+    }
+
+    var ret_sig: *TypeInfo = typeinfo_from_func_ret(fn, 0);
+    var fn_ti: *TypeInfo = typeinfo_make(TYPE_FUNC, 0);
+    fn_ti.fn_params_vec = params_sig;
+    fn_ti.fn_ret_typeinfo = ret_sig;
+    fn_ti.fn_is_variadic = variadic;
+    var fn_sig: *TypeInfo = typeinfo_make(TYPE_FUNC, 0);
+    fn_sig.fn_params_vec = params_sig;
+    fn_sig.fn_ret_typeinfo = ret_sig;
+    fn_sig.fn_is_variadic = variadic;
+    fn_ti.elem_typeinfo = fn_sig;
+    return fn_ti;
+}
+
 func typeinfo_from_field_desc(field: *FieldDesc, disallow_struct_value: u64) -> *TypeInfo {
     if (field == 0) { return 0; }
+    if (field.type_kind == TYPE_FUNC) {
+        if (field.elem_typeinfo != 0 && field.elem_typeinfo.type_kind == TYPE_FUNC) {
+            var sig_ti: *TypeInfo = typeinfo_clone(field.elem_typeinfo);
+            sig_ti.ptr_depth = field.ptr_depth;
+            return sig_ti;
+        }
+        return typeinfo_make(TYPE_FUNC, field.ptr_depth);
+    }
     if (field.type_kind == TYPE_STRUCT) {
         if (disallow_struct_value != 0 && field.ptr_depth == 0) { return 0; }
         var field_struct_def: *AstStructDef = 0;
@@ -252,6 +384,7 @@ func get_type_size(base_type: u64, ptr_depth: u64) -> u64 {
     if (base_type == TYPE_F64) { return 8; }
     if (base_type == TYPE_SLICE) { return 16; }
     if (base_type == TYPE_TRAIT) { return 8; }
+    if (base_type == TYPE_FUNC) { return 8; }
     return 8;
 }
 
@@ -270,11 +403,12 @@ func get_pointee_size(base_type: u64, ptr_depth: u64) -> u64 {
         if (base_type == TYPE_F64) { return 8; }
         if (base_type == TYPE_SLICE) { return 16; }
         if (base_type == TYPE_TRAIT) { return 8; }
+        if (base_type == TYPE_FUNC) { return 8; }
     }
     return 8;
 }
 
-func sizeof_field_desc(field: *FieldDesc) -> u64 {
+func layout_field_sizeof(field: *FieldDesc) -> u64 {
     if (field.bit_width > 0) {
         return (field.bit_width + 7) / 8;
     }
@@ -283,12 +417,12 @@ func sizeof_field_desc(field: *FieldDesc) -> u64 {
         if (field.elem_typeinfo != 0) {
             elem_size = sizeof_type_ex(field.elem_typeinfo);
         } else {
-            elem_size = sizeof_type(field.elem_type_kind, field.elem_ptr_depth, field.struct_name_ptr, field.struct_name_len);
+            elem_size = layout_type_sizeof(field.elem_type_kind, field.elem_ptr_depth, field.struct_name_ptr, field.struct_name_len);
         }
         return elem_size * field.array_len;
     }
     if (field.type_kind == TYPE_SLICE) { return 16; }
-    return sizeof_type(field.type_kind, field.ptr_depth, field.struct_name_ptr, field.struct_name_len);
+    return layout_type_sizeof(field.type_kind, field.ptr_depth, field.struct_name_ptr, field.struct_name_len);
 }
 
 func get_field_desc(struct_def: *AstStructDef, field_name_ptr: u64, field_name_len: u64) -> *FieldDesc {
@@ -297,6 +431,19 @@ func get_field_desc(struct_def: *AstStructDef, field_name_ptr: u64, field_name_l
 }
 
 func check_type_compat(from_base: u64, from_depth: u64, from_tagged: u64, from_layout_ptr: u64, from_layout_len: u64, to_base: u64, to_depth: u64, to_tagged: u64, to_layout_ptr: u64, to_layout_len: u64) -> u64 {
+    if (from_base == TYPE_NULL && from_depth == 0) {
+        if (to_base == TYPE_NULL && to_depth == 0) { return false; }
+        if (to_depth > 0) { return false; }
+        return true;
+    }
+    if (to_base == TYPE_NULL && to_depth == 0) {
+        if (from_base == TYPE_NULL && from_depth == 0) { return false; }
+        return true;
+    }
+    if (from_base == TYPE_FUNC || to_base == TYPE_FUNC) {
+        if (from_base == to_base && from_depth == to_depth) { return false; }
+        return true;
+    }
     if (from_base == TYPE_ARRAY || to_base == TYPE_ARRAY || from_base == TYPE_SLICE || to_base == TYPE_SLICE) {
         if (from_base == to_base && from_depth == to_depth) { return false; }
         return true;
@@ -330,9 +477,118 @@ func check_type_compat(from_base: u64, from_depth: u64, from_tagged: u64, from_l
     return true;
 }
 
+func typeinfo_equal(lhs: *TypeInfo, rhs: *TypeInfo) -> u64 {
+    if (lhs == 0 || rhs == 0) { return 0; }
+    if (lhs.type_kind != rhs.type_kind) { return 0; }
+    if (lhs.ptr_depth != rhs.ptr_depth) { return 0; }
+    if (lhs.is_tagged != rhs.is_tagged) { return 0; }
+    if (lhs.is_tagged != 0) {
+        if (!str_eq(lhs.tag_layout_ptr, lhs.tag_layout_len, rhs.tag_layout_ptr, rhs.tag_layout_len)) { return 0; }
+    }
+    if (lhs.type_kind == TYPE_STRUCT || lhs.type_kind == TYPE_TRAIT || lhs.type_kind == TYPE_GENERIC) {
+        if (!str_eq(lhs.struct_name_ptr, lhs.struct_name_len, rhs.struct_name_ptr, rhs.struct_name_len)) { return 0; }
+    }
+    if (lhs.type_kind == TYPE_ARRAY || lhs.type_kind == TYPE_SLICE) {
+        if (lhs.type_kind == TYPE_ARRAY && lhs.array_len != rhs.array_len) { return 0; }
+        if (lhs.elem_typeinfo != 0 || rhs.elem_typeinfo != 0) {
+            if (lhs.elem_typeinfo == 0 || rhs.elem_typeinfo == 0) { return 0; }
+            if (typeinfo_equal(lhs.elem_typeinfo, rhs.elem_typeinfo) == 0) { return 0; }
+        } else {
+            if (lhs.elem_type_kind != rhs.elem_type_kind) { return 0; }
+            if (lhs.elem_ptr_depth != rhs.elem_ptr_depth) { return 0; }
+            if (lhs.elem_type_kind == TYPE_STRUCT || lhs.elem_type_kind == TYPE_TRAIT || lhs.elem_type_kind == TYPE_GENERIC) {
+                if (!str_eq(lhs.struct_name_ptr, lhs.struct_name_len, rhs.struct_name_ptr, rhs.struct_name_len)) { return 0; }
+            }
+        }
+    }
+    if (lhs.type_kind == TYPE_FUNC) {
+        var ls: *TypeInfo = typeinfo_func_signature(lhs);
+        var rs: *TypeInfo = typeinfo_func_signature(rhs);
+        if ((ls == 0) != (rs == 0)) { return 0; }
+        if (ls == 0) { return 1; }
+        if (ls.fn_is_variadic != rs.fn_is_variadic) { return 0; }
+        var ln: u64 = 0;
+        var rn: u64 = 0;
+        if (ls.fn_params_vec != 0) { ln = ls.fn_params_vec.len(); }
+        if (rs.fn_params_vec != 0) { rn = rs.fn_params_vec.len(); }
+        if (ln != rn) { return 0; }
+        for (var i: u64 = 0; i < ln; i++) {
+            if (typeinfo_equal(ls.fn_params_vec.get(i), rs.fn_params_vec.get(i)) == 0) { return 0; }
+        }
+        if ((ls.fn_ret_typeinfo == 0) != (rs.fn_ret_typeinfo == 0)) { return 0; }
+        if (ls.fn_ret_typeinfo != 0 && typeinfo_equal(ls.fn_ret_typeinfo, rs.fn_ret_typeinfo) == 0) { return 0; }
+    }
+    return 1;
+}
+
+// Assignment-style compatibility:
+// - Primitive/pointer compatibility reuses existing check_type_compat behavior.
+// - Function types use explicit variance rules.
+func typeinfo_is_assignable(src_ti: *TypeInfo, dst_ti: *TypeInfo) -> u64 {
+    if (src_ti == 0 || dst_ti == 0) { return 0; }
+    if (src_ti.type_kind == TYPE_NULL && src_ti.ptr_depth == 0) {
+        if (dst_ti.type_kind == TYPE_NULL && dst_ti.ptr_depth == 0) { return 1; }
+        if (dst_ti.ptr_depth > 0) { return 1; }
+        return 0;
+    }
+    if (dst_ti.type_kind == TYPE_NULL && dst_ti.ptr_depth == 0) {
+        if (src_ti.type_kind == TYPE_NULL && src_ti.ptr_depth == 0) { return 1; }
+        return 0;
+    }
+    if (src_ti.type_kind == TYPE_FUNC || dst_ti.type_kind == TYPE_FUNC) {
+        return typeinfo_func_assignable(src_ti, dst_ti);
+    }
+    var mismatch: u64 = check_type_compat(
+        src_ti.type_kind, src_ti.ptr_depth, src_ti.is_tagged, src_ti.tag_layout_ptr, src_ti.tag_layout_len,
+        dst_ti.type_kind, dst_ti.ptr_depth, dst_ti.is_tagged, dst_ti.tag_layout_ptr, dst_ti.tag_layout_len
+    );
+    if (mismatch != 0) { return 0; }
+    if (src_ti.type_kind == TYPE_ARRAY || dst_ti.type_kind == TYPE_ARRAY || src_ti.type_kind == TYPE_SLICE || dst_ti.type_kind == TYPE_SLICE) {
+        return typeinfo_equal(src_ti, dst_ti);
+    }
+    return 1;
+}
+
+// Function type variance:
+// - Return type: covariant (from_ret assignable to to_ret)
+// - Parameters: contravariant (to_param assignable to from_param)
+func typeinfo_func_assignable(src_ti: *TypeInfo, dst_ti: *TypeInfo) -> u64 {
+    if (src_ti == 0 || dst_ti == 0) { return 0; }
+    if (src_ti.type_kind != TYPE_FUNC || dst_ti.type_kind != TYPE_FUNC) { return 0; }
+    if (src_ti.ptr_depth != dst_ti.ptr_depth) { return 0; }
+    if (src_ti.is_tagged != dst_ti.is_tagged) { return 0; }
+    if (src_ti.is_tagged != 0) {
+        if (!str_eq(src_ti.tag_layout_ptr, src_ti.tag_layout_len, dst_ti.tag_layout_ptr, dst_ti.tag_layout_len)) { return 0; }
+    }
+
+    var fs: *TypeInfo = typeinfo_func_signature(src_ti);
+    var ts: *TypeInfo = typeinfo_func_signature(dst_ti);
+    if ((fs == 0) != (ts == 0)) { return 0; }
+    if (fs == 0) { return 1; }
+    if (fs.fn_is_variadic != ts.fn_is_variadic) { return 0; }
+
+    var fn: u64 = 0;
+    var tn: u64 = 0;
+    if (fs.fn_params_vec != 0) { fn = fs.fn_params_vec.len(); }
+    if (ts.fn_params_vec != 0) { tn = ts.fn_params_vec.len(); }
+    if (fn != tn) { return 0; }
+
+    for (var i: u64 = 0; i < fn; i++) {
+        var from_param: *TypeInfo = fs.fn_params_vec.get(i);
+        var to_param: *TypeInfo = ts.fn_params_vec.get(i);
+        if (typeinfo_is_assignable(to_param, from_param) == 0) { return 0; }
+    }
+
+    if ((fs.fn_ret_typeinfo == 0) != (ts.fn_ret_typeinfo == 0)) { return 0; }
+    if (fs.fn_ret_typeinfo != 0) {
+        if (typeinfo_is_assignable(fs.fn_ret_typeinfo, ts.fn_ret_typeinfo) == 0) { return 0; }
+    }
+    return 1;
+}
+
 // Calculate size of a type including structs
 // Returns size in bytes for allocating on stack
-func sizeof_type(type_kind: u64, ptr_depth: u64, struct_name_ptr: u64, struct_name_len: u64) -> u64 {
+func layout_type_sizeof(type_kind: u64, ptr_depth: u64, struct_name_ptr: u64, struct_name_len: u64) -> u64 {
     // Pointers are always 8 bytes
     if (ptr_depth > 0) { return 8; }
 
@@ -350,6 +606,8 @@ func sizeof_type(type_kind: u64, ptr_depth: u64, struct_name_ptr: u64, struct_na
         case TYPE_F64: return 8;
         case TYPE_SLICE: return 16;
         case TYPE_TRAIT: return 8;
+        case TYPE_FUNC: return 8;
+        case TYPE_NULL: return 8;
         case TYPE_STRUCT:
             var struct_def: *AstStructDef = _typeinfo_find_struct_def(struct_name_ptr, struct_name_len);
             if (struct_def == 0) { return 8; }
@@ -358,6 +616,15 @@ func sizeof_type(type_kind: u64, ptr_depth: u64, struct_name_ptr: u64, struct_na
 
     // Default: 8 bytes
     return 8;
+}
+
+// Compatibility wrappers for call sites that still use legacy names.
+func sizeof_type(type_kind: u64, ptr_depth: u64, struct_name_ptr: u64, struct_name_len: u64) -> u64 {
+    return layout_type_sizeof(type_kind, ptr_depth, struct_name_ptr, struct_name_len);
+}
+
+func sizeof_field_desc(field: *FieldDesc) -> u64 {
+    return layout_field_sizeof(field);
 }
 
 func _typeinfo_find_struct_def(struct_name_ptr: u64, struct_name_len: u64) -> *AstStructDef {
@@ -380,11 +647,57 @@ func _typeinfo_packed_struct_size(struct_info: *AstStructDef) -> u64 {
         if (field_p.bit_width > 0) {
             total_bits = total_bits + field_p.bit_width;
         } else {
-            var fsize: u64 = sizeof_field_desc(field_p);
+            var fsize: u64 = layout_field_sizeof(field_p);
             total_bits = total_bits + fsize * 8;
         }
     }
     return (total_bits + 7) / 8;
+}
+
+struct TypeInfoPackedFieldLookup {
+    public found: u64;
+    public offset: u64;
+    public desc: *FieldDesc;
+}
+
+func _typeinfo_find_packed_field(struct_info: *AstStructDef, field_ptr: u64, field_len: u64) -> TypeInfoPackedFieldLookup {
+    var lookup: TypeInfoPackedFieldLookup;
+    lookup.found = 0;
+    lookup.offset = 0;
+    lookup.desc = 0;
+    if (struct_info == 0 || struct_info.fields_vec == 0) { return lookup; }
+
+    var fields: *Vec<*FieldDesc> = struct_info.fields_vec;
+    var n: u64 = fields.len();
+    var bit_cursor: u64 = 0;
+    for (var i: u64 = 0; i < n; i++) {
+        var f: *FieldDesc = fields.get(i);
+        var width_bits: u64 = 0;
+        if (f.bit_width > 0) {
+            width_bits = f.bit_width;
+        } else {
+            width_bits = layout_field_sizeof(f) * 8;
+        }
+
+        if (str_eq(f.name_ptr, f.name_len, field_ptr, field_len)) {
+            if (f.bit_width > 0) {
+                if ((bit_cursor % 8) != 0 || (f.bit_width % 8) != 0) {
+                    emit_stderr("[ERROR] packed bit-field address requires byte alignment: ");
+                    emit_stderr_len(struct_info.name_ptr, struct_info.name_len);
+                    emit_stderr(".");
+                    emit_stderr_len(field_ptr, field_len);
+                    emit_stderr("\n");
+                    diag_error("TypeInfo error");
+                }
+            }
+            lookup.found = 1;
+            lookup.offset = bit_cursor / 8;
+            lookup.desc = f;
+            return lookup;
+        }
+        bit_cursor = bit_cursor + width_bits;
+    }
+    return lookup;
 }
 
 func _typeinfo_struct_size(struct_info: *AstStructDef) -> u64 {
@@ -406,7 +719,8 @@ func sizeof_type_ex(info: *TypeInfo) -> u64 {
     }
     if (info.type_kind == TYPE_SLICE) { return 16; }
     if (info.type_kind == TYPE_TRAIT) { return 8; }
-    return sizeof_type(info.type_kind, info.ptr_depth, info.struct_name_ptr, info.struct_name_len);
+    if (info.type_kind == TYPE_FUNC) { return 8; }
+    return layout_type_sizeof(info.type_kind, info.ptr_depth, info.struct_name_ptr, info.struct_name_len);
 }
 
 // ============================================
@@ -420,7 +734,7 @@ func _typeinfo_resolve_parent_def(parent: *ParentDesc) -> *AstStructDef {
         emit_stderr("[ERROR] Parent struct not found: ");
         emit_stderr_len(parent.name_ptr, parent.name_len);
         emit_stderr("\n");
-        panic("TypeInfo error");
+        diag_error("TypeInfo error");
     }
     parent.struct_def = sd;
     return sd;
@@ -430,24 +744,20 @@ func _typeinfo_struct_size_internal(struct_info: *AstStructDef, depth: u64) -> u
     if (struct_info == 0) { return 0; }
     if (depth > 64) {
         emit_stderr("[ERROR] Inheritance depth exceeded\n");
-        panic("TypeInfo error");
+        diag_error("TypeInfo error");
     }
     if (struct_info.is_union == 1) {
-        if (struct_info.is_packed == 1) {
-            emit_stderr("[ERROR] packed union is not supported\n");
-            panic("TypeInfo error");
-        }
         if ((struct_info.parents_vec != 0 && struct_info.parents_vec.len() > 0) ||
             (struct_info.traits_vec != 0 && struct_info.traits_vec.len() > 0)) {
             emit_stderr("[ERROR] union cannot use inheritance or traits\n");
-            panic("TypeInfo error");
+            diag_error("TypeInfo error");
         }
         var max_size: u64 = 0;
         var fields_u: *Vec<*FieldDesc> = struct_info.fields_vec;
         var num_fields_u: u64 = fields_u.len();
         for (var ui: u64 = 0; ui < num_fields_u; ui++) {
             var field_u: *FieldDesc = fields_u.get(ui);
-            var size_u: u64 = sizeof_field_desc(field_u);
+            var size_u: u64 = layout_field_sizeof(field_u);
             if (size_u > max_size) { max_size = size_u; }
         }
         return max_size;
@@ -455,7 +765,7 @@ func _typeinfo_struct_size_internal(struct_info: *AstStructDef, depth: u64) -> u
     if (struct_info.is_packed == 1) {
         if (struct_info.parents_vec != 0 && struct_info.parents_vec.len() > 0) {
             emit_stderr("[ERROR] packed struct cannot use inheritance\n");
-            panic("TypeInfo error");
+            diag_error("TypeInfo error");
         }
         return _typeinfo_packed_struct_size(struct_info);
     }
@@ -474,7 +784,7 @@ func _typeinfo_struct_size_internal(struct_info: *AstStructDef, depth: u64) -> u
     var num_fields: u64 = fields.len();
     for (var i: u64 = 0; i < num_fields; i++) {
         var field: *FieldDesc = fields.get(i);
-        var field_size: u64 = sizeof_field_desc(field);
+        var field_size: u64 = layout_field_sizeof(field);
         total_size = total_size + field_size;
     }
     return total_size;
@@ -484,7 +794,7 @@ func _typeinfo_find_parent_offset(struct_info: *AstStructDef, target_ptr: u64, t
     if (struct_info == 0) { return 0; }
     if (depth > 64) {
         emit_stderr("[ERROR] Inheritance depth exceeded\n");
-        panic("TypeInfo error");
+        diag_error("TypeInfo error");
     }
     if (str_eq(struct_info.name_ptr, struct_info.name_len, target_ptr, target_len)) {
         *out_offset = base_offset;
@@ -551,7 +861,7 @@ func _typeinfo_struct_find_field_local(struct_info: *AstStructDef, field_ptr: u6
             *out_desc = field;
             return 1;
         }
-        var field_size: u64 = sizeof_field_desc(field);
+        var field_size: u64 = layout_field_sizeof(field);
         offset = offset + field_size;
     }
     return 0;
@@ -589,7 +899,7 @@ func _typeinfo_struct_find_field_in_parents(struct_info: *AstStructDef, field_pt
         emit_stderr(".");
         emit_stderr_len(field_ptr, field_len);
         emit_stderr("\n");
-        panic("TypeInfo error");
+        diag_error("TypeInfo error");
     }
     if (match_count == 1) {
         *out_offset = match_offset;
@@ -603,14 +913,17 @@ func _typeinfo_struct_find_field_internal(struct_info: *AstStructDef, field_ptr:
     if (struct_info == 0) { return 0; }
     if (depth > 64) {
         emit_stderr("[ERROR] Inheritance depth exceeded\n");
-        panic("TypeInfo error");
+        diag_error("TypeInfo error");
     }
     if (struct_info.is_union == 1) {
         return _typeinfo_struct_find_field_local(struct_info, field_ptr, field_len, 0, out_offset, out_desc);
     }
     if (struct_info.is_packed == 1) {
-        emit_stderr("[ERROR] Packed struct field address is not supported\n");
-        panic("TypeInfo error");
+        var packed_lookup: TypeInfoPackedFieldLookup = _typeinfo_find_packed_field(struct_info, field_ptr, field_len);
+        if (packed_lookup.found == 0) { return 0; }
+        *out_offset = packed_lookup.offset;
+        *out_desc = packed_lookup.desc;
+        return 1;
     }
 
     var parent_total: u64 = _typeinfo_struct_parent_total_size(struct_info, depth);
@@ -625,7 +938,7 @@ func struct_find_field_desc_scoped(struct_def: *AstStructDef, parent_ptr: u64, p
     if (struct_def.is_union == 1) {
         if (parent_ptr != 0) {
             emit_stderr("[ERROR] union cannot use parent scope\n");
-            panic("TypeInfo error");
+            diag_error("TypeInfo error");
         }
         return _typeinfo_struct_find_field_local(struct_def, field_ptr, field_len, 0, out_offset, out_desc);
     }
@@ -637,7 +950,7 @@ func struct_find_field_desc_scoped(struct_def: *AstStructDef, parent_ptr: u64, p
             emit_stderr("[ERROR] Parent scope not found: ");
             emit_stderr_len(parent_ptr, parent_len);
             emit_stderr("\n");
-            panic("TypeInfo error");
+            diag_error("TypeInfo error");
         }
         var field_offset: u64 = 0;
         var field_desc: *FieldDesc = 0;
@@ -648,7 +961,7 @@ func struct_find_field_desc_scoped(struct_def: *AstStructDef, parent_ptr: u64, p
             emit_stderr(".");
             emit_stderr_len(field_ptr, field_len);
             emit_stderr("\n");
-            panic("TypeInfo error");
+            diag_error("TypeInfo error");
         }
         *out_offset = parent_offset + field_offset;
         *out_desc = field_desc;
@@ -669,7 +982,7 @@ func typeinfo_find_field_desc_scoped(struct_def: *AstStructDef, parent_ptr: u64,
     if (struct_def.is_packed == 1) {
         if (parent_ptr != 0) {
             emit_stderr("[ERROR] Packed struct cannot use parent scope\n");
-            panic("TypeInfo error");
+            diag_error("TypeInfo error");
         }
         var fields: *Vec<*FieldDesc> = struct_def.fields_vec;
         var num_fields: u64 = fields.len();
@@ -724,7 +1037,7 @@ func typeinfo_method_call_ret(mc: *AstMethodCall, symtab: *Symtab, is_safe: u64)
     if (mc.args_vec != 0) { arg_count_hint = mc.args_vec.len(); }
 
     if (is_safe != 0) {
-        var safe_mode: u64 = compiler_safe_receiver_mode(recv_ti);
+        var safe_mode: u64 = safe_receiver_mode(recv_ti);
         if (safe_mode == COMPILER_SAFE_RECV_INVALID) {
             if (recv_ti.ptr_depth == 0) {
                 emit_stderr("[ERROR] Safe method call requires pointer receiver\n");
@@ -734,11 +1047,11 @@ func typeinfo_method_call_ret(mc: *AstMethodCall, symtab: *Symtab, is_safe: u64)
     }
 
     var is_trait_recv: u64 = 0;
-    if (recv_ti.type_kind == TYPE_TRAIT || compiler_is_trait_name(recv_ti.struct_name_ptr, recv_ti.struct_name_len) != 0) {
+    if (recv_ti.type_kind == TYPE_TRAIT || sym_is_trait_name(recv_ti.struct_name_ptr, recv_ti.struct_name_len) != 0) {
         is_trait_recv = 1;
     }
     if (is_trait_recv != 0) {
-        var trait_def: *TraitDef = compiler_get_trait_def(recv_ti.struct_name_ptr, recv_ti.struct_name_len);
+        var trait_def: *TraitDef = sym_get_trait_def(recv_ti.struct_name_ptr, recv_ti.struct_name_len);
         if (trait_def == 0) { return typeinfo_make(TYPE_I64, 0); }
         var mcount: u64 = trait_def.methods_vec.len();
         for (var mi: u64 = 0; mi < mcount; mi++) {
@@ -758,7 +1071,7 @@ func typeinfo_method_call_ret(mc: *AstMethodCall, symtab: *Symtab, is_safe: u64)
 
     if (recv_ti.type_kind != TYPE_STRUCT) { return typeinfo_make(TYPE_I64, 0); }
 
-    if (compiler_check_method_access_overload(recv_ti.struct_name_ptr, recv_ti.struct_name_len, mc.method_ptr, mc.method_len, arg_types, arg_count_hint) == 0) {
+    if (check_method_access_overload(recv_ti.struct_name_ptr, recv_ti.struct_name_len, mc.method_ptr, mc.method_len, arg_types, arg_count_hint) == 0) {
         emit_stderr("[ERROR] private method access denied: ");
         emit_stderr_len(recv_ti.struct_name_ptr, recv_ti.struct_name_len);
         emit_stderr(".");
@@ -773,9 +1086,9 @@ func typeinfo_method_call_ret(mc: *AstMethodCall, symtab: *Symtab, is_safe: u64)
     }
 
     if (recv_ti.ptr_depth > 0) {
-        var virt_trait: *NameInfo = compiler_find_virtual_dispatch_trait(recv_ti.struct_name_ptr, recv_ti.struct_name_len, mc.method_ptr, mc.method_len);
+        var virt_trait: *NameInfo = vdispatch_find_trait(recv_ti.struct_name_ptr, recv_ti.struct_name_len, mc.method_ptr, mc.method_len);
         if (virt_trait != 0) {
-            var vtd: *TraitDef = compiler_get_trait_def(virt_trait.ptr, virt_trait.len);
+            var vtd: *TraitDef = sym_get_trait_def(virt_trait.ptr, virt_trait.len);
             if (vtd != 0) {
                 var vmn: u64 = vtd.methods_vec.len();
                 for (var vmi: u64 = 0; vmi < vmn; vmi++) {
@@ -794,16 +1107,16 @@ func typeinfo_method_call_ret(mc: *AstMethodCall, symtab: *Symtab, is_safe: u64)
         }
     }
 
-    var resolved_method: CompilerMethodResolveResult = compiler_resolve_method_overload(recv_ti.struct_name_ptr, recv_ti.struct_name_len, mc.method_ptr, mc.method_len, arg_types, arg_count_hint);
+    var resolved_method: CompilerMethodResolveResult = sym_resolve_method_overload(recv_ti.struct_name_ptr, recv_ti.struct_name_len, mc.method_ptr, mc.method_len, arg_types, arg_count_hint);
     var fn: *AstFunc = 0;
     if (resolved_method.found != 0) {
         fn = resolved_method.fn;
     }
     if (fn == 0 && recv_struct_def != 0) {
-        fn = compiler_find_method_func_in_hierarchy(recv_struct_def, mc.method_ptr, mc.method_len);
+        fn = find_method_func_in_hierarchy(recv_struct_def, mc.method_ptr, mc.method_len);
     }
     if (fn == 0) {
-        var name_info: *NameInfo = compiler_build_method_name(recv_ti.struct_name_ptr, recv_ti.struct_name_len, mc.method_ptr, mc.method_len);
+        var name_info: *NameInfo = build_method_name(recv_ti.struct_name_ptr, recv_ti.struct_name_len, mc.method_ptr, mc.method_len);
         fn = typeinfo_find_func(name_info.ptr, name_info.len);
     }
     if (fn == 0) { return typeinfo_make(TYPE_I64, 0); }
@@ -818,27 +1131,58 @@ func typeinfo_method_call_ret(mc: *AstMethodCall, symtab: *Symtab, is_safe: u64)
 func typeinfo_try_value_type(tr: *AstTry, symtab: *Symtab) -> *TypeInfo {
     var opt_ti: *TypeInfo = get_expr_type_with_symtab(tr.operand, symtab);
     if (opt_ti == 0) { return 0; }
-    var try_kind: u64 = compiler_try_kind_from_typeinfo(opt_ti);
-    if (try_kind == COMPILER_TRY_KIND_INVALID) { return 0; }
-
-    var try_fields: CompilerTryFieldNames = compiler_try_field_names(try_kind);
+    var try_fields: CompilerTryFieldNames = try_field_names_from_typeinfo(opt_ti);
     if (try_fields.found == 0) {
         return 0;
     }
     var value_ptr: u64 = try_fields.value_ptr;
     var value_len: u64 = try_fields.value_len;
 
-    var struct_def: *AstStructDef = compiler_try_resolve_struct_def(opt_ti);
+    var struct_def: *AstStructDef = try_resolve_struct_def(opt_ti);
     if (struct_def == 0) { return 0; }
     var field: *FieldDesc = get_field_desc(struct_def, value_ptr, value_len);
     if (field == 0) { return 0; }
     return typeinfo_from_field_desc(field, 0);
 }
 
+func typeinfo_safe_field_decay_data_ptr(field: *FieldDesc) -> *TypeInfo {
+    if (field == 0) { return 0; }
+    if (field.type_kind == TYPE_STRUCT && field.ptr_depth == 0) {
+        var field_struct_def: *AstStructDef = get_struct_def(field.struct_name_ptr, field.struct_name_len);
+        var out_struct_ptr: *TypeInfo = typeinfo_make_struct(1, field.struct_name_ptr, field.struct_name_len, field_struct_def);
+        out_struct_ptr.is_tagged = field.is_tagged;
+        out_struct_ptr.tag_layout_ptr = field.tag_layout_ptr;
+        out_struct_ptr.tag_layout_len = field.tag_layout_len;
+        return out_struct_ptr;
+    }
+    if ((field.type_kind == TYPE_ARRAY || field.type_kind == TYPE_SLICE) && field.ptr_depth == 0) {
+        if (field.elem_type_kind == TYPE_STRUCT) {
+            var elem_struct_def: *AstStructDef = 0;
+            if (field.elem_typeinfo != 0 && field.elem_typeinfo.struct_def != 0) {
+                elem_struct_def = field.elem_typeinfo.struct_def;
+            }
+            if (elem_struct_def == 0) {
+                elem_struct_def = get_struct_def(field.struct_name_ptr, field.struct_name_len);
+            }
+            return typeinfo_make_struct(field.elem_ptr_depth + 1, field.struct_name_ptr, field.struct_name_len, elem_struct_def);
+        }
+        var out_ptr: *TypeInfo = typeinfo_make(field.elem_type_kind, field.elem_ptr_depth + 1);
+        if (field.elem_typeinfo != 0) {
+            out_ptr.struct_name_ptr = field.elem_typeinfo.struct_name_ptr;
+            out_ptr.struct_name_len = field.elem_typeinfo.struct_name_len;
+            out_ptr.is_tagged = field.elem_typeinfo.is_tagged;
+            out_ptr.tag_layout_ptr = field.elem_typeinfo.tag_layout_ptr;
+            out_ptr.tag_layout_len = field.elem_typeinfo.tag_layout_len;
+        }
+        return out_ptr;
+    }
+    return 0;
+}
+
 func typeinfo_safe_member_access_type(sm: *AstMemberAccess, symtab: *Symtab) -> *TypeInfo {
     var sobj_ti: *TypeInfo = get_expr_type_with_symtab(sm.object, symtab);
     if (sobj_ti == 0) { return 0; }
-    var recv_mode: u64 = compiler_safe_receiver_mode(sobj_ti);
+    var recv_mode: u64 = safe_receiver_mode(sobj_ti);
     if (recv_mode == COMPILER_SAFE_RECV_INVALID) {
         if (sobj_ti.ptr_depth == 0) {
             emit_stderr("[ERROR] Safe member access requires pointer receiver\n");
@@ -851,7 +1195,7 @@ func typeinfo_safe_member_access_type(sm: *AstMemberAccess, symtab: *Symtab) -> 
     if (sstruct_def == 0) { return 0; }
     var sfield: *FieldDesc = typeinfo_find_field_desc_scoped(sstruct_def, sm.parent_ptr, sm.parent_len, sm.member_ptr, sm.member_len);
     if (sfield == 0) { return 0; }
-    if (compiler_check_field_access(sfield) == 0) {
+    if (check_field_access(sfield) == 0) {
         emit_stderr("[ERROR] private field access denied: ");
         emit_stderr_len(sstruct_def.name_ptr, sstruct_def.name_len);
         emit_stderr(".");
@@ -859,13 +1203,18 @@ func typeinfo_safe_member_access_type(sm: *AstMemberAccess, symtab: *Symtab) -> 
         emit_stderr("\n");
         return 0;
     }
-    var sfield_type: u64 = sfield.type_kind;
-    var sfield_ptr_depth: u64 = sfield.ptr_depth;
-    if (sfield_type == TYPE_STRUCT && sfield_ptr_depth == 0) {
-        emit_stderr("[ERROR] Safe member access on struct value is not supported\n");
+    var decayed_ptr: *TypeInfo = typeinfo_safe_field_decay_data_ptr(sfield);
+    if (decayed_ptr != 0) { return decayed_ptr; }
+    return typeinfo_from_field_desc(sfield, 0);
+}
+
+func typeinfo_safe_index_type(ix: *AstIndex, symtab: *Symtab) -> *TypeInfo {
+    var base_ti: *TypeInfo = get_expr_type_with_symtab(ix.base, symtab);
+    if (base_ti == 0 || base_ti.ptr_depth == 0) {
+        emit_stderr("[ERROR] Safe index access requires pointer receiver\n");
         return 0;
     }
-    return typeinfo_from_field_desc(sfield, 0);
+    return typeinfo_from_index_expr(ix, symtab);
 }
 
 func typeinfo_clone_with_depth(src: *TypeInfo, new_ptr_depth: u64) -> *TypeInfo {
@@ -934,7 +1283,42 @@ func typeinfo_from_stack_ctor_expr(sc: *AstStackCtor) -> *TypeInfo {
     return ti_sc2;
 }
 
+func typeinfo_is_lambda_closure_name(name_ptr: u64, name_len: u64) -> u64 {
+    if (name_ptr == 0 || name_len < 18) { return 0; }
+    if (str_eq(name_ptr, 18, "__LambdaClosureObj", 18) == 0) { return 0; }
+    if (name_len == 18) { return 1; }
+    var s: []u8 = slice(name_ptr, name_len);
+    if (s[18] == 95) { return 1; } // "__LambdaClosureObj_"
+    return 0;
+}
+
+func typeinfo_try_lambda_closure_sig(callee_ti: *TypeInfo) -> *TypeInfo {
+    if (callee_ti == 0) { return 0; }
+    if (callee_ti.type_kind != TYPE_STRUCT || callee_ti.ptr_depth == 0) { return 0; }
+    if (typeinfo_is_lambda_closure_name(callee_ti.struct_name_ptr, callee_ti.struct_name_len) == 0) { return 0; }
+    var sd: *AstStructDef = callee_ti.struct_def;
+    if (sd == 0) {
+        sd = get_struct_def(callee_ti.struct_name_ptr, callee_ti.struct_name_len);
+    }
+    if (sd == 0) { return 0; }
+    var fn_field: *FieldDesc = typeinfo_find_field_desc_scoped(sd, 0, 0, "fn", 2);
+    var env_field: *FieldDesc = typeinfo_find_field_desc_scoped(sd, 0, 0, "env", 3);
+    if (fn_field == 0 || env_field == 0) { return 0; }
+    var fn_ti: *TypeInfo = typeinfo_from_field_desc(fn_field, 0);
+    if (fn_ti == 0 || fn_ti.type_kind != TYPE_FUNC) { return 0; }
+    return typeinfo_func_signature(fn_ti);
+}
+
 func typeinfo_from_call_ptr_expr(cp: *AstCallPtr) -> *TypeInfo {
+    var callee_ti: *TypeInfo = get_expr_type_with_symtab(cp.callee, 0);
+    var sig_ti: *TypeInfo = typeinfo_func_signature(callee_ti);
+    if (sig_ti == 0) {
+        sig_ti = typeinfo_try_lambda_closure_sig(callee_ti);
+    }
+    if (sig_ti != 0 && sig_ti.fn_ret_typeinfo != 0) {
+        return typeinfo_clone(sig_ti.fn_ret_typeinfo);
+    }
+
     var callee: u64 = cp.callee;
     var name_ptr2: u64 = 0;
     var name_len2: u64 = 0;
@@ -973,11 +1357,16 @@ func typeinfo_from_ident_expr(ident: *AstIdent, symtab: *Symtab) -> *TypeInfo {
             resolved_ptr0 = resolved0.ptr;
             resolved_len0 = resolved0.len;
         }
-        var ginfo0: *GlobalInfo = compiler_find_global_info(resolved_ptr0, resolved_len0);
+        var ginfo0: *GlobalInfo = sym_find_global_info(resolved_ptr0, resolved_len0);
         if (ginfo0 == 0 && (resolved_ptr0 != name_ptr || resolved_len0 != name_len)) {
-            ginfo0 = compiler_find_global_info(name_ptr, name_len);
+            ginfo0 = sym_find_global_info(name_ptr, name_len);
         }
         if (ginfo0 != 0 && ginfo0.typeinfo_ptr != 0) { return ginfo0.typeinfo_ptr; }
+        var fn0: *AstFunc = typeinfo_find_func(resolved_ptr0, resolved_len0);
+        if (fn0 == 0 && (resolved_ptr0 != name_ptr || resolved_len0 != name_len)) {
+            fn0 = typeinfo_find_func(name_ptr, name_len);
+        }
+        if (fn0 != 0) { return typeinfo_from_func_decl(fn0); }
         return typeinfo_make(TYPE_I64, 0);
     }
 
@@ -996,11 +1385,18 @@ func typeinfo_from_ident_expr(ident: *AstIdent, symtab: *Symtab) -> *TypeInfo {
         resolved_ptr = resolved.ptr;
         resolved_len = resolved.len;
     }
-    var ginfo: *GlobalInfo = compiler_find_global_info(resolved_ptr, resolved_len);
+    var ginfo: *GlobalInfo = sym_find_global_info(resolved_ptr, resolved_len);
     if (ginfo == 0 && (resolved_ptr != name_ptr || resolved_len != name_len)) {
-        ginfo = compiler_find_global_info(name_ptr, name_len);
+        ginfo = sym_find_global_info(name_ptr, name_len);
     }
     if (ginfo != 0 && ginfo.typeinfo_ptr != 0) { return ginfo.typeinfo_ptr; }
+
+    var fn: *AstFunc = typeinfo_find_func(resolved_ptr, resolved_len);
+    if (fn == 0 && (resolved_ptr != name_ptr || resolved_len != name_len)) {
+        fn = typeinfo_find_func(name_ptr, name_len);
+    }
+    if (fn != 0) { return typeinfo_from_func_decl(fn); }
+
     return typeinfo_make(TYPE_I64, 0);
 }
 
@@ -1072,6 +1468,13 @@ func typeinfo_from_slice_expr(slice: *AstSlice, symtab: *Symtab) -> *TypeInfo {
 
 func typeinfo_from_member_access_expr(member_access: *AstMemberAccess, symtab: *Symtab) -> *TypeInfo {
     var obj_ti: *TypeInfo = get_expr_type_with_symtab(member_access.object, symtab);
+    if (ast_kind(member_access.object) == AST_IDENT && member_access.parent_ptr == 0) {
+        var scope_id: *AstIdent = (*AstIdent)member_access.object;
+        var scoped_const: *ConstResult = (*ConstResult)sym_find_scoped_const(scope_id.name_ptr, scope_id.name_len, member_access.member_ptr, member_access.member_len);
+        if (scoped_const != 0 && scoped_const.found != 0) {
+            return typeinfo_make(TYPE_I64, 0);
+        }
+    }
     if (obj_ti == 0) { return 0; }
     if (obj_ti.ptr_depth > 0 && obj_ti.is_tagged == 1 && obj_ti.tag_layout_ptr != 0) {
         return typeinfo_make(TYPE_U64, 0);
@@ -1079,7 +1482,7 @@ func typeinfo_from_member_access_expr(member_access: *AstMemberAccess, symtab: *
     if (obj_ti.type_kind != TYPE_STRUCT || obj_ti.struct_def == 0) { return 0; }
     var field: *FieldDesc = typeinfo_find_field_desc_scoped(obj_ti.struct_def, member_access.parent_ptr, member_access.parent_len, member_access.member_ptr, member_access.member_len);
     if (field == 0) { return 0; }
-    if (compiler_check_field_access(field) == 0) {
+    if (check_field_access(field) == 0) {
         emit_stderr("[ERROR] private field access denied: ");
         emit_stderr_len(obj_ti.struct_def.name_ptr, obj_ti.struct_def.name_len);
         emit_stderr(".");
@@ -1105,11 +1508,13 @@ func typeinfo_from_binary_expr(binary: *AstBinary, symtab: *Symtab) -> *TypeInfo
     var op: u64 = binary.op;
     var left_ti_f: *TypeInfo = get_expr_type_with_symtab(binary.left, symtab);
     var right_ti_f: *TypeInfo = get_expr_type_with_symtab(binary.right, symtab);
-    if (left_ti_f != 0 && right_ti_f != 0) {
-        if (left_ti_f.ptr_depth == 0 && right_ti_f.ptr_depth == 0 && left_ti_f.type_kind == TYPE_F64 && right_ti_f.type_kind == TYPE_F64) {
-            if (op == TOKEN_PLUS || op == TOKEN_MINUS || op == TOKEN_STAR || op == TOKEN_SLASH) {
-                return typeinfo_make(TYPE_F64, 0);
-            }
+    var left_is_f64: u64 = 0;
+    var right_is_f64: u64 = 0;
+    if (left_ti_f != 0) { left_is_f64 = (left_ti_f.ptr_depth == 0 && left_ti_f.type_kind == TYPE_F64); }
+    if (right_ti_f != 0) { right_is_f64 = (right_ti_f.ptr_depth == 0 && right_ti_f.type_kind == TYPE_F64); }
+    if (left_is_f64 != 0 || right_is_f64 != 0) {
+        if (op == TOKEN_PLUS || op == TOKEN_MINUS || op == TOKEN_STAR || op == TOKEN_SLASH) {
+            return typeinfo_make(TYPE_F64, 0);
         }
     }
 
@@ -1131,6 +1536,25 @@ func typeinfo_from_binary_expr(binary: *AstBinary, symtab: *Symtab) -> *TypeInfo
         }
     }
     return 0;
+}
+
+func typeinfo_from_ternary_expr(ternary: *AstTernary, symtab: *Symtab) -> *TypeInfo {
+    if (ternary == 0) { return typeinfo_make(TYPE_I64, 0); }
+    var then_ti: *TypeInfo = get_expr_type_with_symtab(ternary.then_expr, symtab);
+    var else_ti: *TypeInfo = get_expr_type_with_symtab(ternary.else_expr, symtab);
+    if (then_ti == 0) { return else_ti; }
+    if (else_ti == 0) { return then_ti; }
+
+    if (typeinfo_is_assignable(then_ti, else_ti) != 0) { return else_ti; }
+    if (typeinfo_is_assignable(else_ti, then_ti) != 0) { return then_ti; }
+
+    if (then_ti.ptr_depth == 0 && else_ti.ptr_depth == 0) {
+        if (then_ti.type_kind == TYPE_F64 || else_ti.type_kind == TYPE_F64) {
+            return typeinfo_make(TYPE_F64, 0);
+        }
+    }
+
+    return then_ti;
 }
 
 func get_expr_type_with_symtab(node: *AstNode, symtab: *Symtab) -> *TypeInfo {
@@ -1166,6 +1590,7 @@ func get_expr_type_with_symtab(node: *AstNode, symtab: *Symtab) -> *TypeInfo {
     }
     if (kind == AST_DEREF8) { return typeinfo_make(TYPE_U8, 0); }
     if (kind == AST_INDEX) { return typeinfo_from_index_expr(nref.index_expr, symtab); }
+    if (kind == AST_SAFE_INDEX) { return typeinfo_safe_index_type(nref.index_expr, symtab); }
     if (kind == AST_SLICE) { return typeinfo_from_slice_expr(nref.slice_expr, symtab); }
 
     if (kind == AST_MEMBER_ACCESS) {
@@ -1173,6 +1598,7 @@ func get_expr_type_with_symtab(node: *AstNode, symtab: *Symtab) -> *TypeInfo {
         if (mres != 0) { return mres; }
         return 0;
     }
+    if (kind == AST_TERNARY) { return typeinfo_from_ternary_expr(nref.ternary_expr, symtab); }
     if (kind == AST_SAFE_MEMBER_ACCESS) { return typeinfo_safe_member_access_type(nref.member_access, symtab); }
     if (kind == AST_STRUCT_LITERAL) {
         return typeinfo_make_struct(0, 0, 0, nref.struct_lit.struct_def);

@@ -1,0 +1,352 @@
+// parse_decl_program_pipeline.b - top-level program dispatch/pipeline
+
+import std.io;
+import std.vec;
+import std.util;
+import std.str;
+import module_utils;
+import types;
+import lexer;
+import ast;
+import compiler;
+import compiler.core_utils;
+import compiler.generic.engine;
+import compiler.enum_runtime;
+import compiler.symbol_runtime;
+import parser.util;
+import parser.type;
+import parser.expr;
+import parser.stmt;
+import parser.decl;
+import parser.decl.const_decl;
+import parser.decl.enum_decl;
+import parser.decl.impl_block;
+import parser.decl.import_decl;
+import parser.decl.trait_decl;
+
+func decl_report_unexpected_top_level(p: *Parser) -> u64 {
+    var err_tok: *Token = peek_tok(p);
+    if (err_tok == 0) {
+        emit_stderr("[ERROR] Unexpected EOF at top-level declaration\n");
+        panic_here(p, "Unexpected token");
+        return 0;
+    }
+    emit_stderr("[ERROR] Unexpected top-level token at line ");
+    emit_u64_stderr(err_tok.line);
+    emit_stderr(", column ");
+    emit_u64_stderr(err_tok.col);
+    emit_stderr("\n");
+    emit_stderr("  Expected one of: func, const, enum, struct, union, trait, impl, var, import\n");
+    emit_stderr("  Got: ");
+    emit_stderr_len(token_kind_name(err_tok.kind), token_kind_name_len(err_tok.kind));
+    emit_stderr(" (id=");
+    emit_u64_stderr(err_tok.kind);
+    emit_stderr(")");
+    if (err_tok.kind != TOKEN_EOF && err_tok.ptr != 0 && err_tok.len != 0) {
+        emit_stderr(" near `");
+        emit_stderr_len(err_tok.ptr, err_tok.len);
+        emit_stderr("`");
+    }
+    emit_stderr("\n");
+    panic_at_tok(p, err_tok, "Unexpected token");
+    return 0;
+}
+
+func decl_skip_until_semicolon(p: *Parser) -> u64 {
+    while (peek_kind(p) != TOKEN_SEMICOLON && peek_kind(p) != TOKEN_EOF) {
+        advance_tok(p);
+    }
+    consume_tok(p, TOKEN_SEMICOLON);
+    return 0;
+}
+
+func decl_skip_const_decl_signature(p: *Parser) -> u64 {
+    consume_tok(p, TOKEN_CONST);
+    consume_tok(p, TOKEN_IDENTIFIER);
+    if (match_tok(p, TOKEN_EQ)) {
+        decl_skip_until_semicolon(p);
+        return 0;
+    }
+    consume_tok(p, TOKEN_SEMICOLON);
+    return 0;
+}
+
+func decl_skip_global_var_decl_signature(p: *Parser) -> u64 {
+    take_leading_annotations(p);
+    consume_tok(p, TOKEN_VAR);
+    consume_tok(p, TOKEN_IDENTIFIER);
+    if (match_tok(p, TOKEN_COLON)) {
+        type_parse_ex(p);
+    }
+    if (match_tok(p, TOKEN_EQ)) {
+        decl_skip_until_semicolon(p);
+        return 0;
+    }
+    consume_tok(p, TOKEN_SEMICOLON);
+    return 0;
+}
+
+func decl_append_impl_funcs(dst: *Vec<*AstFunc>, src: *Vec<*AstFunc>, mode: u64) -> u64 {
+    var num_impl_funcs: u64 = src.len();
+    for (var i: u64 = 0; i < num_impl_funcs; i++) {
+        var impl_fn: *AstFunc = src.get(i);
+        if (mode == PARSE_PROGRAM_MODE_SIGNATURE && impl_fn == 0) { continue; }
+        dst.push(impl_fn);
+    }
+    return 0;
+}
+
+func decl_append_generated_funcs(p: *Parser, funcs: *Vec<*AstFunc>) -> u64 {
+    var generated: *Vec<u64> = generated_funcs_take(p);
+    if (generated == 0) { return 0; }
+    var n: u64 = generated.len();
+    for (var i: u64 = 0; i < n; i++) {
+        funcs.push((*AstFunc)generated.get(i));
+    }
+    return 0;
+}
+
+func decl_append_generated_globals(p: *Parser, globals: *Vec<*GlobalInfo>) -> u64 {
+    if (globals == 0) { return 0; }
+    var generated: *Vec<u64> = generated_globals_take(p);
+    if (generated == 0) { return 0; }
+    var n: u64 = generated.len();
+    for (var i: u64 = 0; i < n; i++) {
+        globals.push((*GlobalInfo)generated.get(i));
+    }
+    return 0;
+}
+
+func decl_global_var_decl_full(p: *Parser, globals: *Vec<*GlobalInfo>) -> u64 {
+    var annotations: *Vec<*NameInfo> = take_leading_annotations(p);
+    consume_tok(p, TOKEN_VAR);
+    var tok: *Token = peek_tok(p);
+
+    consume_tok(p, TOKEN_IDENTIFIER);
+    var gtype: *TypeInfo = 0;
+    if (match_tok(p, TOKEN_COLON)) {
+        gtype = type_parse_ex(p);
+    } else {
+        gtype = new TypeInfo(TYPE_U64, 0);
+    }
+
+    var init_kind: u64 = GLOBAL_INIT_NONE;
+    var init_expr: *AstNode = 0;
+
+    if (match_tok(p, TOKEN_EQ)) {
+        init_expr = expr_parse(p);
+        if (init_expr == 0) {
+            emit_stderr("[ERROR] Global init expression missing\n");
+            panic_here(p, "Syntax error");
+        }
+        init_kind = GLOBAL_INIT_EXPR;
+    }
+
+    consume_tok(p, TOKEN_SEMICOLON);
+
+    var ginfo: *GlobalInfo = new GlobalInfo();
+    ginfo.name_ptr = tok.ptr;
+    ginfo.name_len = tok.len;
+    ginfo.typeinfo_ptr = gtype;
+    ginfo.init_kind = init_kind;
+    ginfo.init_value = 0;
+    ginfo.init_name_ptr = 0;
+    ginfo.init_name_len = 0;
+    ginfo.init_expr = (u64)init_expr;
+    ginfo.annotations_vec = annotations;
+    globals.push(ginfo);
+    return 0;
+}
+
+func decl_program_handle_func(p: *Parser, mode: u64, funcs: *Vec<*AstFunc>) -> u64 {
+    if (mode == PARSE_PROGRAM_MODE_FULL) {
+        var fn_ptr: *AstFunc = decl_parse_func_decl_top_level(p);
+        if (fn_ptr != 0) { funcs.push(fn_ptr); }
+        return 0;
+    }
+    var sig_ptr: *AstFunc = decl_parse_func_decl_signature(p);
+    if (sig_ptr != 0) { funcs.push(sig_ptr); }
+    return 0;
+}
+
+func decl_program_handle_const(p: *Parser, mode: u64, consts: *Vec<*AstConstDecl>) -> u64 {
+    if (mode == PARSE_PROGRAM_MODE_FULL) {
+        var cdecl: *AstConstDecl = decl_parse_const_decl(p);
+        consts.push(cdecl);
+        return 0;
+    }
+    decl_skip_const_decl_signature(p);
+    return 0;
+}
+
+func decl_program_handle_enum(p: *Parser, mode: u64, consts: *Vec<*AstConstDecl>, funcs: *Vec<*AstFunc>, structs: *Vec<*AstStructDef>) -> u64 {
+    if (mode == PARSE_PROGRAM_MODE_FULL) {
+        var enum_result: *ParseEnumResult = enum_def(p);
+        var enum_consts: *Vec<*AstConstDecl> = enum_result.consts;
+        var num_enum_consts: u64 = enum_consts.len();
+        for (var i: u64 = 0; i < num_enum_consts; i++) {
+            var enum_cdecl: *AstConstDecl = enum_consts.get(i);
+            consts.push(enum_cdecl);
+        }
+        if (enum_result.enum_struct != 0) {
+            register_struct_type(enum_result.enum_struct);
+            if (structs != 0) {
+                structs.push(enum_result.enum_struct);
+            }
+        }
+        if (enum_result.payload_structs != 0) {
+            var payload_n: u64 = enum_result.payload_structs.len();
+            for (var psi: u64 = 0; psi < payload_n; psi++) {
+                var payload_struct: *AstStructDef = enum_result.payload_structs.get(psi);
+                if (payload_struct == 0) { continue; }
+                register_struct_type(payload_struct);
+                if (structs != 0) {
+                    structs.push(payload_struct);
+                }
+            }
+        }
+        if (enum_result.ctor_funcs != 0 && funcs != 0) {
+            var fn_n: u64 = enum_result.ctor_funcs.len();
+            for (var fi: u64 = 0; fi < fn_n; fi++) {
+                funcs.push(enum_result.ctor_funcs.get(fi));
+            }
+        }
+        return 0;
+    }
+    consume_tok(p, TOKEN_ENUM);
+    consume_tok(p, TOKEN_IDENTIFIER);
+    decl_skip_block(p);
+    return 0;
+}
+
+func decl_program_handle_struct(p: *Parser, mode: u64, structs: *Vec<*AstStructDef>) -> u64 {
+    var struct_def: *AstStructDef = decl_parse_struct_def(p);
+    if (mode != PARSE_PROGRAM_MODE_FULL) { return 0; }
+    if (sym_is_generic_struct_def(struct_def) == 0) {
+        structs.push(struct_def);
+    }
+    register_struct_type(struct_def);
+    return 0;
+}
+
+func decl_program_handle_impl(p: *Parser, mode: u64, funcs: *Vec<*AstFunc>) -> u64 {
+    var impl_funcs: *Vec<*AstFunc> = 0;
+    if (decl_is_impl_trait_block(p) != 0) {
+        if (mode == PARSE_PROGRAM_MODE_FULL) {
+            impl_funcs = impl_trait_block(p);
+        } else {
+            impl_funcs = impl_trait_block_signature(p);
+        }
+    } else {
+        if (mode == PARSE_PROGRAM_MODE_FULL) {
+            impl_funcs = impl_block(p);
+        } else {
+            impl_funcs = impl_block_signature(p);
+        }
+    }
+    decl_append_impl_funcs(funcs, impl_funcs, mode);
+    return 0;
+}
+
+func decl_program_handle_global(p: *Parser, mode: u64, globals: *Vec<*GlobalInfo>) -> u64 {
+    if (mode == PARSE_PROGRAM_MODE_FULL) {
+        decl_global_var_decl_full(p, globals);
+        return 0;
+    }
+    decl_skip_global_var_decl_signature(p);
+    return 0;
+}
+
+func decl_program_impl(p: *Parser, mode: u64) -> *AstProgram {
+    if (mode == PARSE_PROGRAM_MODE_SIGNATURE) {
+        set_recovery_mode(p, 1, 40);
+    } else {
+        set_recovery_mode(p, 1, 40);
+    }
+
+    var funcs: *Vec<*AstFunc> = new Vec<*AstFunc>(16);
+    var consts: *Vec<*AstConstDecl> = new Vec<*AstConstDecl>(1);
+    var imports: *Vec<*AstImport> = new Vec<*AstImport>(16);
+    var globals: *Vec<*GlobalInfo> = 0;
+    var structs: *Vec<*AstStructDef> = 0;
+
+    if (mode == PARSE_PROGRAM_MODE_FULL) {
+        consts = new Vec<*AstConstDecl>(64);
+        globals = new Vec<*GlobalInfo>(32);
+        structs = new Vec<*AstStructDef>(16);
+    }
+
+    generated_funcs_begin(p);
+    clear_parsing_context();
+    while (peek_kind(p) != TOKEN_EOF) {
+        clear_parsing_context();
+        var k: u64 = peek_kind(p);
+        switch (k) {
+            case TOKEN_FUNC:
+                decl_program_handle_func(p, mode, funcs);
+                break;
+            case TOKEN_CONST:
+                decl_program_handle_const(p, mode, consts);
+                break;
+            case TOKEN_ENUM:
+                decl_program_handle_enum(p, mode, consts, funcs, structs);
+                break;
+            case TOKEN_STRUCT:
+            case TOKEN_UNION:
+            case TOKEN_PACKED:
+                decl_program_handle_struct(p, mode, structs);
+                break;
+            case TOKEN_TRAIT:
+                trait_parse_def(p, mode);
+                break;
+            case TOKEN_IMPL:
+                decl_program_handle_impl(p, mode, funcs);
+                break;
+            case TOKEN_VAR:
+                decl_program_handle_global(p, mode, globals);
+                break;
+            case TOKEN_AT:
+                var next_k: u64 = peek_kind_after_annotations(p);
+                if (next_k == TOKEN_FUNC) {
+                    decl_program_handle_func(p, mode, funcs);
+                    break;
+                }
+                if (next_k == TOKEN_VAR) {
+                    decl_program_handle_global(p, mode, globals);
+                    break;
+                }
+                emit_stderr("[ERROR] annotation target must be function or variable declaration\n");
+                panic_here(p, "Syntax error");
+                break;
+            case TOKEN_IMPORT:
+                imports.push(import_parse_decl(p));
+                break;
+            default:
+                if (mode == PARSE_PROGRAM_MODE_SIGNATURE) {
+                    advance_tok(p);
+                } else {
+                    decl_report_unexpected_top_level(p);
+                }
+                break;
+        }
+    }
+
+    decl_append_generated_funcs(p, funcs);
+    decl_append_generated_globals(p, globals);
+    clear_parsing_context();
+
+    if (has_errors(p) != 0) {
+        emit_stderr("[ERROR] parse failed with ");
+        emit_u64_stderr(error_count(p));
+        emit_stderr(" error(s)\n");
+        set_recovery_mode(p, 0, 0);
+        return 0;
+    }
+
+    var prog: *AstProgram = ast_program(funcs, consts, imports);
+    if (mode == PARSE_PROGRAM_MODE_FULL) {
+        prog.globals_vec = globals;
+        prog.structs_vec = structs;
+    }
+    return prog;
+}

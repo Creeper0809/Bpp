@@ -1,0 +1,209 @@
+// compiler_resolver.b - Resolver pass contract
+
+import compiler;
+import compiler.super_lowering;
+import compiler.core_utils;
+import compiler.generic.engine;
+import compiler.symbol_runtime;
+import module_utils;
+import std.str;
+import std.vec;
+import ast;
+import types;
+
+func resolve_import_default_module_alias(module_ptr: u64, module_len: u64) -> *NameInfo {
+    if (module_ptr == 0 || module_len == 0) { return new NameInfo{0, 0}; }
+    var start: u64 = 0;
+    var u8s: []u8 = slice(module_ptr, module_len);
+    for (var i: u64 = 0; i < module_len; i++) {
+        if (u8s[i] == 47) { // '/'
+            start = i + 1;
+        }
+    }
+    if (start >= module_len) { start = 0; }
+    var out_len: u64 = module_len - start;
+    var out_ptr: u64 = heap_alloc((out_len + 1) * sizeof(u8));
+    str_copy(out_ptr, module_ptr + start, out_len);
+    var out_u8: []u8 = slice(out_ptr, out_len + 1);
+    out_u8[out_len] = 0;
+    return new NameInfo{out_ptr, out_len};
+}
+
+func resolve_import_sanitize_module_alias(module_ptr: u64, module_len: u64) -> *NameInfo {
+    if (module_ptr == 0 || module_len == 0) { return new NameInfo{0, 0}; }
+    var out_ptr: u64 = heap_alloc((module_len + 1) * sizeof(u8));
+    var in_u8: []u8 = slice(module_ptr, module_len);
+    var out_u8: []u8 = slice(out_ptr, module_len + 1);
+    for (var i: u64 = 0; i < module_len; i++) {
+        var c: u64 = in_u8[i];
+        var is_alpha_lower: u64 = (c >= 97 && c <= 122);
+        var is_alpha_upper: u64 = (c >= 65 && c <= 90);
+        var is_digit: u64 = (c >= 48 && c <= 57);
+        if (is_alpha_lower != 0 || is_alpha_upper != 0 || is_digit != 0 || c == 95) {
+            out_u8[i] = (u8)c;
+        } else {
+            out_u8[i] = 95; // '_'
+        }
+    }
+    out_u8[module_len] = 0;
+    return new NameInfo{out_ptr, module_len};
+}
+
+func resolve_import_pick_module_alias(
+    importer_ptr: u64,
+    importer_len: u64,
+    preferred_ptr: u64,
+    preferred_len: u64,
+    module_ptr: u64,
+    module_len: u64,
+    allow_fallback: u64
+) -> *NameInfo {
+    var existing: *NameInfo = resolve_module_namespace_alias(importer_ptr, importer_len, preferred_ptr, preferred_len);
+    if (existing == 0 || (existing.ptr == module_ptr && existing.len == module_len)) {
+        return new NameInfo{preferred_ptr, preferred_len};
+    }
+
+    if (allow_fallback == 0) { return new NameInfo{0, 0}; }
+
+    var base: *NameInfo = resolve_import_sanitize_module_alias(module_ptr, module_len);
+    if (base.ptr == 0 || base.len == 0) { return new NameInfo{0, 0}; }
+
+    var candidate_ptr: u64 = base.ptr;
+    var candidate_len: u64 = base.len;
+    while (true) {
+        var occupied: *NameInfo = resolve_module_namespace_alias(importer_ptr, importer_len, candidate_ptr, candidate_len);
+        if (occupied == 0 || (occupied.ptr == module_ptr && occupied.len == module_len)) {
+            return new NameInfo{candidate_ptr, candidate_len};
+        }
+        candidate_ptr = str_concat(candidate_ptr, candidate_len, "_", 1);
+        candidate_len = candidate_len + 1;
+    }
+    return new NameInfo{0, 0};
+}
+
+// After all modules are loaded, resolve import aliases using stored import lists.
+func finalize_import_aliases() -> u64 {
+    if (g_compiler_ctx.loaded_modules_vec == 0) { return false; }
+    var n: u64 = g_compiler_ctx.loaded_modules_vec.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var info: *NameInfo = g_compiler_ctx.loaded_modules_vec.get(i);
+        var module_path: u64 = info.ptr;
+        var module_path_len: u64 = info.len;
+        var module_id: *NameInfo = module_id_from_path(module_path, module_path_len);
+        var module_ptr: u64 = module_id.ptr;
+        var module_len: u64 = module_id.len;
+
+        var imports: *Vec<*AstImport> = g_compiler_ctx.module_imports_pass2.get(module_path, module_path_len);
+        if (imports == 0) { continue; }
+        var num_imports: u64 = imports.len();
+        for (var ii: u64 = 0; ii < num_imports; ii++) {
+            var imp: *AstImport = imports.get(ii);
+            var imp_path: u64 = imp.path_ptr;
+            var imp_len: u64 = imp.path_len;
+            var imp_sym_ptr: u64 = imp.symbol_ptr;
+            var imp_sym_len: u64 = imp.symbol_len;
+            var imp_alias_ptr: u64 = imp.alias_ptr;
+            var imp_alias_len: u64 = imp.alias_len;
+
+            var imp_mod_id: *NameInfo = module_util_module_id_from_import(imp_path, imp_len);
+            var imp_mod_ptr: u64 = imp_mod_id.ptr;
+            var imp_mod_len: u64 = imp_mod_id.len;
+
+            if (imp_sym_ptr == 0) {
+                var ns_alias_ptr: u64 = imp_alias_ptr;
+                var ns_alias_len: u64 = imp_alias_len;
+                var explicit_alias: u64 = 1;
+                if (ns_alias_ptr == 0 || ns_alias_len == 0) {
+                    var default_alias: *NameInfo = resolve_import_default_module_alias(imp_mod_ptr, imp_mod_len);
+                    ns_alias_ptr = default_alias.ptr;
+                    ns_alias_len = default_alias.len;
+                    explicit_alias = 0;
+                }
+                var resolved_alias: *NameInfo = resolve_import_pick_module_alias(
+                    module_ptr,
+                    module_len,
+                    ns_alias_ptr,
+                    ns_alias_len,
+                    imp_mod_ptr,
+                    imp_mod_len,
+                    explicit_alias == 0
+                );
+                if (resolved_alias == 0 || resolved_alias.ptr == 0 || resolved_alias.len == 0) {
+                    emit_stderr("[ERROR] module namespace alias conflict: ");
+                    emit_stderr_len(ns_alias_ptr, ns_alias_len);
+                    emit_stderr_nl();
+                    diag_error("Compilation failed");
+                    continue;
+                }
+                add_module_namespace_alias(
+                    module_ptr,
+                    module_len,
+                    resolved_alias.ptr,
+                    resolved_alias.len,
+                    imp_mod_ptr,
+                    imp_mod_len
+                );
+                import_all_from_module(module_ptr, module_len, imp_mod_ptr, imp_mod_len);
+            } else {
+                import_symbol_from_module(module_ptr, module_len, imp_mod_ptr, imp_mod_len, imp_sym_ptr, imp_sym_len, imp_alias_ptr, imp_alias_len);
+            }
+        }
+    }
+    return true;
+}
+
+func resolve_super_references() -> u64 {
+    if (g_compiler_ctx.all_funcs != 0) {
+        var fn_count: u64 = g_compiler_ctx.all_funcs.len();
+        for (var i: u64 = 0; i < fn_count; i++) {
+            var fn: *AstFunc = g_compiler_ctx.all_funcs.get(i);
+            if (fn == 0 || fn.body == 0) { continue; }
+            var super_allowed: u64 = 0;
+            if (sym_method_param_start_index(fn) != 0) { super_allowed = 1; }
+            var owner_info: *NameInfo = sym_get_impl_method_owner(fn.name_ptr, fn.name_len);
+            var owner_ptr: u64 = 0;
+            var owner_len: u64 = 0;
+            if (owner_info != 0) {
+                owner_ptr = owner_info.ptr;
+                owner_len = owner_info.len;
+            }
+            super_lower_stmt(fn.body, owner_ptr, owner_len, super_allowed);
+        }
+    }
+
+    if (g_compiler_ctx.all_globals != 0) {
+        var gn: u64 = g_compiler_ctx.all_globals.len();
+        for (var gi: u64 = 0; gi < gn; gi++) {
+            var ginfo: *GlobalInfo = g_compiler_ctx.all_globals.get(gi);
+            if (ginfo == 0 || ginfo.init_expr == 0) { continue; }
+            ginfo.init_expr = (u64)super_lower_expr((*AstNode)ginfo.init_expr, 0, 0, 0);
+        }
+    }
+    return 0;
+}
+
+func resolve_finalize_import_aliases_with_ctx(ctx: *CompilerCtx) -> u64 {
+    if (compiler_ctx_is_active(ctx) == 0) {
+        emit_stderr("[ERROR] resolve_finalize_import_aliases_with_ctx requires active compiler context\n");
+        return 1;
+    }
+    finalize_import_aliases();
+    return 0;
+}
+
+func resolve_super_references_with_ctx(ctx: *CompilerCtx) -> u64 {
+    if (compiler_ctx_is_active(ctx) == 0) {
+        emit_stderr("[ERROR] resolve_super_references_with_ctx requires active compiler context\n");
+        return 1;
+    }
+    resolve_super_references();
+    return 0;
+}
+
+func finalize_import_aliases_pass() -> u64 {
+    return resolve_finalize_import_aliases_with_ctx(compiler_ctx_current());
+}
+
+func resolve_super_references_pass() -> u64 {
+    return resolve_super_references_with_ctx(compiler_ctx_current());
+}

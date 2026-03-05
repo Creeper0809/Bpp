@@ -1,4 +1,4 @@
-// parse_stmt.b - Statement parsing
+// stmt_parse.b - Statement parsing
 //
 // Parses all statement types:
 // - Variable declarations
@@ -11,14 +11,22 @@ import std.io;
 import std.vec;
 import std.util;
 import std.str;
+import module_utils;
 import types;
 import lexer;
 import ast;
+import compiler;
+import compiler.core_utils;
+import compiler.generic.engine;
+import compiler.enum_runtime;
+import compiler.symbol_runtime;
 import parser.util;
 import parser.type;
 import parser.expr;
+import parser.stmt.switching;
+import parser.stmt.misc;
 
-func parse_stmt_internal_name(prefix_ptr: u64, prefix_len: u64, id: u64) -> *NameInfo {
+func stmt_internal_name(prefix_ptr: u64, prefix_len: u64, id: u64) -> *NameInfo {
     var id_buf: u64 = heap_alloc(32 * sizeof(u8));
     var id_len: u64 = io_u64_to_ascii(id_buf, id);
     var total_len: u64 = prefix_len + id_len;
@@ -30,42 +38,16 @@ func parse_stmt_internal_name(prefix_ptr: u64, prefix_len: u64, id: u64) -> *Nam
     return new NameInfo{out_ptr, total_len};
 }
 
-func parse_try_context_push(p: *Parser, flag_ptr: u64, flag_len: u64, allowed_depth: u64) -> u64 {
-    if (p.try_throw_flag_ptr_stack == 0) {
-        p.try_throw_flag_ptr_stack = new Vec<u64>(8);
-        p.try_throw_flag_len_stack = new Vec<u64>(8);
-        p.try_throw_allowed_depth_stack = new Vec<u64>(8);
-    }
-    p.try_throw_flag_ptr_stack.push(flag_ptr);
-    p.try_throw_flag_len_stack.push(flag_len);
-    p.try_throw_allowed_depth_stack.push(allowed_depth);
-    return 0;
-}
-
-func parse_try_context_pop(p: *Parser) -> u64 {
-    if (p.try_throw_flag_ptr_stack == 0 || p.try_throw_flag_ptr_stack.len() == 0) { return 0; }
-    p.try_throw_flag_ptr_stack.pop();
-    p.try_throw_flag_len_stack.pop();
-    p.try_throw_allowed_depth_stack.pop();
-    return 0;
-}
-
-func parse_try_context_active(p: *Parser) -> u64 {
-    if (p.try_throw_flag_ptr_stack == 0) { return 0; }
-    if (p.try_throw_flag_ptr_stack.len() == 0) { return 0; }
-    return 1;
-}
-
 // ============================================
 // Variable Declaration
 // ============================================
 
-func parse_var_decl(p: *Parser) -> *AstNode {
-    var annotations: *Vec<*NameInfo> = parse_take_leading_annotations(p);
-    parse_consume(p, TOKEN_VAR);
+func stmt_parse_var_decl(p: *Parser) -> *AstNode {
+    var annotations: *Vec<*NameInfo> = take_leading_annotations(p);
+    consume_tok(p, TOKEN_VAR);
     
-    var name_tok: *Token = parse_peek(p);
-    parse_consume(p, TOKEN_IDENTIFIER);
+    var name_tok: *Token = peek_tok(p);
+    consume_tok(p, TOKEN_IDENTIFIER);
     
     var type_kind: u64 = TYPE_I64;
     var ptr_depth: u64 = 0;
@@ -82,8 +64,8 @@ func parse_var_decl(p: *Parser) -> *AstNode {
     var array_len_param_len: u64 = 0;
     var elem_typeinfo: *TypeInfo = 0;
     
-    if (parse_match(p, TOKEN_COLON)) {
-        var ty_info: *TypeInfo = parse_type_ex(p);
+    if (match_tok(p, TOKEN_COLON)) {
+        var ty_info: *TypeInfo = type_parse_ex(p);
         type_kind = ty_info.type_kind;
         ptr_depth = ty_info.ptr_depth;
         is_tagged = ty_info.is_tagged;
@@ -116,11 +98,11 @@ func parse_var_decl(p: *Parser) -> *AstNode {
     
     var init: *AstNode = 0;
     
-    if (parse_match(p, TOKEN_EQ)) {
-        init = parse_expr(p);
+    if (match_tok(p, TOKEN_EQ)) {
+        init = expr_parse(p);
     }
     
-    parse_consume(p, TOKEN_SEMICOLON);
+    consume_tok(p, TOKEN_SEMICOLON);
     
     var decl: *AstVarDecl = ast_var_decl(name_tok.ptr, name_tok.len, type_kind, ptr_depth, init);
     decl.is_tagged = is_tagged;
@@ -136,6 +118,7 @@ func parse_var_decl(p: *Parser) -> *AstNode {
     decl.array_len_param_len = array_len_param_len;
     decl.elem_typeinfo = elem_typeinfo;
     decl.annotations_vec = annotations;
+    register_local_decl(p, decl);
     return (*AstNode)decl;
 }
 
@@ -153,6 +136,33 @@ func is_assignable_expr(expr: *AstNode) -> u64 {
     }
 }
 
+func stmt_is_enum_member_const_target(target: *AstNode) -> u64 {
+    if (target == 0) { return 0; }
+    if (ast_kind(target) != AST_MEMBER_ACCESS) { return 0; }
+
+    var ma: *AstMemberAccess = (*AstMemberAccess)target;
+    if (ma.parent_ptr != 0) { return 0; }
+    if (ma.object == 0 || ast_kind(ma.object) != AST_IDENT) { return 0; }
+
+    var sid: *AstIdent = (*AstIdent)ma.object;
+    var scoped_const: *ConstResult = (*ConstResult)sym_find_scoped_const(sid.name_ptr, sid.name_len, ma.member_ptr, ma.member_len);
+    if (scoped_const == 0 || scoped_const.found == 0) { return 0; }
+    return 1;
+}
+
+func stmt_validate_assignment_target_not_enum_const(p: *Parser, target: *AstNode) -> u64 {
+    if (stmt_is_enum_member_const_target(target) == 0) { return 0; }
+    var ma: *AstMemberAccess = (*AstMemberAccess)target;
+    var sid: *AstIdent = (*AstIdent)ma.object;
+    emit_stderr("[ERROR] Cannot assign to enum member constant: ");
+    emit_stderr_len(sid.name_ptr, sid.name_len);
+    emit_stderr(".");
+    emit_stderr_len(ma.member_ptr, ma.member_len);
+    emit_stderr("\n");
+    panic_here(p, "Syntax error");
+    return 0;
+}
+
 func make_incdec_rhs(incdec_kind: u64, target: *AstNode) -> *AstNode {
     var one: *AstNode = ast_literal(1);
     switch (incdec_kind) {
@@ -165,28 +175,30 @@ func make_incdec_rhs(incdec_kind: u64, target: *AstNode) -> *AstNode {
     }
 }
 
-func parse_assign_or_postfix_expr(p: *Parser, lhs: *AstNode) -> *AstNode {
-    if (parse_match(p, TOKEN_EQ)) {
-        var rhs: *AstNode = parse_expr(p);
+func stmt_parse_assign_or_postfix_expr(p: *Parser, lhs: *AstNode) -> *AstNode {
+    if (match_tok(p, TOKEN_EQ)) {
+        stmt_validate_assignment_target_not_enum_const(p, lhs);
+        var rhs: *AstNode = expr_parse(p);
         return ast_assign(lhs, rhs);
     }
-    return parse_postfix_incdec_after_expr(p, lhs);
+    return stmt_parse_postfix_incdec_after_expr(p, lhs);
 }
 
-func parse_prefix_incdec_assign(p: *Parser) -> *AstNode {
-    var k: u64 = parse_peek_kind(p);
-    parse_consume(p, k);
-    var target: *AstNode = parse_unary(p);
+func stmt_parse_prefix_incdec_assign(p: *Parser) -> *AstNode {
+    var k: u64 = peek_kind(p);
+    consume_tok(p, k);
+    var target: *AstNode = expr_parse_unary(p);
     if (!is_assignable_expr(target)) {
         emit_stderr("[ERROR] ++/-- requires assignable expression\n");
-        parse_panic_here(p, "Syntax error");
+        panic_here(p, "Syntax error");
     }
+    stmt_validate_assignment_target_not_enum_const(p, target);
     var rhs: *AstNode = make_incdec_rhs(k, target);
     return ast_assign(target, rhs);
 }
 
-func parse_postfix_incdec_after_expr(p: *Parser, expr: *AstNode) -> *AstNode {
-    var k: u64 = parse_peek_kind(p);
+func stmt_parse_postfix_incdec_after_expr(p: *Parser, expr: *AstNode) -> *AstNode {
+    var k: u64 = peek_kind(p);
     switch (k) {
         case TOKEN_PLUSPLUS:
         case TOKEN_MINUSMINUS:
@@ -194,39 +206,41 @@ func parse_postfix_incdec_after_expr(p: *Parser, expr: *AstNode) -> *AstNode {
         default:
             return expr;
     }
-    parse_consume(p, k);
+    consume_tok(p, k);
     if (!is_assignable_expr(expr)) {
         emit_stderr("[ERROR] ++/-- requires assignable expression\n");
-        parse_panic_here(p, "Syntax error");
+        panic_here(p, "Syntax error");
     }
+    stmt_validate_assignment_target_not_enum_const(p, expr);
     var rhs: *AstNode = make_incdec_rhs(k, expr);
     return ast_assign(expr, rhs);
 }
 
-func parse_wrap_stmt_in_block(stmt: *AstNode) -> *AstNode {
+func stmt_wrap_in_block(stmt: *AstNode) -> *AstNode {
     var stmts: *Vec<*AstNode> = new Vec<*AstNode>(1);
     stmts.push(stmt);
     return ast_block(stmts);
 }
 
-func parse_stmt_or_block(p: *Parser) -> *AstNode {
-    if (parse_peek_kind(p) == TOKEN_LBRACE) {
-        return parse_block(p);
+func stmt_parse_or_block(p: *Parser) -> *AstNode {
+    if (peek_kind(p) == TOKEN_LBRACE) {
+        return stmt_parse_block(p);
     }
-    return parse_wrap_stmt_in_block(parse_stmt(p));
+    return stmt_wrap_in_block(stmt_parse(p));
 }
 
-func parse_assign_or_expr(p: *Parser) -> *AstNode {
-    var expr: *AstNode = parse_expr(p);
+func stmt_parse_assign_or_expr(p: *Parser) -> *AstNode {
+    var expr: *AstNode = expr_parse(p);
     
-    if (parse_match(p, TOKEN_EQ)) {
-        var val: *AstNode = parse_expr(p);
-        parse_consume(p, TOKEN_SEMICOLON);
+    if (match_tok(p, TOKEN_EQ)) {
+        stmt_validate_assignment_target_not_enum_const(p, expr);
+        var val: *AstNode = expr_parse(p);
+        consume_tok(p, TOKEN_SEMICOLON);
         return ast_assign(expr, val);
     }
 
     // Compound assignment: x += 5  =>  x = x + 5
-    var k: u64 = parse_peek_kind(p);
+    var k: u64 = peek_kind(p);
     var bin_op: u64 = 0;
     switch (k) {
         case TOKEN_PLUS_EQ: bin_op = TOKEN_PLUS; break;
@@ -237,36 +251,38 @@ func parse_assign_or_expr(p: *Parser) -> *AstNode {
         default: bin_op = 0; break;
     }
     if (bin_op != 0) {
-        parse_consume(p, k);
+        consume_tok(p, k);
         if (!is_assignable_expr(expr)) {
             emit_stderr("[ERROR] Compound assignment requires assignable expression\n");
-            parse_panic_here(p, "Syntax error");
+            panic_here(p, "Syntax error");
         }
-        var rhs: *AstNode = parse_expr(p);
+        stmt_validate_assignment_target_not_enum_const(p, expr);
+        var rhs: *AstNode = expr_parse(p);
         
         var new_val: *AstNode = ast_binary(bin_op, expr, rhs);
-        parse_consume(p, TOKEN_SEMICOLON);
+        consume_tok(p, TOKEN_SEMICOLON);
         return ast_assign(expr, new_val);
     }
 
     // Postfix ++/-- statement sugar: x++; x--;  =>  x = x +/- 1;
-    var post_k: u64 = parse_peek_kind(p);
+    var post_k: u64 = peek_kind(p);
     switch (post_k) {
         case TOKEN_PLUSPLUS:
         case TOKEN_MINUSMINUS:
-            parse_consume(p, post_k);
+            consume_tok(p, post_k);
             if (!is_assignable_expr(expr)) {
                 emit_stderr("[ERROR] ++/-- requires assignable expression\n");
-                parse_panic_here(p, "Syntax error");
+                panic_here(p, "Syntax error");
             }
+            stmt_validate_assignment_target_not_enum_const(p, expr);
             var rhs: *AstNode = make_incdec_rhs(post_k, expr);
-            parse_consume(p, TOKEN_SEMICOLON);
+            consume_tok(p, TOKEN_SEMICOLON);
             return ast_assign(expr, rhs);
         default:
             break;
     }
     
-    parse_consume(p, TOKEN_SEMICOLON);
+    consume_tok(p, TOKEN_SEMICOLON);
     return ast_expr_stmt(expr);
 }
 
@@ -274,74 +290,110 @@ func parse_assign_or_expr(p: *Parser) -> *AstNode {
 // Control Flow Statements
 // ============================================
 
-func parse_if_stmt(p: *Parser) -> *AstNode {
-    parse_consume(p, TOKEN_IF);
-    parse_consume(p, TOKEN_LPAREN);
-    var cond: *AstNode = parse_expr(p);
-    parse_consume(p, TOKEN_RPAREN);
+func stmt_parse_if(p: *Parser) -> *AstNode {
+    consume_tok(p, TOKEN_IF);
+    consume_tok(p, TOKEN_LPAREN);
+    var cond: *AstNode = expr_parse(p);
+    consume_tok(p, TOKEN_RPAREN);
     
-    var then_blk: *AstNode = parse_stmt_or_block(p);
+    var then_blk: *AstNode = stmt_parse_or_block(p);
     
     var else_blk: *AstNode = 0;
-    if (parse_match(p, TOKEN_ELSE)) {
-        if (parse_peek_kind(p) == TOKEN_IF) {
-            else_blk = parse_wrap_stmt_in_block(parse_if_stmt(p));
+    if (match_tok(p, TOKEN_ELSE)) {
+        if (peek_kind(p) == TOKEN_IF) {
+            else_blk = stmt_wrap_in_block(stmt_parse_if(p));
         } else {
-            else_blk = parse_stmt_or_block(p);
+            else_blk = stmt_parse_or_block(p);
         }
     }
     
     return ast_if(cond, then_blk, else_blk);
 }
 
-func parse_while_stmt(p: *Parser) -> *AstNode {
-    parse_consume(p, TOKEN_WHILE);
-    parse_consume(p, TOKEN_LPAREN);
-    var cond: *AstNode = parse_expr(p);
-    parse_consume(p, TOKEN_RPAREN);
+func stmt_parse_while(p: *Parser) -> *AstNode {
+    consume_tok(p, TOKEN_WHILE);
+    consume_tok(p, TOKEN_LPAREN);
+    var cond: *AstNode = expr_parse(p);
+    consume_tok(p, TOKEN_RPAREN);
     
     p.breakable_depth = p.breakable_depth + 1;
-    var body: *AstNode = parse_stmt_or_block(p);
+    var body: *AstNode = stmt_parse_or_block(p);
     p.breakable_depth = p.breakable_depth - 1;
     
     return ast_while(cond, body);
 }
 
-func parse_for_stmt(p: *Parser) -> *AstNode {
-    parse_consume(p, TOKEN_FOR);
-    parse_consume(p, TOKEN_LPAREN);
+func stmt_parse_do_while(p: *Parser) -> *AstNode {
+    consume_tok(p, TOKEN_DO);
+
+    p.breakable_depth = p.breakable_depth + 1;
+    var body: *AstNode = stmt_parse_or_block(p);
+    p.breakable_depth = p.breakable_depth - 1;
+
+    consume_tok(p, TOKEN_WHILE);
+    consume_tok(p, TOKEN_LPAREN);
+    var cond: *AstNode = expr_parse(p);
+    consume_tok(p, TOKEN_RPAREN);
+    consume_tok(p, TOKEN_SEMICOLON);
+
+    var first_name: *NameInfo = stmt_internal_name("__do_first_", 11, next_generated_id(p));
+    var first_decl: *AstVarDecl = ast_var_decl(first_name.ptr, first_name.len, TYPE_U64, 0, (*AstNode)ast_literal(1));
+    var first_ident_a: *AstNode = (*AstNode)ast_ident(first_name.ptr, first_name.len);
+    var first_ident_b: *AstNode = (*AstNode)ast_ident(first_name.ptr, first_name.len);
+    var loop_cond: *AstNode = (*AstNode)ast_binary(TOKEN_OROR, first_ident_a, cond);
+    var clear_first: *AstNode = (*AstNode)ast_assign(first_ident_b, (*AstNode)ast_literal(0));
+
+    var loop_body_stmts: *Vec<*AstNode> = new Vec<*AstNode>(8);
+    loop_body_stmts.push(clear_first);
+    if (body != 0 && ast_kind(body) == AST_BLOCK) {
+        stmt_try_append_block_stmts(loop_body_stmts, body);
+    } else if (body != 0) {
+        loop_body_stmts.push(body);
+    }
+    var loop_body: *AstNode = (*AstNode)ast_block(loop_body_stmts);
+    var lowered_while: *AstNode = (*AstNode)ast_while(loop_cond, loop_body);
+
+    var out_stmts: *Vec<*AstNode> = new Vec<*AstNode>(2);
+    out_stmts.push((*AstNode)first_decl);
+    out_stmts.push(lowered_while);
+    return (*AstNode)ast_block(out_stmts);
+}
+
+func stmt_parse_for(p: *Parser) -> *AstNode {
+    consume_tok(p, TOKEN_FOR);
+    consume_tok(p, TOKEN_LPAREN);
 
     var init: *AstNode = 0;
-    var k: u64 = parse_peek_kind(p);
+    var k: u64 = peek_kind(p);
 
     // Parse init clause
     switch (k) {
         case TOKEN_SEMICOLON:
-            parse_consume(p, TOKEN_SEMICOLON);
+            consume_tok(p, TOKEN_SEMICOLON);
             break;
         case TOKEN_VAR:
-            init = parse_var_decl(p);
+            init = stmt_parse_var_decl(p);
             break;
         case TOKEN_PLUSPLUS:
         case TOKEN_MINUSMINUS:
-            init = parse_prefix_incdec_assign(p);
-            parse_consume(p, TOKEN_SEMICOLON);
+            init = stmt_parse_prefix_incdec_assign(p);
+            consume_tok(p, TOKEN_SEMICOLON);
             break;
         default:
-            var lhs: *AstNode = parse_expr(p);
-            init = parse_assign_or_postfix_expr(p, lhs);
-            parse_consume(p, TOKEN_SEMICOLON);
+            var lhs: *AstNode = expr_parse(p);
+            init = stmt_parse_assign_or_postfix_expr(p, lhs);
+            consume_tok(p, TOKEN_SEMICOLON);
             break;
     }
 
     var cond: *AstNode = 0;
-    if (parse_peek_kind(p) != TOKEN_SEMICOLON) {
-        cond = parse_expr(p);
+    if (peek_kind(p) != TOKEN_SEMICOLON) {
+        cond = expr_parse(p);
     }
-    parse_consume(p, TOKEN_SEMICOLON);
+    consume_tok(p, TOKEN_SEMICOLON);
 
     var update: *AstNode = 0;
-    k = parse_peek_kind(p);
+    k = peek_kind(p);
 
     // Parse update clause
     switch (k) {
@@ -350,84 +402,86 @@ func parse_for_stmt(p: *Parser) -> *AstNode {
             break;
         case TOKEN_PLUSPLUS:
         case TOKEN_MINUSMINUS:
-            update = parse_prefix_incdec_assign(p);
+            update = stmt_parse_prefix_incdec_assign(p);
             break;
         default:
-            var upd_lhs: *AstNode = parse_expr(p);
-            update = parse_assign_or_postfix_expr(p, upd_lhs);
+            var upd_lhs: *AstNode = expr_parse(p);
+            update = stmt_parse_assign_or_postfix_expr(p, upd_lhs);
             break;
     }
 
-    parse_consume(p, TOKEN_RPAREN);
+    consume_tok(p, TOKEN_RPAREN);
 
     p.breakable_depth = p.breakable_depth + 1;
-    var body: *AstNode = parse_stmt_or_block(p);
+    var body: *AstNode = stmt_parse_or_block(p);
     p.breakable_depth = p.breakable_depth - 1;
     return ast_for(init, cond, update, body);
 }
 
-func parse_switch_stmt(p: *Parser) -> *AstNode {
-    if (parse_peek_kind(p) == TOKEN_MATCH) {
-        parse_consume(p, TOKEN_MATCH);
-    } else {
-        parse_consume(p, TOKEN_SWITCH);
+func stmt_switch_parse_case_body(p: *Parser) -> *AstNode {
+    var stmts: *Vec<*AstNode> = new Vec<*AstNode>(8);
+    while (peek_kind(p) != TOKEN_CASE) {
+        if (peek_kind(p) == TOKEN_DEFAULT) { break; }
+        if (peek_kind(p) == TOKEN_RBRACE) { break; }
+        if (peek_kind(p) == TOKEN_EOF) { break; }
+        stmts.push(stmt_parse(p));
     }
-    parse_consume(p, TOKEN_LPAREN);
-    var expr: *AstNode = parse_expr(p);
-    parse_consume(p, TOKEN_RPAREN);
-    parse_consume(p, TOKEN_LBRACE);
+    return (*AstNode)ast_block(stmts);
+}
+
+func stmt_parse_switch(p: *Parser) -> *AstNode {
+    var is_match_stmt: u64 = 0;
+    if (peek_kind(p) == TOKEN_MATCH) {
+        consume_tok(p, TOKEN_MATCH);
+        is_match_stmt = 1;
+    } else {
+        consume_tok(p, TOKEN_SWITCH);
+    }
+    consume_tok(p, TOKEN_LPAREN);
+    var expr: *AstNode = expr_parse(p);
+    consume_tok(p, TOKEN_RPAREN);
+    consume_tok(p, TOKEN_LBRACE);
 
     var cases: *Vec<*AstNode> = new Vec<*AstNode>(16);
+    var arms: *Vec<*ParseSwitchArm> = new Vec<*ParseSwitchArm>(16);
+    var has_pattern_arm: u64 = 0;
     p.breakable_depth = p.breakable_depth + 1;
 
-    while (parse_peek_kind(p) != TOKEN_RBRACE) {
-        if (parse_peek_kind(p) == TOKEN_EOF) { break; }
-
-        var is_default: u64 = 0;
-        var value: *AstNode = 0;
-        var matched: u64 = 0;
-
-        switch (parse_peek_kind(p)) {
-            case TOKEN_CASE:
-                parse_consume(p, TOKEN_CASE);
-                if (parse_peek_kind(p) == TOKEN_IDENTIFIER) {
-                    var wc_tok: *Token = parse_peek(p);
-                    if (wc_tok.len == 1 && str_eq(wc_tok.ptr, wc_tok.len, "_", 1) != 0) {
-                        parse_adv(p);
-                        is_default = 1;
-                        matched = 1;
-                        break;
-                    }
-                }
-                value = parse_expr(p);
-                matched = 1;
-                break;
-            case TOKEN_DEFAULT:
-                parse_consume(p, TOKEN_DEFAULT);
-                is_default = 1;
-                matched = 1;
-                break;
-            default:
-                break;
+    while (peek_kind(p) != TOKEN_RBRACE) {
+        if (peek_kind(p) == TOKEN_EOF) { break; }
+        var arm: *ParseSwitchArm = switch_parse_case_head(p, is_match_stmt);
+        if (arm == 0) { break; }
+        consume_tok(p, TOKEN_COLON);
+        arm.body = stmt_switch_parse_case_body(p);
+        if (arm.kind == PARSE_SWITCH_ARM_VARIANT) {
+            has_pattern_arm = 1;
         }
-        if (matched == 0) { break; }
+        arms.push(arm);
 
-        parse_consume(p, TOKEN_COLON);
-
-        var stmts: *Vec<*AstNode> = new Vec<*AstNode>(8);
-        while (parse_peek_kind(p) != TOKEN_CASE) {
-            if (parse_peek_kind(p) == TOKEN_DEFAULT) { break; }
-            if (parse_peek_kind(p) == TOKEN_RBRACE) { break; }
-            if (parse_peek_kind(p) == TOKEN_EOF) { break; }
-            stmts.push(parse_stmt(p));
+        if (arm.kind == PARSE_SWITCH_ARM_DEFAULT) {
+            cases.push(ast_case(0, arm.body, 1));
+            continue;
         }
-
-        var case_body: *AstNode = ast_block(stmts);
-        cases.push(ast_case(value, case_body, is_default));
+        if (arm.kind == PARSE_SWITCH_ARM_SIMPLE) {
+            if (arm.values_vec == 0 || arm.values_vec.len() == 0) {
+                emit_stderr("[ERROR] case value is required\n");
+                panic_here(p, "Syntax error");
+            }
+            var cvn: u64 = arm.values_vec.len();
+            for (var ci: u64 = 0; ci < cvn; ci++) {
+                cases.push(ast_case(arm.values_vec.get(ci), arm.body, 0));
+            }
+        }
     }
 
     p.breakable_depth = p.breakable_depth - 1;
-    parse_consume(p, TOKEN_RBRACE);
+    consume_tok(p, TOKEN_RBRACE);
+    if (has_pattern_arm != 0) {
+        return switch_lower_pattern_match(p, expr, arms, is_match_stmt);
+    }
+    if (is_match_stmt != 0) {
+        return ast_match(expr, cases);
+    }
     return ast_switch(expr, cases);
 }
 
@@ -435,57 +489,39 @@ func parse_switch_stmt(p: *Parser) -> *AstNode {
 // Jump Statements
 // ============================================
 
-func parse_break_stmt(p: *Parser) -> *AstNode {
-    parse_consume(p, TOKEN_BREAK);
-    parse_consume(p, TOKEN_SEMICOLON);
+func stmt_parse_break(p: *Parser) -> *AstNode {
+    consume_tok(p, TOKEN_BREAK);
+    if (p.breakable_depth == 0) {
+        emit_stderr("[ERROR] break can only be used inside loop/switch\n");
+        panic_here(p, "Syntax error");
+    }
+    consume_tok(p, TOKEN_SEMICOLON);
     return ast_break();
 }
 
-func parse_continue_stmt(p: *Parser) -> *AstNode {
-    parse_consume(p, TOKEN_CONTINUE);
-    parse_consume(p, TOKEN_SEMICOLON);
+func stmt_parse_continue(p: *Parser) -> *AstNode {
+    consume_tok(p, TOKEN_CONTINUE);
+    if (p.breakable_depth == 0) {
+        emit_stderr("[ERROR] continue can only be used inside loop\n");
+        panic_here(p, "Syntax error");
+    }
+    consume_tok(p, TOKEN_SEMICOLON);
     return ast_continue();
 }
 
-func parse_return_stmt(p: *Parser) -> *AstNode {
-    parse_consume(p, TOKEN_RETURN);
+func stmt_parse_return(p: *Parser) -> *AstNode {
+    consume_tok(p, TOKEN_RETURN);
     
     var expr: *AstNode = 0;
-    if (parse_peek_kind(p) != TOKEN_SEMICOLON) {
-        expr = parse_expr(p);
+    if (peek_kind(p) != TOKEN_SEMICOLON) {
+        expr = expr_parse(p);
     }
     
-    parse_consume(p, TOKEN_SEMICOLON);
+    consume_tok(p, TOKEN_SEMICOLON);
     return ast_return(expr);
 }
 
-func parse_throw_stmt(p: *Parser) -> *AstNode {
-    parse_consume(p, TOKEN_THROW);
-    if (parse_try_context_active(p) == 0) {
-        emit_stderr("[ERROR] throw can only be used inside try { ... }\n");
-        parse_panic_here(p, "Syntax error");
-    }
-
-    var top_idx: u64 = p.try_throw_flag_ptr_stack.len() - 1;
-    var allowed_depth: u64 = p.try_throw_allowed_depth_stack.get(top_idx);
-    if (p.breakable_depth != allowed_depth) {
-        emit_stderr("[ERROR] throw inside nested loop/switch is not supported\n");
-        parse_panic_here(p, "Syntax error");
-    }
-
-    var flag_ptr: u64 = p.try_throw_flag_ptr_stack.get(top_idx);
-    var flag_len: u64 = p.try_throw_flag_len_stack.get(top_idx);
-    var thrown_expr: *AstNode = parse_expr(p);
-    parse_consume(p, TOKEN_SEMICOLON);
-
-    var throw_stmts: *Vec<*AstNode> = new Vec<*AstNode>(3);
-    throw_stmts.push((*AstNode)ast_expr_stmt(thrown_expr));
-    throw_stmts.push((*AstNode)ast_assign((*AstNode)ast_ident(flag_ptr, flag_len), (*AstNode)ast_literal(1)));
-    throw_stmts.push((*AstNode)ast_break());
-    return (*AstNode)ast_block(throw_stmts);
-}
-
-func parse_try_stmt_append_block_stmts(dst: *Vec<*AstNode>, block_node: *AstNode) -> u64 {
+func stmt_try_append_block_stmts(dst: *Vec<*AstNode>, block_node: *AstNode) -> u64 {
     if (block_node == 0) { return 0; }
     if (ast_kind(block_node) != AST_BLOCK) {
         dst.push(block_node);
@@ -500,258 +536,154 @@ func parse_try_stmt_append_block_stmts(dst: *Vec<*AstNode>, block_node: *AstNode
     return 0;
 }
 
-func parse_try_stmt(p: *Parser) -> *AstNode {
-    parse_consume(p, TOKEN_TRY);
-    p.try_stmt_counter = p.try_stmt_counter + 1;
-    var flag_name: *NameInfo = parse_stmt_internal_name("__try_thrown_", 12, p.try_stmt_counter);
-
-    var allowed_depth: u64 = p.breakable_depth;
-    parse_try_context_push(p, flag_name.ptr, flag_name.len, allowed_depth);
-    var try_block: *AstNode = parse_block(p);
-    parse_try_context_pop(p);
+func stmt_parse_try(p: *Parser) -> *AstNode {
+    consume_tok(p, TOKEN_TRY);
+    var try_block: *AstNode = stmt_parse_block(p);
 
     var catch_block: *AstNode = 0;
+    var catch_name_ptr: u64 = 0;
+    var catch_name_len: u64 = 0;
+    var catch_value_type: *TypeInfo = 0;
     var finally_block: *AstNode = 0;
-    if (parse_peek_kind(p) == TOKEN_CATCH) {
-        parse_consume(p, TOKEN_CATCH);
-        catch_block = parse_block(p);
+    if (peek_kind(p) == TOKEN_CATCH) {
+        consume_tok(p, TOKEN_CATCH);
+        if (match_tok(p, TOKEN_LPAREN)) {
+            var catch_tok: *Token = peek_tok(p);
+            consume_tok(p, TOKEN_IDENTIFIER);
+            catch_name_ptr = catch_tok.ptr;
+            catch_name_len = catch_tok.len;
+            if (match_tok(p, TOKEN_COLON)) {
+                catch_value_type = type_parse_ex(p);
+            }
+            consume_tok(p, TOKEN_RPAREN);
+        }
+        catch_block = stmt_parse_block(p);
     }
-    if (parse_peek_kind(p) == TOKEN_FINALLY) {
-        parse_consume(p, TOKEN_FINALLY);
-        finally_block = parse_block(p);
+    if (peek_kind(p) == TOKEN_FINALLY) {
+        consume_tok(p, TOKEN_FINALLY);
+        finally_block = stmt_parse_block(p);
     }
+
     if (catch_block == 0 && finally_block == 0) {
         emit_stderr("[ERROR] try statement requires catch and/or finally block\n");
-        parse_panic_here(p, "Syntax error");
+        panic_here(p, "Syntax error");
     }
-
-    var lowered_stmts: *Vec<*AstNode> = new Vec<*AstNode>(6);
-    lowered_stmts.push((*AstNode)ast_var_decl(flag_name.ptr, flag_name.len, TYPE_U64, 0, (*AstNode)ast_literal(0)));
-
-    var while_body_stmts: *Vec<*AstNode> = new Vec<*AstNode>(8);
-    parse_try_stmt_append_block_stmts(while_body_stmts, try_block);
-    while_body_stmts.push((*AstNode)ast_break());
-    var while_body: *AstNode = (*AstNode)ast_block(while_body_stmts);
-    lowered_stmts.push((*AstNode)ast_while((*AstNode)ast_literal(1), while_body));
-
-    if (catch_block != 0) {
-        var thrown_ident: *AstNode = (*AstNode)ast_ident(flag_name.ptr, flag_name.len);
-        var thrown_cond: *AstNode = (*AstNode)ast_binary(TOKEN_BANGEQ, thrown_ident, (*AstNode)ast_literal(0));
-        lowered_stmts.push((*AstNode)ast_if(thrown_cond, catch_block, 0));
-    }
-
-    if (finally_block != 0) {
-        lowered_stmts.push(finally_block);
-    }
-
-    return (*AstNode)ast_block(lowered_stmts);
-}
-
-// ============================================
-// Alias Statement
-// ============================================
-
-func parse_alias_stmt(p: *Parser) -> *AstNode {
-    parse_consume(p, TOKEN_ALIAS);
-
-    var reg_tok: *Token = parse_peek(p);
-    parse_consume(p, TOKEN_IDENTIFIER);
-
-    parse_consume(p, TOKEN_COLON);
-
-    var name_tok: *Token = parse_peek(p);
-    parse_consume(p, TOKEN_IDENTIFIER);
-
-    parse_consume(p, TOKEN_SEMICOLON);
-
-    return (*AstNode)ast_alias(reg_tok.ptr, reg_tok.len, name_tok.ptr, name_tok.len);
+    return (*AstNode)ast_try_stmt(try_block, catch_block, finally_block, catch_name_ptr, catch_name_len, catch_value_type);
 }
 
 // ============================================
 // Defer Statement
 // ============================================
 
-func parse_defer_stmt(p: *Parser) -> *AstNode {
-    parse_consume(p, TOKEN_DEFER);
-    var stmt: *AstNode = parse_stmt(p);
+func stmt_parse_defer(p: *Parser) -> *AstNode {
+    consume_tok(p, TOKEN_DEFER);
+    var stmt: *AstNode = stmt_parse(p);
     return (*AstNode)ast_defer(stmt);
-}
-
-// ============================================
-// Debug Statements (assert/todo/unreachable)
-// ============================================
-
-func build_debug_fail_stmt(msg_ptr: u64, msg_len: u64, line: u64) -> *AstNode {
-    var args: *Vec<*AstNode> = new Vec<*AstNode>(3);
-    args.push((*AstNode)ast_string(msg_ptr, msg_len));
-    args.push((*AstNode)ast_literal(msg_len));
-    args.push((*AstNode)ast_literal(line));
-    var call: *AstCall = ast_call("debug_fail", 10, args);
-    return ast_expr_stmt((*AstNode)call);
-}
-
-func parse_assert_stmt(p: *Parser) -> *AstNode {
-    var tok: *Token = parse_peek(p);
-    parse_consume(p, TOKEN_ASSERT);
-    parse_consume(p, TOKEN_LPAREN);
-    var cond: *AstNode = parse_expr(p);
-    parse_consume(p, TOKEN_RPAREN);
-    parse_consume(p, TOKEN_SEMICOLON);
-
-    var not_cond: *AstNode = (*AstNode)ast_unary(TOKEN_BANG, cond);
-    var fail_stmt: *AstNode = build_debug_fail_stmt("assert failed", 13, tok.line);
-    var stmts: *Vec<*AstNode> = new Vec<*AstNode>(1);
-    stmts.push(fail_stmt);
-    var blk: *AstNode = (*AstNode)ast_block(stmts);
-    return (*AstNode)ast_if(not_cond, blk, 0);
-}
-
-func parse_todo_stmt(p: *Parser) -> *AstNode {
-    var tok: *Token = parse_peek(p);
-    parse_consume(p, TOKEN_TODO);
-    parse_consume(p, TOKEN_SEMICOLON);
-    return build_debug_fail_stmt("todo reached", 12, tok.line);
-}
-
-func parse_unreachable_stmt(p: *Parser) -> *AstNode {
-    var tok: *Token = parse_peek(p);
-    parse_consume(p, TOKEN_UNREACHABLE);
-    parse_consume(p, TOKEN_SEMICOLON);
-    return build_debug_fail_stmt("unreachable", 11, tok.line);
-}
-
-// ============================================
-// Delete Statement
-// ============================================
-
-func parse_delete_stmt(p: *Parser) -> *AstNode {
-    parse_consume(p, TOKEN_DELETE);
-    var expr: *AstNode = parse_expr(p);
-    parse_consume(p, TOKEN_SEMICOLON);
-    return (*AstNode)ast_delete(expr);
-}
-
-// ============================================
-// ASM Block
-// ============================================
-
-func parse_asm_stmt(p: *Parser) -> *AstNode {
-    parse_consume(p, TOKEN_ASM);
-    parse_consume(p, TOKEN_LBRACE);
-    
-    var asm_text: *Vec<u64> = new Vec<u64>(256);
-    
-    var prev_line: i64 = -1;
-    
-    while (parse_peek_kind(p) != TOKEN_RBRACE) {
-        if (parse_peek_kind(p) == TOKEN_EOF) {
-            emit_stderr("[ERROR] Unexpected EOF in asm block\n");
-            parse_panic_here(p, "Syntax error");
-        }
-        
-        var tok: *Token = parse_peek(p);
-        var cur_line: i64 = (i64)tok.line;
-        
-        if (prev_line >= 0) {
-            if (cur_line > prev_line) {
-                asm_text.push(10);
-            } else {
-                asm_text.push(32);
-            }
-        }
-        prev_line = cur_line;
-        
-        var ptr: u64 = tok.ptr;
-        var len: u64 = tok.len;
-        var ptr_u8: *u8 = (*u8)ptr;
-
-        for (var i: u64 = 0; i < len; i++) {
-            asm_text.push(ptr_u8[i]);
-        }
-        parse_adv(p);
-    }
-    
-    parse_consume(p, TOKEN_RBRACE);
-    
-    return ast_asm(asm_text);
 }
 
 // ============================================
 // Block and Generic Statement
 // ============================================
 
-func parse_block(p: *Parser) -> *AstNode {
-    push_trace("parse_block", "parser/stmt.b", __LINE__);
+func stmt_is_lambda_closure_decl(stmt: *AstNode) -> u64 {
+    if (stmt == 0) { return 0; }
+    if (ast_kind(stmt) != AST_VAR_DECL) { return 0; }
+    var decl: *AstVarDecl = (*AstVarDecl)stmt;
+    if (decl.init_expr == 0) { return 0; }
+    if (ast_kind(decl.init_expr) != AST_CALL) { return 0; }
+    var call: *AstCall = (*AstCall)decl.init_expr;
+    if (call.name_ptr == 0 || call.name_len < 14) { return 0; }
+    if (str_eq(call.name_ptr, 14, "__lambda_bind_", 14) == 0) { return 0; }
+    return 1;
+}
+
+func stmt_block_try_append_owned_cleanup(stmts: *Vec<*AstNode>, stmt: *AstNode) -> u64 {
+    if (stmts == 0 || stmt_is_lambda_closure_decl(stmt) == 0) { return 0; }
+    var decl: *AstVarDecl = (*AstVarDecl)stmt;
+    var delete_expr: *AstNode = (*AstNode)ast_ident(decl.name_ptr, decl.name_len);
+    var delete_stmt: *AstNode = (*AstNode)ast_delete(delete_expr);
+    stmts.push((*AstNode)ast_defer(delete_stmt));
+    return 0;
+}
+
+func stmt_parse_block(p: *Parser) -> *AstNode {
+    push_trace("stmt_parse_block", "parser/stmt.b", __LINE__);
     defer pop_trace();
     
-    parse_consume(p, TOKEN_LBRACE);
+    consume_tok(p, TOKEN_LBRACE);
+    var local_scope_mark: u64 = mark_local_scope(p);
     
     var stmts: *Vec<*AstNode> = new Vec<*AstNode>(16);
     
-    while (parse_peek_kind(p) != TOKEN_RBRACE) {
-        if (parse_peek_kind(p) == TOKEN_EOF) { break; }
-        stmts.push(parse_stmt(p));
+    while (peek_kind(p) != TOKEN_RBRACE) {
+        if (peek_kind(p) == TOKEN_EOF) { break; }
+        var stmt: *AstNode = stmt_parse(p);
+        stmts.push(stmt);
+        stmt_block_try_append_owned_cleanup(stmts, stmt);
     }
     
-    parse_consume(p, TOKEN_RBRACE);
+    consume_tok(p, TOKEN_RBRACE);
+    restore_local_scope(p, local_scope_mark);
     
     return ast_block(stmts);
 }
 
-func parse_stmt(p: *Parser) -> *AstNode {
-    push_trace("parse_stmt", "parser/stmt.b", __LINE__);
+func stmt_parse(p: *Parser) -> *AstNode {
+    push_trace("stmt_parse", "parser/stmt.b", __LINE__);
     defer pop_trace();
-    var k: u64 = parse_peek_kind(p);
+    var k: u64 = peek_kind(p);
     switch (k) {
         case TOKEN_PLUSPLUS:
         case TOKEN_MINUSMINUS:
-            var stmt: *AstNode = parse_prefix_incdec_assign(p);
-            parse_consume(p, TOKEN_SEMICOLON);
+            var stmt: *AstNode = stmt_parse_prefix_incdec_assign(p);
+            consume_tok(p, TOKEN_SEMICOLON);
             return stmt;
         case TOKEN_VAR:
-            return parse_var_decl(p);
+            return stmt_parse_var_decl(p);
         case TOKEN_AT:
-            var next_k: u64 = parse_peek_kind_after_annotations(p);
+            var next_k: u64 = peek_kind_after_annotations(p);
             if (next_k == TOKEN_VAR) {
-                return parse_var_decl(p);
+                return stmt_parse_var_decl(p);
             }
             emit_stderr("[ERROR] statement annotation target must be variable declaration\n");
-            parse_panic_here(p, "Syntax error");
-            return parse_assign_or_expr(p);
+            panic_here(p, "Syntax error");
+            return stmt_parse_assign_or_expr(p);
         case TOKEN_IF:
-            return parse_if_stmt(p);
+            return stmt_parse_if(p);
         case TOKEN_WHILE:
-            return parse_while_stmt(p);
+            return stmt_parse_while(p);
+        case TOKEN_DO:
+            return stmt_parse_do_while(p);
         case TOKEN_FOR:
-            return parse_for_stmt(p);
+            return stmt_parse_for(p);
         case TOKEN_SWITCH:
         case TOKEN_MATCH:
-            return parse_switch_stmt(p);
+            return stmt_parse_switch(p);
         case TOKEN_BREAK:
-            return parse_break_stmt(p);
+            return stmt_parse_break(p);
         case TOKEN_CONTINUE:
-            return parse_continue_stmt(p);
+            return stmt_parse_continue(p);
         case TOKEN_ASM:
-            return parse_asm_stmt(p);
+            return misc_parse_asm(p);
         case TOKEN_ALIAS:
-            return parse_alias_stmt(p);
+            return misc_parse_alias(p);
         case TOKEN_DEFER:
-            return parse_defer_stmt(p);
+            return stmt_parse_defer(p);
         case TOKEN_DELETE:
-            return parse_delete_stmt(p);
+            return misc_parse_delete(p);
         case TOKEN_TRY:
-            return parse_try_stmt(p);
+            return stmt_parse_try(p);
         case TOKEN_THROW:
-            return parse_throw_stmt(p);
+            return misc_parse_throw(p);
         case TOKEN_ASSERT:
-            return parse_assert_stmt(p);
+            return misc_parse_assert(p);
         case TOKEN_TODO:
-            return parse_todo_stmt(p);
+            return misc_parse_todo(p);
         case TOKEN_UNREACHABLE:
-            return parse_unreachable_stmt(p);
+            return misc_parse_unreachable(p);
         case TOKEN_RETURN:
-            return parse_return_stmt(p);
+            return stmt_parse_return(p);
         default:
-            return parse_assign_or_expr(p);
+            return stmt_parse_assign_or_expr(p);
     }
 }

@@ -1,0 +1,763 @@
+// lexer.b - Lexer implementation for v3.8
+
+import std.io;
+import std.str;
+import std.util;
+import types;
+import std.vec;
+import std.char;
+
+// ============================================
+// ASCII Character Constants
+// ============================================
+const CHAR_NEWLINE = 10;
+const CHAR_SPACE = 32;
+const CHAR_EXCLAIM = 33;
+const CHAR_QUOTE = 34;
+const CHAR_PERCENT = 37;
+const CHAR_AMPERSAND = 38;
+const CHAR_APOSTROPHE = 39;
+const CHAR_LPAREN = 40;
+const CHAR_RPAREN = 41;
+const CHAR_STAR = 42;
+const CHAR_PLUS = 43;
+const CHAR_COMMA = 44;
+const CHAR_MINUS = 45;
+const CHAR_DOT = 46;
+const CHAR_SLASH = 47;
+const CHAR_COLON = 58;
+const CHAR_SEMICOLON = 59;
+const CHAR_LT = 60;
+const CHAR_EQ = 61;
+const CHAR_GT = 62;
+const CHAR_QUESTION = 63;
+const CHAR_AT = 64;
+const CHAR_LBRACKET = 91;
+const CHAR_BACKSLASH = 92;
+const CHAR_RBRACKET = 93;
+const CHAR_CARET = 94;
+const CHAR_LBRACE = 123;
+const CHAR_PIPE = 124;
+const CHAR_RBRACE = 125;
+const CHAR_TILDE = 126;
+
+var g_tok_pool_ptr: u64 = 0;
+var g_tok_pool_len: u64 = 0;
+var g_tok_pool_cap: u64 = 0;
+
+func tok_pool_begin(estimated_tokens: u64) -> u64 {
+    var cap: u64 = estimated_tokens;
+    if (cap < 256) { cap = 256; }
+    g_tok_pool_ptr = heap_alloc(cap * sizeof(Token));
+    g_tok_pool_cap = cap;
+    g_tok_pool_len = 0;
+    return 0;
+}
+
+func tok_pool_alloc() -> *Token {
+    if (g_tok_pool_ptr == 0 || g_tok_pool_len >= g_tok_pool_cap) {
+        var cap2: u64 = g_tok_pool_cap * 2;
+        if (cap2 < 256) { cap2 = 256; }
+        g_tok_pool_ptr = heap_alloc(cap2 * sizeof(Token));
+        g_tok_pool_cap = cap2;
+        g_tok_pool_len = 0;
+    }
+
+    var idx: u64 = g_tok_pool_len;
+    g_tok_pool_len = g_tok_pool_len + 1;
+    return (*Token)(g_tok_pool_ptr + idx * sizeof(Token));
+}
+
+// Lexer structure: [src_ptr, src_len, pos, line, col]
+
+func lex_new(src: u64, len: u64) -> *Lexer {
+    var l: *Lexer = (*Lexer)heap_alloc(sizeof(Lexer));
+    l.src_ptr = src;
+    l.src_len = len;
+    l.pos = 0;
+    l.line = 1;
+    l.col = 1;
+    return l;
+}
+
+func lex_at_end(lex: *Lexer) -> u64 {
+    if (lex.pos >= lex.src_len) { return true; }
+    return false;
+}
+
+func lex_peek(lex: *Lexer) -> u64 {
+    if (lex_at_end(lex)) { return 0; }
+    var src_u8: *u8 = (*u8)lex.src_ptr;
+    return src_u8[lex.pos];
+}
+
+func lex_peek_next(lex: *Lexer) -> u64 {
+    if (lex.pos + 1 >= lex.src_len) { return 0; }
+    var src_u8: *u8 = (*u8)lex.src_ptr;
+    return src_u8[lex.pos + 1];
+}
+
+func lex_advance(lex: *Lexer) -> u64 {
+    var c: u64 = lex_peek(lex);
+    lex.pos = lex.pos + 1;
+    if (c == CHAR_NEWLINE) {
+        lex.line = lex.line + 1;
+        lex.col = 1;
+    } else {
+        lex.col = lex.col + 1;
+    }
+    return c;
+}
+
+func lex_skip_ws(lex: *Lexer) -> u64 {
+    while (!lex_at_end(lex)) {
+        var c: u64 = lex_peek(lex);
+        if (!is_whitespace(c)) { break; }
+        lex_advance(lex);
+    }
+}
+
+func lex_skip_line_comment(lex: *Lexer) -> u64 {
+    lex_advance(lex); // /
+    lex_advance(lex); // /
+    while (!lex_at_end(lex)) {
+        var c: u64 = lex_peek(lex);
+        if (c == CHAR_NEWLINE) {
+            lex_advance(lex);
+            break;
+        }
+        lex_advance(lex);
+    }
+    return 1;
+}
+
+func lex_skip_block_comment(lex: *Lexer) -> u64 {
+    var start_line: u64 = lex.line;
+    var start_col: u64 = lex.col;
+
+    lex_advance(lex); // /
+    lex_advance(lex); // *
+
+    while (!lex_at_end(lex)) {
+        var c: u64 = lex_peek(lex);
+        if (c == CHAR_STAR && lex_peek_next(lex) == CHAR_SLASH) {
+            lex_advance(lex); // *
+            lex_advance(lex); // /
+            return 1;
+        }
+        lex_advance(lex);
+    }
+
+    begin_error_capture();
+    set_error_context("Unterminated block comment", 26);
+    emit_stderr("[ERROR] Unterminated block comment at line ");
+    emit_u64_stderr(start_line);
+    emit_stderr(", column ");
+    emit_u64_stderr(start_col);
+    emit_stderr_nl();
+    panic("Lex error");
+    return 0;
+}
+
+func lex_skip_comment(lex: *Lexer) -> u64 {
+    if (lex_peek(lex) != CHAR_SLASH) { return 0; }
+    var next: u64 = lex_peek_next(lex);
+    if (next == CHAR_SLASH) {
+        return lex_skip_line_comment(lex);
+    }
+    if (next == CHAR_STAR) {
+        return lex_skip_block_comment(lex);
+    }
+    return 0;
+}
+
+func lex_skip_ws_and_comments(lex: *Lexer) -> u64 {
+    while (!lex_at_end(lex)) {
+        lex_skip_ws(lex);
+        var c: u64 = lex_peek(lex);
+        if (c == CHAR_SLASH) {
+            if (lex_skip_comment(lex) != 0) { continue; }
+            break;
+        } else {
+            break;
+        }
+    }
+}
+
+// ============================================
+// Keyword Lookup Table
+// ============================================
+
+// Keyword table entry: [keyword_ptr, keyword_len, token_kind]
+// Using a length-dispatch table for keyword recognition.
+
+func lex_check_keyword_len2(s: *u8) -> u64 {
+    var c0: u64 = s[0];
+    var c1: u64 = s[1];
+    if (c0 == 105 && c1 == 102) { return TOKEN_IF; } // if
+    if (c0 == 97 && c1 == 115) { return TOKEN_AS; }  // as
+    if (c0 == 117 && c1 == 56) { return TOKEN_U8; }  // u8
+    if (c0 == 105 && c1 == 56) { return TOKEN_I8; }  // i8
+    return TOKEN_IDENTIFIER;
+}
+
+func lex_check_keyword_len3(s: *u8) -> u64 {
+    var c0: u64 = s[0];
+    var c1: u64 = s[1];
+    var c2: u64 = s[2];
+    if (c0 == 110 && c1 == 101 && c2 == 119) { return TOKEN_NEW; } // new
+    if (c0 == 118 && c1 == 97 && c2 == 114) { return TOKEN_VAR; }   // var
+    if (c0 == 102 && c1 == 111 && c2 == 114) { return TOKEN_FOR; }  // for
+    if (c0 == 97 && c1 == 115 && c2 == 109) { return TOKEN_ASM; }   // asm
+    if (c0 == 116 && c1 == 114 && c2 == 121) { return TOKEN_TRY; }  // try
+    if (c0 == 117 && c1 == 49 && c2 == 54) { return TOKEN_U16; }    // u16
+    if (c0 == 117 && c1 == 51 && c2 == 50) { return TOKEN_U32; }    // u32
+    if (c0 == 117 && c1 == 54 && c2 == 52) { return TOKEN_U64; }    // u64
+    if (c0 == 105 && c1 == 49 && c2 == 54) { return TOKEN_I16; }    // i16
+    if (c0 == 105 && c1 == 51 && c2 == 50) { return TOKEN_I32; }    // i32
+    if (c0 == 105 && c1 == 54 && c2 == 52) { return TOKEN_I64; }    // i64
+    if (c0 == 102 && c1 == 54 && c2 == 52) { return TOKEN_F64; }    // f64
+    return TOKEN_IDENTIFIER;
+}
+
+func lex_check_keyword_len4(s: *u8) -> u64 {
+    var c0: u64 = s[0];
+    var c1: u64 = s[1];
+    var c2: u64 = s[2];
+    var c3: u64 = s[3];
+    if (c0 == 102 && c1 == 117 && c2 == 110 && c3 == 99) { return TOKEN_FUNC; }  // func
+    if (c0 == 97 && c1 == 98 && c2 == 115 && c3 == 116) { return TOKEN_ABST; }   // abst
+    if (c0 == 116 && c1 == 111 && c2 == 100 && c3 == 111) { return TOKEN_TODO; } // todo
+    if (c0 == 101 && c1 == 108 && c2 == 115 && c3 == 101) { return TOKEN_ELSE; } // else
+    if (c0 == 116 && c1 == 114 && c2 == 117 && c3 == 101) { return TOKEN_TRUE; } // true
+    if (c0 == 98 && c1 == 111 && c2 == 111 && c3 == 108) { return TOKEN_BOOL; } // bool
+    if (c0 == 110 && c1 == 117 && c2 == 108 && c3 == 108) { return TOKEN_NULL; } // null
+    if (c0 == 101 && c1 == 110 && c2 == 117 && c3 == 109) { return TOKEN_ENUM; } // enum
+    if (c0 == 105 && c1 == 109 && c2 == 112 && c3 == 108) { return TOKEN_IMPL; } // impl
+    if (c0 == 99 && c1 == 97 && c2 == 115 && c3 == 101) { return TOKEN_CASE; }   // case
+    if (c0 == 99 && c1 == 104 && c2 == 97 && c3 == 114) { return TOKEN_CHAR; }   // char
+    if (c0 == 102 && c1 == 114 && c2 == 111 && c3 == 109) { return TOKEN_FROM; } // from
+    return TOKEN_IDENTIFIER;
+}
+
+func lex_check_keyword_len5(s: *u8) -> u64 {
+    var c0: u64 = s[0];
+    var c1: u64 = s[1];
+    var c2: u64 = s[2];
+    var c3: u64 = s[3];
+    var c4: u64 = s[4];
+    if (c0 == 99 && c1 == 111 && c2 == 110 && c3 == 115 && c4 == 116) { return TOKEN_CONST; } // const
+    if (c0 == 102 && c1 == 97 && c2 == 108 && c3 == 115 && c4 == 101) { return TOKEN_FALSE; } // false
+    if (c0 == 119 && c1 == 104 && c2 == 105 && c3 == 108 && c4 == 101) { return TOKEN_WHILE; } // while
+    if (c0 == 98 && c1 == 114 && c2 == 101 && c3 == 97 && c4 == 107) { return TOKEN_BREAK; } // break
+    if (c0 == 109 && c1 == 97 && c2 == 116 && c3 == 99 && c4 == 104) { return TOKEN_MATCH; } // match
+    if (c0 == 99 && c1 == 97 && c2 == 116 && c3 == 99 && c4 == 104) { return TOKEN_CATCH; } // catch
+    if (c0 == 116 && c1 == 104 && c2 == 114 && c3 == 111 && c4 == 119) { return TOKEN_THROW; } // throw
+    if (c0 == 97 && c1 == 108 && c2 == 105 && c3 == 97 && c4 == 115) { return TOKEN_ALIAS; } // alias
+    if (c0 == 100 && c1 == 101 && c2 == 102 && c3 == 101 && c4 == 114) { return TOKEN_DEFER; } // defer
+    if (c0 == 116 && c1 == 114 && c2 == 97 && c3 == 105 && c4 == 116) { return TOKEN_TRAIT; } // trait
+    if (c0 == 115 && c1 == 117 && c2 == 112 && c3 == 101 && c4 == 114) { return TOKEN_SUPER; } // super
+    if (c0 == 117 && c1 == 110 && c2 == 105 && c3 == 111 && c4 == 110) { return TOKEN_UNION; } // union
+    return TOKEN_IDENTIFIER;
+}
+
+func lex_check_keyword_len6(s: *u8) -> u64 {
+    var c0: u64 = s[0];
+    var c1: u64 = s[1];
+    var c2: u64 = s[2];
+    var c3: u64 = s[3];
+    var c4: u64 = s[4];
+    var c5: u64 = s[5];
+    if (c0 == 114 && c1 == 101 && c2 == 116 && c3 == 117 && c4 == 114 && c5 == 110) { return TOKEN_RETURN; } // return
+    if (c0 == 115 && c1 == 116 && c2 == 114 && c3 == 117 && c4 == 99 && c5 == 116) { return TOKEN_STRUCT; } // struct
+    if (c0 == 115 && c1 == 119 && c2 == 105 && c3 == 116 && c4 == 99 && c5 == 104) { return TOKEN_SWITCH; } // switch
+    if (c0 == 105 && c1 == 109 && c2 == 112 && c3 == 111 && c4 == 114 && c5 == 116) { return TOKEN_IMPORT; } // import
+    if (c0 == 115 && c1 == 105 && c2 == 122 && c3 == 101 && c4 == 111 && c5 == 102) { return TOKEN_SIZEOF; } // sizeof
+    if (c0 == 115 && c1 == 116 && c2 == 97 && c3 == 116 && c4 == 105 && c5 == 99) { return TOKEN_STATIC; } // static
+    if (c0 == 112 && c1 == 117 && c2 == 98 && c3 == 108 && c4 == 105 && c5 == 99) { return TOKEN_PUBLIC; } // public
+    if (c0 == 116 && c1 == 97 && c2 == 103 && c3 == 103 && c4 == 101 && c5 == 100) { return TOKEN_TAGGED; } // tagged
+    if (c0 == 112 && c1 == 97 && c2 == 99 && c3 == 107 && c4 == 101 && c5 == 100) { return TOKEN_PACKED; } // packed
+    if (c0 == 100 && c1 == 101 && c2 == 108 && c3 == 101 && c4 == 116 && c5 == 101) { return TOKEN_DELETE; } // delete
+    if (c0 == 97 && c1 == 115 && c2 == 115 && c3 == 101 && c4 == 114 && c5 == 116) { return TOKEN_ASSERT; } // assert
+    return TOKEN_IDENTIFIER;
+}
+
+func lex_check_keyword_len7(s: *u8) -> u64 {
+    if (s[0] == 100 && s[1] == 101 && s[2] == 102 && s[3] == 97 && s[4] == 117 && s[5] == 108 && s[6] == 116) { return TOKEN_DEFAULT; } // default
+    if (s[0] == 102 && s[1] == 105 && s[2] == 110 && s[3] == 97 && s[4] == 108 && s[5] == 108 && s[6] == 121) { return TOKEN_FINALLY; } // finally
+    if (s[0] == 112 && s[1] == 114 && s[2] == 105 && s[3] == 118 && s[4] == 97 && s[5] == 116 && s[6] == 101) { return TOKEN_PRIVATE; } // private
+    return TOKEN_IDENTIFIER;
+}
+
+func lex_check_keyword_len8(s: *u8) -> u64 {
+    if (s[0] == 99 && s[1] == 111 && s[2] == 110 && s[3] == 116 && s[4] == 105 && s[5] == 110 && s[6] == 117 && s[7] == 101) { return TOKEN_CONTINUE; } // continue
+    if (s[0] == 95 && s[1] == 95 && s[2] == 76 && s[3] == 73 && s[4] == 78 && s[5] == 69 && s[6] == 95 && s[7] == 95) { return TOKEN_LINE_MACRO; } // __LINE__
+    return TOKEN_IDENTIFIER;
+}
+
+func lex_check_keyword_len9(s: *u8) -> u64 {
+    if (s[0] == 112 && s[1] == 114 && s[2] == 111 && s[3] == 116 && s[4] == 101 && s[5] == 99 && s[6] == 116 && s[7] == 101 && s[8] == 100) { return TOKEN_PROTECTED; } // protected
+    return TOKEN_IDENTIFIER;
+}
+
+func lex_check_keyword_len10(s: *u8) -> u64 {
+    if (s[0] == 100 && s[1] == 101 && s[2] == 115 && s[3] == 116 && s[4] == 114 && s[5] == 117 && s[6] == 99 && s[7] == 116 && s[8] == 111 && s[9] == 114) { return TOKEN_DESTRUCTOR; } // destructor
+    return TOKEN_IDENTIFIER;
+}
+
+func lex_check_keyword_len11(s: *u8) -> u64 {
+    if (s[0] == 99 && s[1] == 111 && s[2] == 110 && s[3] == 115 && s[4] == 116 && s[5] == 114 && s[6] == 117 && s[7] == 99 && s[8] == 116 && s[9] == 111 && s[10] == 114) { return TOKEN_CONSTRUCTOR; } // constructor
+    if (s[0] == 117 && s[1] == 110 && s[2] == 114 && s[3] == 101 && s[4] == 97 && s[5] == 99 && s[6] == 104 && s[7] == 97 && s[8] == 98 && s[9] == 108 && s[10] == 101) { return TOKEN_UNREACHABLE; } // unreachable
+    return TOKEN_IDENTIFIER;
+}
+
+func lex_check_keyword(ptr: u64, len: u64) -> u64 {
+    var s: *u8 = (*u8)ptr;
+    if (len == 2) { return lex_check_keyword_len2(s); }
+    if (len == 3) { return lex_check_keyword_len3(s); }
+    if (len == 4) { return lex_check_keyword_len4(s); }
+    if (len == 5) { return lex_check_keyword_len5(s); }
+    if (len == 6) { return lex_check_keyword_len6(s); }
+    if (len == 7) { return lex_check_keyword_len7(s); }
+    if (len == 8) { return lex_check_keyword_len8(s); }
+    if (len == 9) { return lex_check_keyword_len9(s); }
+    if (len == 10) { return lex_check_keyword_len10(s); }
+    if (len == 11) { return lex_check_keyword_len11(s); }
+    return TOKEN_IDENTIFIER;
+}
+
+// Token structure: [kind, ptr, len, line, col]
+
+func tok_new(kind: u64, ptr: u64, len: u64, line: u64, col: u64) -> *Token {
+    var t: *Token = tok_pool_alloc();
+    t.kind = kind;
+    t.ptr = ptr;
+    t.len = len;
+    t.line = line;
+    t.col = col;
+    return t;
+}
+
+func lex_try_identifier_or_keyword(lex: *Lexer, src: u64, start: u64, c: u64, line: u64, col: u64) -> *Token {
+    if (is_alpha(c) == 0) { return 0; }
+    while (!lex_at_end(lex)) {
+        if (is_alnum(lex_peek(lex))) {
+            lex_advance(lex);
+        } else {
+            break;
+        }
+    }
+    var len: u64 = lex.pos - start;
+    var kind: u64 = lex_check_keyword(src + start, len);
+    return tok_new(kind, src + start, len, line, col);
+}
+
+func lex_try_number(lex: *Lexer, src: u64, start: u64, c: u64, line: u64, col: u64) -> *Token {
+    if (is_digit(c) == 0) { return 0; }
+    while (!lex_at_end(lex)) {
+        if (is_digit(lex_peek(lex))) {
+            lex_advance(lex);
+        } else {
+            break;
+        }
+    }
+    if (lex_peek(lex) == CHAR_DOT && is_digit(lex_peek_next(lex))) {
+        lex_advance(lex);
+        while (!lex_at_end(lex)) {
+            if (is_digit(lex_peek(lex))) {
+                lex_advance(lex);
+            } else {
+                break;
+            }
+        }
+        var f_len: u64 = lex.pos - start;
+        return tok_new(TOKEN_FLOAT, src + start, f_len, line, col);
+    }
+    var len: u64 = lex.pos - start;
+    return tok_new(TOKEN_NUMBER, src + start, len, line, col);
+}
+
+func lex_try_string(lex: *Lexer, src: u64, start: u64, c: u64, line: u64, col: u64) -> *Token {
+    if (c != CHAR_QUOTE) { return 0; }
+    var closed: u64 = 0;
+    while (!lex_at_end(lex)) {
+        var ch: u64 = lex_peek(lex);
+        if (ch == CHAR_NEWLINE) {
+            begin_error_capture();
+            set_error_context("Unterminated string literal", 25);
+            emit_stderr("[ERROR] Unterminated string literal at line ");
+            emit_u64_stderr(line);
+            emit_stderr(", column ");
+            emit_u64_stderr(col);
+            emit_stderr_nl();
+            panic("Lex error");
+        }
+        if (ch == CHAR_QUOTE) {
+            lex_advance(lex);
+            closed = 1;
+            break;
+        }
+        if (ch == CHAR_BACKSLASH) {
+            lex_advance(lex);
+            if (!lex_at_end(lex)) {
+                lex_advance(lex);
+            }
+        } else {
+            lex_advance(lex);
+        }
+    }
+    if (closed == 0) {
+        begin_error_capture();
+        set_error_context("Unterminated string literal", 25);
+        emit_stderr("[ERROR] Unterminated string literal at line ");
+        emit_u64_stderr(line);
+        emit_stderr(", column ");
+        emit_u64_stderr(col);
+        emit_stderr_nl();
+        panic("Lex error");
+    }
+    var len: u64 = lex.pos - start;
+    return tok_new(TOKEN_STRING, src + start, len, line, col);
+}
+
+func lex_try_char_literal(lex: *Lexer, src: u64, start: u64, c: u64, line: u64, col: u64) -> *Token {
+    if (c != CHAR_APOSTROPHE) { return 0; }
+
+    while (!lex_at_end(lex)) {
+        var ch: u64 = lex_peek(lex);
+        if (ch == CHAR_NEWLINE) {
+            begin_error_capture();
+            set_error_context("Unterminated char literal", 23);
+            emit_stderr("[ERROR] Unterminated char literal at line ");
+            emit_u64_stderr(line);
+            emit_stderr(", column ");
+            emit_u64_stderr(col);
+            emit_stderr_nl();
+            panic("Lex error");
+        }
+        if (ch == CHAR_APOSTROPHE) {
+            lex_advance(lex);
+            var len: u64 = lex.pos - start;
+            return tok_new(TOKEN_CHAR, src + start, len, line, col);
+        }
+        if (ch == CHAR_BACKSLASH) {
+            lex_advance(lex);
+            if (lex_at_end(lex)) { break; }
+        }
+        lex_advance(lex);
+    }
+
+    begin_error_capture();
+    set_error_context("Unterminated char literal", 23);
+    emit_stderr("[ERROR] Unterminated char literal at line ");
+    emit_u64_stderr(line);
+    emit_stderr(", column ");
+    emit_u64_stderr(col);
+    emit_stderr_nl();
+    panic("Lex error");
+    return 0;
+}
+
+func lex_panic_invalid_char(line: u64, col: u64, c: u64) -> u64 {
+    begin_error_capture();
+    set_error_context("Invalid character", 17);
+    emit_stderr("[ERROR] Invalid character at line ");
+    emit_u64_stderr(line);
+    emit_stderr(", column ");
+    emit_u64_stderr(col);
+    emit_stderr(": byte ");
+    emit_u64_stderr(c);
+    emit_stderr_nl();
+    panic("Lex error");
+    return 0;
+}
+
+func lex_try_two_char_ops(lex: *Lexer, src: u64, start: u64, c: u64, line: u64, col: u64) -> *Token {
+    if (c == CHAR_EQ) {
+        if (lex_peek(lex) == CHAR_EQ) {
+            lex_advance(lex);
+            return tok_new(TOKEN_EQEQ, src + start, 2, line, col);
+        }
+        return tok_new(TOKEN_EQ, src + start, 1, line, col);
+    }
+    if (c == CHAR_EXCLAIM) {
+        if (lex_peek(lex) == CHAR_EQ) {
+            lex_advance(lex);
+            return tok_new(TOKEN_BANGEQ, src + start, 2, line, col);
+        }
+        return tok_new(TOKEN_BANG, src + start, 1, line, col);
+    }
+    if (c == CHAR_LT) {
+        if (lex_peek(lex) == CHAR_EQ) {
+            lex_advance(lex);
+            return tok_new(TOKEN_LTEQ, src + start, 2, line, col);
+        }
+        if (lex_peek(lex) == CHAR_LT) {
+            lex_advance(lex);
+            return tok_new(TOKEN_LSHIFT, src + start, 2, line, col);
+        }
+        return tok_new(TOKEN_LT, src + start, 1, line, col);
+    }
+    if (c == CHAR_GT) {
+        if (lex_peek(lex) == CHAR_EQ) {
+            lex_advance(lex);
+            return tok_new(TOKEN_GTEQ, src + start, 2, line, col);
+        }
+        if (lex_peek(lex) == CHAR_GT) {
+            lex_advance(lex);
+            return tok_new(TOKEN_RSHIFT, src + start, 2, line, col);
+        }
+        return tok_new(TOKEN_GT, src + start, 1, line, col);
+    }
+    if (c == CHAR_AMPERSAND) {
+        if (lex_peek(lex) == CHAR_AMPERSAND) {
+            lex_advance(lex);
+            return tok_new(TOKEN_ANDAND, src + start, 2, line, col);
+        }
+        return tok_new(TOKEN_AMPERSAND, src + start, 1, line, col);
+    }
+    if (c == CHAR_PIPE) {
+        if (lex_peek(lex) == CHAR_PIPE) {
+            lex_advance(lex);
+            return tok_new(TOKEN_OROR, src + start, 2, line, col);
+        }
+        return tok_new(TOKEN_PIPE, src + start, 1, line, col);
+    }
+    return 0;
+}
+
+func lex_try_single_char_ops(lex: *Lexer, src: u64, start: u64, c: u64, line: u64, col: u64) -> *Token {
+    if (c == CHAR_LPAREN) { return tok_new(TOKEN_LPAREN, src + start, 1, line, col); }
+    if (c == CHAR_RPAREN) { return tok_new(TOKEN_RPAREN, src + start, 1, line, col); }
+    if (c == CHAR_LBRACE) { return tok_new(TOKEN_LBRACE, src + start, 1, line, col); }
+    if (c == CHAR_RBRACE) { return tok_new(TOKEN_RBRACE, src + start, 1, line, col); }
+    if (c == CHAR_LBRACKET) { return tok_new(TOKEN_LBRACKET, src + start, 1, line, col); }
+    if (c == CHAR_RBRACKET) { return tok_new(TOKEN_RBRACKET, src + start, 1, line, col); }
+    if (c == CHAR_SEMICOLON) { return tok_new(TOKEN_SEMICOLON, src + start, 1, line, col); }
+    if (c == CHAR_COLON) { return tok_new(TOKEN_COLON, src + start, 1, line, col); }
+    if (c == CHAR_COMMA) { return tok_new(TOKEN_COMMA, src + start, 1, line, col); }
+    if (c == CHAR_DOT) {
+        if (lex_peek(lex) == CHAR_QUESTION) {
+            lex_advance(lex);
+            return tok_new(TOKEN_DOT_Q, src + start, 2, line, col);
+        }
+        return tok_new(TOKEN_DOT, src + start, 1, line, col);
+    }
+    if (c == CHAR_QUESTION) { return tok_new(TOKEN_QUESTION, src + start, 1, line, col); }
+    if (c == CHAR_AT) { return tok_new(TOKEN_AT, src + start, 1, line, col); }
+    if (c == CHAR_PLUS) {
+        if (lex_peek(lex) == CHAR_PLUS) {
+            lex_advance(lex);
+            return tok_new(TOKEN_PLUSPLUS, src + start, 2, line, col);
+        }
+        if (lex_peek(lex) == CHAR_EQ) {
+            lex_advance(lex);
+            return tok_new(TOKEN_PLUS_EQ, src + start, 2, line, col);
+        }
+        return tok_new(TOKEN_PLUS, src + start, 1, line, col);
+    }
+    if (c == CHAR_MINUS) {
+        if (lex_peek(lex) == CHAR_MINUS) {
+            lex_advance(lex);
+            return tok_new(TOKEN_MINUSMINUS, src + start, 2, line, col);
+        }
+        if (lex_peek(lex) == CHAR_GT) {
+            lex_advance(lex);
+            return tok_new(TOKEN_ARROW, src + start, 2, line, col);
+        }
+        if (lex_peek(lex) == CHAR_EQ) {
+            lex_advance(lex);
+            return tok_new(TOKEN_MINUS_EQ, src + start, 2, line, col);
+        }
+        return tok_new(TOKEN_MINUS, src + start, 1, line, col);
+    }
+    if (c == CHAR_STAR) {
+        if (lex_peek(lex) == CHAR_EQ) {
+            lex_advance(lex);
+            return tok_new(TOKEN_STAR_EQ, src + start, 2, line, col);
+        }
+        return tok_new(TOKEN_STAR, src + start, 1, line, col);
+    }
+    if (c == CHAR_SLASH) {
+        if (lex_peek(lex) == CHAR_EQ) {
+            lex_advance(lex);
+            return tok_new(TOKEN_SLASH_EQ, src + start, 2, line, col);
+        }
+        return tok_new(TOKEN_SLASH, src + start, 1, line, col);
+    }
+    if (c == CHAR_PERCENT) {
+        if (lex_peek(lex) == CHAR_EQ) {
+            lex_advance(lex);
+            return tok_new(TOKEN_PERCENT_EQ, src + start, 2, line, col);
+        }
+        return tok_new(TOKEN_PERCENT, src + start, 1, line, col);
+    }
+    if (c == CHAR_TILDE) { return tok_new(TOKEN_TILDE, src + start, 1, line, col); }
+    if (c == CHAR_CARET) { return tok_new(TOKEN_CARET, src + start, 1, line, col); }
+    return 0;
+}
+
+
+
+func lex_next(lex: *Lexer) -> *Token {
+    lex_skip_ws_and_comments(lex);
+    
+    var line: u64 = lex.line;
+    var col: u64 = lex.col;
+    
+    if (lex_at_end(lex)) {
+        return tok_new(TOKEN_EOF, 0, 0, line, col);
+    }
+    
+    var start: u64 = lex.pos;
+    var c: u64 = lex_advance(lex);
+    var src: u64 = lex.src_ptr;
+    var tok: *Token = lex_try_identifier_or_keyword(lex, src, start, c, line, col);
+    if (tok != 0) { return tok; }
+    tok = lex_try_number(lex, src, start, c, line, col);
+    if (tok != 0) { return tok; }
+    tok = lex_try_string(lex, src, start, c, line, col);
+    if (tok != 0) { return tok; }
+    tok = lex_try_char_literal(lex, src, start, c, line, col);
+    if (tok != 0) { return tok; }
+    tok = lex_try_two_char_ops(lex, src, start, c, line, col);
+    if (tok != 0) { return tok; }
+    tok = lex_try_single_char_ops(lex, src, start, c, line, col);
+    if (tok != 0) { return tok; }
+    lex_panic_invalid_char(line, col, c);
+    return tok_new(TOKEN_EOF, 0, 0, line, col);
+}
+
+func lex_preprocess_is_var_decl_start(source_u8: []u8, i: u64, source_len: u64) -> u64 {
+    if (i + 3 >= source_len) { return 0; }
+    if (source_u8[i] != 118 || source_u8[i + 1] != 97 || source_u8[i + 2] != 114) { return 0; }
+    if (source_u8[i + 3] == 32 || source_u8[i + 3] == 9) { return 1; }
+    return 0;
+}
+
+struct LexPreprocessLineState {
+    public line_start: u64;
+    public in_global_var: u64;
+}
+
+func lex_preprocess_update_line_state(source_u8: []u8, i: u64, source_len: u64, line_start: u64, in_global_var: u64) -> LexPreprocessLineState {
+    var state: LexPreprocessLineState;
+    state.line_start = line_start;
+    state.in_global_var = in_global_var;
+
+    if (line_start == 0) { return state; }
+    var c: u64 = source_u8[i];
+    if (lex_preprocess_is_var_decl_start(source_u8, i, source_len) != 0) {
+        state.in_global_var = 1;
+        state.line_start = 0;
+        return state;
+    }
+    if (c == 10) {
+        state.in_global_var = 0;
+        state.line_start = 1;
+        return state;
+    }
+    if (c == 32 || c == 9) {
+        state.line_start = 0;
+        state.in_global_var = 0;
+        return state;
+    }
+    state.in_global_var = 0;
+    state.line_start = 0;
+    return state;
+}
+
+// Lexer-only source normalization.
+// Keeps parser and compiler pipeline logic simple by fixing tokenization edge
+// cases directly at lexer boundary.
+func lex_preprocess_source(source_ptr: u64, source_len: u64) -> *NameInfo {
+    if (source_ptr == 0 || source_len < 2) { return 0; }
+    var source_u8: []u8 = slice(source_ptr, source_len + 1);
+
+    var has_shift_pair: u64 = 0;
+    for (var i0: u64 = 0; i0 + 1 < source_len; i0++) {
+        if (source_u8[i0] == 62 && source_u8[i0 + 1] == 62) {
+            has_shift_pair = 1;
+            break;
+        }
+    }
+    if (has_shift_pair == 0) { return 0; }
+
+    var repl_count: u64 = 0;
+    var i: u64 = 0;
+    var line_start: u64 = 1;
+    var in_global_var: u64 = 0;
+    while (i + 1 < source_len) {
+        var c: u64 = source_u8[i];
+        var state: LexPreprocessLineState = lex_preprocess_update_line_state(source_u8, i, source_len, line_start, in_global_var);
+        line_start = state.line_start;
+        in_global_var = state.in_global_var;
+        if (c == 10) {
+            in_global_var = 0;
+            line_start = 1;
+            i = i + 1;
+            continue;
+        }
+        if (in_global_var != 0 && c == 62 && source_u8[i + 1] == 62) {
+            repl_count = repl_count + 1;
+            i = i + 2;
+            continue;
+        }
+        i = i + 1;
+    }
+
+    if (repl_count == 0) { return 0; }
+
+    var new_size: u64 = source_len + repl_count;
+    var new_buf: u64 = heap_alloc((new_size + 1) * sizeof(u8));
+    var new_u8: []u8 = slice(new_buf, new_size + 1);
+    var si: u64 = 0;
+    var di: u64 = 0;
+    line_start = 1;
+    in_global_var = 0;
+    while (si < source_len) {
+        var ch: u64 = source_u8[si];
+        var state2: LexPreprocessLineState = lex_preprocess_update_line_state(source_u8, si, source_len, line_start, in_global_var);
+        line_start = state2.line_start;
+        in_global_var = state2.in_global_var;
+        if (ch == 10) {
+            new_u8[di] = ch;
+            di = di + 1;
+            si = si + 1;
+            in_global_var = 0;
+            line_start = 1;
+            continue;
+        }
+        if (in_global_var != 0 && ch == 62 && si + 1 < source_len && source_u8[si + 1] == 62) {
+            new_u8[di] = 62;
+            new_u8[di + 1] = 32;
+            new_u8[di + 2] = 62;
+            di = di + 3;
+            si = si + 2;
+            continue;
+        }
+        new_u8[di] = ch;
+        di = di + 1;
+        si = si + 1;
+    }
+    new_u8[new_size] = 0;
+    return new NameInfo{new_buf, new_size};
+}
+
+func lex_all(src: u64, len: u64) -> *Vec<*Token> {
+    push_trace("lex_all", "lexer.b", __LINE__);
+    defer pop_trace();
+    
+    // Approximate token count to reduce allocator churn in hot lexing path.
+    tok_pool_begin((len / 2) + 16);
+
+    var l: *Lexer = lex_new(src, len);
+    var tokens: *Vec<*Token> = new Vec<*Token>(256);
+    while (1) {
+        var tok: *Token = lex_next(l);
+        tokens.push(tok);
+        if (tok.kind == TOKEN_EOF) { break; }
+    }
+    
+    return tokens;
+}

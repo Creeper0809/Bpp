@@ -15,6 +15,10 @@ import std.hashmap;
 import types;
 import ast;
 import compiler;
+import compiler.trait_runtime;
+import compiler.core_utils;
+import compiler.generic.engine;
+import compiler.symbol_runtime;
 import emitter.typeinfo;
 import emitter.symtab;
 
@@ -32,10 +36,12 @@ var g_floats: *Vec<*FloatEntry>;               // Float literals table
 var g_loop_labels: *Vec<u64>;                  // Stack of loop end labels for break
 var g_loop_continue_labels: *Vec<u64>;         // Stack of loop continue labels
 var g_globals: *Vec<*GlobalInfo>;              // Global variables list
+var g_backend_globals: *Vec<*GlobalInfo>;      // Backend-owned internal globals
 var g_globals_map: *HashMap<u64, *GlobalInfo>; // Global lookup cache: name -> global info
 var g_defer_stack: *Vec<*AstNode>;              // Stack of deferred statements
 var g_defer_markers: *Vec<u64>;                 // Block scope markers for defer
 var g_defer_loop_markers: *Vec<u64>;            // Loop/switch scope markers for defer
+var g_closure_handle_map: *HashMap<u64, u64>;   // Local vars that hold lambda closure object pointers
 
 // Current function return type information (for struct return)
 var g_current_func_ret_type;
@@ -43,50 +49,185 @@ var g_current_func_ret_ptr_depth;
 var g_current_func_ret_struct_name_ptr;
 var g_current_func_ret_struct_name_len;
 
+struct EmitterCtx {
+    public symtab: *Symtab;
+    public globals: *Vec<*GlobalInfo>;
+    public backend_globals: *Vec<*GlobalInfo>;
+    public consts: *Vec<*ConstInfo>;
+    public label_counter: u64;
+}
+
+impl EmitterCtx {
+    public constructor() {
+        self.symtab = 0;
+        self.globals = 0;
+        self.backend_globals = 0;
+        self.consts = 0;
+        self.label_counter = 0;
+    }
+}
+
+var g_emitter_ctx: *EmitterCtx;
+
+func emitter_ctx_current() -> *EmitterCtx {
+    if (g_emitter_ctx == 0) {
+        g_emitter_ctx = new EmitterCtx();
+    }
+    g_emitter_ctx.symtab = g_symtab;
+    g_emitter_ctx.globals = g_globals;
+    g_emitter_ctx.backend_globals = g_backend_globals;
+    g_emitter_ctx.consts = g_consts;
+    g_emitter_ctx.label_counter = g_label_counter;
+    return g_emitter_ctx;
+}
+
 // ============================================
 // State Accessors
 // ============================================
 
-func emitter_get_symtab() -> *Symtab { return g_symtab; }
-func emitter_set_symtab(s: *Symtab) -> u64 { g_symtab = s; }
+func symtab_current() -> *Symtab { return g_symtab; }
+func symtab_set(s: *Symtab) -> u64 { g_symtab = s; }
+func symtab_current_with_ctx(ctx: *EmitterCtx) -> *Symtab {
+    if (ctx == 0) { return g_symtab; }
+    return ctx.symtab;
+}
+func symtab_set_with_ctx(ctx: *EmitterCtx, s: *Symtab) -> u64 {
+    if (ctx != 0) { ctx.symtab = s; }
+    g_symtab = s;
+    return 0;
+}
 
-func emitter_get_globals() -> *Vec<*GlobalInfo> { return g_globals; }
-func emitter_set_globals(g: *Vec<*GlobalInfo>) -> u64 {
+func globals_current() -> *Vec<*GlobalInfo> { return g_globals; }
+func backend_globals_current() -> *Vec<*GlobalInfo> { return g_backend_globals; }
+func globals_current_with_ctx(ctx: *EmitterCtx) -> *Vec<*GlobalInfo> {
+    if (ctx == 0) { return g_globals; }
+    return ctx.globals;
+}
+func backend_globals_current_with_ctx(ctx: *EmitterCtx) -> *Vec<*GlobalInfo> {
+    if (ctx == 0) { return g_backend_globals; }
+    return ctx.backend_globals;
+}
+func globals_set(g: *Vec<*GlobalInfo>) -> u64 {
+    return globals_set_with_ctx(emitter_ctx_current(), g);
+}
+func globals_set_with_ctx(ctx: *EmitterCtx, g: *Vec<*GlobalInfo>) -> u64 {
     g_globals = g;
-    emitter_rebuild_globals_map();
+    g_backend_globals = new Vec<*GlobalInfo>(8);
+    if (ctx != 0) {
+        ctx.globals = g_globals;
+        ctx.backend_globals = g_backend_globals;
+    }
+    rebuild_globals_map();
     return 0;
 }
 
-func emitter_get_consts() -> *Vec<*ConstInfo> { return g_consts; }
-func emitter_set_consts(c: *Vec<*ConstInfo>) -> u64 {
+func add_backend_global(ginfo: *GlobalInfo) -> u64 {
+    if (ginfo == 0) { return 0; }
+    if (g_backend_globals == 0) {
+        g_backend_globals = new Vec<*GlobalInfo>(8);
+    }
+    if (is_global_var(ginfo.name_ptr, ginfo.name_len) != 0) { return 0; }
+    g_backend_globals.push(ginfo);
+    if (g_globals_map != 0) {
+        g_globals_map.put(ginfo.name_ptr, ginfo.name_len, ginfo);
+    }
+    return 0;
+}
+
+func consts_current() -> *Vec<*ConstInfo> { return g_consts; }
+func consts_current_with_ctx(ctx: *EmitterCtx) -> *Vec<*ConstInfo> {
+    if (ctx == 0) { return g_consts; }
+    return ctx.consts;
+}
+func consts_set(c: *Vec<*ConstInfo>) -> u64 {
+    return consts_set_with_ctx(emitter_ctx_current(), c);
+}
+func consts_set_with_ctx(ctx: *EmitterCtx, c: *Vec<*ConstInfo>) -> u64 {
     g_consts = c;
-    emitter_rebuild_consts_map();
+    if (ctx != 0) { ctx.consts = c; }
+    rebuild_consts_map();
     return 0;
 }
 
-func emitter_get_loop_labels() -> *Vec<u64> { return g_loop_labels; }
-func emitter_get_continue_labels() -> *Vec<u64> { return g_loop_continue_labels; }
-func emitter_get_defer_stack() -> *Vec<*AstNode> { return g_defer_stack; }
-func emitter_get_defer_markers() -> *Vec<u64> { return g_defer_markers; }
-func emitter_get_defer_loop_markers() -> *Vec<u64> { return g_defer_loop_markers; }
+func loop_labels() -> *Vec<u64> { return g_loop_labels; }
+func continue_labels() -> *Vec<u64> { return g_loop_continue_labels; }
+func defer_stack() -> *Vec<*AstNode> { return g_defer_stack; }
+func defer_markers() -> *Vec<u64> { return g_defer_markers; }
+func defer_loop_markers() -> *Vec<u64> { return g_defer_loop_markers; }
 
-func emitter_set_ret_type(t: u64) -> u64 { g_current_func_ret_type = t; }
-func emitter_set_ret_ptr_depth(d: u64) -> u64 { g_current_func_ret_ptr_depth = d; }
-func emitter_set_ret_struct_name(ptr: u64, len: u64) -> u64 {
+func closure_handles_reset() -> u64 {
+    g_closure_handle_map = new HashMap<u64, u64>(16);
+    return 0;
+}
+
+func closure_handle_set(name_ptr: u64, name_len: u64, enabled: u64) -> u64 {
+    if (name_ptr == 0 || name_len == 0) { return 0; }
+    if (g_closure_handle_map == 0) {
+        closure_handles_reset();
+    }
+    if (enabled == 0) {
+        g_closure_handle_map.put(name_ptr, name_len, 0);
+        return 0;
+    }
+    g_closure_handle_map.put(name_ptr, name_len, 1);
+    return 0;
+}
+
+func closure_handle_is(name_ptr: u64, name_len: u64) -> u64 {
+    if (name_ptr == 0 || name_len == 0) { return 0; }
+    if (g_closure_handle_map == 0) { return 0; }
+    if (g_closure_handle_map.get(name_ptr, name_len) == 1) { return 1; }
+    return 0;
+}
+
+func lambda_bind_name_is(name_ptr: u64, name_len: u64) -> u64 {
+    if (name_ptr == 0 || name_len < 14) { return 0; }
+    if (str_eq(name_ptr, 14, "__lambda_bind_", 14) == 0) { return 0; }
+    return 1;
+}
+
+func emitter_closure_expr_is_lambda_handle(expr: u64) -> u64 {
+    if (expr == 0) { return 0; }
+    var kind: u64 = ast_kind(expr);
+    if (kind == AST_CALL) {
+        var call: *AstCall = (*AstCall)expr;
+        if (lambda_bind_name_is(call.name_ptr, call.name_len) != 0) { return 1; }
+        return 0;
+    }
+    if (kind == AST_IDENT) {
+        var idn: *AstIdent = (*AstIdent)expr;
+        return closure_handle_is(idn.name_ptr, idn.name_len);
+    }
+    return 0;
+}
+
+func emitter_closure_track_from_expr(target_name_ptr: u64, target_name_len: u64, value_expr: u64) -> u64 {
+    if (target_name_ptr == 0 || target_name_len == 0) { return 0; }
+    if (emitter_closure_expr_is_lambda_handle(value_expr) != 0) {
+        closure_handle_set(target_name_ptr, target_name_len, 1);
+        return 0;
+    }
+    closure_handle_set(target_name_ptr, target_name_len, 0);
+    return 0;
+}
+
+func ret_type_set(t: u64) -> u64 { g_current_func_ret_type = t; }
+func ret_ptr_depth_set(d: u64) -> u64 { g_current_func_ret_ptr_depth = d; }
+func ret_struct_name_set(ptr: u64, len: u64) -> u64 {
     g_current_func_ret_struct_name_ptr = ptr;
     g_current_func_ret_struct_name_len = len;
 }
 
-func emitter_get_ret_type() -> u64 { return g_current_func_ret_type; }
-func emitter_get_ret_ptr_depth() -> u64 { return g_current_func_ret_ptr_depth; }
-func emitter_get_ret_struct_name_ptr() -> u64 { return g_current_func_ret_struct_name_ptr; }
-func emitter_get_ret_struct_name_len() -> u64 { return g_current_func_ret_struct_name_len; }
+func ret_type_current() -> u64 { return g_current_func_ret_type; }
+func ret_ptr_depth_current() -> u64 { return g_current_func_ret_ptr_depth; }
+func ret_struct_name_ptr_current() -> u64 { return g_current_func_ret_struct_name_ptr; }
+func ret_struct_name_len_current() -> u64 { return g_current_func_ret_struct_name_len; }
 
 // ============================================
 // Initialization
 // ============================================
 
-func emitter_init() -> u64 {
+func init_state() -> u64 {
     // Create symtab via helper for consistent initialization
     // symtab = [names_vec, offsets_vec, types_vec, count, stack_offset]
     g_symtab = symtab_new();
@@ -102,30 +243,43 @@ func emitter_init() -> u64 {
     g_consts = new Vec<*ConstInfo>(64);
     g_consts_map = new HashMap<u64, *ConstInfo>(128);
     g_globals_map = new HashMap<u64, *GlobalInfo>(128);
+    g_backend_globals = new Vec<*GlobalInfo>(8);
     g_defer_stack = new Vec<*AstNode>(32);
     g_defer_markers = new Vec<u64>(32);
     g_defer_loop_markers = new Vec<u64>(16);
+    g_closure_handle_map = new HashMap<u64, u64>(16);
 }
 
-func emitter_rebuild_globals_map() -> u64 {
+func rebuild_globals_map() -> u64 {
     var cap: u64 = 16;
-    if (g_globals != 0 && g_globals.len() > 0) {
-        cap = g_globals.len() * 2;
+    var user_count: u64 = 0;
+    var backend_count: u64 = 0;
+    if (g_globals != 0) { user_count = g_globals.len(); }
+    if (g_backend_globals != 0) { backend_count = g_backend_globals.len(); }
+    var total: u64 = user_count + backend_count;
+    if (total > 0) {
+        cap = total * 2;
         if (cap < 16) { cap = 16; }
     }
     g_globals_map = new HashMap<u64, *GlobalInfo>(cap);
-    if (g_globals == 0) { return 0; }
-
-    var len: u64 = g_globals.len();
-    for (var i: u64 = 0; i < len; i++) {
-        var ginfo: *GlobalInfo = g_globals.get(i);
-        if (ginfo == 0) { continue; }
-        g_globals_map.put(ginfo.name_ptr, ginfo.name_len, ginfo);
+    if (g_globals != 0) {
+        for (var i: u64 = 0; i < user_count; i++) {
+            var ginfo: *GlobalInfo = g_globals.get(i);
+            if (ginfo == 0) { continue; }
+            g_globals_map.put(ginfo.name_ptr, ginfo.name_len, ginfo);
+        }
+    }
+    if (g_backend_globals != 0) {
+        for (var j: u64 = 0; j < backend_count; j++) {
+            var bg: *GlobalInfo = g_backend_globals.get(j);
+            if (bg == 0) { continue; }
+            g_globals_map.put(bg.name_ptr, bg.name_len, bg);
+        }
     }
     return 0;
 }
 
-func emitter_rebuild_consts_map() -> u64 {
+func rebuild_consts_map() -> u64 {
     var cap: u64 = 16;
     if (g_consts != 0 && g_consts.len() > 0) {
         cap = g_consts.len() * 2;
@@ -143,17 +297,18 @@ func emitter_rebuild_consts_map() -> u64 {
     return 0;
 }
 
-func emitter_set_globals_from_prog(globals: *Vec<*GlobalInfo>) -> u64 {
+func globals_set_from_prog(globals: *Vec<*GlobalInfo>) -> u64 {
     if (globals == 0) {
         g_globals = new Vec<*GlobalInfo>(32);
     } else {
         g_globals = globals;
     }
-    emitter_rebuild_globals_map();
+    g_backend_globals = new Vec<*GlobalInfo>(8);
+    rebuild_globals_map();
     return 0;
 }
 
-func emitter_load_consts(consts: *Vec<*AstConstDecl>) -> u64 {
+func load_consts(consts: *Vec<*AstConstDecl>) -> u64 {
     g_consts = new Vec<*ConstInfo>(64);
     g_consts_map = new HashMap<u64, *ConstInfo>(128);
     if (consts == 0) { return 0; }
@@ -237,7 +392,7 @@ func emit_asm_text_with_alias(text_vec: *Vec<u64>) -> u64 {
         }
         tok_u8[tok_len] = 0;
 
-        var alias_info_ptr: *NameInfo = compiler_reg_alias_get(tok_ptr, tok_len);
+        var alias_info_ptr: *NameInfo = sym_reg_alias_get(tok_ptr, tok_len);
         if (alias_info_ptr != 0) {
             emit_len(alias_info_ptr.ptr, alias_info_ptr.len);
         } else {
@@ -633,7 +788,7 @@ func _global_eval_const_value(name_ptr: u64, name_len: u64, out_value: *u64) -> 
                 emit_stderr("  candidate2: ");
                 emit_stderr_len(cinfo.name_ptr, cinfo.name_len);
                 emit_stderr("\n");
-                panic("Syntax error");
+                diag_error("Syntax error");
             }
         }
         if (matched != 0) {
@@ -655,6 +810,26 @@ func _global_eval_scalar_expr(expr: *AstNode, out_value: *u64) -> u64 {
     if (kind == AST_IDENT) {
         var id: *AstIdent = (*AstIdent)expr;
         return _global_eval_const_value(id.name_ptr, id.name_len, out_value);
+    }
+    if (kind == AST_MEMBER_ACCESS) {
+        var ma: *AstMemberAccess = (*AstMemberAccess)expr;
+        var scope_ptr: u64 = 0;
+        var scope_len: u64 = 0;
+        if (ma.parent_ptr != 0 && ma.parent_len != 0) {
+            scope_ptr = ma.parent_ptr;
+            scope_len = ma.parent_len;
+        } else {
+            if (ast_kind(ma.object) != AST_IDENT) { return false; }
+            var scope_id: *AstIdent = (*AstIdent)ma.object;
+            scope_ptr = scope_id.name_ptr;
+            scope_len = scope_id.name_len;
+        }
+        var scoped: *ConstResult = (*ConstResult)sym_find_scoped_const(scope_ptr, scope_len, ma.member_ptr, ma.member_len);
+        if (scoped != 0 && scoped.found != 0) {
+            *out_value = scoped.value;
+            return true;
+        }
+        return false;
     }
     if (kind == AST_UNARY) {
         var un: *AstUnary = (*AstUnary)expr;
@@ -703,7 +878,7 @@ func _global_emit_scalar_value(size: u64, value: u64) -> u64 {
         return 0;
     }
     emit_stderr("[ERROR] Unsupported global init size\n");
-    panic("Syntax error");
+    diag_error("Syntax error");
 }
 
 func _global_emit_struct_literal_label(ginfo: *GlobalInfo) -> u64 {
@@ -715,34 +890,26 @@ func _global_emit_struct_literal_label(ginfo: *GlobalInfo) -> u64 {
 }
 
 func _global_emit_struct_literal_field_size_or_panic(f: *FieldDesc) -> u64 {
-    if (f.type_kind == TYPE_STRUCT && f.ptr_depth == 0) {
-        emit_stderr("[ERROR] Nested struct init not supported\n");
-        panic("Syntax error");
-    }
-    if (f.type_kind == TYPE_ARRAY || f.type_kind == TYPE_SLICE) {
-        emit_stderr("[ERROR] Array/slice struct init not supported\n");
-        panic("Syntax error");
-    }
-    var field_size: u64 = sizeof_field_desc(f);
+    var field_size: u64 = layout_field_sizeof(f);
     if (field_size == 0) {
         emit_stderr("[ERROR] Global struct field size invalid\n");
-        panic("Syntax error");
+        diag_error("Syntax error");
     }
     return field_size;
 }
 
 func _global_emit_struct_literal_vptr_or_panic(struct_def: *AstStructDef, f: *FieldDesc) -> u64 {
-    var impls: *Vec<*TraitImpl> = compiler_get_trait_impls();
+    var impls: *Vec<*TraitImpl> = sym_get_trait_impls();
     if (impls == 0) {
         emit_stderr("[ERROR] Trait impl list missing for global vptr init\n");
-        panic("Syntax error");
+        diag_error("Syntax error");
     }
     var found_impl: u64 = 0;
     var impl_count: u64 = impls.len();
     for (var ti: u64 = 0; ti < impl_count; ti++) {
         var impl_info: *TraitImpl = impls.get(ti);
         if (!str_eq(impl_info.struct_ptr, impl_info.struct_len, struct_def.name_ptr, struct_def.name_len)) { continue; }
-        var vptr_name: *NameInfo = compiler_build_vptr_field_name(impl_info.trait_ptr, impl_info.trait_len);
+        var vptr_name: *NameInfo = trait_build_vptr_field_name(impl_info.trait_ptr, impl_info.trait_len);
         if (!str_eq(vptr_name.ptr, vptr_name.len, f.name_ptr, f.name_len)) { continue; }
         emit("    dq _gvar_");
         emit_len(impl_info.vtable_global_ptr, impl_info.vtable_global_len);
@@ -752,9 +919,254 @@ func _global_emit_struct_literal_vptr_or_panic(struct_def: *AstStructDef, f: *Fi
     }
     if (found_impl == 0) {
         emit_stderr("[ERROR] Trait impl not found for global vptr init\n");
-        panic("Syntax error");
+        diag_error("Syntax error");
     }
     return 0;
+}
+
+func _global_find_global_info_by_name(name_ptr: u64, name_len: u64) -> *GlobalInfo {
+    if (g_globals == 0) { return 0; }
+    var n: u64 = g_globals.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var ginfo: *GlobalInfo = g_globals.get(i);
+        if (str_eq(ginfo.name_ptr, ginfo.name_len, name_ptr, name_len)) {
+            return ginfo;
+        }
+    }
+    return 0;
+}
+
+func _global_emit_qword_symbol(symbol_ptr: u64, symbol_len: u64, is_global_var: u64) -> u64 {
+    emit("    dq ");
+    if (is_global_var != 0) {
+        emit("_gvar_");
+    }
+    emit_len(symbol_ptr, symbol_len);
+    emit_nl();
+    return 0;
+}
+
+func _global_emit_ident_pointer_value_or_panic(id: *AstIdent) -> u64 {
+    var resolved_ptr: u64 = id.name_ptr;
+    var resolved_len: u64 = id.name_len;
+    var resolved: *NameInfo = resolve_name(id.name_ptr, id.name_len);
+    if (resolved != 0) {
+        resolved_ptr = resolved.ptr;
+        resolved_len = resolved.len;
+    }
+
+    if (sym_func_exists(resolved_ptr, resolved_len) != 0 || sym_func_exists(id.name_ptr, id.name_len) != 0) {
+        _global_emit_qword_symbol(resolved_ptr, resolved_len, 0);
+        return 0;
+    }
+
+    var ginfo_resolved: *GlobalInfo = _global_find_global_info_by_name(resolved_ptr, resolved_len);
+    if (ginfo_resolved != 0) {
+        _global_emit_qword_symbol(ginfo_resolved.name_ptr, ginfo_resolved.name_len, 1);
+        return 0;
+    }
+
+    var ginfo_raw: *GlobalInfo = _global_find_global_info_by_name(id.name_ptr, id.name_len);
+    if (ginfo_raw != 0) {
+        _global_emit_qword_symbol(ginfo_raw.name_ptr, ginfo_raw.name_len, 1);
+        return 0;
+    }
+
+    var value: u64 = 0;
+    if (_global_eval_scalar_expr((*AstNode)id, &value) != 0) {
+        _global_emit_scalar_value(8, value);
+        return 0;
+    }
+
+    emit_stderr("[ERROR] Unsupported global pointer initializer symbol: ");
+    emit_stderr_len(id.name_ptr, id.name_len);
+    emit_stderr("\n");
+    diag_error("Syntax error");
+}
+
+func _global_emit_pointer_value_or_panic(expr: *AstNode) -> u64 {
+    if (expr == 0) {
+        emit_stderr("[ERROR] Missing global pointer initializer expression\n");
+        diag_error("Syntax error");
+    }
+    var kind: u64 = ast_kind(expr);
+    if (kind == AST_STRING) {
+        var str: *AstString = (*AstString)expr;
+        var label_id: u64 = string_get_label(str.str_ptr, str.str_len);
+        emit("    dq _str");
+        emit_u64(label_id);
+        emit_nl();
+        return 0;
+    }
+    if (kind == AST_IDENT) {
+        _global_emit_ident_pointer_value_or_panic((*AstIdent)expr);
+        return 0;
+    }
+    if (kind == AST_ADDR_OF) {
+        var addrof: *AstAddrOf = (*AstAddrOf)expr;
+        if (addrof.operand != 0 && ast_kind(addrof.operand) == AST_IDENT) {
+            _global_emit_ident_pointer_value_or_panic((*AstIdent)addrof.operand);
+            return 0;
+        }
+    }
+
+    var value: u64 = 0;
+    if (_global_eval_scalar_expr(expr, &value) != 0) {
+        _global_emit_scalar_value(8, value);
+        return 0;
+    }
+
+    emit_stderr("[ERROR] Unsupported global pointer initializer expression\n");
+    diag_error("Syntax error");
+}
+
+func _global_emit_u8_array_from_string_or_panic(array_len: u64, str_expr: *AstString) -> u64 {
+    if (str_expr == 0 || str_expr.str_len < 2) {
+        emit_stderr("[ERROR] Invalid string literal for global array initializer\n");
+        diag_error("Syntax error");
+    }
+    var raw_u8: []u8 = slice(str_expr.str_ptr, str_expr.str_len);
+    var emitted: u64 = 0;
+    for (var j: u64 = 1; j < str_expr.str_len - 1; j++) {
+        if (emitted >= array_len) {
+            emit_stderr("[ERROR] String literal too large for global array initializer\n");
+            diag_error("Syntax error");
+        }
+        var out_b: u64 = raw_u8[j];
+        if (out_b == 92) {
+            j = j + 1;
+            if (j >= str_expr.str_len - 1) {
+                emit_stderr("[ERROR] Unterminated escape in global array string initializer\n");
+                diag_error("Syntax error");
+            }
+            var ec: u64 = raw_u8[j];
+            if (ec == 110) { out_b = 10; }      // \n
+            else if (ec == 116) { out_b = 9; }  // \t
+            else if (ec == 48) { out_b = 0; }   // \0
+            else if (ec == 92) { out_b = 92; }  // \\
+            else if (ec == 34) { out_b = 34; }  // \"
+            else { out_b = ec; }
+        }
+        emit("    db ");
+        emit_u64(out_b & 255);
+        emit_nl();
+        emitted = emitted + 1;
+    }
+    if (emitted < array_len) {
+        _global_emit_padding(array_len - emitted);
+    }
+    return 0;
+}
+
+func _global_emit_array_field_value_or_panic(f: *FieldDesc, val_expr: *AstNode) -> u64 {
+    var field_size: u64 = layout_field_sizeof(f);
+    if (val_expr != 0 && ast_kind(val_expr) == AST_STRING && f.elem_type_kind == TYPE_U8 && f.elem_ptr_depth == 0) {
+        _global_emit_u8_array_from_string_or_panic(f.array_len, (*AstString)val_expr);
+        return 0;
+    }
+    if (field_size <= 8) {
+        _global_emit_struct_literal_value_or_panic(field_size, val_expr);
+        return 0;
+    }
+    emit_stderr("[ERROR] Unsupported global array field initializer\n");
+    diag_error("Syntax error");
+}
+
+func _global_emit_slice_field_value_or_panic(val_expr: *AstNode) -> u64 {
+    if (val_expr == 0) {
+        _global_emit_scalar_value(8, 0);
+        _global_emit_scalar_value(8, 0);
+        return 0;
+    }
+    if (ast_kind(val_expr) == AST_SLICE) {
+        var sl: *AstSlice = (*AstSlice)val_expr;
+        _global_emit_pointer_value_or_panic(sl.ptr_expr);
+        var len_value: u64 = 0;
+        if (_global_eval_scalar_expr(sl.len_expr, &len_value) == 0) {
+            emit_stderr("[ERROR] Global slice length must be compile-time scalar\n");
+            diag_error("Syntax error");
+        }
+        _global_emit_scalar_value(8, len_value);
+        return 0;
+    }
+    var zero_value: u64 = 1;
+    if (_global_eval_scalar_expr(val_expr, &zero_value) != 0 && zero_value == 0) {
+        _global_emit_scalar_value(8, 0);
+        _global_emit_scalar_value(8, 0);
+        return 0;
+    }
+    emit_stderr("[ERROR] Unsupported global slice field initializer\n");
+    diag_error("Syntax error");
+}
+
+func _global_emit_struct_literal_body_or_panic(struct_def: *AstStructDef, values: *Vec<*AstNode>) -> u64 {
+    if (struct_def == 0) {
+        emit_stderr("[ERROR] Missing struct def for global init\n");
+        diag_error("Syntax error");
+    }
+    var fields: *Vec<*FieldDesc> = struct_def.fields_vec;
+    if (fields == 0) {
+        emit_stderr("[ERROR] Global struct literal missing fields\n");
+        diag_error("Syntax error");
+    }
+    var fn: u64 = fields.len();
+    var vn: u64 = 0;
+    if (values != 0) { vn = values.len(); }
+
+    var cursor: u64 = 0;
+    var value_index: u64 = 0;
+    for (var i: u64 = 0; i < fn; i++) {
+        var f: *FieldDesc = fields.get(i);
+        var field_size: u64 = _global_emit_struct_literal_field_size_or_panic(f);
+
+        if (trait_is_vptr_field_name(f.name_ptr, f.name_len) != 0) {
+            _global_emit_struct_literal_vptr_or_panic(struct_def, f);
+            cursor = cursor + field_size;
+            continue;
+        }
+
+        if (value_index >= vn) {
+            _global_emit_padding(field_size);
+            cursor = cursor + field_size;
+            continue;
+        }
+
+        var val_expr: *AstNode = values.get(value_index);
+        if (f.type_kind == TYPE_STRUCT && f.ptr_depth == 0) {
+            if (val_expr == 0 || ast_kind(val_expr) != AST_STRUCT_LITERAL) {
+                emit_stderr("[ERROR] Global nested struct field requires struct literal initializer\n");
+                diag_error("Syntax error");
+            }
+            var nested_lit: *AstStructLiteral = (*AstStructLiteral)val_expr;
+            var nested_def: *AstStructDef = nested_lit.struct_def;
+            if (nested_def == 0) {
+                nested_def = get_struct_def(f.struct_name_ptr, f.struct_name_len);
+            }
+            if (nested_def == 0) {
+                emit_stderr("[ERROR] Nested struct definition not found for global initializer\n");
+                diag_error("Syntax error");
+            }
+            _global_emit_struct_literal_body_or_panic(nested_def, nested_lit.values_vec);
+        } else if (f.type_kind == TYPE_ARRAY && f.ptr_depth == 0) {
+            _global_emit_array_field_value_or_panic(f, val_expr);
+        } else if (f.type_kind == TYPE_SLICE && f.ptr_depth == 0) {
+            _global_emit_slice_field_value_or_panic(val_expr);
+        } else if (field_size == 8 && (f.ptr_depth > 0 || f.type_kind == TYPE_FUNC || f.type_kind == TYPE_TRAIT)) {
+            _global_emit_pointer_value_or_panic(val_expr);
+        } else {
+            _global_emit_struct_literal_value_or_panic(field_size, val_expr);
+        }
+
+        cursor = cursor + field_size;
+        value_index = value_index + 1;
+    }
+
+    var struct_size: u64 = layout_type_sizeof(TYPE_STRUCT, 0, struct_def.name_ptr, struct_def.name_len);
+    if (cursor < struct_size) {
+        _global_emit_padding(struct_size - cursor);
+        cursor = struct_size;
+    }
+    return cursor;
 }
 
 func _global_emit_struct_literal_value_or_panic(field_size: u64, val_expr: *AstNode) -> u64 {
@@ -768,7 +1180,7 @@ func _global_emit_struct_literal_value_or_panic(field_size: u64, val_expr: *AstN
             resolved_ptr = resolved.ptr;
             resolved_len = resolved.len;
         }
-        if (compiler_func_exists(resolved_ptr, resolved_len) != 0 || compiler_func_exists(id.name_ptr, id.name_len) != 0) {
+        if (sym_func_exists(resolved_ptr, resolved_len) != 0 || sym_func_exists(id.name_ptr, id.name_len) != 0) {
             emit("    dq ");
             emit_len(resolved_ptr, resolved_len);
             emit_nl();
@@ -778,7 +1190,7 @@ func _global_emit_struct_literal_value_or_panic(field_size: u64, val_expr: *AstN
     var value: u64 = 0;
     if (_global_eval_scalar_expr(val_expr, &value) == 0) {
         emit_stderr("[ERROR] Unsupported global struct literal value\n");
-        panic("Syntax error");
+        diag_error("Syntax error");
     }
     _global_emit_scalar_value(field_size, value);
     return 0;
@@ -791,38 +1203,11 @@ func _global_emit_struct_literal(ginfo: *GlobalInfo, lit: *AstStructLiteral) -> 
     }
     if (struct_def == 0) {
         emit_stderr("[ERROR] Missing struct def for global init\n");
-        panic("Syntax error");
+        diag_error("Syntax error");
     }
-
-    var fields: *Vec<*FieldDesc> = struct_def.fields_vec;
-    var values: *Vec<*AstNode> = lit.values_vec;
-    if (fields == 0 || values == 0) {
-        emit_stderr("[ERROR] Global struct literal missing fields\n");
-        panic("Syntax error");
-    }
-    var fn: u64 = fields.len();
-    var vn: u64 = values.len();
 
     _global_emit_struct_literal_label(ginfo);
-
-    var cursor: u64 = 0;
-    var value_index: u64 = 0;
-    for (var i: u64 = 0; i < fn; i++) {
-        var f: *FieldDesc = fields.get(i);
-        var field_size: u64 = _global_emit_struct_literal_field_size_or_panic(f);
-
-        if (compiler_is_vptr_field_name(f.name_ptr, f.name_len) != 0) {
-            _global_emit_struct_literal_vptr_or_panic(struct_def, f);
-            cursor = cursor + field_size;
-            continue;
-        }
-
-        if (value_index >= vn) { break; }
-        var val_expr: *AstNode = values.get(value_index);
-        _global_emit_struct_literal_value_or_panic(field_size, val_expr);
-        cursor = cursor + field_size;
-        value_index = value_index + 1;
-    }
+    var cursor: u64 = _global_emit_struct_literal_body_or_panic(struct_def, lit.values_vec);
 
     if (ginfo.typeinfo_ptr != 0) {
         var struct_size: u64 = sizeof_type_ex(ginfo.typeinfo_ptr);
@@ -834,12 +1219,12 @@ func _global_emit_struct_literal(ginfo: *GlobalInfo, lit: *AstStructLiteral) -> 
 }
 
 func globals_emit_data() -> u64 {
-    var count: u64 = g_globals.len();
-    if (count == 0) { return; }
-
     var emitted: u64 = 0;
-    for (var i: u64 = 0; i < count; i++) {
+    var count_user: u64 = 0;
+    if (g_globals != 0) { count_user = g_globals.len(); }
+    for (var i: u64 = 0; i < count_user; i++) {
         var ginfo: *GlobalInfo = g_globals.get(i);
+        if (ginfo == 0) { continue; }
         if (ginfo.init_kind == GLOBAL_INIT_NONE || ginfo.init_kind == GLOBAL_INIT_RUNTIME) { continue; }
 
         set_current_module_for_global(ginfo.name_ptr, ginfo.name_len);
@@ -853,15 +1238,16 @@ func globals_emit_data() -> u64 {
             var expr: *AstNode = (*AstNode)ginfo.init_expr;
             if (expr == 0) {
                 emit_stderr("[ERROR] Global init expr missing\n");
-                panic("Syntax error");
+                diag_error("Syntax error");
             }
             var ek: u64 = ast_kind(expr);
             if (ek == AST_STRUCT_LITERAL) {
                 _global_emit_struct_literal(ginfo, (*AstStructLiteral)expr);
                 continue;
             }
-            emit_stderr("[ERROR] Unsupported global init expr kind\n");
-            panic("Syntax error");
+            // Non-static initializer: lower to runtime global init and place storage in .bss.
+            ginfo.init_kind = GLOBAL_INIT_RUNTIME;
+            continue;
         }
 
         var size: u64 = 8;
@@ -877,7 +1263,7 @@ func globals_emit_data() -> u64 {
                 emit_stderr("[ERROR] Global init const not found: ");
                 emit_stderr_len(ginfo.init_name_ptr, ginfo.init_name_len);
                 emit_stderr("\n");
-                panic("Syntax error");
+                diag_error("Syntax error");
             }
         }
 
@@ -887,17 +1273,44 @@ func globals_emit_data() -> u64 {
         emit_nl();
         _global_emit_scalar_value(size, value);
     }
+
+    var count_backend: u64 = 0;
+    if (g_backend_globals != 0) { count_backend = g_backend_globals.len(); }
+    for (var bi: u64 = 0; bi < count_backend; bi++) {
+        var bginfo: *GlobalInfo = g_backend_globals.get(bi);
+        if (bginfo == 0) { continue; }
+        if (bginfo.init_kind == GLOBAL_INIT_NONE || bginfo.init_kind == GLOBAL_INIT_RUNTIME) { continue; }
+
+        if (emitted == 0) {
+            emitln("\nsection .data");
+            emitted = 1;
+        }
+
+        var bsize: u64 = 8;
+        if (bginfo.typeinfo_ptr != 0) {
+            bsize = sizeof_type_ex(bginfo.typeinfo_ptr);
+        }
+        if (bsize == 0) { bsize = 8; }
+        emit("_gvar_");
+        emit_len(bginfo.name_ptr, bginfo.name_len);
+        emit(":");
+        emit_nl();
+        _global_emit_scalar_value(bsize, bginfo.init_value);
+    }
 }
 
 func globals_emit_bss() -> u64 {
-    var count: u64 = g_globals.len();
-    
-    if (count == 0) { return; }
+    var count_user: u64 = 0;
+    var count_backend: u64 = 0;
+    if (g_globals != 0) { count_user = g_globals.len(); }
+    if (g_backend_globals != 0) { count_backend = g_backend_globals.len(); }
+    if (count_user == 0 && count_backend == 0) { return; }
     
     emitln("\nsection .bss");
     
-    for (var i: u64 = 0; i < count; i++) {
+    for (var i: u64 = 0; i < count_user; i++) {
         var ginfo: *GlobalInfo = g_globals.get(i);
+        if (ginfo == 0) { continue; }
         if (ginfo.init_kind != GLOBAL_INIT_NONE && ginfo.init_kind != GLOBAL_INIT_RUNTIME) { continue; }
         var size: u64 = 8;
         if (ginfo.typeinfo_ptr != 0) {
@@ -910,6 +1323,21 @@ func globals_emit_bss() -> u64 {
         emit(": resb ");
         emit_u64(size);
         emit_nl();
-        
+    }
+
+    for (var bi: u64 = 0; bi < count_backend; bi++) {
+        var bginfo: *GlobalInfo = g_backend_globals.get(bi);
+        if (bginfo == 0) { continue; }
+        if (bginfo.init_kind != GLOBAL_INIT_NONE && bginfo.init_kind != GLOBAL_INIT_RUNTIME) { continue; }
+        var bsize: u64 = 8;
+        if (bginfo.typeinfo_ptr != 0) {
+            bsize = sizeof_type_ex(bginfo.typeinfo_ptr);
+        }
+        if (bsize == 0) { bsize = 8; }
+        emit("_gvar_");
+        emit_len(bginfo.name_ptr, bginfo.name_len);
+        emit(": resb ");
+        emit_u64(bsize);
+        emit_nl();
     }
 }

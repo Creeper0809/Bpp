@@ -1,0 +1,218 @@
+// compiler_core_utils.b - Common utility wrappers and diagnostics
+
+import compiler;
+import compiler.source_cache;
+import compiler.manifest;
+import compiler.symbol_runtime;
+import std.io;
+import std.str;
+import lexer;
+import module_utils;
+import ast;
+import types;
+
+func decl_lookup_none(default_access: u64) -> CompilerDeclLookup {
+    var lookup: CompilerDeclLookup;
+    lookup.found = 0;
+    lookup.owner_ptr = 0;
+    lookup.owner_len = 0;
+    lookup.access = default_access;
+    lookup.sig = 0;
+    return lookup;
+}
+
+// ============================================
+// File Reading
+// ============================================
+
+func read_entire_file(path: u64) -> u64 {
+    return source_read_entire_file(path, &g_compiler_ctx.file_ptr, &g_compiler_ctx.file_len);
+}
+
+func report_module_open_error(file_path: u64, file_path_len: u64) -> u64 {
+    emit_stderr("[ERROR] Cannot open module: ");
+    var file_path_u8: []u8 = slice(file_path, file_path_len);
+    for (var i: u64 = 0; i < file_path_len; i++) {
+        emit_char(file_path_u8[i]);
+    }
+    emit_nl();
+    diag_note_error();
+    return 0;
+}
+
+func get_cached_module_source(file_path: u64, file_path_len: u64) -> *NameInfo {
+    if (g_compiler_ctx.module_source_cache == 0) {
+        g_compiler_ctx.module_source_cache = new HashMap<u64, *NameInfo>(64);
+    }
+    return source_get_cached_module_source(
+        g_compiler_ctx.module_source_cache,
+        file_path,
+        file_path_len,
+        &g_compiler_ctx.file_ptr,
+        &g_compiler_ctx.file_len
+    );
+}
+
+func set_current_source(file_path: u64, file_path_len: u64) -> u64 {
+    var source_info: *NameInfo = get_cached_module_source(file_path, file_path_len);
+    if (source_info == 0) { return false; }
+    return true;
+}
+
+func get_cached_module_tokens(file_path: u64, file_path_len: u64) -> *Vec<*Token> {
+    if (g_compiler_ctx.module_tokens_cache == 0) {
+        g_compiler_ctx.module_tokens_cache = new HashMap<u64, *Vec<*Token>>(64);
+    }
+
+    if (g_compiler_ctx.lex_ctx == 0) {
+        g_compiler_ctx.lex_ctx = lex_ctx_new();
+    }
+    var lex_errors: u64 = 0;
+    var tokens: *Vec<*Token> = source_get_cached_module_tokens(
+        g_compiler_ctx.module_source_cache,
+        g_compiler_ctx.module_tokens_cache,
+        g_compiler_ctx.lex_ctx,
+        file_path,
+        file_path_len,
+        &lex_errors,
+        &g_compiler_ctx.file_ptr,
+        &g_compiler_ctx.file_len
+    );
+    if (lex_errors != 0) {
+        emit_stderr("[ERROR] lexing failed for module: ");
+        emit_stderr_len(file_path, file_path_len);
+        emit_stderr(" (");
+        emit_u64_stderr(lex_errors);
+        emit_stderr(" error(s))\n");
+        diag_note_error();
+        return 0;
+    }
+    return tokens;
+}
+
+// ============================================
+// Manifest + Path Parsing
+// ============================================
+
+func read_manifest_value(manifest_path: u64, key_prefix: u64, key_prefix_len: u64) -> u64 {
+    var out_file_len: u64 = 0;
+    var value: u64 = read_value(manifest_path, key_prefix, key_prefix_len, &out_file_len);
+    g_compiler_ctx.file_len = out_file_len;
+    return value;
+}
+
+func manifest_resolve_path(manifest_dir: u64, manifest_dir_len: u64, value_path: u64) -> u64 {
+    return resolve_path_impl(manifest_dir, manifest_dir_len, value_path);
+}
+
+// ============================================
+// Module Id + Mangling Helpers
+// ============================================
+
+// Returns [ptr,len] struct (16 bytes)
+func module_id_from_path(path: u64, path_len: u64) -> *NameInfo {
+    return module_util_module_id_from_path(path, path_len, g_compiler_ctx.lib_dir, g_compiler_ctx.lib_dir_len, g_compiler_ctx.base_dir, g_compiler_ctx.base_dir_len);
+}
+
+// ============================================
+// Module Loading
+// ============================================
+
+func resolve_parent_def(parent_desc: *ParentDesc, panic_context: u64) -> *AstStructDef {
+    if (parent_desc == 0) { return 0; }
+    if (parent_desc.struct_def != 0) { return parent_desc.struct_def; }
+    var parent_def: *AstStructDef = get_struct_def(parent_desc.name_ptr, parent_desc.name_len);
+    if (parent_def == 0) {
+        emit_stderr("[ERROR] Parent struct not found: ");
+        emit_stderr_len(parent_desc.name_ptr, parent_desc.name_len);
+        emit_stderr("\n");
+        diag_error(panic_context);
+        var empty_parents: *Vec<*ParentDesc> = new Vec<*ParentDesc>(0);
+        var empty_fields: *Vec<*FieldDesc> = new Vec<*FieldDesc>(0);
+        var empty_traits: *Vec<*TraitRef> = new Vec<*TraitRef>(0);
+        var placeholder: *AstStructDef = ast_struct_def(parent_desc.name_ptr, parent_desc.name_len,
+                                                        empty_parents, empty_fields, 0, empty_traits, 0);
+        parent_desc.struct_def = placeholder;
+        return placeholder;
+    }
+    parent_desc.struct_def = parent_def;
+    return parent_def;
+}
+
+func is_not_found_u64(value: u64) -> u64 {
+    if (value == COMPILER_NOT_FOUND_U64) { return 1; }
+    return 0;
+}
+
+func diag_note_error() -> u64 {
+    g_compiler_diag_count = g_compiler_diag_count + 1;
+    return g_compiler_diag_count;
+}
+
+func diag_reset() -> u64 {
+    g_compiler_diag_count = 0;
+    g_compiler_diag_limit_reached = 0;
+    return 0;
+}
+
+func diag_count() -> u64 {
+    return g_compiler_diag_count;
+}
+
+func diag_has_errors() -> u64 {
+    if (g_compiler_diag_count != 0) { return 1; }
+    return 0;
+}
+
+func diag_should_stop_pass() -> u64 {
+    if (g_compiler_diag_limit_reached != 0) { return 1; }
+    if (g_compiler_diag_count != 0) { return 1; }
+    return 0;
+}
+
+func diag_force_stop_pass() -> u64 {
+    g_compiler_diag_limit_reached = 1;
+    diag_note_error();
+    return g_compiler_diag_count;
+}
+
+func trait_diag_error(prefix: u64, method_ptr: u64, method_len: u64) -> u64 {
+    emit_stderr(prefix);
+    emit_stderr_len(method_ptr, method_len);
+    emit_stderr("\n");
+    diag_note_error();
+    return 0;
+}
+
+func diag_error(msg: u64) -> u64 {
+    var panic_msg: u64 = msg;
+    if (panic_msg == 0) { panic_msg = "Compilation failed"; }
+
+    begin_error_capture();
+    set_error_context(panic_msg, str_len(panic_msg));
+    // Keep panic as a diagnostic emitter (non fail-fast) so callers can continue collecting errors.
+    if (str_eq(panic_msg, str_len(panic_msg), "Compilation failed", 18) == 0) {
+        emit_stderr("[ERROR] ");
+        emit_stderr_len(panic_msg, str_len(panic_msg));
+        emit_stderr_nl();
+    }
+    if (g_compiler_ctx.current_module_ptr != 0 && g_compiler_ctx.current_module_len != 0) {
+        emit_stderr("[ERROR] while compiling module: ");
+        emit_stderr_len(g_compiler_ctx.current_module_ptr, g_compiler_ctx.current_module_len);
+        emit_stderr_nl();
+    }
+    diag_note_error();
+    return 0;
+}
+
+func error_callsite(msg: u64, call_name_ptr: u64, call_name_len: u64) -> u64 {
+    emit_stderr("[ERROR] ");
+    emit_stderr(msg);
+    if (call_name_ptr != 0 && call_name_len != 0) {
+        emit_stderr(": ");
+        emit_stderr_len(call_name_ptr, call_name_len);
+    }
+    emit_stderr("\n");
+    diag_note_error();
+    return 0;
+}
