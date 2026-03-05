@@ -95,7 +95,6 @@ function Invoke-TestProcess {
     return $proc.ExitCode
 }
 
-<<<<<<< HEAD
 function Test-IsCrashExitCode {
     param([int]$ExitCode)
 
@@ -106,8 +105,6 @@ function Test-IsCrashExitCode {
     return $false
 }
 
-=======
->>>>>>> origin/main
 function Get-SanitizedCaseName {
     param([string]$Name)
 
@@ -284,14 +281,10 @@ foreach ($testCase in $testCases) {
     $status = "PASS"
 
     if ($compileCode -ne 0) {
-<<<<<<< HEAD
         if (Test-IsCrashExitCode -ExitCode $compileCode) {
             $caseOk = $false
             $status = "FAIL (compiler crash exit=$compileCode)"
         } elseif ($expectCompileFail) {
-=======
-        if ($expectCompileFail) {
->>>>>>> origin/main
             if ($expectErrContainsList.Count -gt 0) {
                 $errText = Get-Content $errFile -Raw
                 $missing = @()
