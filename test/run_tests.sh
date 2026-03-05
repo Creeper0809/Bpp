@@ -4,9 +4,12 @@
 
 set -e
 set -o pipefail
+<<<<<<< HEAD
 # Runtime-fail tests intentionally trigger traps/signals. Disable core dumps so
 # timeout-based exit checks remain stable under high parallel load.
 ulimit -c 0 >/dev/null 2>&1 || true
+=======
+>>>>>>> origin/main
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$SCRIPT_DIR/.."
@@ -75,6 +78,14 @@ detect_default_compiler() {
         return 0
     fi
 
+<<<<<<< HEAD
+=======
+    if [ -x "$ROOT_DIR/bin/bootstrap" ]; then
+        echo "$ROOT_DIR/bin/bootstrap"
+        return 0
+    fi
+
+>>>>>>> origin/main
     if [ -x "$ROOT_DIR/bin/stage1" ]; then
         echo "$ROOT_DIR/bin/stage1"
         return 0
@@ -87,11 +98,14 @@ detect_default_compiler() {
         return 0
     fi
 
+<<<<<<< HEAD
     if [ -x "$ROOT_DIR/bin/bootstrap" ]; then
         echo "$ROOT_DIR/bin/bootstrap"
         return 0
     fi
 
+=======
+>>>>>>> origin/main
     return 1
 }
 
@@ -120,7 +134,11 @@ COMPILER="${1:-}"
 if [ -z "$COMPILER" ]; then
     COMPILER="$(detect_default_compiler)" || {
         echo "Error: Compiler not found."
+<<<<<<< HEAD
         echo "  Tried: BPP_COMPILER, bin/\${BPP_VERSION}_stage1, bin/stage1, bin/*_stage1, bin/bootstrap"
+=======
+        echo "  Tried: BPP_COMPILER, bin/\${BPP_VERSION}_stage1, bin/bootstrap, bin/stage1, bin/*_stage1"
+>>>>>>> origin/main
         exit 1
     }
 fi
@@ -142,11 +160,17 @@ TEST_JOBS=${TEST_JOBS:-0}
 TEST_PROFILE=${TEST_PROFILE:-full}
 TEST_MODE_FILTER=${TEST_MODE_FILTER:-}
 TEST_OPT_FILTER=${TEST_OPT_FILTER:-}
+<<<<<<< HEAD
 TEST_NAME_FILTER=${TEST_NAME_FILTER:-}
 COMPILE_FAIL_SINGLE_VARIANT=${COMPILE_FAIL_SINGLE_VARIANT:-}
 TEST_SUITE_CASE_LIMIT=${TEST_SUITE_CASE_LIMIT:-}
 STRICT_FAIL_DIAGNOSTICS=${STRICT_FAIL_DIAGNOSTICS:-1}
 TEST_TIMEOUT_SEC=${TEST_TIMEOUT_SEC:-15}
+=======
+COMPILE_FAIL_SINGLE_VARIANT=${COMPILE_FAIL_SINGLE_VARIANT:-}
+TEST_SUITE_CASE_LIMIT=${TEST_SUITE_CASE_LIMIT:-}
+STRICT_FAIL_DIAGNOSTICS=${STRICT_FAIL_DIAGNOSTICS:-1}
+>>>>>>> origin/main
 FAST_IO_ACTIVE=0
 
 BUILD_DIR="$BUILD_DIR_BASE"
@@ -350,11 +374,17 @@ if [ "$TEST_QUIET" -eq 0 ]; then
     echo "[INFO] Profile: $TEST_PROFILE"
     echo "[INFO] Mode filter: $GLOBAL_MODES_CSV"
     echo "[INFO] Opt filter: $GLOBAL_OPTS_CSV"
+<<<<<<< HEAD
     echo "[INFO] Name filter: ${TEST_NAME_FILTER:-<none>}"
     echo "[INFO] Compile-fail single variant: $COMPILE_FAIL_SINGLE_VARIANT"
     echo "[INFO] Strict fail diagnostics: $STRICT_FAIL_DIAGNOSTICS"
     echo "[INFO] Suite case limit: $TEST_SUITE_CASE_LIMIT (0=all)"
     echo "[INFO] Runtime timeout: ${TEST_TIMEOUT_SEC}s"
+=======
+    echo "[INFO] Compile-fail single variant: $COMPILE_FAIL_SINGLE_VARIANT"
+    echo "[INFO] Strict fail diagnostics: $STRICT_FAIL_DIAGNOSTICS"
+    echo "[INFO] Suite case limit: $TEST_SUITE_CASE_LIMIT (0=all)"
+>>>>>>> origin/main
     echo "[INFO] Stress runs: $STRESS_RUNS"
     echo "[INFO] Stability runs: $STABILITY_RUNS"
     echo ""
@@ -418,6 +448,7 @@ run_matrix_case() {
         opt_flag="-O1"
     fi
 
+<<<<<<< HEAD
     local compile_exit=0
     $COMPILER $opt_flag $ir_flag -asm "$test_file" > "$asm_file" 2>"$err_file"
     compile_exit="$?"
@@ -429,6 +460,11 @@ run_matrix_case() {
             case_fail=1
             case_status="FAIL (compiler crash: signal $sig, exit=$compile_exit)"
         elif [ "$expect_compile_fail" -eq 1 ]; then
+=======
+    if ! $COMPILER $opt_flag $ir_flag -asm "$test_file" > "$asm_file" 2>"$err_file"; then
+        persist_result_file "$err_file" "$err_file_persist"
+        if [ "$expect_compile_fail" -eq 1 ]; then
+>>>>>>> origin/main
             if [ "$STRICT_FAIL_DIAGNOSTICS" -eq 1 ] && [ -z "$expect_error_file" ]; then
                 case_fail=1
                 case_status="FAIL (missing expected compile error directive)"
@@ -455,7 +491,11 @@ run_matrix_case() {
             fi
         else
             case_fail=1
+<<<<<<< HEAD
             case_status="FAIL (compile exit=$compile_exit)"
+=======
+            case_status="FAIL (compile)"
+>>>>>>> origin/main
         fi
     else
         if [ "$expect_compile_fail" -eq 1 ]; then
@@ -470,7 +510,11 @@ run_matrix_case() {
             case_fail=1
             case_status="FAIL (link)"
         else
+<<<<<<< HEAD
             timeout "${TEST_TIMEOUT_SEC}s" "$bin_file" >/dev/null 2>/dev/null
+=======
+            timeout 5s "$bin_file" >/dev/null 2>/dev/null
+>>>>>>> origin/main
             local exit_code="$?"
             if [ "$exit_code" -eq "$expected" ]; then
                 case_pass=1
@@ -479,7 +523,11 @@ run_matrix_case() {
                     local i=0
                     local stress_exit=0
                     for ((i=1; i<=STRESS_RUNS; i++)); do
+<<<<<<< HEAD
                         timeout "${TEST_TIMEOUT_SEC}s" "$bin_file" >/dev/null 2>/dev/null
+=======
+                        timeout 5s "$bin_file" >/dev/null 2>/dev/null
+>>>>>>> origin/main
                         stress_exit="$?"
                         if [ "$stress_exit" -ne "$expected" ]; then
                             stress_ok=0
@@ -500,7 +548,11 @@ run_matrix_case() {
                     local j=0
                     local stability_exit=0
                     for ((j=1; j<=STABILITY_RUNS; j++)); do
+<<<<<<< HEAD
                         timeout "${TEST_TIMEOUT_SEC}s" "$bin_file" >/dev/null 2>/dev/null
+=======
+                        timeout 5s "$bin_file" >/dev/null 2>/dev/null
+>>>>>>> origin/main
                         stability_exit="$?"
                         if [ "$stability_exit" -ne "$expected" ]; then
                             stability_ok=0
@@ -516,7 +568,11 @@ run_matrix_case() {
                     fi
                 fi
             else
+<<<<<<< HEAD
                 timeout "${TEST_TIMEOUT_SEC}s" "$bin_file" > "$out_file" 2>&1
+=======
+                timeout 5s "$bin_file" > "$out_file" 2>&1
+>>>>>>> origin/main
                 persist_result_file "$out_file" "$out_file_persist"
                 case_fail=1
                 case_status="FAIL (exit=$exit_code, expect=$expected)"
@@ -630,6 +686,7 @@ run_ir_case() {
     local err_file_persist="$RESULTS_DIR_BASE/${test_name}.ir.err"
     rm -f "$err_file"
 
+<<<<<<< HEAD
     local ssa_exit=0
     $COMPILER -dump-ssa "$test_file" > "$ssa_out" 2>"$err_file"
     ssa_exit="$?"
@@ -664,6 +721,24 @@ run_ir_case() {
         else
             case_pass=1
         fi
+=======
+    if ! $COMPILER -dump-ssa "$test_file" > "$ssa_out" 2>"$err_file"; then
+        persist_result_file "$err_file" "$err_file_persist"
+        case_fail=1
+        case_status="FAIL (ssa dump)"
+    elif ! grep -q "phi" "$ssa_out"; then
+        case_fail=1
+        case_status="FAIL (ssa missing phi)"
+    elif ! $COMPILER -dump-ir "$test_file" > "$addr_out" 2>>"$err_file"; then
+        persist_result_file "$err_file" "$err_file_persist"
+        case_fail=1
+        case_status="FAIL (3addr dump)"
+    elif grep -q "phi" "$addr_out"; then
+        case_fail=1
+        case_status="FAIL (3addr has phi)"
+    else
+        case_pass=1
+>>>>>>> origin/main
     fi
 
     if [ "$KEEP_TEST_ARTIFACTS" -eq 0 ]; then
@@ -717,11 +792,14 @@ fi
 for TEST_FILE in "${TEST_FILES[@]}"; do
     TEST_NAME=$(basename "$TEST_FILE" .bpp)
     TEST_LABEL="${TEST_DISPLAY_NAME[$TEST_FILE]:-$TEST_NAME}"
+<<<<<<< HEAD
     if [ -n "$TEST_NAME_FILTER" ]; then
         if [[ ! "$TEST_LABEL" =~ $TEST_NAME_FILTER ]] && [[ ! "$TEST_NAME" =~ $TEST_NAME_FILTER ]]; then
             continue
         fi
     fi
+=======
+>>>>>>> origin/main
     CONTENT_HASH=$(awk '{if ($0 !~ /^\/\/ (Covers:|Mode:|Opt:|Expect exit code:|Expect compile fail:|Expect error contains:)/) print}' "$TEST_FILE" | md5sum | awk '{print $1}')
     if [ -n "${SEEN_HASH[$CONTENT_HASH]}" ]; then
         if [ "$TEST_QUIET" -eq 0 ]; then

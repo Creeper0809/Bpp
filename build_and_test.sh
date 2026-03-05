@@ -9,7 +9,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$SCRIPT_DIR"
 BUILD_DIR="$ROOT_DIR/build"
 BIN_DIR="$ROOT_DIR/bin"
+<<<<<<< HEAD
 OLD_DIR="$ROOT_DIR/old"
+=======
+>>>>>>> origin/main
 CONFIG_FILE="$SCRIPT_DIR/config.ini"
 
 read_config_value() {
@@ -65,6 +68,7 @@ pick_latest_stage1_file() {
     fi
 }
 
+<<<<<<< HEAD
 discover_latest_old_version_tag() {
     if [ ! -d "$OLD_DIR" ]; then
         return 0
@@ -109,6 +113,8 @@ pick_old_latest_stage1_file() {
     fi
 }
 
+=======
+>>>>>>> origin/main
 pick_first_existing_file() {
     local candidate
     for candidate in "$@"; do
@@ -120,6 +126,7 @@ pick_first_existing_file() {
     return 1
 }
 
+<<<<<<< HEAD
 extract_numeric_version() {
     local token="$1"
     if [[ "$token" =~ v([0-9]+) ]]; then
@@ -129,6 +136,8 @@ extract_numeric_version() {
     return 1
 }
 
+=======
+>>>>>>> origin/main
 VERSION="${BPP_VERSION:-}"
 if [ -z "$VERSION" ]; then
     VERSION="$(read_config_value VERSION)"
@@ -150,6 +159,7 @@ TEST_FAST_IO="${TEST_FAST_IO:-1}"
 TEST_QUIET="${TEST_QUIET:-1}"
 KEEP_TEST_ARTIFACTS="${KEEP_TEST_ARTIFACTS:-0}"
 TEST_JOBS="${TEST_JOBS:-0}"
+<<<<<<< HEAD
 TEST_PROFILE="${TEST_PROFILE:-}"
 BUILD_AND_TEST_PROFILE="${BUILD_AND_TEST_PROFILE:-full}"
 SELFHOST_VERIFY="${SELFHOST_VERIFY:-}"
@@ -188,10 +198,17 @@ if [ "$TEST_JOBS" -eq 0 ]; then
     if [ "$TEST_JOBS" -lt 12 ]; then TEST_JOBS=12; fi
     if [ "$TEST_JOBS" -gt 64 ]; then TEST_JOBS=64; fi
 fi
+=======
+TEST_PROFILE="${TEST_PROFILE:-quick}"
+STRESS_RUNS="${STRESS_RUNS:-0}"
+STABILITY_RUNS="${STABILITY_RUNS:-0}"
+TEST_SUITE_CASE_LIMIT="${TEST_SUITE_CASE_LIMIT:-0}"
+>>>>>>> origin/main
 
 # Use RAM disk for large self-host ASM I/O when available (no build step skipped).
 ASM_WORK_DIR="$BUILD_DIR"
 if [ -d "/dev/shm" ] && [ -w "/dev/shm" ]; then
+<<<<<<< HEAD
     # Avoid silent truncation when tmpfs is full (would produce invalid stage binaries).
     SHM_AVAIL_KB="$(df -Pk /dev/shm | awk 'NR==2 {print $4}')"
     SHM_MIN_KB=1048576  # 1 GiB safety margin for large self-host ASM outputs
@@ -201,13 +218,20 @@ if [ -d "/dev/shm" ] && [ -w "/dev/shm" ]; then
     else
         echo "[WARN] /dev/shm free space is low (${SHM_AVAIL_KB:-unknown} KB). Falling back to build/."
     fi
+=======
+    ASM_WORK_DIR="/dev/shm/bpp_${VERSION}_selfhost_$$"
+    mkdir -p "$ASM_WORK_DIR"
+>>>>>>> origin/main
 fi
 trap 'if [ "$ASM_WORK_DIR" != "$BUILD_DIR" ]; then rm -rf "$ASM_WORK_DIR"; fi' EXIT
 
 STAGE0_ASM="$ASM_WORK_DIR/${VERSION}_stage0.asm"
 STAGE1_ASM="$ASM_WORK_DIR/${VERSION}_stage1.asm"
 STAGE2_ASM="$ASM_WORK_DIR/${VERSION}_stage2.asm"
+<<<<<<< HEAD
 BRIDGE_STAGE0_ASM="$ASM_WORK_DIR/${VERSION}_bridge_stage0.asm"
+=======
+>>>>>>> origin/main
 
 echo "========================================="
 echo "${VERSION} Build & Test Automation"
@@ -226,10 +250,13 @@ if [ -n "$BASE_BIN" ] && [ ! -f "$BASE_BIN" ]; then
     exit 1
 fi
 if [ -z "$BASE_BIN" ]; then
+<<<<<<< HEAD
     # Default policy: use the last historical version from old/ as bootstrap base.
     BASE_BIN="$(pick_old_latest_stage1_file || true)"
 fi
 if [ -z "$BASE_BIN" ]; then
+=======
+>>>>>>> origin/main
     BASE_BIN="$(pick_first_existing_file \
         "./bin/stage1" \
         "./bin/bootstrap" \
@@ -242,7 +269,11 @@ if [ -z "$BASE_BIN" ]; then
 fi
 if [ -z "$BASE_BIN" ]; then
     echo "Error: Base compiler not found."
+<<<<<<< HEAD
     echo "   Tried: old/<latest>/bin/*, bin/<old_latest>_stage1, bin/bootstrap, bin/stage1, bin/${BASE_COMPILER}, bin/${VERSION}_stage1, bin/${VERSION}, bin/*_stage1"
+=======
+    echo "   Tried: bin/bootstrap, bin/stage1, bin/${BASE_COMPILER}, bin/${VERSION}_stage1, bin/${VERSION}, bin/*_stage1"
+>>>>>>> origin/main
     echo "   Hint: set BPP_BASE_COMPILER=/abs/path/to/compiler"
     exit 1
 fi
@@ -259,6 +290,7 @@ if [ ! -x "${BASE_BIN}" ]; then
     exit 1
 fi
 
+<<<<<<< HEAD
 BOOTSTRAP_BIN="${BASE_BIN}"
 TARGET_VER_NUM="$(extract_numeric_version "$VERSION" || true)"
 BASE_VER_NUM="$(extract_numeric_version "$(basename "$BASE_BIN")" || true)"
@@ -279,6 +311,9 @@ if [ -n "${TARGET_VER_NUM:-}" ] && [ -n "${BASE_VER_NUM:-}" ] \
 fi
 
 "${BOOTSTRAP_BIN}" -asm "${SRC_FILE}" > "${STAGE0_ASM}"
+=======
+"${BASE_BIN}" -asm "${SRC_FILE}" > "${STAGE0_ASM}"
+>>>>>>> origin/main
 nasm ${NASM_FLAGS} "${STAGE0_ASM}" -o "build/${VERSION}_stage0.o"
 ld build/${VERSION}_stage0.o -o bin/${VERSION}_stage0
 echo "Stage 0 Build Completed"
@@ -295,6 +330,7 @@ echo "Stage 1 Build Completed"
 echo ""
 
 # Step 3: 셀프 호스팅 (2단계)
+<<<<<<< HEAD
 FINAL_ASM="$STAGE1_ASM"
 if [ "$SELFHOST_VERIFY" = "1" ]; then
     echo "[3/6] Self-Hosting Stage 2..."
@@ -322,25 +358,57 @@ else
     echo "[4/6] Self-Hosting Verification... skipped (SELFHOST_VERIFY=0)"
     echo ""
 fi
+=======
+echo "[3/6] Self-Hosting Stage 2..."
+./bin/${VERSION}_stage1 -asm "${SRC_FILE}" > "${STAGE2_ASM}"
+echo "Stage 2 Build Completed"
+echo ""
+
+# Step 4: ASM 비교 (1단계 vs 2단계)
+echo "[4/6] Self-Hosting Verification..."
+# We only need equality check; cmp is faster than textual diff for this.
+if cmp -s "${STAGE1_ASM}" "${STAGE2_ASM}"; then
+    echo "Self-Hosting Success! (Stage 1 == Stage 2)"
+    echo "   ASM: $(wc -l < "${STAGE1_ASM}") lines"
+else
+    echo "Self-Hosting Failed! ASM is different."
+    echo "   Stage 1: $(wc -l < "${STAGE1_ASM}") lines"
+    echo "   Stage 2: $(wc -l < "${STAGE2_ASM}") lines"
+    exit 1
+fi
+echo ""
+>>>>>>> origin/main
 
 # Persist ASM artifacts under build/ as before.
 cp "${STAGE0_ASM}" "build/${VERSION}_stage0.asm"
 cp "${STAGE1_ASM}" "build/${VERSION}_stage1.asm"
+<<<<<<< HEAD
 if [ "$SELFHOST_VERIFY" = "1" ] && [ -f "${STAGE2_ASM}" ]; then
     cp "${STAGE2_ASM}" "build/${VERSION}_stage2.asm"
 fi
+=======
+cp "${STAGE2_ASM}" "build/${VERSION}_stage2.asm"
+>>>>>>> origin/main
 
 # Step 5: 테스트 실행
 echo "[5/6] Running Tests..."
 TEST_FAST_IO="$TEST_FAST_IO" TEST_QUIET="$TEST_QUIET" KEEP_TEST_ARTIFACTS="$KEEP_TEST_ARTIFACTS" \
+<<<<<<< HEAD
 TEST_JOBS="$TEST_JOBS" TEST_PROFILE="$TEST_PROFILE" TEST_SUITE_CASE_LIMIT="$TEST_SUITE_CASE_LIMIT" TEST_NAME_FILTER="$TEST_NAME_FILTER" STRESS_RUNS="$STRESS_RUNS" STABILITY_RUNS="$STABILITY_RUNS" \
+=======
+TEST_JOBS="$TEST_JOBS" TEST_PROFILE="$TEST_PROFILE" TEST_SUITE_CASE_LIMIT="$TEST_SUITE_CASE_LIMIT" STRESS_RUNS="$STRESS_RUNS" STABILITY_RUNS="$STABILITY_RUNS" \
+>>>>>>> origin/main
   bash ${TEST_SCRIPT} bin/${VERSION}_stage1 2>&1 | tail -15
 
 # Step 6: 바이너리(.out) 생성 (기본 실행 경로)
 echo ""
 echo "[6/6] Generating Executable..."
 OUT_OBJ="build/${VERSION}.out.o"
+<<<<<<< HEAD
 nasm ${NASM_FLAGS} "${FINAL_ASM}" -o "${OUT_OBJ}"
+=======
+nasm ${NASM_FLAGS} "${STAGE2_ASM}" -o "${OUT_OBJ}"
+>>>>>>> origin/main
 ld "${OUT_OBJ}" -o "build/${VERSION}.out"
 rm -f "${OUT_OBJ}"
 
