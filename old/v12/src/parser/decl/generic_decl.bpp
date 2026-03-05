@@ -1,0 +1,376 @@
+// parse_decl_generic.b - generic bounds/params and parameter parsing helpers
+
+import std.io;
+import std.vec;
+import std.util;
+import std.str;
+import module_utils;
+import types;
+import lexer;
+import ast;
+import compiler;
+import compiler.core_utils;
+import compiler.generic.engine;
+import compiler.enum_runtime;
+import compiler.symbol_runtime;
+import parser.util;
+import parser.type;
+import parser.expr;
+import parser.stmt;
+import parser.decl;
+
+func generic_param_find(params: *Vec<*GenericParam>, name_ptr: u64, name_len: u64) -> *GenericParam {
+    if (params == 0) { return 0; }
+    var n: u64 = params.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var gp: *GenericParam = params.get(i);
+        if (str_eq(gp.name_ptr, gp.name_len, name_ptr, name_len) != 0) {
+            return gp;
+        }
+    }
+    return 0;
+}
+
+func generic_parse_assoc_bindings(p: *Parser, gp: *GenericParam) -> u64 {
+    if (gp == 0) { return 0; }
+    if (match_tok(p, TOKEN_LT) == 0) { return 0; }
+    gp.assoc_bindings = new Vec<*GenericAssocBinding>(2);
+    var parsed_any: u64 = 0;
+    while (1) {
+        if (peek_kind(p) != TOKEN_IDENTIFIER) {
+            emit_stderr("[ERROR] Expected associated type name in trait bound\n");
+            panic_here(p, "Syntax error");
+        }
+        var assoc_tok: *Token = peek_tok(p);
+        consume_tok(p, TOKEN_IDENTIFIER);
+        consume_tok(p, TOKEN_EQ);
+        var assoc_ti: *TypeInfo = type_parse_ex(p);
+        var binding: *GenericAssocBinding = new GenericAssocBinding();
+        binding.name_ptr = assoc_tok.ptr;
+        binding.name_len = assoc_tok.len;
+        binding.type_ptr = assoc_ti;
+        var bn: u64 = gp.assoc_bindings.len();
+        for (var bi: u64 = 0; bi < bn; bi++) {
+            var prev: *GenericAssocBinding = gp.assoc_bindings.get(bi);
+            if (prev == 0) { continue; }
+            if (str_eq(prev.name_ptr, prev.name_len, binding.name_ptr, binding.name_len) != 0) {
+                emit_stderr("[ERROR] duplicate associated type binding in generic bound: ");
+                emit_stderr_len(binding.name_ptr, binding.name_len);
+                emit_stderr("\n");
+                panic_here(p, "Syntax error");
+            }
+        }
+        gp.assoc_bindings.push(binding);
+        if (parsed_any == 0) {
+            gp.assoc_name_ptr = assoc_tok.ptr;
+            gp.assoc_name_len = assoc_tok.len;
+            gp.assoc_type_ptr = assoc_ti;
+            parsed_any = 1;
+        }
+        if (match_tok(p, TOKEN_COMMA) == 0) { break; }
+    }
+
+    consume_generic_gt(p);
+    return 0;
+}
+
+func generic_parse_trait_assoc_bindings(p: *Parser) -> *Vec<*TraitAssocBinding> {
+    if (match_tok(p, TOKEN_LT) == 0) { return 0; }
+    var bindings: *Vec<*TraitAssocBinding> = new Vec<*TraitAssocBinding>(2);
+    while (1) {
+        if (peek_kind(p) != TOKEN_IDENTIFIER) {
+            emit_stderr("[ERROR] Expected associated type name in impl trait bindings\n");
+            panic_here(p, "Syntax error");
+        }
+        var name_tok: *Token = peek_tok(p);
+        consume_tok(p, TOKEN_IDENTIFIER);
+        consume_tok(p, TOKEN_EQ);
+        var ty: *TypeInfo = type_parse_ex(p);
+        var binding: *TraitAssocBinding = new TraitAssocBinding();
+        binding.name_ptr = name_tok.ptr;
+        binding.name_len = name_tok.len;
+        binding.type_ptr = ty;
+        var bn: u64 = bindings.len();
+        for (var bi: u64 = 0; bi < bn; bi++) {
+            var prev: *TraitAssocBinding = bindings.get(bi);
+            if (prev == 0) { continue; }
+            if (str_eq(prev.name_ptr, prev.name_len, binding.name_ptr, binding.name_len) != 0) {
+                emit_stderr("[ERROR] duplicate associated type binding in impl header: ");
+                emit_stderr_len(binding.name_ptr, binding.name_len);
+                emit_stderr("\n");
+                panic_here(p, "Syntax error");
+            }
+        }
+        bindings.push(binding);
+        if (match_tok(p, TOKEN_COMMA) == 0) { break; }
+    }
+    consume_generic_gt(p);
+    return bindings;
+}
+
+func generic_parse_trait_bound(p: *Parser, gp: *GenericParam) -> u64 {
+    if (gp == 0) { return 0; }
+    if (peek_kind(p) != TOKEN_IDENTIFIER) {
+        emit_stderr("[ERROR] Expected trait name after ':' in generic bound\n");
+        panic_here(p, "Syntax error");
+    }
+    var trait_tok: *Token = peek_tok(p);
+    consume_tok(p, TOKEN_IDENTIFIER);
+    gp.bound_trait_ptr = trait_tok.ptr;
+    gp.bound_trait_len = trait_tok.len;
+    gp.assoc_name_ptr = 0;
+    gp.assoc_name_len = 0;
+    gp.assoc_type_ptr = 0;
+    gp.assoc_bindings = 0;
+    generic_parse_assoc_bindings(p, gp);
+    return 0;
+}
+
+func generic_where_clause(p: *Parser, params: *Vec<*GenericParam>) -> u64 {
+    if (params == 0 || params.len() == 0) { return 0; }
+    if (match_tok(p, TOKEN_WHERE) == 0) { return 0; }
+
+    while (1) {
+        if (peek_kind(p) != TOKEN_IDENTIFIER) {
+            emit_stderr("[ERROR] Expected generic parameter name in where clause\n");
+            panic_here(p, "Syntax error");
+        }
+        var gp_tok: *Token = peek_tok(p);
+        consume_tok(p, TOKEN_IDENTIFIER);
+        var gp: *GenericParam = generic_param_find(params, gp_tok.ptr, gp_tok.len);
+        if (gp == 0) {
+            emit_stderr("[ERROR] Unknown generic parameter in where clause: ");
+            emit_stderr_len(gp_tok.ptr, gp_tok.len);
+            emit_stderr("\n");
+            panic_here(p, "Syntax error");
+        }
+        consume_tok(p, TOKEN_COLON);
+        generic_parse_trait_bound(p, gp);
+        if (match_tok(p, TOKEN_COMMA) == 0) { break; }
+    }
+    return 0;
+}
+
+func generic_params_impl(p: *Parser, allow_any: u64) -> *Vec<*GenericParam> {
+    var tok: *Token = peek_tok(p);
+    if (tok == 0) { return 0; }
+    if (peek_kind(p) != TOKEN_LT) { return 0; }
+    if (allow_any != 0) {
+        if (decl_is_generic_param_list_any(p) == 0) { return 0; }
+    } else {
+        if (decl_is_generic_param_list(p) == 0) { return 0; }
+    }
+    consume_tok(p, TOKEN_LT);
+
+    var params: *Vec<*GenericParam> = new Vec<*GenericParam>(4);
+    while (1) {
+        var is_value: u64 = 0;
+        if (match_tok(p, TOKEN_CONST)) { is_value = 1; }
+
+        if (peek_kind(p) != TOKEN_IDENTIFIER) {
+            emit_stderr("[ERROR] Expected generic parameter name\n");
+            panic_here(p, "Syntax error");
+        }
+
+        var name_tok: *Token = peek_tok(p);
+        var name_ptr: u64 = name_tok.ptr;
+        var name_len: u64 = name_tok.len;
+        consume_tok(p, TOKEN_IDENTIFIER);
+
+        var value_type_kind: u64 = 0;
+        var bound_trait_ptr: u64 = 0;
+        var bound_trait_len: u64 = 0;
+        var assoc_name_ptr: u64 = 0;
+        var assoc_name_len: u64 = 0;
+        var assoc_type_ptr: *TypeInfo = 0;
+        var assoc_bindings: *Vec<*GenericAssocBinding> = 0;
+        if (match_tok(p, TOKEN_COLON)) {
+            if (is_value == 1) {
+                value_type_kind = type_parse_base(p);
+                if (value_type_kind == TYPE_STRUCT || value_type_kind == TYPE_VOID) {
+                    emit_stderr("[ERROR] Invalid value generic type\n");
+                    panic_here(p, "Syntax error");
+                }
+                if (generic_is_value_type_allowed(value_type_kind) == 0) {
+                    emit_stderr("[ERROR] Value generic type must be integer or bool\n");
+                    panic_here(p, "Syntax error");
+                }
+            } else {
+                var gp_bound: *GenericParam = new GenericParam();
+                generic_parse_trait_bound(p, gp_bound);
+                bound_trait_ptr = gp_bound.bound_trait_ptr;
+                bound_trait_len = gp_bound.bound_trait_len;
+                assoc_name_ptr = gp_bound.assoc_name_ptr;
+                assoc_name_len = gp_bound.assoc_name_len;
+                assoc_type_ptr = gp_bound.assoc_type_ptr;
+                assoc_bindings = gp_bound.assoc_bindings;
+            }
+        } else if (is_value == 1) {
+            emit_stderr("[ERROR] const generic requires type annotation\n");
+            panic_here(p, "Syntax error");
+        }
+
+        var gp: *GenericParam = new GenericParam();
+        if (is_value == 1) { gp.kind = GENERIC_KIND_VALUE; }
+        else { gp.kind = GENERIC_KIND_TYPE; }
+        gp.name_ptr = name_ptr;
+        gp.name_len = name_len;
+        gp.value_type_kind = value_type_kind;
+        gp.bound_trait_ptr = bound_trait_ptr;
+        gp.bound_trait_len = bound_trait_len;
+        gp.assoc_name_ptr = assoc_name_ptr;
+        gp.assoc_name_len = assoc_name_len;
+        gp.assoc_type_ptr = assoc_type_ptr;
+        gp.assoc_bindings = assoc_bindings;
+        params.push(gp);
+
+        if (match_tok(p, TOKEN_COMMA)) { continue; }
+        break;
+    }
+
+    consume_generic_gt(p);
+    return params;
+}
+
+func generic_is_value_type_allowed(type_kind: u64) -> u64 {
+    switch (type_kind) {
+        case TYPE_BOOL:
+        case TYPE_U8:
+        case TYPE_U16:
+        case TYPE_U32:
+        case TYPE_U64:
+        case TYPE_I8:
+        case TYPE_I16:
+        case TYPE_I32:
+        case TYPE_I64:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+func generic_params_any(p: *Parser) -> *Vec<*GenericParam> {
+    push_trace("generic_params_any", "parser/decl.b", __LINE__);
+    defer pop_trace();
+    return generic_params_impl(p, 1);
+}
+
+func generic_parse_param(p: *Parser) -> *Param {
+    var is_variadic: u64 = 0;
+    if (match_tok(p, TOKEN_DOT)) {
+        consume_tok(p, TOKEN_DOT);
+        consume_tok(p, TOKEN_DOT);
+        is_variadic = 1;
+    }
+
+    var name_tok: *Token = peek_tok(p);
+    consume_tok(p, TOKEN_IDENTIFIER);
+    if (name_tok == 0) {
+        panic_here(p, "Syntax error");
+        var invalid_param: *Param = new Param();
+        invalid_param.name_ptr = 0;
+        invalid_param.name_len = 0;
+        invalid_param.is_variadic = is_variadic;
+        invalid_param.has_default = 0;
+        invalid_param.default_expr = 0;
+        invalid_param.type_kind = TYPE_U64;
+        invalid_param.ptr_depth = 0;
+        invalid_param.is_tagged = 0;
+        invalid_param.struct_name_ptr = 0;
+        invalid_param.struct_name_len = 0;
+        invalid_param.tag_layout_ptr = 0;
+        invalid_param.tag_layout_len = 0;
+        invalid_param.elem_type_kind = 0;
+        invalid_param.elem_ptr_depth = 0;
+        invalid_param.array_len = 0;
+        invalid_param.array_len_is_param = 0;
+        invalid_param.array_len_param_ptr = 0;
+        invalid_param.array_len_param_len = 0;
+        invalid_param.elem_typeinfo = 0;
+        return invalid_param;
+    }
+
+    var generic_params: *Vec<*GenericParam> = generic_params_any(p);
+    if (generic_params != 0) {
+        type_parser_set_generic_params(p, generic_params);
+    }
+
+    var param: *Param = new Param();
+    param.name_ptr = name_tok.ptr;
+    param.name_len = name_tok.len;
+    param.is_variadic = is_variadic;
+    param.has_default = 0;
+    param.default_expr = 0;
+
+    if (match_tok(p, TOKEN_COLON)) {
+        var ty: *TypeInfo = type_parse_ex(p);
+        param.fill_from_typeinfo(ty);
+        param.decay_array_to_ptr();
+    } else {
+        param.type_kind = TYPE_U64;
+        param.ptr_depth = 0;
+        param.is_tagged = 0;
+        param.struct_name_ptr = 0;
+        param.struct_name_len = 0;
+        param.tag_layout_ptr = 0;
+        param.tag_layout_len = 0;
+        param.elem_type_kind = 0;
+        param.elem_ptr_depth = 0;
+        param.array_len = 0;
+        param.array_len_is_param = 0;
+        param.array_len_param_ptr = 0;
+        param.array_len_param_len = 0;
+        param.elem_typeinfo = 0;
+    }
+
+    if (match_tok(p, TOKEN_EQ)) {
+        param.default_expr = (u64)expr_parse(p);
+        param.has_default = 1;
+    }
+
+    return param;
+}
+
+func generic_validate_params(p: *Parser, params: *Vec<*Param>) -> u64 {
+    if (params == 0) { return 0; }
+    var n: u64 = params.len();
+    var seen_default: u64 = 0;
+    var seen_variadic: u64 = 0;
+
+    for (var i: u64 = 0; i < n; i++) {
+        var pi: *Param = params.get(i);
+        if (pi == 0) { continue; }
+        if (pi.is_variadic != 0) {
+            if (seen_variadic != 0) {
+                emit_stderr("[ERROR] function cannot declare multiple variadic parameters\n");
+                panic_here(p, "Syntax error");
+            }
+            if (pi.has_default != 0) {
+                emit_stderr("[ERROR] variadic parameter cannot have default value\n");
+                panic_here(p, "Syntax error");
+            }
+            seen_variadic = 1;
+            if (i + 1 < n) {
+                emit_stderr("[ERROR] variadic parameter must be the last parameter\n");
+                panic_here(p, "Syntax error");
+            }
+            if (pi.ptr_depth == 0) {
+                pi.ptr_depth = 1;
+            }
+            continue;
+        }
+        if (seen_variadic != 0) {
+            emit_stderr("[ERROR] variadic parameter must be the last parameter\n");
+            panic_here(p, "Syntax error");
+        }
+        if (pi.has_default != 0) {
+            seen_default = 1;
+            continue;
+        }
+        if (seen_default != 0) {
+            emit_stderr("[ERROR] non-default parameter cannot follow default parameter\n");
+            panic_here(p, "Syntax error");
+        }
+    }
+    return 0;
+}
