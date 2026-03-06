@@ -131,6 +131,7 @@ fi
 
 VERSION="$(derive_version_label "$COMPILER")"
 TEST_DIR="test/source"
+TEST_FAIL_DIR="test/source_fail"
 IR_TEST_DIR="test/ir"
 BUILD_DIR_BASE="build/${VERSION}_tests"
 RESULTS_DIR_BASE="build/test_results"
@@ -679,8 +680,15 @@ run_ir_case() {
     return 0
 }
 
-# Find all top-level test files (exclude module files).
-mapfile -t SOURCE_FILES < <(find "$TEST_DIR" -maxdepth 1 -type f -name '*.bpp' | sort -V)
+# Find all top-level test files across success/fail dirs (exclude module files).
+SOURCE_GLOBS=()
+if [ -d "$TEST_DIR" ]; then
+    SOURCE_GLOBS+=("$TEST_DIR")
+fi
+if [ -d "$TEST_FAIL_DIR" ]; then
+    SOURCE_GLOBS+=("$TEST_FAIL_DIR")
+fi
+mapfile -t SOURCE_FILES < <(find "${SOURCE_GLOBS[@]}" -maxdepth 1 -type f -name '*.bpp' | sort -V)
 TEST_FILES=()
 for TEST_FILE in "${SOURCE_FILES[@]}"; do
     TEST_BASE_NAME=$(basename "$TEST_FILE")
@@ -710,7 +718,7 @@ for TEST_FILE in "${SOURCE_FILES[@]}"; do
 done
 
 if [ "${#TEST_FILES[@]}" -eq 0 ]; then
-    echo "No test files found in $TEST_DIR"
+    echo "No test files found in $TEST_DIR or $TEST_FAIL_DIR"
     exit 1
 fi
 
