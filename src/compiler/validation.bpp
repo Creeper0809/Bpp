@@ -16,6 +16,355 @@ import std.vec;
 import types;
 import ast;
 
+func property_hook_emit_field_error(field: *FieldDesc, msg: u64) -> u64 {
+    emit_stderr("[ERROR] ");
+    emit_stderr(msg);
+    emit_stderr(": ");
+    if (field != 0) {
+        emit_stderr_len(field.owner_struct_ptr, field.owner_struct_len);
+        emit_stderr(".");
+        emit_stderr_len(field.name_ptr, field.name_len);
+    } else {
+        emit_stderr("<field>");
+    }
+    emit_stderr("\n");
+    diag_note_error();
+    return 0;
+}
+
+func property_hook_build_name(struct_ptr: u64, struct_len: u64, mid_ptr: u64, mid_len: u64, field_ptr: u64, field_len: u64) -> *NameInfo {
+    var p1: *NameInfo = module_util_build_joined_name(struct_ptr, struct_len, mid_ptr, mid_len);
+    return module_util_build_joined_name(p1.ptr, p1.len, field_ptr, field_len);
+}
+
+func property_hook_field_matches_param(field: *FieldDesc, param: *Param) -> u64 {
+    if (field == 0 || param == 0) { return 0; }
+    if (param.is_variadic != 0 || param.has_default != 0) { return 0; }
+    if (field.type_kind != param.type_kind) { return 0; }
+    if (field.ptr_depth != param.ptr_depth) { return 0; }
+    if (field.type_kind == TYPE_STRUCT || field.type_kind == TYPE_GENERIC || field.type_kind == TYPE_TRAIT) {
+        if (str_eq(field.struct_name_ptr, field.struct_name_len, param.struct_name_ptr, param.struct_name_len) == 0 &&
+            property_hook_name_matches(param.struct_name_ptr, param.struct_name_len, field.struct_name_ptr, field.struct_name_len) == 0 &&
+            property_hook_name_matches(field.struct_name_ptr, field.struct_name_len, param.struct_name_ptr, param.struct_name_len) == 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+func property_hook_field_matches_return(field: *FieldDesc, fn: *AstFunc) -> u64 {
+    if (field == 0 || fn == 0) { return 0; }
+    if (field.type_kind != fn.ret_type) { return 0; }
+    if (field.ptr_depth != fn.ret_ptr_depth) { return 0; }
+    if (field.type_kind == TYPE_STRUCT || field.type_kind == TYPE_GENERIC || field.type_kind == TYPE_TRAIT) {
+        if (str_eq(field.struct_name_ptr, field.struct_name_len, fn.ret_struct_name_ptr, fn.ret_struct_name_len) == 0 &&
+            property_hook_name_matches(fn.ret_struct_name_ptr, fn.ret_struct_name_len, field.struct_name_ptr, field.struct_name_len) == 0 &&
+            property_hook_name_matches(field.struct_name_ptr, field.struct_name_len, fn.ret_struct_name_ptr, fn.ret_struct_name_len) == 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+func property_hook_validate_self_param(field: *FieldDesc, self_param: *Param) -> u64 {
+    if (field == 0 || self_param == 0) { return 0; }
+    if (self_param.is_variadic != 0 || self_param.has_default != 0) { return 0; }
+    if (self_param.type_kind != TYPE_STRUCT || self_param.ptr_depth != 1 || self_param.is_tagged != 0) { return 0; }
+    if (str_eq(self_param.struct_name_ptr, self_param.struct_name_len, field.owner_struct_ptr, field.owner_struct_len) == 0) {
+        if (property_hook_name_matches(self_param.struct_name_ptr, self_param.struct_name_len, field.owner_struct_ptr, field.owner_struct_len) == 0 &&
+            property_hook_name_matches(field.owner_struct_ptr, field.owner_struct_len, self_param.struct_name_ptr, self_param.struct_name_len) == 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+func property_hook_name_matches(cand_ptr: u64, cand_len: u64, hook_ptr: u64, hook_len: u64) -> u64 {
+    if (cand_ptr == 0 || cand_len == 0 || hook_ptr == 0 || hook_len == 0) { return 0; }
+    if (str_eq(cand_ptr, cand_len, hook_ptr, hook_len) != 0) { return 1; }
+    if (cand_len <= hook_len) { return 0; }
+    var suffix_ptr: u64 = cand_ptr + (cand_len - hook_len);
+    if (str_eq(suffix_ptr, hook_len, hook_ptr, hook_len) == 0) { return 0; }
+    var s: []u8 = slice(cand_ptr, cand_len);
+    if (s[cand_len - hook_len - 1] != 95) { return 0; } // '_'
+    return 1;
+}
+
+func property_hook_parse_field_annotations(field: *FieldDesc) -> u64 {
+    if (field == 0 || field.annotations_vec == 0) { return 1; }
+    var anns: *Vec<*NameInfo> = field.annotations_vec;
+    var n: u64 = anns.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var info: *NameInfo = anns.get(i);
+        var ann: *CompilerAnnotationParsed = annotation_parse(info);
+        if (ann == 0 || ann.parse_ok == 0 || ann.name_ptr == 0 || ann.name_len == 0) {
+            property_hook_emit_field_error(field, "malformed field annotation");
+            return 0;
+        }
+
+        var is_setter: u64 = 0;
+        var is_getter: u64 = 0;
+        if (str_eq(ann.name_ptr, ann.name_len, "setter", 6) != 0) { is_setter = 1; }
+        if (str_eq(ann.name_ptr, ann.name_len, "getter", 6) != 0) { is_getter = 1; }
+        if (is_setter == 0 && is_getter == 0) {
+            property_hook_emit_field_error(field, "unsupported field annotation");
+            return 0;
+        }
+
+        var args_n: u64 = 0;
+        if (ann.args_vec != 0) { args_n = ann.args_vec.len(); }
+        var hook_mode: u64 = FIELD_HOOK_NONE;
+        var hook_ptr: u64 = 0;
+        var hook_len: u64 = 0;
+
+        if (args_n == 0) {
+            hook_mode = FIELD_HOOK_AUTO;
+        } else if (args_n == 1) {
+            var arg0: *CompilerAnnotationArg = ann.args_vec.get(0);
+            if (arg0 == 0 || arg0.key_ptr != 0 || arg0.kind != COMPILER_ANN_ARG_IDENT || arg0.ident_ptr == 0 || arg0.ident_len == 0) {
+                property_hook_emit_field_error(field, "hook annotation argument must be a function identifier");
+                return 0;
+            }
+            hook_mode = FIELD_HOOK_MANUAL;
+            hook_ptr = arg0.ident_ptr;
+            hook_len = arg0.ident_len;
+        } else {
+            property_hook_emit_field_error(field, "hook annotation accepts at most one argument");
+            return 0;
+        }
+
+        if (is_setter != 0) {
+            if (field.setter_hook_mode != FIELD_HOOK_NONE) {
+                property_hook_emit_field_error(field, "duplicate @[setter] annotation");
+                return 0;
+            }
+            field.setter_hook_mode = hook_mode;
+            field.setter_hook_ptr = hook_ptr;
+            field.setter_hook_len = hook_len;
+        } else {
+            if (field.getter_hook_mode != FIELD_HOOK_NONE) {
+                property_hook_emit_field_error(field, "duplicate @[getter] annotation");
+                return 0;
+            }
+            field.getter_hook_mode = hook_mode;
+            field.getter_hook_ptr = hook_ptr;
+            field.getter_hook_len = hook_len;
+        }
+    }
+    return 1;
+}
+
+func property_hook_validate_manual_setter(field: *FieldDesc) -> u64 {
+    if (field == 0) { return 1; }
+    if (field.setter_hook_mode != FIELD_HOOK_MANUAL) { return 1; }
+    var any_name_match: u64 = 0;
+    var picked_ptr: u64 = 0;
+    var picked_len: u64 = 0;
+
+    if (g_compiler_ctx.all_funcs != 0) {
+        var n: u64 = g_compiler_ctx.all_funcs.len();
+        for (var i: u64 = 0; i < n; i++) {
+            var fn: *AstFunc = g_compiler_ctx.all_funcs.get(i);
+            if (fn == 0) { continue; }
+            if (property_hook_name_matches(fn.name_ptr, fn.name_len, field.setter_hook_ptr, field.setter_hook_len) == 0) { continue; }
+            any_name_match = 1;
+            picked_ptr = fn.name_ptr;
+            picked_len = fn.name_len;
+            break;
+        }
+    }
+    if (picked_ptr == 0 && g_compiler_ctx.all_func_sigs != 0) {
+        var sn: u64 = g_compiler_ctx.all_func_sigs.len();
+        for (var j: u64 = 0; j < sn; j++) {
+            var sig: *AstFunc = g_compiler_ctx.all_func_sigs.get(j);
+            if (sig == 0) { continue; }
+            if (property_hook_name_matches(sig.name_ptr, sig.name_len, field.setter_hook_ptr, field.setter_hook_len) == 0) { continue; }
+            any_name_match = 1;
+            picked_ptr = sig.name_ptr;
+            picked_len = sig.name_len;
+            break;
+        }
+    }
+
+    if (any_name_match == 0) {
+        property_hook_emit_field_error(field, "setter hook function not found");
+        return 0;
+    }
+    if (picked_ptr != 0 && picked_len != 0) {
+        field.setter_hook_ptr = picked_ptr;
+        field.setter_hook_len = picked_len;
+    }
+    return 1;
+}
+
+func property_hook_validate_manual_getter(field: *FieldDesc) -> u64 {
+    if (field == 0) { return 1; }
+    if (field.getter_hook_mode != FIELD_HOOK_MANUAL) { return 1; }
+    var any_name_match: u64 = 0;
+
+    if (g_compiler_ctx.all_funcs != 0) {
+        var n: u64 = g_compiler_ctx.all_funcs.len();
+        for (var i: u64 = 0; i < n; i++) {
+            var fn: *AstFunc = g_compiler_ctx.all_funcs.get(i);
+            if (fn == 0) { continue; }
+            if (property_hook_name_matches(fn.name_ptr, fn.name_len, field.getter_hook_ptr, field.getter_hook_len) == 0) { continue; }
+            any_name_match = 1;
+            var params: *Vec<*Param> = fn.params_vec;
+            if (params == 0 || params.len() != 1) { continue; }
+            var p0: *Param = params.get(0);
+            if (property_hook_validate_self_param(field, p0) == 0) { continue; }
+            if (property_hook_field_matches_return(field, fn) == 0) { continue; }
+            field.getter_hook_ptr = fn.name_ptr;
+            field.getter_hook_len = fn.name_len;
+            return 1;
+        }
+    }
+    if (g_compiler_ctx.all_func_sigs != 0) {
+        var sn: u64 = g_compiler_ctx.all_func_sigs.len();
+        for (var j: u64 = 0; j < sn; j++) {
+            var sig: *AstFunc = g_compiler_ctx.all_func_sigs.get(j);
+            if (sig == 0) { continue; }
+            if (property_hook_name_matches(sig.name_ptr, sig.name_len, field.getter_hook_ptr, field.getter_hook_len) == 0) { continue; }
+            any_name_match = 1;
+            var sparams: *Vec<*Param> = sig.params_vec;
+            if (sparams == 0 || sparams.len() != 1) { continue; }
+            var sp0: *Param = sparams.get(0);
+            if (property_hook_validate_self_param(field, sp0) == 0) { continue; }
+            if (property_hook_field_matches_return(field, sig) == 0) { continue; }
+            field.getter_hook_ptr = sig.name_ptr;
+            field.getter_hook_len = sig.name_len;
+            return 1;
+        }
+    }
+
+    if (any_name_match == 0) {
+        property_hook_emit_field_error(field, "getter hook function not found");
+        return 0;
+    }
+    property_hook_emit_field_error(field, "getter hook signature mismatch");
+    return 1;
+}
+
+func property_hook_create_value_param(field: *FieldDesc) -> *Param {
+    var p: *Param = new Param();
+    p.name_ptr = (u64)"val";
+    p.name_len = 3;
+    p.type_kind = field.type_kind;
+    p.ptr_depth = field.ptr_depth;
+    p.is_tagged = field.is_tagged;
+    p.struct_name_ptr = field.struct_name_ptr;
+    p.struct_name_len = field.struct_name_len;
+    p.tag_layout_ptr = field.tag_layout_ptr;
+    p.tag_layout_len = field.tag_layout_len;
+    p.elem_type_kind = field.elem_type_kind;
+    p.elem_ptr_depth = field.elem_ptr_depth;
+    p.array_len = field.array_len;
+    p.elem_typeinfo = field.elem_typeinfo;
+    p.is_variadic = 0;
+    p.has_default = 0;
+    return p;
+}
+
+func property_hook_create_auto_setter(field: *FieldDesc) -> u64 {
+    if (field == 0 || field.setter_hook_mode != FIELD_HOOK_AUTO) { return 1; }
+    var name: *NameInfo = property_hook_build_name(field.owner_struct_ptr, field.owner_struct_len, "set", 3, field.name_ptr, field.name_len);
+    if (sym_func_exists(name.ptr, name.len) != 0) {
+        property_hook_emit_field_error(field, "auto setter name collision");
+        return 0;
+    }
+
+    var params: *Vec<*Param> = new Vec<*Param>(2);
+    var self_param: *Param = new Param();
+    self_param.set_as_self_param(field.owner_struct_ptr, field.owner_struct_len);
+    params.push(self_param);
+    params.push(property_hook_create_value_param(field));
+
+    var stmts: *Vec<*AstNode> = new Vec<*AstNode>(1);
+    var target: *AstNode = ast_raw_member_access((*AstNode)ast_ident("self", 4), field.name_ptr, field.name_len);
+    var value: *AstNode = ast_ident("val", 3);
+    stmts.push((*AstNode)ast_assign(target, value));
+    var body: *AstNode = (*AstNode)ast_block(stmts);
+
+    var fn: *AstFunc = ast_func_ex(name.ptr, name.len, params, TYPE_VOID, 0, 0, 0, 0, 0, 0, body);
+    if (g_compiler_ctx.all_funcs == 0) { g_compiler_ctx.all_funcs = new Vec<*AstFunc>(8); }
+    if (g_compiler_ctx.all_func_sigs == 0) { g_compiler_ctx.all_func_sigs = new Vec<*AstFunc>(8); }
+    g_compiler_ctx.all_funcs.push(fn);
+    g_compiler_ctx.all_func_sigs.push(annotation_clone_sig(fn, fn.name_ptr, fn.name_len));
+    sym_invalidate_func_lookup();
+
+    field.setter_hook_ptr = name.ptr;
+    field.setter_hook_len = name.len;
+    return 1;
+}
+
+func property_hook_create_auto_getter(field: *FieldDesc) -> u64 {
+    if (field == 0 || field.getter_hook_mode != FIELD_HOOK_AUTO) { return 1; }
+    var name: *NameInfo = property_hook_build_name(field.owner_struct_ptr, field.owner_struct_len, "get", 3, field.name_ptr, field.name_len);
+    if (sym_func_exists(name.ptr, name.len) != 0) {
+        property_hook_emit_field_error(field, "auto getter name collision");
+        return 0;
+    }
+
+    var ret_type: u64 = field.type_kind;
+    var ret_ptr_depth: u64 = field.ptr_depth;
+    var ret_is_tagged: u64 = field.is_tagged;
+    var ret_struct_ptr: u64 = field.struct_name_ptr;
+    var ret_struct_len: u64 = field.struct_name_len;
+    var ret_tag_ptr: u64 = field.tag_layout_ptr;
+    var ret_tag_len: u64 = field.tag_layout_len;
+    if (field.type_kind == TYPE_ARRAY) {
+        ret_type = field.elem_type_kind;
+        ret_ptr_depth = field.elem_ptr_depth + 1;
+        ret_is_tagged = 0;
+        ret_tag_ptr = 0;
+        ret_tag_len = 0;
+    }
+
+    var params: *Vec<*Param> = new Vec<*Param>(1);
+    var self_param: *Param = new Param();
+    self_param.set_as_self_param(field.owner_struct_ptr, field.owner_struct_len);
+    params.push(self_param);
+
+    var stmts: *Vec<*AstNode> = new Vec<*AstNode>(1);
+    var value: *AstNode = ast_raw_member_access((*AstNode)ast_ident("self", 4), field.name_ptr, field.name_len);
+    stmts.push((*AstNode)ast_return(value));
+    var body: *AstNode = (*AstNode)ast_block(stmts);
+
+    var fn: *AstFunc = ast_func_ex(name.ptr, name.len, params, ret_type, ret_ptr_depth, ret_is_tagged, ret_struct_ptr, ret_struct_len, ret_tag_ptr, ret_tag_len, body);
+    if (g_compiler_ctx.all_funcs == 0) { g_compiler_ctx.all_funcs = new Vec<*AstFunc>(8); }
+    if (g_compiler_ctx.all_func_sigs == 0) { g_compiler_ctx.all_func_sigs = new Vec<*AstFunc>(8); }
+    g_compiler_ctx.all_funcs.push(fn);
+    g_compiler_ctx.all_func_sigs.push(annotation_clone_sig(fn, fn.name_ptr, fn.name_len));
+    sym_invalidate_func_lookup();
+
+    field.getter_hook_ptr = name.ptr;
+    field.getter_hook_len = name.len;
+    return 1;
+}
+
+func property_hooks_finalize() -> u64 {
+    if (g_compiler_ctx.all_structs_vec == 0) { return 0; }
+    var sn: u64 = g_compiler_ctx.all_structs_vec.len();
+    for (var si: u64 = 0; si < sn; si++) {
+        if (diag_should_stop_pass() != 0) { break; }
+        var sd: *AstStructDef = g_compiler_ctx.all_structs_vec.get(si);
+        if (sd == 0 || sd.fields_vec == 0) { continue; }
+        var fields: *Vec<*FieldDesc> = sd.fields_vec;
+        var fn: u64 = fields.len();
+        for (var fi: u64 = 0; fi < fn; fi++) {
+            if (diag_should_stop_pass() != 0) { break; }
+            var field: *FieldDesc = fields.get(fi);
+            if (field == 0) { continue; }
+            if (property_hook_parse_field_annotations(field) == 0) { continue; }
+            if (property_hook_create_auto_setter(field) == 0) { continue; }
+            if (property_hook_create_auto_getter(field) == 0) { continue; }
+            if (property_hook_validate_manual_setter(field) == 0) { continue; }
+            property_hook_validate_manual_getter(field);
+        }
+    }
+    return 0;
+}
+
 func validate_global_function_name_collisions_core() -> u64 {
     if (g_compiler_ctx.all_funcs == 0 || g_compiler_ctx.all_globals == 0) { return 0; }
 
@@ -116,6 +465,8 @@ func validate_impl_overrides_core() -> u64 {
 
 func apply_annotations() -> u64 {
     if (g_compiler_ctx.all_funcs == 0) { return 0; }
+    property_hooks_finalize();
+    if (diag_should_stop_pass() != 0) { return 0; }
 
     var original_count: u64 = g_compiler_ctx.all_funcs.len();
     var generated_id: u64 = 0;
