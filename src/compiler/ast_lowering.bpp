@@ -13,6 +13,13 @@ import std.hashmap;
 import ast;
 import types;
 
+var g_lower_parse_sugar_symtab: *HashMap<u64, *TypeInfo> = 0;
+
+func lower_parse_sugar_set_symtab(symtab: *HashMap<u64, *TypeInfo>) -> u64 {
+    g_lower_parse_sugar_symtab = symtab;
+    return 0;
+}
+
 func lower_try_resolve_struct_name(name_ptr: u64, name_len: u64) -> CompilerResolvedStructName {
     var result: CompilerResolvedStructName;
     result.found = 0;
@@ -417,6 +424,97 @@ func lower_parse_sugar_static_method_call(mc: *AstMethodCall, is_safe: u64) -> *
     var lowered_call: *AstCall = ast_call_with_origin_named(lowered_name.ptr, lowered_name.len, mc.args_vec, mc.arg_names_vec, AST_CALL_ORIGIN_MEMBER_LOWERED);
     lower_normalize_direct_call_args(lowered_call);
     return (*AstNode)lowered_call;
+}
+
+func lower_operator_receiver_type(expr: *AstNode) -> *TypeInfo {
+    if (expr == 0) { return 0; }
+    var ti: *TypeInfo = generic_infer_expr_type(expr, g_lower_parse_sugar_symtab);
+    if (ti == 0 || ti.type_kind != TYPE_STRUCT) { return 0; }
+    if (ti.struct_name_ptr == 0 || ti.struct_name_len == 0) {
+        if (ti.struct_def != 0) {
+            ti.struct_name_ptr = ti.struct_def.name_ptr;
+            ti.struct_name_len = ti.struct_def.name_len;
+        }
+    }
+    if (ti.struct_name_ptr == 0 || ti.struct_name_len == 0) { return 0; }
+    if (get_struct_def(ti.struct_name_ptr, ti.struct_name_len) == 0) { return 0; }
+    return ti;
+}
+
+func lower_operator_arg_type_vec1(arg0: *AstNode) -> *Vec<*TypeInfo> {
+    var out: *Vec<*TypeInfo> = new Vec<*TypeInfo>(1);
+    out.push(generic_infer_expr_type(arg0, g_lower_parse_sugar_symtab));
+    return out;
+}
+
+func lower_operator_arg_type_vec2(arg0: *AstNode, arg1: *AstNode) -> *Vec<*TypeInfo> {
+    var out: *Vec<*TypeInfo> = new Vec<*TypeInfo>(2);
+    out.push(generic_infer_expr_type(arg0, g_lower_parse_sugar_symtab));
+    out.push(generic_infer_expr_type(arg1, g_lower_parse_sugar_symtab));
+    return out;
+}
+
+func lower_operator_can_dispatch(receiver: *AstNode, method_ptr: u64, method_len: u64, arg_types: *Vec<*TypeInfo>, arg_count_hint: u64) -> u64 {
+    var recv_ti: *TypeInfo = lower_operator_receiver_type(receiver);
+    if (recv_ti == 0) { return 0; }
+
+    var resolved: CompilerMethodResolveResult = sym_resolve_method_overload_with_count_fallback(
+        recv_ti.struct_name_ptr, recv_ti.struct_name_len,
+        method_ptr, method_len,
+        arg_types, arg_count_hint
+    );
+    if (resolved.found == 0) { return 0; }
+
+    if (check_method_access_overload(recv_ti.struct_name_ptr, recv_ti.struct_name_len, method_ptr, method_len, arg_types, arg_count_hint) == 0) {
+        emit_stderr("[ERROR] Cannot access overloaded operator method: ");
+        emit_stderr_len(recv_ti.struct_name_ptr, recv_ti.struct_name_len);
+        emit_stderr(".");
+        emit_stderr_len(method_ptr, method_len);
+        emit_stderr("\n");
+        diag_error("Compiler error");
+    }
+    return 1;
+}
+
+func lower_parse_sugar_binary_operator(bin: *AstBinary) -> *AstNode {
+    if (bin == 0) { return 0; }
+    var method_name: *NameInfo = compiler_operator_binary_name(bin.op);
+    if (method_name == 0) { return (*AstNode)bin; }
+
+    var arg_types: *Vec<*TypeInfo> = lower_operator_arg_type_vec1(bin.right);
+    if (lower_operator_can_dispatch(bin.left, method_name.ptr, method_name.len, arg_types, 1) == 0) {
+        return (*AstNode)bin;
+    }
+
+    var args: *Vec<*AstNode> = new Vec<*AstNode>(1);
+    args.push(bin.right);
+    return (*AstNode)ast_method_call(bin.left, method_name.ptr, method_name.len, args);
+}
+
+func lower_parse_sugar_unary_operator(un: *AstUnary) -> *AstNode {
+    if (un == 0) { return 0; }
+    var method_name: *NameInfo = compiler_operator_unary_name(un.op);
+    if (method_name == 0) { return (*AstNode)un; }
+
+    if (lower_operator_can_dispatch(un.operand, method_name.ptr, method_name.len, 0, 0) == 0) {
+        return (*AstNode)un;
+    }
+
+    var args: *Vec<*AstNode> = new Vec<*AstNode>(0);
+    return (*AstNode)ast_method_call(un.operand, method_name.ptr, method_name.len, args);
+}
+
+func lower_parse_sugar_index_operator(ix: *AstIndex) -> *AstNode {
+    if (ix == 0) { return 0; }
+    var method_name: *NameInfo = compiler_operator_index_get_name();
+    var arg_types: *Vec<*TypeInfo> = lower_operator_arg_type_vec1(ix.index);
+    if (lower_operator_can_dispatch(ix.base, method_name.ptr, method_name.len, arg_types, 1) == 0) {
+        return (*AstNode)ix;
+    }
+
+    var args: *Vec<*AstNode> = new Vec<*AstNode>(1);
+    args.push(ix.index);
+    return (*AstNode)ast_method_call(ix.base, method_name.ptr, method_name.len, args);
 }
 
 const COMPILER_EXC_STATE_NONE = 0;
@@ -966,4 +1064,3 @@ func lower_parse_sugar_stmt(stmt: *AstNode) -> u64 {
     var walker: CompilerAstWalker = ast_walker_new(COMPILER_AST_WALK_LOWER_PARSE_SUGAR, 0, 0);
     return ast_walker_walk_stmt(&walker, stmt);
 }
-
