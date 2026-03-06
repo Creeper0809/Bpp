@@ -2608,6 +2608,96 @@ func cg_binary_emit_int_op(op: u64, use_signed: u64) -> u64 {
     return;
 }
 
+func cg_binary_is_number_type(ti: *TypeInfo) -> u64 {
+    if (ti == 0 || ti.ptr_depth != 0 || ti.type_kind != TYPE_STRUCT) { return 0; }
+    if (ti.struct_name_ptr == 0 || ti.struct_name_len == 0) {
+        if (ti.struct_def != 0) {
+            ti.struct_name_ptr = ti.struct_def.name_ptr;
+            ti.struct_name_len = ti.struct_def.name_len;
+        }
+    }
+    if (ti.struct_name_ptr == 0 || ti.struct_name_len == 0) { return 0; }
+    if (str_eq(ti.struct_name_ptr, ti.struct_name_len, "Number", 6) != 0) { return 1; }
+    if (str_eq(ti.struct_name_ptr, ti.struct_name_len, "std_number__Number", 18) != 0) { return 1; }
+    return 0;
+}
+
+func cg_binary_is_addressable(node: *AstNode) -> u64 {
+    if (node == 0) { return 0; }
+    var kind: u64 = ast_kind(node);
+    if (kind == AST_IDENT || kind == AST_DEREF || kind == AST_DEREF8 || kind == AST_INDEX || kind == AST_MEMBER_ACCESS) {
+        return 1;
+    }
+    return 0;
+}
+
+func cg_binary_is_integer_expr(node: *AstNode) -> u64 {
+    if (node == 0) { return 0; }
+    var kind: u64 = ast_kind(node);
+    if (kind == AST_LITERAL) { return 1; }
+    if (kind == AST_UNARY) {
+        var un: *AstUnary = (*AstUnary)node;
+        if (un.op == TOKEN_MINUS && un.operand != 0 && ast_kind(un.operand) == AST_LITERAL) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+func cg_binary_emit_number_cmp(binary: *AstBinary, left_ti: *TypeInfo, right_ti: *TypeInfo, symtab: *Symtab, op: u64) -> u64 {
+    var left: *AstNode = binary.left;
+    var right: *AstNode = binary.right;
+    var left_is_number: u64 = cg_binary_is_number_type(left_ti);
+    var right_is_number: u64 = cg_binary_is_number_type(right_ti);
+    if (left_is_number == 0 && right_is_number == 0) { return 0; }
+
+    if (left_is_number != 0 && right_is_number != 0 &&
+        cg_binary_is_addressable(left) != 0 && cg_binary_is_addressable(right) != 0) {
+        cg_lvalue((u64)left);
+        emit("    push rax\n");
+        cg_lvalue((u64)right);
+        emit("    mov rsi, rax\n");
+        emit("    pop rdi\n");
+        emit("    call std_number__number_eq_ptr\n");
+        if (op == TOKEN_BANGEQ) {
+            emit("    cmp rax, 0\n");
+            emit("    sete al\n");
+            emit("    movzx rax, al\n");
+        }
+        return 1;
+    }
+
+    if (left_is_number != 0 && cg_binary_is_addressable(left) != 0 && cg_binary_is_integer_expr(right) != 0) {
+        cg_lvalue((u64)left);
+        emit("    push rax\n");
+        cg_expr((u64)right);
+        emit("    mov rsi, rax\n");
+        emit("    pop rdi\n");
+        emit("    call std_number__number_cmp_i64_ptr\n");
+        emit("    cmp rax, 0\n");
+        if (op == TOKEN_BANGEQ) { emit("    setne al\n"); }
+        else { emit("    sete al\n"); }
+        emit("    movzx rax, al\n");
+        return 1;
+    }
+
+    if (right_is_number != 0 && cg_binary_is_addressable(right) != 0 && cg_binary_is_integer_expr(left) != 0) {
+        cg_lvalue((u64)right);
+        emit("    push rax\n");
+        cg_expr((u64)left);
+        emit("    mov rsi, rax\n");
+        emit("    pop rdi\n");
+        emit("    call std_number__number_cmp_i64_ptr\n");
+        emit("    cmp rax, 0\n");
+        if (op == TOKEN_BANGEQ) { emit("    setne al\n"); }
+        else { emit("    sete al\n"); }
+        emit("    movzx rax, al\n");
+        return 1;
+    }
+
+    return 0;
+}
+
 func cg_binary_expr(node: u64, symtab: *Symtab) -> u64 {
     var binary: *AstBinary = (*AstBinary)node;
     var op: u64 = binary.op;
@@ -2623,6 +2713,14 @@ func cg_binary_expr(node: u64, symtab: *Symtab) -> u64 {
     if (op == TOKEN_OROR) {
         cg_binary_short_circuit_or(left, right);
         return;
+    }
+
+    if (op == TOKEN_EQEQ || op == TOKEN_BANGEQ) {
+        var left_ti_eq: *TypeInfo = get_expr_type_with_symtab((*AstNode)left, symtab);
+        var right_ti_eq: *TypeInfo = get_expr_type_with_symtab((*AstNode)right, symtab);
+        if (cg_binary_emit_number_cmp(binary, left_ti_eq, right_ti_eq, symtab, op) != 0) {
+            return;
+        }
     }
     
     // Standard binary: evaluate both sides
