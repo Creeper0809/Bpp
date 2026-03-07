@@ -607,6 +607,7 @@ func annotation_complexity_rank_name(rank: u64) -> u64 {
         case 6: return "O(n^3)";
         case 7: return "O(2^n)";
         case 8: return "O(n!)";
+        case 13: return "O(n!*poly)";
     }
     return "unknown";
 }
@@ -1702,6 +1703,83 @@ func annotation_complexity_loop_iteration_rank_with_ctx(cond: *AstNode, update_s
     return 3;
 }
 
+func annotation_complexity_loop_has_unresolved_pattern(cond: *AstNode, update_stmt: *AstNode, body_stmt: *AstNode, constraints_ann: *CompilerAnnotationParsed, fallback_bound: u64) -> u64 {
+    var var_ptr: u64 = 0;
+    var var_len: u64 = 0;
+    var bound_expr: *AstNode = 0;
+    var dir: u64 = 0;
+    var sqrt_mode: u64 = 0;
+    if (annotation_complexity_cond_square_var_bound(cond, &var_ptr, &var_len, &bound_expr, &dir) != 0) {
+        sqrt_mode = 1;
+    } else if (annotation_complexity_cond_var_bound(cond, &var_ptr, &var_len, &bound_expr, &dir) == 0) {
+        return 1;
+    }
+
+    var update_kind: u64 = ANN_LOOP_UPDATE_NONE;
+    if (update_stmt != 0) { update_kind = annotation_complexity_update_kind_from_stmt(update_stmt, var_ptr, var_len); }
+    if (update_kind == ANN_LOOP_UPDATE_NONE && body_stmt != 0) {
+        update_kind = annotation_complexity_update_kind_from_stmt(body_stmt, var_ptr, var_len);
+    }
+
+    if (dir == 1 && update_kind == ANN_LOOP_UPDATE_GEO_INC) { return 0; }
+    if (dir == 2 && update_kind == ANN_LOOP_UPDATE_GEO_DEC) { return 0; }
+    if (dir == 1 && update_kind == ANN_LOOP_UPDATE_LINEAR_INC) { return 0; }
+    if (dir == 2 && update_kind == ANN_LOOP_UPDATE_LINEAR_DEC) { return 0; }
+
+    if (bound_expr != 0 && annotation_complexity_expr_bound(bound_expr, constraints_ann, fallback_bound) <= 1) { return 0; }
+    if (sqrt_mode != 0) { return 1; }
+    return 1;
+}
+
+func annotation_complexity_stmt_has_unresolved_loop(stmt: *AstNode, constraints_ann: *CompilerAnnotationParsed, fallback_bound: u64) -> u64 {
+    if (stmt == 0) { return 0; }
+    var kind: u64 = ast_kind(stmt);
+    if (kind == AST_WHILE) {
+        var wl: *AstWhile = (*AstWhile)stmt;
+        if (annotation_complexity_loop_has_unresolved_pattern(wl.cond, 0, wl.body, constraints_ann, fallback_bound) != 0) { return 1; }
+        return annotation_complexity_stmt_has_unresolved_loop(wl.body, constraints_ann, fallback_bound);
+    }
+    if (kind == AST_FOR) {
+        var fr: *AstFor = (*AstFor)stmt;
+        if (annotation_complexity_loop_has_unresolved_pattern(fr.cond, fr.update, fr.body, constraints_ann, fallback_bound) != 0) { return 1; }
+        if (annotation_complexity_stmt_has_unresolved_loop(fr.init, constraints_ann, fallback_bound) != 0) { return 1; }
+        return annotation_complexity_stmt_has_unresolved_loop(fr.body, constraints_ann, fallback_bound);
+    }
+    if (kind == AST_DO_WHILE) {
+        var dw: *AstDoWhile = (*AstDoWhile)stmt;
+        if (annotation_complexity_loop_has_unresolved_pattern(dw.cond, 0, dw.body, constraints_ann, fallback_bound) != 0) { return 1; }
+        return annotation_complexity_stmt_has_unresolved_loop(dw.body, constraints_ann, fallback_bound);
+    }
+    if (kind == AST_BLOCK) {
+        var blk: *AstBlock = (*AstBlock)stmt;
+        if (blk.stmts_vec != 0) {
+            var bn: u64 = blk.stmts_vec.len();
+            for (var bi: u64 = 0; bi < bn; bi++) {
+                if (annotation_complexity_stmt_has_unresolved_loop(blk.stmts_vec.get(bi), constraints_ann, fallback_bound) != 0) { return 1; }
+            }
+        }
+        return 0;
+    }
+    if (kind == AST_IF) {
+        var ifs: *AstIf = (*AstIf)stmt;
+        if (annotation_complexity_stmt_has_unresolved_loop(ifs.then_block, constraints_ann, fallback_bound) != 0) { return 1; }
+        return annotation_complexity_stmt_has_unresolved_loop(ifs.else_block, constraints_ann, fallback_bound);
+    }
+    if (kind == AST_SWITCH || kind == AST_MATCH) {
+        var sw: *AstSwitch = (*AstSwitch)stmt;
+        if (sw.cases_vec != 0) {
+            var cn: u64 = sw.cases_vec.len();
+            for (var ci: u64 = 0; ci < cn; ci++) {
+                if (annotation_complexity_stmt_has_unresolved_loop(sw.cases_vec.get(ci), constraints_ann, fallback_bound) != 0) { return 1; }
+            }
+        }
+        return 0;
+    }
+    if (kind == AST_CASE) { return annotation_complexity_stmt_has_unresolved_loop(((*AstCase)stmt).body, constraints_ann, fallback_bound); }
+    if (kind == AST_DEFER) { return annotation_complexity_stmt_has_unresolved_loop(((*AstDefer)stmt).stmt, constraints_ann, fallback_bound); }
+    return 0;
+}
+
 func annotation_complexity_loop_iterations(cond: *AstNode, constraints_ann: *CompilerAnnotationParsed, fallback_bound: u64) -> u64 {
     return annotation_complexity_loop_iterations_with_ctx(cond, 0, 0, constraints_ann, fallback_bound);
 }
@@ -1711,18 +1789,21 @@ func annotation_complexity_rank_mul(lhs_rank: u64, rhs_rank: u64) -> u64 {
     if (rhs_rank == 0) { return lhs_rank; }
     if (lhs_rank == 1) { return rhs_rank; }
     if (rhs_rank == 1) { return lhs_rank; }
-    if (lhs_rank == 7 || lhs_rank == 8 || rhs_rank == 7 || rhs_rank == 8) { return 7; }
+    if (lhs_rank == 13 || rhs_rank == 13) { return 13; }
+    if (lhs_rank == 8 || rhs_rank == 8) { return 13; }
+    if (lhs_rank == 7 || rhs_rank == 7) { return 7; }
     if (lhs_rank == 12 && rhs_rank == 12) { return 12; } // polylog * polylog -> polylog
     if ((lhs_rank == 12 && rhs_rank == 2) || (lhs_rank == 2 && rhs_rank == 12)) { return 12; }
-    if ((lhs_rank == 12 && rhs_rank == 11) || (lhs_rank == 11 && rhs_rank == 12)) { return 11; }
-    if ((lhs_rank == 12 && rhs_rank == 10) || (lhs_rank == 10 && rhs_rank == 12)) { return 10; }
+    // Conservative uplift for missing fractional-polylog buckets.
+    if ((lhs_rank == 12 && rhs_rank == 11) || (lhs_rank == 11 && rhs_rank == 12)) { return 10; }
+    if ((lhs_rank == 12 && rhs_rank == 10) || (lhs_rank == 10 && rhs_rank == 12)) { return 3; }
     if ((lhs_rank == 12 && rhs_rank == 3) || (lhs_rank == 3 && rhs_rank == 12)) { return 5; } // n*polylog ~= conservative n^2
     if ((lhs_rank == 12 && rhs_rank == 9) || (lhs_rank == 9 && rhs_rank == 12)) { return 5; }
     if ((lhs_rank == 12 && rhs_rank == 4) || (lhs_rank == 4 && rhs_rank == 12)) { return 5; }
     if ((lhs_rank == 12 && rhs_rank == 5) || (lhs_rank == 5 && rhs_rank == 12)) { return 6; }
     if (lhs_rank == 11 && rhs_rank == 11) { return 10; } // n^(1/4)*n^(1/4)=sqrt(n)
     if ((lhs_rank == 11 && rhs_rank == 10) || (lhs_rank == 10 && rhs_rank == 11)) { return 3; } // n^(3/4) -> n bucket
-    if ((lhs_rank == 11 && rhs_rank == 2) || (lhs_rank == 2 && rhs_rank == 11)) { return 11; } // n^(1/4)logn -> n^(1/4) bucket
+    if ((lhs_rank == 11 && rhs_rank == 2) || (lhs_rank == 2 && rhs_rank == 11)) { return 10; } // conservative uplift
     if ((lhs_rank == 11 && rhs_rank == 3) || (lhs_rank == 3 && rhs_rank == 11)) { return 5; } // n^(5/4) -> n^2 bucket
     if ((lhs_rank == 11 && rhs_rank == 9) || (lhs_rank == 9 && rhs_rank == 11)) { return 5; }
     if ((lhs_rank == 11 && rhs_rank == 4) || (lhs_rank == 4 && rhs_rank == 11)) { return 6; }
@@ -1902,10 +1983,28 @@ func annotation_complexity_estimate_ops(rank: u64, n_bound: u64) -> u64 {
         var sq: u64 = annotation_complexity_sat_mul(n_bound, n_bound, cap);
         return annotation_complexity_sat_mul(sq, n_bound, cap);
     }
-    if (rank == 7 || rank == 8) {
-        // Treat exponential/factorial as quickly exploding.
+    if (rank == 7) {
+        // Exponential growth.
         if (n_bound >= 63) { return cap; }
         return (1 << n_bound);
+    }
+    if (rank == 8) {
+        // Factorial growth (strictly stronger than exponential).
+        if (n_bound >= 21) { return cap; }
+        var fac: u64 = 1;
+        for (var i: u64 = 2; i <= n_bound; i++) {
+            fac = annotation_complexity_sat_mul(fac, i, cap);
+        }
+        return fac;
+    }
+    if (rank == 13) {
+        // n! multiplied by at least polynomial/log factors.
+        if (n_bound >= 20) { return cap; }
+        var fac2: u64 = 1;
+        for (var j: u64 = 2; j <= n_bound; j++) {
+            fac2 = annotation_complexity_sat_mul(fac2, j, cap);
+        }
+        return annotation_complexity_sat_mul(fac2, n_bound + 1, cap);
     }
     return 0;
 }
@@ -1924,6 +2023,7 @@ func annotation_complexity_rank_order(rank: u64) -> u64 {
         case 6: return 10; // O(n^3)
         case 7: return 11; // O(2^n)
         case 8: return 12; // O(n!)
+        case 13: return 13; // O(n!*poly)
     }
     return 0;
 }
@@ -2224,11 +2324,23 @@ func annotation_complexity_scan_expr_for_self_calls(expr: *AstNode, fn_name_ptr:
     return 0;
 }
 
+func annotation_complexity_name_matches_mangled_suffix(full_ptr: u64, full_len: u64, target_ptr: u64, target_len: u64) -> u64 {
+    if (full_ptr == 0 || full_len == 0 || target_ptr == 0 || target_len == 0) { return 0; }
+    if (full_len < target_len + 2) { return 0; }
+    var off: u64 = full_len - target_len;
+    var full: []u8 = slice(full_ptr, full_len);
+    if (full[off - 1] == 95 && full[off - 2] == 95 &&
+        str_eq(full_ptr + off, target_len, target_ptr, target_len) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
 func annotation_complexity_name_matches_self_call(call_ptr: u64, call_len: u64, fn_ptr: u64, fn_len: u64) -> u64 {
     if (call_ptr == 0 || call_len == 0 || fn_ptr == 0 || fn_len == 0) { return 0; }
     if (str_eq(call_ptr, call_len, fn_ptr, fn_len) != 0) { return 1; }
-    if (call_name_matches_tail(call_ptr, call_len, fn_ptr, fn_len) != 0) { return 1; }
-    if (call_name_matches_tail(fn_ptr, fn_len, call_ptr, call_len) != 0) { return 1; }
+    if (annotation_complexity_name_matches_mangled_suffix(call_ptr, call_len, fn_ptr, fn_len) != 0) { return 1; }
+    if (annotation_complexity_name_matches_mangled_suffix(fn_ptr, fn_len, call_ptr, call_len) != 0) { return 1; }
     return 0;
 }
 
@@ -2989,11 +3101,362 @@ func annotation_complexity_has_sieve_like_pattern_stmt(stmt: *AstNode) -> u64 {
 
 func annotation_complexity_name_contains(name_ptr: u64, name_len: u64, needle_ptr: u64, needle_len: u64) -> u64 {
     if (name_ptr == 0 || name_len == 0 || needle_ptr == 0 || needle_len == 0 || needle_len > name_len) { return 0; }
-    var s: []u8 = slice(name_ptr, name_len);
     var i: u64 = 0;
     while (i + needle_len <= name_len) {
         if (str_eq(name_ptr + i, needle_len, needle_ptr, needle_len) != 0) { return 1; }
         i = i + 1;
+    }
+    return 0;
+}
+
+func annotation_complexity_name_token_char(ch: u64) -> u64 {
+    if ((ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122)) { return 1; }
+    return 0;
+}
+
+func annotation_complexity_name_contains_token(name_ptr: u64, name_len: u64, token_ptr: u64, token_len: u64) -> u64 {
+    if (name_ptr == 0 || name_len == 0 || token_ptr == 0 || token_len == 0 || token_len > name_len) { return 0; }
+    var s: []u8 = slice(name_ptr, name_len);
+    var i: u64 = 0;
+    while (i + token_len <= name_len) {
+        if (str_eq(name_ptr + i, token_len, token_ptr, token_len) != 0) {
+            var left_ok: u64 = 0;
+            var right_ok: u64 = 0;
+            if (i == 0) { left_ok = 1; }
+            else if (annotation_complexity_name_token_char(s[i - 1]) == 0) { left_ok = 1; }
+            var end_idx: u64 = i + token_len;
+            if (end_idx >= name_len) { right_ok = 1; }
+            else if (annotation_complexity_name_token_char(s[end_idx]) == 0) { right_ok = 1; }
+            if (left_ok != 0 && right_ok != 0) { return 1; }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+func annotation_complexity_expr_has_call_token(expr: *AstNode, token_ptr: u64, token_len: u64) -> u64 {
+    if (expr == 0 || token_ptr == 0 || token_len == 0) { return 0; }
+    var kind: u64 = ast_kind(expr);
+    var nref: AstNodeTagRef;
+    nref.node = expr;
+    switch (kind) {
+        case AST_CALL:
+            if (annotation_complexity_name_contains_token(nref.call.name_ptr, nref.call.name_len, token_ptr, token_len) != 0) { return 1; }
+            if (nref.call.args_vec != 0) {
+                var an: u64 = nref.call.args_vec.len();
+                for (var i: u64 = 0; i < an; i++) {
+                    if (annotation_complexity_expr_has_call_token(nref.call.args_vec.get(i), token_ptr, token_len) != 0) { return 1; }
+                }
+            }
+            return 0;
+        case AST_GENERIC_CALL:
+            if (annotation_complexity_name_contains_token(nref.generic_call.name_ptr, nref.generic_call.name_len, token_ptr, token_len) != 0) { return 1; }
+            if (nref.generic_call.args_vec != 0) {
+                var gn: u64 = nref.generic_call.args_vec.len();
+                for (var gi: u64 = 0; gi < gn; gi++) {
+                    if (annotation_complexity_expr_has_call_token(nref.generic_call.args_vec.get(gi), token_ptr, token_len) != 0) { return 1; }
+                }
+            }
+            return 0;
+        case AST_STATIC_GENERIC_CALL:
+            if (annotation_complexity_name_contains_token(nref.static_generic_call.method_ptr, nref.static_generic_call.method_len, token_ptr, token_len) != 0) { return 1; }
+            if (nref.static_generic_call.args_vec != 0) {
+                var sn: u64 = nref.static_generic_call.args_vec.len();
+                for (var si: u64 = 0; si < sn; si++) {
+                    if (annotation_complexity_expr_has_call_token(nref.static_generic_call.args_vec.get(si), token_ptr, token_len) != 0) { return 1; }
+                }
+            }
+            return 0;
+        case AST_METHOD_CALL:
+        case AST_SAFE_METHOD_CALL:
+            if (annotation_complexity_name_contains_token(nref.method_call.method_ptr, nref.method_call.method_len, token_ptr, token_len) != 0) { return 1; }
+            if (annotation_complexity_expr_has_call_token(nref.method_call.receiver, token_ptr, token_len) != 0) { return 1; }
+            if (nref.method_call.args_vec != 0) {
+                var mn: u64 = nref.method_call.args_vec.len();
+                for (var mi: u64 = 0; mi < mn; mi++) {
+                    if (annotation_complexity_expr_has_call_token(nref.method_call.args_vec.get(mi), token_ptr, token_len) != 0) { return 1; }
+                }
+            }
+            return 0;
+        case AST_CALL_PTR:
+            if (nref.call_ptr.callee != 0 && ast_kind(nref.call_ptr.callee) == AST_IDENT) {
+                var cid: *AstIdent = (*AstIdent)nref.call_ptr.callee;
+                if (annotation_complexity_name_contains_token(cid.name_ptr, cid.name_len, token_ptr, token_len) != 0) { return 1; }
+            }
+            if (annotation_complexity_expr_has_call_token(nref.call_ptr.callee, token_ptr, token_len) != 0) { return 1; }
+            if (nref.call_ptr.args_vec != 0) {
+                var pn: u64 = nref.call_ptr.args_vec.len();
+                for (var pi: u64 = 0; pi < pn; pi++) {
+                    if (annotation_complexity_expr_has_call_token(nref.call_ptr.args_vec.get(pi), token_ptr, token_len) != 0) { return 1; }
+                }
+            }
+            return 0;
+        case AST_BINARY:
+            if (annotation_complexity_expr_has_call_token(nref.binary.left, token_ptr, token_len) != 0) { return 1; }
+            if (annotation_complexity_expr_has_call_token(nref.binary.right, token_ptr, token_len) != 0) { return 1; }
+            return 0;
+        case AST_UNARY:
+            return annotation_complexity_expr_has_call_token(nref.unary.operand, token_ptr, token_len);
+        case AST_INDEX:
+        case AST_SAFE_INDEX:
+            if (annotation_complexity_expr_has_call_token(nref.index_expr.base, token_ptr, token_len) != 0) { return 1; }
+            if (annotation_complexity_expr_has_call_token(nref.index_expr.index, token_ptr, token_len) != 0) { return 1; }
+            return 0;
+        case AST_MEMBER_ACCESS:
+        case AST_SAFE_MEMBER_ACCESS:
+            return annotation_complexity_expr_has_call_token(nref.member_access.object, token_ptr, token_len);
+        case AST_CAST:
+            return annotation_complexity_expr_has_call_token(nref.cast_expr.expr, token_ptr, token_len);
+        case AST_ADDR_OF:
+            return annotation_complexity_expr_has_call_token(nref.addr_of.operand, token_ptr, token_len);
+        case AST_DEREF:
+            return annotation_complexity_expr_has_call_token(nref.deref.operand, token_ptr, token_len);
+        case AST_DEREF8:
+            return annotation_complexity_expr_has_call_token(nref.deref8.operand, token_ptr, token_len);
+        case AST_TRY:
+            return annotation_complexity_expr_has_call_token(nref.try_expr.operand, token_ptr, token_len);
+        case AST_TERNARY:
+            if (annotation_complexity_expr_has_call_token(nref.ternary_expr.cond, token_ptr, token_len) != 0) { return 1; }
+            if (annotation_complexity_expr_has_call_token(nref.ternary_expr.then_expr, token_ptr, token_len) != 0) { return 1; }
+            if (annotation_complexity_expr_has_call_token(nref.ternary_expr.else_expr, token_ptr, token_len) != 0) { return 1; }
+            return 0;
+    }
+    return 0;
+}
+
+func annotation_complexity_stmt_has_call_token(stmt: *AstNode, token_ptr: u64, token_len: u64) -> u64 {
+    if (stmt == 0 || token_ptr == 0 || token_len == 0) { return 0; }
+    var kind: u64 = ast_kind(stmt);
+    switch (kind) {
+        case AST_BLOCK:
+            var blk: *AstBlock = (*AstBlock)stmt;
+            if (blk.stmts_vec != 0) {
+                var bn: u64 = blk.stmts_vec.len();
+                for (var bi: u64 = 0; bi < bn; bi++) {
+                    if (annotation_complexity_stmt_has_call_token(blk.stmts_vec.get(bi), token_ptr, token_len) != 0) { return 1; }
+                }
+            }
+            return 0;
+        case AST_IF:
+            var ifs: *AstIf = (*AstIf)stmt;
+            if (annotation_complexity_expr_has_call_token(ifs.cond, token_ptr, token_len) != 0) { return 1; }
+            if (annotation_complexity_stmt_has_call_token(ifs.then_block, token_ptr, token_len) != 0) { return 1; }
+            return annotation_complexity_stmt_has_call_token(ifs.else_block, token_ptr, token_len);
+        case AST_WHILE:
+            var wl: *AstWhile = (*AstWhile)stmt;
+            if (annotation_complexity_expr_has_call_token(wl.cond, token_ptr, token_len) != 0) { return 1; }
+            return annotation_complexity_stmt_has_call_token(wl.body, token_ptr, token_len);
+        case AST_FOR:
+            var fr: *AstFor = (*AstFor)stmt;
+            if (annotation_complexity_stmt_has_call_token(fr.init, token_ptr, token_len) != 0) { return 1; }
+            if (annotation_complexity_expr_has_call_token(fr.cond, token_ptr, token_len) != 0) { return 1; }
+            if (annotation_complexity_expr_has_call_token(fr.update, token_ptr, token_len) != 0) { return 1; }
+            return annotation_complexity_stmt_has_call_token(fr.body, token_ptr, token_len);
+        case AST_DO_WHILE:
+            var dw: *AstDoWhile = (*AstDoWhile)stmt;
+            if (annotation_complexity_stmt_has_call_token(dw.body, token_ptr, token_len) != 0) { return 1; }
+            return annotation_complexity_expr_has_call_token(dw.cond, token_ptr, token_len);
+        case AST_SWITCH:
+        case AST_MATCH:
+            var sw: *AstSwitch = (*AstSwitch)stmt;
+            if (annotation_complexity_expr_has_call_token(sw.expr, token_ptr, token_len) != 0) { return 1; }
+            if (sw.cases_vec != 0) {
+                var cn: u64 = sw.cases_vec.len();
+                for (var ci: u64 = 0; ci < cn; ci++) {
+                    if (annotation_complexity_stmt_has_call_token(sw.cases_vec.get(ci), token_ptr, token_len) != 0) { return 1; }
+                }
+            }
+            return 0;
+        case AST_CASE:
+            var cs: *AstCase = (*AstCase)stmt;
+            if (annotation_complexity_expr_has_call_token(cs.value, token_ptr, token_len) != 0) { return 1; }
+            return annotation_complexity_stmt_has_call_token(cs.body, token_ptr, token_len);
+        case AST_DEFER:
+            return annotation_complexity_stmt_has_call_token(((*AstDefer)stmt).stmt, token_ptr, token_len);
+        case AST_VAR_DECL:
+            return annotation_complexity_expr_has_call_token(((*AstVarDecl)stmt).init_expr, token_ptr, token_len);
+        case AST_ASSIGN:
+            var asn: *AstAssign = (*AstAssign)stmt;
+            if (annotation_complexity_expr_has_call_token(asn.target, token_ptr, token_len) != 0) { return 1; }
+            return annotation_complexity_expr_has_call_token(asn.value, token_ptr, token_len);
+        case AST_EXPR_STMT:
+            return annotation_complexity_expr_has_call_token(((*AstExprStmt)stmt).expr, token_ptr, token_len);
+        case AST_RETURN:
+            return annotation_complexity_expr_has_call_token(((*AstReturn)stmt).expr, token_ptr, token_len);
+        case AST_DELETE:
+            return annotation_complexity_expr_has_call_token(((*AstDelete)stmt).expr, token_ptr, token_len);
+        case AST_THROW_STMT:
+            return annotation_complexity_expr_has_call_token(((*AstThrowStmt)stmt).expr, token_ptr, token_len);
+    }
+    return 0;
+}
+
+func annotation_complexity_name_matches_symbol(name_ptr: u64, name_len: u64, needle_ptr: u64, needle_len: u64) -> u64 {
+    if (name_ptr == 0 || name_len == 0 || needle_ptr == 0 || needle_len == 0) { return 0; }
+    if (str_eq(name_ptr, name_len, needle_ptr, needle_len) != 0) { return 1; }
+    if (name_len < needle_len + 2) { return 0; }
+    var off: u64 = name_len - needle_len;
+    var full: []u8 = slice(name_ptr, name_len);
+    if (full[off - 1] == 95 && full[off - 2] == 95 &&
+        str_eq(name_ptr + off, needle_len, needle_ptr, needle_len) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+func annotation_complexity_expr_has_strict_call_name(expr: *AstNode, needle_ptr: u64, needle_len: u64) -> u64 {
+    if (expr == 0 || needle_ptr == 0 || needle_len == 0) { return 0; }
+    var kind: u64 = ast_kind(expr);
+    var nref: AstNodeTagRef;
+    nref.node = expr;
+    switch (kind) {
+        case AST_CALL:
+            if (annotation_complexity_name_matches_symbol(nref.call.name_ptr, nref.call.name_len, needle_ptr, needle_len) != 0) { return 1; }
+            if (nref.call.args_vec != 0) {
+                var an: u64 = nref.call.args_vec.len();
+                for (var i: u64 = 0; i < an; i++) {
+                    if (annotation_complexity_expr_has_strict_call_name(nref.call.args_vec.get(i), needle_ptr, needle_len) != 0) { return 1; }
+                }
+            }
+            return 0;
+        case AST_GENERIC_CALL:
+            if (annotation_complexity_name_matches_symbol(nref.generic_call.name_ptr, nref.generic_call.name_len, needle_ptr, needle_len) != 0) { return 1; }
+            if (nref.generic_call.args_vec != 0) {
+                var gn: u64 = nref.generic_call.args_vec.len();
+                for (var gi: u64 = 0; gi < gn; gi++) {
+                    if (annotation_complexity_expr_has_strict_call_name(nref.generic_call.args_vec.get(gi), needle_ptr, needle_len) != 0) { return 1; }
+                }
+            }
+            return 0;
+        case AST_STATIC_GENERIC_CALL:
+            if (annotation_complexity_name_matches_symbol(nref.static_generic_call.method_ptr, nref.static_generic_call.method_len, needle_ptr, needle_len) != 0) { return 1; }
+            if (nref.static_generic_call.args_vec != 0) {
+                var sn: u64 = nref.static_generic_call.args_vec.len();
+                for (var si: u64 = 0; si < sn; si++) {
+                    if (annotation_complexity_expr_has_strict_call_name(nref.static_generic_call.args_vec.get(si), needle_ptr, needle_len) != 0) { return 1; }
+                }
+            }
+            return 0;
+        case AST_METHOD_CALL:
+        case AST_SAFE_METHOD_CALL:
+            if (annotation_complexity_name_matches_symbol(nref.method_call.method_ptr, nref.method_call.method_len, needle_ptr, needle_len) != 0) { return 1; }
+            if (annotation_complexity_expr_has_strict_call_name(nref.method_call.receiver, needle_ptr, needle_len) != 0) { return 1; }
+            if (nref.method_call.args_vec != 0) {
+                var mn: u64 = nref.method_call.args_vec.len();
+                for (var mi: u64 = 0; mi < mn; mi++) {
+                    if (annotation_complexity_expr_has_strict_call_name(nref.method_call.args_vec.get(mi), needle_ptr, needle_len) != 0) { return 1; }
+                }
+            }
+            return 0;
+        case AST_CALL_PTR:
+            if (nref.call_ptr.callee != 0 && ast_kind(nref.call_ptr.callee) == AST_IDENT) {
+                var cid: *AstIdent = (*AstIdent)nref.call_ptr.callee;
+                if (annotation_complexity_name_matches_symbol(cid.name_ptr, cid.name_len, needle_ptr, needle_len) != 0) { return 1; }
+            }
+            if (annotation_complexity_expr_has_strict_call_name(nref.call_ptr.callee, needle_ptr, needle_len) != 0) { return 1; }
+            if (nref.call_ptr.args_vec != 0) {
+                var pn: u64 = nref.call_ptr.args_vec.len();
+                for (var pi: u64 = 0; pi < pn; pi++) {
+                    if (annotation_complexity_expr_has_strict_call_name(nref.call_ptr.args_vec.get(pi), needle_ptr, needle_len) != 0) { return 1; }
+                }
+            }
+            return 0;
+        case AST_BINARY:
+            if (annotation_complexity_expr_has_strict_call_name(nref.binary.left, needle_ptr, needle_len) != 0) { return 1; }
+            if (annotation_complexity_expr_has_strict_call_name(nref.binary.right, needle_ptr, needle_len) != 0) { return 1; }
+            return 0;
+        case AST_UNARY:
+            return annotation_complexity_expr_has_strict_call_name(nref.unary.operand, needle_ptr, needle_len);
+        case AST_INDEX:
+        case AST_SAFE_INDEX:
+            if (annotation_complexity_expr_has_strict_call_name(nref.index_expr.base, needle_ptr, needle_len) != 0) { return 1; }
+            if (annotation_complexity_expr_has_strict_call_name(nref.index_expr.index, needle_ptr, needle_len) != 0) { return 1; }
+            return 0;
+        case AST_MEMBER_ACCESS:
+        case AST_SAFE_MEMBER_ACCESS:
+            return annotation_complexity_expr_has_strict_call_name(nref.member_access.object, needle_ptr, needle_len);
+        case AST_CAST:
+            return annotation_complexity_expr_has_strict_call_name(nref.cast_expr.expr, needle_ptr, needle_len);
+        case AST_ADDR_OF:
+            return annotation_complexity_expr_has_strict_call_name(nref.addr_of.operand, needle_ptr, needle_len);
+        case AST_DEREF:
+            return annotation_complexity_expr_has_strict_call_name(nref.deref.operand, needle_ptr, needle_len);
+        case AST_DEREF8:
+            return annotation_complexity_expr_has_strict_call_name(nref.deref8.operand, needle_ptr, needle_len);
+        case AST_TRY:
+            return annotation_complexity_expr_has_strict_call_name(nref.try_expr.operand, needle_ptr, needle_len);
+        case AST_TERNARY:
+            if (annotation_complexity_expr_has_strict_call_name(nref.ternary_expr.cond, needle_ptr, needle_len) != 0) { return 1; }
+            if (annotation_complexity_expr_has_strict_call_name(nref.ternary_expr.then_expr, needle_ptr, needle_len) != 0) { return 1; }
+            if (annotation_complexity_expr_has_strict_call_name(nref.ternary_expr.else_expr, needle_ptr, needle_len) != 0) { return 1; }
+            return 0;
+    }
+    return 0;
+}
+
+func annotation_complexity_stmt_has_strict_call_name(stmt: *AstNode, needle_ptr: u64, needle_len: u64) -> u64 {
+    if (stmt == 0 || needle_ptr == 0 || needle_len == 0) { return 0; }
+    var kind: u64 = ast_kind(stmt);
+    switch (kind) {
+        case AST_BLOCK:
+            var blk: *AstBlock = (*AstBlock)stmt;
+            if (blk.stmts_vec != 0) {
+                var bn: u64 = blk.stmts_vec.len();
+                for (var bi: u64 = 0; bi < bn; bi++) {
+                    if (annotation_complexity_stmt_has_strict_call_name(blk.stmts_vec.get(bi), needle_ptr, needle_len) != 0) { return 1; }
+                }
+            }
+            return 0;
+        case AST_IF:
+            var ifs: *AstIf = (*AstIf)stmt;
+            if (annotation_complexity_expr_has_strict_call_name(ifs.cond, needle_ptr, needle_len) != 0) { return 1; }
+            if (annotation_complexity_stmt_has_strict_call_name(ifs.then_block, needle_ptr, needle_len) != 0) { return 1; }
+            return annotation_complexity_stmt_has_strict_call_name(ifs.else_block, needle_ptr, needle_len);
+        case AST_WHILE:
+            var wl: *AstWhile = (*AstWhile)stmt;
+            if (annotation_complexity_expr_has_strict_call_name(wl.cond, needle_ptr, needle_len) != 0) { return 1; }
+            return annotation_complexity_stmt_has_strict_call_name(wl.body, needle_ptr, needle_len);
+        case AST_FOR:
+            var fr: *AstFor = (*AstFor)stmt;
+            if (annotation_complexity_stmt_has_strict_call_name(fr.init, needle_ptr, needle_len) != 0) { return 1; }
+            if (annotation_complexity_expr_has_strict_call_name(fr.cond, needle_ptr, needle_len) != 0) { return 1; }
+            if (annotation_complexity_expr_has_strict_call_name(fr.update, needle_ptr, needle_len) != 0) { return 1; }
+            return annotation_complexity_stmt_has_strict_call_name(fr.body, needle_ptr, needle_len);
+        case AST_DO_WHILE:
+            var dw: *AstDoWhile = (*AstDoWhile)stmt;
+            if (annotation_complexity_stmt_has_strict_call_name(dw.body, needle_ptr, needle_len) != 0) { return 1; }
+            return annotation_complexity_expr_has_strict_call_name(dw.cond, needle_ptr, needle_len);
+        case AST_SWITCH:
+        case AST_MATCH:
+            var sw: *AstSwitch = (*AstSwitch)stmt;
+            if (annotation_complexity_expr_has_strict_call_name(sw.expr, needle_ptr, needle_len) != 0) { return 1; }
+            if (sw.cases_vec != 0) {
+                var cn: u64 = sw.cases_vec.len();
+                for (var ci: u64 = 0; ci < cn; ci++) {
+                    if (annotation_complexity_stmt_has_strict_call_name(sw.cases_vec.get(ci), needle_ptr, needle_len) != 0) { return 1; }
+                }
+            }
+            return 0;
+        case AST_CASE:
+            var cs: *AstCase = (*AstCase)stmt;
+            if (annotation_complexity_expr_has_strict_call_name(cs.value, needle_ptr, needle_len) != 0) { return 1; }
+            return annotation_complexity_stmt_has_strict_call_name(cs.body, needle_ptr, needle_len);
+        case AST_DEFER:
+            return annotation_complexity_stmt_has_strict_call_name(((*AstDefer)stmt).stmt, needle_ptr, needle_len);
+        case AST_VAR_DECL:
+            return annotation_complexity_expr_has_strict_call_name(((*AstVarDecl)stmt).init_expr, needle_ptr, needle_len);
+        case AST_ASSIGN:
+            var asn: *AstAssign = (*AstAssign)stmt;
+            if (annotation_complexity_expr_has_strict_call_name(asn.target, needle_ptr, needle_len) != 0) { return 1; }
+            return annotation_complexity_expr_has_strict_call_name(asn.value, needle_ptr, needle_len);
+        case AST_EXPR_STMT:
+            return annotation_complexity_expr_has_strict_call_name(((*AstExprStmt)stmt).expr, needle_ptr, needle_len);
+        case AST_RETURN:
+            return annotation_complexity_expr_has_strict_call_name(((*AstReturn)stmt).expr, needle_ptr, needle_len);
+        case AST_DELETE:
+            return annotation_complexity_expr_has_strict_call_name(((*AstDelete)stmt).expr, needle_ptr, needle_len);
+        case AST_THROW_STMT:
+            return annotation_complexity_expr_has_strict_call_name(((*AstThrowStmt)stmt).expr, needle_ptr, needle_len);
     }
     return 0;
 }
@@ -3662,20 +4125,186 @@ func annotation_complexity_scan_stmt_self_call_patterns(stmt: *AstNode, fn_ptr: 
 func annotation_complexity_find_func_by_name(name_ptr: u64, name_len: u64) -> *AstFunc {
     if (name_ptr == 0 || name_len == 0 || g_compiler_ctx.all_funcs == 0) { return 0; }
     var n: u64 = g_compiler_ctx.all_funcs.len();
+    var exact: *AstFunc = 0;
+    var tail: *AstFunc = 0;
     for (var i: u64 = 0; i < n; i++) {
         var fn: *AstFunc = g_compiler_ctx.all_funcs.get(i);
         if (fn == 0 || fn.name_ptr == 0 || fn.name_len == 0) { continue; }
-        if (str_eq(fn.name_ptr, fn.name_len, name_ptr, name_len) != 0) { return fn; }
+        if (str_eq(fn.name_ptr, fn.name_len, name_ptr, name_len) != 0) {
+            if (exact == 0 || fn.name_len < exact.name_len) { exact = fn; }
+            continue;
+        }
         if (fn.name_len > name_len + 2) {
             var off: u64 = fn.name_len - name_len;
             var full: []u8 = slice(fn.name_ptr, fn.name_len);
             if (full[off - 1] == 95 && full[off - 2] == 95 &&
                 str_eq(fn.name_ptr + off, name_len, name_ptr, name_len) != 0) {
-                return fn;
+                if (tail == 0 || fn.name_len < tail.name_len) { tail = fn; }
             }
         }
     }
+    if (exact != 0) { return exact; }
+    if (tail != 0) { return tail; }
     return 0;
+}
+
+func annotation_complexity_param_is_self_like(p: *Param) -> u64 {
+    if (p == 0) { return 0; }
+    if (p.name_ptr != 0 && p.name_len == 4 && str_eq(p.name_ptr, p.name_len, "self", 4) != 0) { return 1; }
+    return 0;
+}
+
+func annotation_complexity_fn_accepts_call_shape(fn: *AstFunc, explicit_arg_count: u64, include_implicit_self: u64, arg_names: *Vec<*NameInfo>) -> u64 {
+    if (fn == 0) { return 0; }
+    var params: *Vec<*Param> = fn.params_vec;
+    if (params == 0) {
+        if (call_has_named_args(arg_names) != 0) { return 0; }
+        if (explicit_arg_count == 0) { return 1; }
+        return 0;
+    }
+
+    var start_idx: u64 = 0;
+    var pn: u64 = params.len();
+    if (include_implicit_self != 0 && pn > 0) {
+        var first: *Param = params.get(0);
+        if (annotation_complexity_param_is_self_like(first) != 0) { start_idx = 1; }
+    }
+    if (start_idx > pn) { start_idx = pn; }
+
+    var required: u64 = 0;
+    var max_fixed: u64 = 0;
+    var has_variadic: u64 = 0;
+    var variadic_name_ptr: u64 = 0;
+    var variadic_name_len: u64 = 0;
+    for (var i: u64 = start_idx; i < pn; i++) {
+        var p: *Param = params.get(i);
+        if (p == 0) { continue; }
+        if (p.is_variadic != 0) {
+            has_variadic = 1;
+            variadic_name_ptr = p.name_ptr;
+            variadic_name_len = p.name_len;
+            continue;
+        }
+        max_fixed = max_fixed + 1;
+        if (p.has_default == 0) { required = required + 1; }
+    }
+
+    if (call_has_named_args(arg_names) == 0) {
+        if (explicit_arg_count < required) { return 0; }
+        if (has_variadic == 0 && explicit_arg_count > max_fixed) { return 0; }
+        return 1;
+    }
+
+    var assigned: *Vec<u64> = new Vec<u64>(max_fixed + 1);
+    for (var si: u64 = 0; si < max_fixed; si++) {
+        assigned.push(0);
+    }
+
+    var seen_named: u64 = 0;
+    var next_positional: u64 = 0;
+    for (var ai: u64 = 0; ai < explicit_arg_count; ai++) {
+        var arg_name: *NameInfo = call_named_at(arg_names, ai);
+        if (arg_name != 0) {
+            seen_named = 1;
+            var named_idx: u64 = call_find_param_index_by_name(params, start_idx, max_fixed, arg_name.ptr, arg_name.len);
+            if (named_idx == COMPILER_CALL_UTILS_NOT_FOUND_U64) {
+                if (has_variadic != 0 && variadic_name_ptr != 0 && variadic_name_len != 0 &&
+                    str_eq(variadic_name_ptr, variadic_name_len, arg_name.ptr, arg_name.len) != 0) {
+                    // Named argument targeting variadic parameter is invalid.
+                    return 0;
+                }
+                return 0;
+            }
+            if (assigned.get(named_idx) != 0) { return 0; }
+            assigned.set(named_idx, 1);
+            continue;
+        }
+
+        if (seen_named != 0) { return 0; }
+        if (next_positional < max_fixed) {
+            assigned.set(next_positional, 1);
+            next_positional = next_positional + 1;
+            continue;
+        }
+        if (has_variadic == 0) { return 0; }
+    }
+
+    for (var fi: u64 = 0; fi < max_fixed; fi++) {
+        if (assigned.get(fi) != 0) { continue; }
+        var param: *Param = params.get(start_idx + fi);
+        if (param == 0 || param.has_default == 0) { return 0; }
+    }
+    return 1;
+}
+
+func annotation_complexity_collect_time_rank_for_name(name_ptr: u64, name_len: u64, method_only: u64, explicit_arg_count: u64, include_implicit_self: u64, arg_names: *Vec<*NameInfo>, out_rank: *u64, out_unknown: *u64, out_seen: *u64) -> u64 {
+    if (out_rank != 0) { *out_rank = 0; }
+    if (out_unknown != 0) { *out_unknown = 0; }
+    if (out_seen != 0) { *out_seen = 0; }
+    if (name_ptr == 0 || name_len == 0 || g_compiler_ctx.all_funcs == 0) {
+        if (out_unknown != 0) { *out_unknown = 1; }
+        return 0;
+    }
+
+    var max_rank: u64 = 0;
+    var unknown_hit: u64 = 0;
+    var seen: u64 = 0;
+    var n: u64 = g_compiler_ctx.all_funcs.len();
+    var exact_exists: u64 = 0;
+    var preferred_len: u64 = 0;
+    for (var ei: u64 = 0; ei < n; ei++) {
+        var efn: *AstFunc = g_compiler_ctx.all_funcs.get(ei);
+        if (efn == 0 || efn.name_ptr == 0 || efn.name_len == 0) { continue; }
+        if (str_eq(efn.name_ptr, efn.name_len, name_ptr, name_len) == 0) { continue; }
+        if (method_only != 0) {
+            var eowner: *NameInfo = sym_get_impl_method_owner(efn.name_ptr, efn.name_len);
+            if ((efn.impl_owner_ptr == 0 || efn.impl_owner_len == 0) && eowner == 0) { continue; }
+        }
+        if (annotation_complexity_fn_accepts_call_shape(efn, explicit_arg_count, include_implicit_self, arg_names) == 0) { continue; }
+        exact_exists = 1;
+        break;
+    }
+
+    for (var pi: u64 = 0; pi < n; pi++) {
+        var pfn: *AstFunc = g_compiler_ctx.all_funcs.get(pi);
+        if (pfn == 0 || pfn.name_ptr == 0 || pfn.name_len == 0) { continue; }
+        if (annotation_complexity_name_matches_symbol(pfn.name_ptr, pfn.name_len, name_ptr, name_len) == 0) { continue; }
+        if (exact_exists != 0 && str_eq(pfn.name_ptr, pfn.name_len, name_ptr, name_len) == 0) { continue; }
+        if (method_only != 0) {
+            var powner: *NameInfo = sym_get_impl_method_owner(pfn.name_ptr, pfn.name_len);
+            if ((pfn.impl_owner_ptr == 0 || pfn.impl_owner_len == 0) && powner == 0) { continue; }
+        }
+        if (annotation_complexity_fn_accepts_call_shape(pfn, explicit_arg_count, include_implicit_self, arg_names) == 0) { continue; }
+        if (preferred_len == 0 || pfn.name_len < preferred_len) { preferred_len = pfn.name_len; }
+    }
+
+    for (var i: u64 = 0; i < n; i++) {
+        var fn: *AstFunc = g_compiler_ctx.all_funcs.get(i);
+        if (fn == 0 || fn.name_ptr == 0 || fn.name_len == 0) { continue; }
+        if (annotation_complexity_name_matches_symbol(fn.name_ptr, fn.name_len, name_ptr, name_len) == 0) { continue; }
+        if (exact_exists != 0 && str_eq(fn.name_ptr, fn.name_len, name_ptr, name_len) == 0) { continue; }
+        if (preferred_len != 0 && fn.name_len != preferred_len) { continue; }
+        if (method_only != 0) {
+            var owner: *NameInfo = sym_get_impl_method_owner(fn.name_ptr, fn.name_len);
+            if ((fn.impl_owner_ptr == 0 || fn.impl_owner_len == 0) && owner == 0) { continue; }
+        }
+        if (annotation_complexity_fn_accepts_call_shape(fn, explicit_arg_count, include_implicit_self, arg_names) == 0) { continue; }
+        seen = 1;
+        var r: u64 = annotation_complexity_declared_or_budget_time_rank(fn);
+        if (r == 0) {
+            unknown_hit = 1;
+        } else if (annotation_complexity_rank_order(r) > annotation_complexity_rank_order(max_rank)) {
+            max_rank = r;
+        }
+    }
+
+    if (out_rank != 0) { *out_rank = max_rank; }
+    if (out_unknown != 0) {
+        if (seen == 0 || unknown_hit != 0) { *out_unknown = 1; }
+        else { *out_unknown = 0; }
+    }
+    if (out_seen != 0) { *out_seen = seen; }
+    return seen;
 }
 
 func annotation_complexity_declared_or_budget_time_rank(fn: *AstFunc) -> u64 {
@@ -3708,13 +4337,17 @@ func annotation_complexity_scan_expr_external_call_summary(expr: *AstNode, self_
     if (kind == AST_CALL) {
         if (annotation_complexity_name_matches_self_call(nref.call.name_ptr, nref.call.name_len, self_ptr, self_len) == 0) {
             *out_calls = *out_calls + 1;
-            var callee: *AstFunc = annotation_complexity_find_func_by_name(nref.call.name_ptr, nref.call.name_len);
-            if (callee == 0) {
+            var call_rank: u64 = 0;
+            var call_unknown: u64 = 0;
+            var call_seen: u64 = 0;
+            var call_argc: u64 = 0;
+            if (nref.call.args_vec != 0) { call_argc = nref.call.args_vec.len(); }
+            annotation_complexity_collect_time_rank_for_name(nref.call.name_ptr, nref.call.name_len, 0, call_argc, 0, nref.call.arg_names_vec, &call_rank, &call_unknown, &call_seen);
+            if (call_seen == 0) {
                 *out_unknown = *out_unknown + 1;
             } else {
-                var cr: u64 = annotation_complexity_declared_or_budget_time_rank(callee);
-                if (cr == 0) { *out_unknown = *out_unknown + 1; }
-                else if (annotation_complexity_rank_order(cr) > annotation_complexity_rank_order(*out_max_rank)) { *out_max_rank = cr; }
+                if (call_unknown != 0) { *out_unknown = *out_unknown + 1; }
+                if (annotation_complexity_rank_order(call_rank) > annotation_complexity_rank_order(*out_max_rank)) { *out_max_rank = call_rank; }
             }
         }
         if (nref.call.args_vec != 0) {
@@ -3728,13 +4361,17 @@ func annotation_complexity_scan_expr_external_call_summary(expr: *AstNode, self_
     if (kind == AST_GENERIC_CALL) {
         if (annotation_complexity_name_matches_self_call(nref.generic_call.name_ptr, nref.generic_call.name_len, self_ptr, self_len) == 0) {
             *out_calls = *out_calls + 1;
-            var gcallee: *AstFunc = annotation_complexity_find_func_by_name(nref.generic_call.name_ptr, nref.generic_call.name_len);
-            if (gcallee == 0) {
+            var gen_rank: u64 = 0;
+            var gen_unknown: u64 = 0;
+            var gen_seen: u64 = 0;
+            var gen_argc: u64 = 0;
+            if (nref.generic_call.args_vec != 0) { gen_argc = nref.generic_call.args_vec.len(); }
+            annotation_complexity_collect_time_rank_for_name(nref.generic_call.name_ptr, nref.generic_call.name_len, 0, gen_argc, 0, nref.generic_call.arg_names_vec, &gen_rank, &gen_unknown, &gen_seen);
+            if (gen_seen == 0) {
                 *out_unknown = *out_unknown + 1;
             } else {
-                var gr: u64 = annotation_complexity_declared_or_budget_time_rank(gcallee);
-                if (gr == 0) { *out_unknown = *out_unknown + 1; }
-                else if (annotation_complexity_rank_order(gr) > annotation_complexity_rank_order(*out_max_rank)) { *out_max_rank = gr; }
+                if (gen_unknown != 0) { *out_unknown = *out_unknown + 1; }
+                if (annotation_complexity_rank_order(gen_rank) > annotation_complexity_rank_order(*out_max_rank)) { *out_max_rank = gen_rank; }
             }
         }
         if (nref.generic_call.args_vec != 0) {
@@ -3745,10 +4382,52 @@ func annotation_complexity_scan_expr_external_call_summary(expr: *AstNode, self_
         }
         return 0;
     }
+    if (kind == AST_STATIC_GENERIC_CALL) {
+        if (annotation_complexity_name_matches_self_call(nref.static_generic_call.method_ptr, nref.static_generic_call.method_len, self_ptr, self_len) == 0) {
+            *out_calls = *out_calls + 1;
+            var sg_rank: u64 = 0;
+            var sg_unknown: u64 = 0;
+            var sg_seen: u64 = 0;
+            var sg_argc: u64 = 0;
+            if (nref.static_generic_call.args_vec != 0) { sg_argc = nref.static_generic_call.args_vec.len(); }
+            annotation_complexity_collect_time_rank_for_name(nref.static_generic_call.method_ptr, nref.static_generic_call.method_len, 0, sg_argc, 0, nref.static_generic_call.arg_names_vec, &sg_rank, &sg_unknown, &sg_seen);
+            if (sg_seen == 0) {
+                *out_unknown = *out_unknown + 1;
+            } else {
+                if (sg_unknown != 0) { *out_unknown = *out_unknown + 1; }
+                if (annotation_complexity_rank_order(sg_rank) > annotation_complexity_rank_order(*out_max_rank)) { *out_max_rank = sg_rank; }
+            }
+        }
+        if (nref.static_generic_call.args_vec != 0) {
+            var sgn: u64 = nref.static_generic_call.args_vec.len();
+            for (var sgi: u64 = 0; sgi < sgn; sgi++) {
+                annotation_complexity_scan_expr_external_call_summary(nref.static_generic_call.args_vec.get(sgi), self_ptr, self_len, out_max_rank, out_unknown, out_calls);
+            }
+        }
+        return 0;
+    }
     if (kind == AST_METHOD_CALL || kind == AST_SAFE_METHOD_CALL) {
-        // Method dispatch may hide concrete callee in this pass.
-        *out_calls = *out_calls + 1;
-        *out_unknown = *out_unknown + 1;
+        if (annotation_complexity_name_matches_self_call(nref.method_call.method_ptr, nref.method_call.method_len, self_ptr, self_len) == 0) {
+            *out_calls = *out_calls + 1;
+            var method_rank: u64 = 0;
+            var method_unknown: u64 = 0;
+            var method_seen: u64 = 0;
+            var method_argc: u64 = 0;
+            if (nref.method_call.args_vec != 0) { method_argc = nref.method_call.args_vec.len(); }
+            annotation_complexity_collect_time_rank_for_name(nref.method_call.method_ptr, nref.method_call.method_len, 1, method_argc, 1, nref.method_call.arg_names_vec, &method_rank, &method_unknown, &method_seen);
+            if (method_seen == 0) {
+                annotation_complexity_collect_time_rank_for_name(nref.method_call.method_ptr, nref.method_call.method_len, 0, method_argc, 1, nref.method_call.arg_names_vec, &method_rank, &method_unknown, &method_seen);
+            }
+            if (method_seen == 0) {
+                annotation_complexity_collect_time_rank_for_name(nref.method_call.method_ptr, nref.method_call.method_len, 0, method_argc, 0, nref.method_call.arg_names_vec, &method_rank, &method_unknown, &method_seen);
+            }
+            if (method_seen == 0) {
+                *out_unknown = *out_unknown + 1;
+            } else {
+                if (method_unknown != 0) { *out_unknown = *out_unknown + 1; }
+                if (annotation_complexity_rank_order(method_rank) > annotation_complexity_rank_order(*out_max_rank)) { *out_max_rank = method_rank; }
+            }
+        }
         annotation_complexity_scan_expr_external_call_summary(nref.method_call.receiver, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
         if (nref.method_call.args_vec != 0) {
             var mn: u64 = nref.method_call.args_vec.len();
@@ -3763,13 +4442,17 @@ func annotation_complexity_scan_expr_external_call_summary(expr: *AstNode, self_
         if (nref.call_ptr.callee != 0 && ast_kind(nref.call_ptr.callee) == AST_IDENT) {
             var cid: *AstIdent = (*AstIdent)nref.call_ptr.callee;
             if (annotation_complexity_name_matches_self_call(cid.name_ptr, cid.name_len, self_ptr, self_len) == 0) {
-                var pcallee: *AstFunc = annotation_complexity_find_func_by_name(cid.name_ptr, cid.name_len);
-                if (pcallee == 0) {
+                var ptr_rank: u64 = 0;
+                var ptr_unknown: u64 = 0;
+                var ptr_seen: u64 = 0;
+                var ptr_argc: u64 = 0;
+                if (nref.call_ptr.args_vec != 0) { ptr_argc = nref.call_ptr.args_vec.len(); }
+                annotation_complexity_collect_time_rank_for_name(cid.name_ptr, cid.name_len, 0, ptr_argc, 0, 0, &ptr_rank, &ptr_unknown, &ptr_seen);
+                if (ptr_seen == 0) {
                     *out_unknown = *out_unknown + 1;
                 } else {
-                    var pr: u64 = annotation_complexity_declared_or_budget_time_rank(pcallee);
-                    if (pr == 0) { *out_unknown = *out_unknown + 1; }
-                    else if (annotation_complexity_rank_order(pr) > annotation_complexity_rank_order(*out_max_rank)) { *out_max_rank = pr; }
+                    if (ptr_unknown != 0) { *out_unknown = *out_unknown + 1; }
+                    if (annotation_complexity_rank_order(ptr_rank) > annotation_complexity_rank_order(*out_max_rank)) { *out_max_rank = ptr_rank; }
                 }
             }
         } else {
@@ -3874,6 +4557,7 @@ func annotation_complexity_scan_stmt_external_call_summary(stmt: *AstNode, self_
         case AST_TERNARY:
         case AST_CALL:
         case AST_GENERIC_CALL:
+        case AST_STATIC_GENERIC_CALL:
         case AST_METHOD_CALL:
         case AST_SAFE_METHOD_CALL:
         case AST_CALL_PTR:
@@ -3888,10 +4572,10 @@ func annotation_complexity_scan_stmt_external_call_summary(stmt: *AstNode, self_
 
 func annotation_complexity_has_random_like_call(stmt: *AstNode) -> u64 {
     if (stmt == 0) { return 0; }
-    if (annotation_complexity_stmt_has_call_name(stmt, "rand", 4) != 0) { return 1; }
-    if (annotation_complexity_stmt_has_call_name(stmt, "random", 6) != 0) { return 1; }
-    if (annotation_complexity_stmt_has_call_name(stmt, "random_u64", 10) != 0) { return 1; }
-    if (annotation_complexity_stmt_has_call_name(stmt, "xorshift", 8) != 0) { return 1; }
+    if (annotation_complexity_stmt_has_call_token(stmt, "rand", 4) != 0) { return 1; }
+    if (annotation_complexity_stmt_has_call_token(stmt, "random", 6) != 0) { return 1; }
+    if (annotation_complexity_stmt_has_call_token(stmt, "random_u64", 10) != 0) { return 1; }
+    if (annotation_complexity_stmt_has_call_token(stmt, "xorshift", 8) != 0) { return 1; }
     return 0;
 }
 
@@ -3975,6 +4659,8 @@ func annotation_complexity_infer_time_rank_with_meta(fn: *AstFunc, constraints_a
     if (out_mode != 0) { *out_mode = annotation_complexity_infer_mode(fn); }
     if (out_conf != 0) { *out_conf = ANN_COMPLEXITY_CONF_UNKNOWN; }
     if (fn == 0 || fn.body == 0) { return 1; }
+    var fallback_bound: u64 = annotation_complexity_constraints_max(constraints_ann);
+    var unresolved_loop: u64 = annotation_complexity_stmt_has_unresolved_loop(fn.body, constraints_ann, fallback_bound);
     var memo_hint_rank: u64 = 0;
     if (annotation_complexity_infer_memo_hint_rank(fn, constraints_ann, &memo_hint_rank) != 0 && memo_hint_rank != 0) {
         if (out_reason != 0) { *out_reason = ANN_COMPLEXITY_REASON_DP_MEMO_HINT; }
@@ -4005,26 +4691,37 @@ func annotation_complexity_infer_time_rank_with_meta(fn: *AstFunc, constraints_a
     annotation_complexity_scan_stmt_self_call_patterns(fn.body, fn.name_ptr, fn.name_len, &recur_total, &recur_half, &recur_minus, &recur_same);
     if (recur_total >= 2 && recur_half >= 2) {
         if (out_reason != 0) { *out_reason = ANN_COMPLEXITY_REASON_RECURRENCE; }
-        if (out_conf != 0) { *out_conf = ANN_COMPLEXITY_CONF_HEURISTIC; }
+        if (out_conf != 0) {
+            if (unresolved_loop != 0) { *out_conf = ANN_COMPLEXITY_CONF_UNKNOWN; }
+            else { *out_conf = ANN_COMPLEXITY_CONF_HEURISTIC; }
+        }
         return 4; // conservative divide-and-conquer bucket
     }
     if (recur_total >= 1 && recur_half >= 1) {
         if (out_reason != 0) { *out_reason = ANN_COMPLEXITY_REASON_RECURRENCE; }
-        if (out_conf != 0) { *out_conf = ANN_COMPLEXITY_CONF_HEURISTIC; }
+        if (out_conf != 0) {
+            if (unresolved_loop != 0) { *out_conf = ANN_COMPLEXITY_CONF_UNKNOWN; }
+            else { *out_conf = ANN_COMPLEXITY_CONF_HEURISTIC; }
+        }
         return 2; // T(n)=T(n/2)+...
     }
     if (recur_total == 1 && recur_minus >= 1) {
         if (out_reason != 0) { *out_reason = ANN_COMPLEXITY_REASON_RECURRENCE; }
-        if (out_conf != 0) { *out_conf = ANN_COMPLEXITY_CONF_HEURISTIC; }
+        if (out_conf != 0) {
+            if (unresolved_loop != 0) { *out_conf = ANN_COMPLEXITY_CONF_UNKNOWN; }
+            else { *out_conf = ANN_COMPLEXITY_CONF_HEURISTIC; }
+        }
         return 3;
     }
     if (recur_total >= 2 && recur_minus >= 2) {
         if (out_reason != 0) { *out_reason = ANN_COMPLEXITY_REASON_RECURRENCE; }
-        if (out_conf != 0) { *out_conf = ANN_COMPLEXITY_CONF_HEURISTIC; }
+        if (out_conf != 0) {
+            if (unresolved_loop != 0) { *out_conf = ANN_COMPLEXITY_CONF_UNKNOWN; }
+            else { *out_conf = ANN_COMPLEXITY_CONF_HEURISTIC; }
+        }
         return 7; // branching linear-depth recursion
     }
 
-    var fallback_bound: u64 = annotation_complexity_constraints_max(constraints_ann);
     var structural_rank: u64 = annotation_complexity_stmt_infer_rank(fn.body, constraints_ann, fallback_bound);
     var ext_max_rank: u64 = 0;
     var ext_unknown: u64 = 0;
@@ -4058,8 +4755,13 @@ func annotation_complexity_infer_time_rank_with_meta(fn: *AstFunc, constraints_a
             else { *out_reason = ANN_COMPLEXITY_REASON_STRUCTURAL; }
         }
         if (out_conf != 0) {
-            if (ext_unknown == 0 && ext_calls == 0) { *out_conf = ANN_COMPLEXITY_CONF_PROVEN; }
-            else { *out_conf = ANN_COMPLEXITY_CONF_HEURISTIC; }
+            if (unresolved_loop != 0) {
+                *out_conf = ANN_COMPLEXITY_CONF_UNKNOWN;
+            } else if (ext_unknown > 0 && annotation_complexity_has_random_like_call(fn.body) == 0) {
+                *out_conf = ANN_COMPLEXITY_CONF_UNKNOWN;
+            } else {
+                *out_conf = ANN_COMPLEXITY_CONF_HEURISTIC;
+            }
         }
         return structural_rank;
     }
@@ -4121,10 +4823,26 @@ func annotation_complexity_validate_contract(fn: *AstFunc) -> u64 {
         budget_mode = annotation_complexity_parse_mode_arg(annotation_complexity_find_named_arg(budget_ann, "mode", 4));
     }
 
-    var compare_time_rank: u64 = declared_time_rank;
-    if (compare_time_rank == 0) { compare_time_rank = inferred_time_rank; }
+    var compare_time_rank: u64 = inferred_time_rank;
+    if (declared_time_rank != 0 && annotation_complexity_rank_order(declared_time_rank) > annotation_complexity_rank_order(compare_time_rank)) {
+        compare_time_rank = declared_time_rank;
+    }
+    if (compare_time_rank == 0) { compare_time_rank = declared_time_rank; }
     var compare_mode: u64 = declared_mode;
     if (compare_mode == ANN_COMPLEXITY_MODE_UNSPEC) { compare_mode = inferred_mode; }
+    if (declared_time_rank != 0 && inferred_time_rank != 0 &&
+        annotation_complexity_rank_exceeds(inferred_time_rank, declared_time_rank) != 0) {
+        emit_stderr("[ERROR] declared complexity underestimates inferred complexity on function ");
+        emit_stderr_len(fn.name_ptr, fn.name_len);
+        emit_stderr(": inferred=");
+        emit_stderr(annotation_complexity_rank_name(inferred_time_rank));
+        emit_stderr(", declared=");
+        emit_stderr(annotation_complexity_rank_name(declared_time_rank));
+        if (inferred_conf == ANN_COMPLEXITY_CONF_UNKNOWN) { emit_stderr(", confidence=unknown"); }
+        emit_stderr("\n");
+        diag_note_error();
+        return 0;
+    }
     if (budget_mode != ANN_COMPLEXITY_MODE_UNSPEC && compare_mode != ANN_COMPLEXITY_MODE_UNSPEC && budget_mode != compare_mode) {
         emit_stderr("[ERROR] complexity mode mismatch on function ");
         emit_stderr_len(fn.name_ptr, fn.name_len);
@@ -4232,10 +4950,12 @@ func annotation_complexity_validate_contract(fn: *AstFunc) -> u64 {
         emit_stderr("\n");
     }
 
-    if (budget_ann != 0 && declared_time_rank == 0 && inferred_conf == ANN_COMPLEXITY_CONF_UNKNOWN) {
-        emit_stderr("[WARN] complexity confidence UNKNOWN on function ");
+    if (budget_ann != 0 && inferred_conf == ANN_COMPLEXITY_CONF_UNKNOWN) {
+        emit_stderr("[ERROR] complexity confidence UNKNOWN on function ");
         emit_stderr_len(fn.name_ptr, fn.name_len);
-        emit_stderr(" (budget checks may be conservative or incomplete)\n");
+        emit_stderr(" (cannot enforce complexity_budget safely)\n");
+        diag_note_error();
+        return 0;
     }
 
     if (budget_ann != 0) {
@@ -4313,13 +5033,27 @@ func annotation_complexity_validate_contract(fn: *AstFunc) -> u64 {
         }
     }
 
-    if (constraints_ann != 0 && limit_ann != 0) {
+    if (limit_ann != 0) {
         var ms_arg: *CompilerAnnotationArg = annotation_complexity_find_named_arg(limit_ann, "ms", 2);
         if (ms_arg != 0 && ms_arg.kind == 2) {
+            if (constraints_ann == 0) {
+                emit_stderr("[ERROR] time_limit on function ");
+                emit_stderr_len(fn.name_ptr, fn.name_len);
+                emit_stderr(" requires @constraints(...) for bounded static estimation\n");
+                diag_note_error();
+                return 0;
+            }
             var max_bound: u64 = annotation_complexity_constraints_max(constraints_ann);
 
             var ops_est: u64 = annotation_complexity_estimate_ops(compare_time_rank, max_bound);
             if (inferred_ops_precise != 0) { ops_est = inferred_ops_precise; }
+            if (ops_est == 0) {
+                emit_stderr("[ERROR] time_limit on function ");
+                emit_stderr_len(fn.name_ptr, fn.name_len);
+                emit_stderr(" is not enforceable: unknown complexity estimate\n");
+                diag_note_error();
+                return 0;
+            }
             var ops_per_ms: u64 = 200000;
             var machine_arg: *CompilerAnnotationArg = annotation_complexity_find_named_arg(limit_ann, "machine", 7);
             if (machine_arg != 0) {
