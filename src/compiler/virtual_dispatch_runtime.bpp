@@ -298,19 +298,157 @@ func vdispatch_is_trait_impl_func(fn: *AstFunc) -> u64 {
     return 0;
 }
 
+const VDISPATCH_MAGIC_OVERRIDE_NOT_MAGIC = 0;
+const VDISPATCH_MAGIC_OVERRIDE_VALID = 1;
+const VDISPATCH_MAGIC_OVERRIDE_INVALID = 2;
+
+func vdispatch_magic_struct_name_matches(a_ptr: u64, a_len: u64, b_ptr: u64, b_len: u64) -> u64 {
+    if (a_ptr == 0 || a_len == 0 || b_ptr == 0 || b_len == 0) { return 0; }
+    if (str_eq(a_ptr, a_len, b_ptr, b_len) != 0) { return 1; }
+    var a_base_len: u64 = sym_find_generic_suffix_index(a_ptr, a_len);
+    if (a_base_len > a_len) { a_base_len = a_len; }
+    var b_base_len: u64 = sym_find_generic_suffix_index(b_ptr, b_len);
+    if (b_base_len > b_len) { b_base_len = b_len; }
+    if (str_eq(a_ptr, a_base_len, b_ptr, b_base_len) != 0) { return 1; }
+    return 0;
+}
+
+func vdispatch_magic_self_param_matches_owner(fn: *AstFunc, p: *Param) -> u64 {
+    if (fn == 0 || p == 0) { return 0; }
+    if (sym_is_self_param(p) == 0) { return 0; }
+    if (p.ptr_depth != 1) { return 0; }
+    if (vdispatch_magic_struct_name_matches(p.struct_name_ptr, p.struct_name_len, fn.impl_owner_ptr, fn.impl_owner_len) == 0) { return 0; }
+    return 1;
+}
+
+func vdispatch_magic_rhs_param_matches_owner(fn: *AstFunc, p: *Param) -> u64 {
+    if (fn == 0 || p == 0) { return 0; }
+    if (p.is_variadic != 0 || p.has_default != 0) { return 0; }
+    if (p.type_kind != TYPE_STRUCT || p.ptr_depth != 0) { return 0; }
+    if (vdispatch_magic_struct_name_matches(p.struct_name_ptr, p.struct_name_len, fn.impl_owner_ptr, fn.impl_owner_len) == 0) { return 0; }
+    return 1;
+}
+
+func vdispatch_magic_override_signature_error(fn: *AstFunc, method_ptr: u64, method_len: u64, expected_ptr: u64, expected_len: u64) -> u64 {
+    emit_stderr("[ERROR] magic override signature mismatch: ");
+    emit_stderr_len(fn.impl_owner_ptr, fn.impl_owner_len);
+    emit_stderr(".");
+    emit_stderr_len(method_ptr, method_len);
+    emit_stderr(" expected ");
+    emit_stderr_len(expected_ptr, expected_len);
+    emit_stderr("\n");
+    diag_note_error();
+    return 0;
+}
+
+func vdispatch_magic_override_without_base_status(fn: *AstFunc, method_ptr: u64, method_len: u64) -> u64 {
+    if (fn == 0) { return VDISPATCH_MAGIC_OVERRIDE_NOT_MAGIC; }
+    var kind: u64 = sym_magic_method_kind(method_ptr, method_len);
+    if (kind == COMPILER_MAGIC_METHOD_NONE) { return VDISPATCH_MAGIC_OVERRIDE_NOT_MAGIC; }
+    if (fn.params_vec == 0 || fn.params_vec.len() == 0) {
+        vdispatch_magic_override_signature_error(fn, method_ptr, method_len, "(self: *Self, ...)", 18);
+        return VDISPATCH_MAGIC_OVERRIDE_INVALID;
+    }
+
+    var p0: *Param = fn.params_vec.get(0);
+    if (vdispatch_magic_self_param_matches_owner(fn, p0) == 0) {
+        vdispatch_magic_override_signature_error(fn, method_ptr, method_len, "(self: *Self, ...)", 18);
+        return VDISPATCH_MAGIC_OVERRIDE_INVALID;
+    }
+
+    if (kind == COMPILER_MAGIC_METHOD_TO_STR || kind == COMPILER_MAGIC_METHOD_HASH) {
+        if (fn.params_vec.len() != 1 || fn.ret_ptr_depth != 0 || fn.ret_type != TYPE_U64) {
+            vdispatch_magic_override_signature_error(fn, method_ptr, method_len, "(self: *Self) -> u64", 20);
+            return VDISPATCH_MAGIC_OVERRIDE_INVALID;
+        }
+        return VDISPATCH_MAGIC_OVERRIDE_VALID;
+    }
+
+    if (kind == COMPILER_MAGIC_METHOD_EQ) {
+        if (fn.params_vec.len() != 2 || fn.ret_ptr_depth != 0) {
+            vdispatch_magic_override_signature_error(fn, method_ptr, method_len, "(self: *Self, rhs: Self) -> bool|u64", 36);
+            return VDISPATCH_MAGIC_OVERRIDE_INVALID;
+        }
+        var rhs: *Param = fn.params_vec.get(1);
+        if (vdispatch_magic_rhs_param_matches_owner(fn, rhs) == 0) {
+            vdispatch_magic_override_signature_error(fn, method_ptr, method_len, "(self: *Self, rhs: Self) -> bool|u64", 36);
+            return VDISPATCH_MAGIC_OVERRIDE_INVALID;
+        }
+        if (fn.ret_type != TYPE_BOOL && fn.ret_type != TYPE_U64) {
+            vdispatch_magic_override_signature_error(fn, method_ptr, method_len, "(self: *Self, rhs: Self) -> bool|u64", 36);
+            return VDISPATCH_MAGIC_OVERRIDE_INVALID;
+        }
+        return VDISPATCH_MAGIC_OVERRIDE_VALID;
+    }
+
+    if (kind == COMPILER_MAGIC_METHOD_CMP) {
+        if (fn.params_vec.len() != 2 || fn.ret_ptr_depth != 0 || fn.ret_type != TYPE_I64) {
+            vdispatch_magic_override_signature_error(fn, method_ptr, method_len, "(self: *Self, rhs: Self) -> i64", 31);
+            return VDISPATCH_MAGIC_OVERRIDE_INVALID;
+        }
+        var rhs2: *Param = fn.params_vec.get(1);
+        if (vdispatch_magic_rhs_param_matches_owner(fn, rhs2) == 0) {
+            vdispatch_magic_override_signature_error(fn, method_ptr, method_len, "(self: *Self, rhs: Self) -> i64", 31);
+            return VDISPATCH_MAGIC_OVERRIDE_INVALID;
+        }
+        return VDISPATCH_MAGIC_OVERRIDE_VALID;
+    }
+
+    return VDISPATCH_MAGIC_OVERRIDE_NOT_MAGIC;
+}
+
+func vdispatch_validate_single_magic_method_contract(fn: *AstFunc) -> u64 {
+    if (fn == 0) { return 0; }
+    if (fn.impl_owner_ptr == 0 || fn.impl_owner_len == 0) { return 0; }
+    var method_ptr: u64 = fn.impl_original_name_ptr;
+    var method_len: u64 = fn.impl_original_name_len;
+    if (method_ptr == 0 || method_len == 0) {
+        method_ptr = fn.name_ptr;
+        method_len = fn.name_len;
+    }
+    if (sym_is_magic_method_name(method_ptr, method_len) == 0) { return 0; }
+    if (fn.params_vec == 0 || fn.params_vec.len() == 0) { return 0; }
+    if (sym_is_self_param(fn.params_vec.get(0)) == 0) { return 0; }
+    vdispatch_magic_override_without_base_status(fn, method_ptr, method_len);
+    return 0;
+}
+
 func vdispatch_validate_single_impl_override(fn: *AstFunc) -> u64 {
     if (fn == 0) { return 0; }
     if (fn.impl_owner_ptr == 0 || fn.impl_owner_len == 0) { return 0; }
     if (vdispatch_is_trait_impl_func(fn) != 0) { return 0; }
 
     var owner_def: *AstStructDef = get_struct_def(fn.impl_owner_ptr, fn.impl_owner_len);
-    if (owner_def == 0 || owner_def.parents_vec == 0) { return 0; }
+    if (owner_def == 0) { return 0; }
 
     var method_ptr: u64 = fn.impl_original_name_ptr;
     var method_len: u64 = fn.impl_original_name_len;
     if (method_ptr == 0 || method_len == 0) {
         method_ptr = fn.name_ptr;
         method_len = fn.name_len;
+    }
+
+    if (fn.impl_is_override != 0 && sym_is_magic_method_name(method_ptr, method_len) != 0) {
+        var precheck_magic_status: u64 = vdispatch_magic_override_without_base_status(fn, method_ptr, method_len);
+        if (precheck_magic_status == VDISPATCH_MAGIC_OVERRIDE_INVALID) {
+            return 0;
+        }
+    }
+
+    if (owner_def.parents_vec == 0 || owner_def.parents_vec.len() == 0) {
+        if (fn.impl_is_override != 0) {
+            var root_magic_status: u64 = vdispatch_magic_override_without_base_status(fn, method_ptr, method_len);
+            if (root_magic_status == VDISPATCH_MAGIC_OVERRIDE_VALID || root_magic_status == VDISPATCH_MAGIC_OVERRIDE_INVALID) {
+                return 0;
+            }
+            emit_stderr("[ERROR] @[override] has no base method: ");
+            emit_stderr_len(fn.impl_owner_ptr, fn.impl_owner_len);
+            emit_stderr(".");
+            emit_stderr_len(method_ptr, method_len);
+            emit_stderr("\n");
+            diag_note_error();
+        }
+        return 0;
     }
 
     var method_arg_types: *Vec<*TypeInfo> = sym_method_arg_types_from_params(fn);
@@ -321,6 +459,10 @@ func vdispatch_validate_single_impl_override(fn: *AstFunc) -> u64 {
 
     if (base_lookup.found == 0) {
         if (fn.impl_is_override != 0) {
+            var magic_status: u64 = vdispatch_magic_override_without_base_status(fn, method_ptr, method_len);
+            if (magic_status == VDISPATCH_MAGIC_OVERRIDE_VALID || magic_status == VDISPATCH_MAGIC_OVERRIDE_INVALID) {
+                return 0;
+            }
             emit_stderr("[ERROR] @[override] has no base method: ");
             emit_stderr_len(fn.impl_owner_ptr, fn.impl_owner_len);
             emit_stderr(".");
