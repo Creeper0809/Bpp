@@ -1,9 +1,18 @@
 // number.b - Builtin arbitrary-precision signed integer (Number)
 //
-// This module backs the `number` type keyword in the language.
-// Representation:
-// - sign: -1, 0, +1
-// - digits: little-endian limbs in base 1e9
+// Storage model (one-word tagged value):
+// - Small: bits[0] = 1, payload is signed 63-bit immediate (via arithmetic >> 1)
+// - Big:   bits[0] = 0, payload is aligned pointer to NumberBig
+//
+// Lifecycle policy for big values:
+// - ARENA: no per-object release (default)
+// - RC: retain/release counters tracked
+// - GC: reserved policy marker
+//
+// NOTE:
+// The compiler currently does implicit raw value copies in some paths, so the
+// default policy is ARENA for safety. RC metadata is maintained for explicit
+// runtime API paths (`number_assign`, `number_clone`) and future compiler hooks.
 
 import std.vec;
 
@@ -12,134 +21,117 @@ const NUMBER_MAX_U64 = 18446744073709551615;
 const NUMBER_MAX_I64_U64 = 9223372036854775807;
 const NUMBER_MIN_I64_MAG = 9223372036854775808;
 
+const NUMBER_TAG_SMALL = 1;
+const NUMBER_TAG_MASK = 1;
+const NUMBER_PTR_MASK = 18446744073709551614;
+
+const NUMBER_SMALL_MAX_U64 = 4611686018427387903;
+
+const NUMBER_MM_ARENA = 1;
+const NUMBER_MM_RC = 2;
+const NUMBER_MM_GC = 3;
+
+var g_number_mm_policy: u64;
+var g_number_arena_epoch: u64;
+var g_number_big_allocated: u64;
+var g_number_big_live: u64;
+var g_number_big_retain_count: u64;
+var g_number_big_release_count: u64;
+
 struct Number {
-    public sign: i64;
-    public digits: *Vec<u32>;
+    public bits: u64;
 }
 
-func number_vec_new(cap: u64) -> *Vec<u32> {
-    var c: u64 = cap;
-    if (c < 1) { c = 1; }
-    return new Vec<u32>(c);
+struct NumberBig {
+    public sign: i64;
+    public digits: *Vec<u32>;
+    public rc: u64;
+    public mm_policy: u64;
+    public arena_epoch: u64;
+}
+
+func number_small_min() -> i64 {
+    var v: i64 = -4611686018427387903;
+    return v - 1;
+}
+
+func number_small_max() -> i64 {
+    return 4611686018427387903;
+}
+
+func number_mm_policy_default() -> u64 {
+    if (g_number_mm_policy == 0) {
+        g_number_mm_policy = NUMBER_MM_ARENA;
+    }
+    return g_number_mm_policy;
+}
+
+func number_get_mm_policy() -> u64 {
+    return number_mm_policy_default();
+}
+
+func number_set_mm_policy(policy: u64) -> u64 {
+    if (policy == NUMBER_MM_ARENA || policy == NUMBER_MM_RC || policy == NUMBER_MM_GC) {
+        g_number_mm_policy = policy;
+    }
+    return number_mm_policy_default();
+}
+
+func number_arena_reset() -> u64 {
+    // Reserved hook for future epoch-scoped arena sweep.
+    g_number_arena_epoch = g_number_arena_epoch + 1;
+    return g_number_arena_epoch;
+}
+
+func number_small_encode(v: i64) -> u64 {
+    return (((u64)v) << 1) | NUMBER_TAG_SMALL;
+}
+
+func number_small_decode(bits: u64) -> i64 {
+    return ((i64)bits) >> 1;
+}
+
+func number_is_small_bits(bits: u64) -> u64 {
+    return (bits & NUMBER_TAG_MASK) != 0;
+}
+
+func number_make_small(v: i64) -> Number {
+    var out: Number = Number { 0 };
+    out.bits = number_small_encode(v);
+    return out;
 }
 
 func number_make_zero() -> Number {
-    return Number { 0, number_vec_new(1) };
+    return number_make_small(0);
 }
 
-func number_trim_inplace(x: *Number) -> u64 {
-    if (x == 0 || x.digits == 0) { return 0; }
-    var n: u64 = ((*Vec<u32>)x.digits).len();
-    while (n > 0) {
-        var last: u32 = ((*Vec<u32>)x.digits).get(n - 1);
-        if ((u64)last != 0) { break; }
-        ((*Vec<u32>)x.digits).pop();
-        n = n - 1;
-    }
-    if (n == 0) { x.sign = 0; }
-    return 0;
+func number_bits(v: *Number) -> u64 {
+    if (v == 0) { return number_small_encode(0); }
+    return v.bits;
 }
 
-func number_clone(src: *Number) -> Number {
-    if (src == 0) { return number_make_zero(); }
-    var out: Number = Number { src.sign, number_vec_new(((*Vec<u32>)src.digits).len() + 1) };
-    var n: u64 = ((*Vec<u32>)src.digits).len();
-    for (var i: u64 = 0; i < n; i = i + 1) {
-        ((*Vec<u32>)out.digits).push(((*Vec<u32>)src.digits).get(i));
-    }
-    return out;
+func number_is_small(v: *Number) -> u64 {
+    return number_is_small_bits(number_bits(v));
 }
 
-func number_abs_cmp(a: *Number, b: *Number) -> i64 {
-    var an: u64 = 0;
-    var bn: u64 = 0;
-    if (a != 0 && a.digits != 0) { an = ((*Vec<u32>)a.digits).len(); }
-    if (b != 0 && b.digits != 0) { bn = ((*Vec<u32>)b.digits).len(); }
-    if (an > bn) { return 1; }
-    if (an < bn) { return -1; }
-    var i: u64 = an;
-    while (i > 0) {
-        i = i - 1;
-        var av: u64 = (u64)((*Vec<u32>)a.digits).get(i);
-        var bv: u64 = (u64)((*Vec<u32>)b.digits).get(i);
-        if (av > bv) { return 1; }
-        if (av < bv) { return -1; }
-    }
-    return 0;
+func number_small_value(v: *Number) -> i64 {
+    return number_small_decode(number_bits(v));
 }
 
-func number_add_abs(a: *Number, b: *Number) -> Number {
-    var an: u64 = ((*Vec<u32>)a.digits).len();
-    var bn: u64 = ((*Vec<u32>)b.digits).len();
-    var n: u64 = an;
-    if (bn > n) { n = bn; }
-    var out: Number = Number { 1, number_vec_new(n + 1) };
-    var carry: u64 = 0;
-    for (var i: u64 = 0; i < n; i = i + 1) {
-        var av: u64 = 0;
-        var bv: u64 = 0;
-        if (i < an) { av = (u64)((*Vec<u32>)a.digits).get(i); }
-        if (i < bn) { bv = (u64)((*Vec<u32>)b.digits).get(i); }
-        var cur: u64 = av + bv + carry;
-        ((*Vec<u32>)out.digits).push((u32)(cur % NUMBER_BASE));
-        carry = cur / NUMBER_BASE;
-    }
-    if (carry != 0) {
-        ((*Vec<u32>)out.digits).push((u32)carry);
-    }
-    number_trim_inplace(&out);
-    return out;
+func number_big_ptr_from_bits(bits: u64) -> *NumberBig {
+    return (*NumberBig)(bits & NUMBER_PTR_MASK);
 }
 
-func number_sub_abs(a: *Number, b: *Number) -> Number {
-    // Preconditions: |a| >= |b|
-    var an: u64 = ((*Vec<u32>)a.digits).len();
-    var bn: u64 = ((*Vec<u32>)b.digits).len();
-    var out: Number = Number { 1, number_vec_new(an) };
-    var borrow: i64 = 0;
-    for (var i: u64 = 0; i < an; i = i + 1) {
-        var av: i64 = (i64)(u64)((*Vec<u32>)a.digits).get(i);
-        var bv: i64 = 0;
-        if (i < bn) { bv = (i64)(u64)((*Vec<u32>)b.digits).get(i); }
-        var cur: i64 = av - bv - borrow;
-        if (cur < 0) {
-            cur = cur + (i64)NUMBER_BASE;
-            borrow = 1;
-        } else {
-            borrow = 0;
-        }
-        ((*Vec<u32>)out.digits).push((u32)(u64)cur);
-    }
-    number_trim_inplace(&out);
-    return out;
+func number_big_ptr(v: *Number) -> *NumberBig {
+    if (v == 0) { return 0; }
+    if (number_is_small(v) != 0) { return 0; }
+    return number_big_ptr_from_bits(v.bits);
 }
 
-// Kept as top-level symbol because parser-level number literal lowering calls this.
-func number_from_i64(v: i64) -> Number {
-    if (v == 0) { return number_make_zero(); }
-    var out: Number = Number { 1, number_vec_new(3) };
-    var mag: u64 = (u64)v;
-    if (v < 0) {
-        out.sign = -1;
-        mag = 0 - mag;
-    }
-    while (mag != 0) {
-        ((*Vec<u32>)out.digits).push((u32)(mag % NUMBER_BASE));
-        mag = mag / NUMBER_BASE;
-    }
-    number_trim_inplace(&out);
-    return out;
-}
-
-func number_from_u64(v: u64) -> Number {
-    if (v == 0) { return number_make_zero(); }
-    var out: Number = Number { 1, number_vec_new(3) };
-    var mag: u64 = v;
-    while (mag != 0) {
-        ((*Vec<u32>)out.digits).push((u32)(mag % NUMBER_BASE));
-        mag = mag / NUMBER_BASE;
-    }
-    number_trim_inplace(&out);
+func number_make_big_handle(big: *NumberBig) -> Number {
+    if (big == 0) { return number_make_zero(); }
+    var out: Number = Number { 0 };
+    out.bits = ((u64)big) & NUMBER_PTR_MASK;
     return out;
 }
 
@@ -152,17 +144,217 @@ func number_i64_max() -> i64 {
     return 9223372036854775807;
 }
 
-func number_abs_to_u64_checked(v: *Number, out: *u64) -> u64 {
+func number_i64_abs_mag(v: i64, out: *u64) -> u64 {
+    if (out == 0) { return 0; }
+    if (v >= 0) {
+        out[0] = (u64)v;
+        return 1;
+    }
+    if (v == number_i64_min()) {
+        out[0] = NUMBER_MIN_I64_MAG;
+        return 1;
+    }
+    out[0] = (u64)(0 - v);
+    return 1;
+}
+
+func number_fits_small_i64(v: i64) -> u64 {
+    if (v < number_small_min()) { return 0; }
+    if (v > number_small_max()) { return 0; }
+    return 1;
+}
+
+func number_i64_add_checked(a: i64, b: i64, out: *i64) -> u64 {
+    if (out == 0) { return 0; }
+    if (b > 0) {
+        if (a > number_i64_max() - b) { return 0; }
+    }
+    if (b < 0) {
+        if (a < number_i64_min() - b) { return 0; }
+    }
+    out[0] = a + b;
+    return 1;
+}
+
+func number_i64_sub_checked(a: i64, b: i64, out: *i64) -> u64 {
+    if (out == 0) { return 0; }
+    if (b > 0) {
+        if (a < number_i64_min() + b) { return 0; }
+    }
+    if (b < 0) {
+        if (a > number_i64_max() + b) { return 0; }
+    }
+    out[0] = a - b;
+    return 1;
+}
+
+func number_i64_mul_checked(a: i64, b: i64, out: *i64) -> u64 {
+    if (out == 0) { return 0; }
+    if (a == 0 || b == 0) {
+        out[0] = 0;
+        return 1;
+    }
+
+    var ua: u64 = 0;
+    var ub: u64 = 0;
+    number_i64_abs_mag(a, &ua);
+    number_i64_abs_mag(b, &ub);
+
+    var negative: u64 = 0;
+    if (a < 0) {
+        if (b > 0) { negative = 1; }
+    } else if (a > 0) {
+        if (b < 0) { negative = 1; }
+    }
+
+    var limit: u64 = NUMBER_MAX_I64_U64;
+    if (negative != 0) { limit = NUMBER_MIN_I64_MAG; }
+    if (ub != 0) {
+        if (ua > limit / ub) { return 0; }
+    }
+
+    var mag: u64 = ua * ub;
+    if (negative == 0) {
+        if (mag > NUMBER_MAX_I64_U64) { return 0; }
+        out[0] = (i64)mag;
+        return 1;
+    }
+
+    if (mag > NUMBER_MIN_I64_MAG) { return 0; }
+    if (mag == NUMBER_MIN_I64_MAG) {
+        out[0] = number_i64_min();
+        return 1;
+    }
+    out[0] = 0 - (i64)mag;
+    return 1;
+}
+
+func number_big_new(sign: i64, cap: u64) -> *NumberBig {
+    var c: u64 = cap;
+    if (c < 1) { c = 1; }
+    var big: *NumberBig = new NumberBig();
+    big.sign = sign;
+    big.digits = new Vec<u32>(c);
+    big.rc = 1;
+    big.mm_policy = number_mm_policy_default();
+    big.arena_epoch = g_number_arena_epoch;
+    g_number_big_allocated = g_number_big_allocated + 1;
+    g_number_big_live = g_number_big_live + 1;
+    return big;
+}
+
+func number_big_retain(big: *NumberBig) -> u64 {
+    if (big == 0) { return 0; }
+    if (big.mm_policy == NUMBER_MM_RC) {
+        big.rc = big.rc + 1;
+        g_number_big_retain_count = g_number_big_retain_count + 1;
+    }
+    return 0;
+}
+
+func number_big_release(big: *NumberBig) -> u64 {
+    if (big == 0) { return 0; }
+    if (big.mm_policy == NUMBER_MM_RC) {
+        if (big.rc > 0) {
+            big.rc = big.rc - 1;
+            g_number_big_release_count = g_number_big_release_count + 1;
+            if (big.rc == 0) {
+                // Deferred reclamation path (safe default). Arena/GC integration point.
+                if (g_number_big_live > 0) { g_number_big_live = g_number_big_live - 1; }
+            }
+        }
+    }
+    return 0;
+}
+
+func number_retain_ptr(v: *Number) -> u64 {
+    if (v == 0) { return 0; }
+    if (number_is_small(v) != 0) { return 0; }
+    return number_big_retain(number_big_ptr(v));
+}
+
+func number_release_ptr(v: *Number) -> u64 {
+    if (v == 0) { return 0; }
+    if (number_is_small(v) != 0) { return 0; }
+    return number_big_release(number_big_ptr(v));
+}
+
+func number_big_trim_inplace(big: *NumberBig) -> u64 {
+    if (big == 0 || big.digits == 0) { return 0; }
+    var n: u64 = big.digits.len();
+    while (n > 0) {
+        var last: u32 = big.digits.get(n - 1);
+        if ((u64)last != 0) { break; }
+        big.digits.pop();
+        n = n - 1;
+    }
+    if (n == 0) {
+        big.sign = 0;
+        return 0;
+    }
+    if (big.sign > 0) { big.sign = 1; }
+    else if (big.sign < 0) { big.sign = -1; }
+    return 0;
+}
+
+func number_big_copy(src: *NumberBig) -> *NumberBig {
+    if (src == 0) {
+        var z: *NumberBig = number_big_new(0, 1);
+        return z;
+    }
+    var n: u64 = 0;
+    if (src.digits != 0) { n = src.digits.len(); }
+    var out: *NumberBig = number_big_new(src.sign, n + 1);
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        out.digits.push(src.digits.get(i));
+    }
+    number_big_trim_inplace(out);
+    return out;
+}
+
+func number_big_abs_copy(src: *NumberBig) -> *NumberBig {
+    var out: *NumberBig = number_big_copy(src);
+    if (out.sign < 0) { out.sign = 1; }
+    return out;
+}
+
+func number_big_from_u64_raw(v: u64) -> *NumberBig {
+    if (v == 0) {
+        var z: *NumberBig = number_big_new(0, 1);
+        return z;
+    }
+    var out: *NumberBig = number_big_new(1, 4);
+    var mag: u64 = v;
+    while (mag != 0) {
+        out.digits.push((u32)(mag % NUMBER_BASE));
+        mag = mag / NUMBER_BASE;
+    }
+    number_big_trim_inplace(out);
+    return out;
+}
+
+func number_big_from_i64_raw(v: i64) -> *NumberBig {
+    if (v == 0) {
+        var z: *NumberBig = number_big_new(0, 1);
+        return z;
+    }
+    var mag: u64 = 0;
+    number_i64_abs_mag(v, &mag);
+    var out: *NumberBig = number_big_from_u64_raw(mag);
+    if (v < 0 && out.sign != 0) { out.sign = -1; }
+    return out;
+}
+
+func number_big_abs_to_u64_checked(big: *NumberBig, out: *u64) -> u64 {
     if (out == 0) { return 0; }
     out[0] = 0;
-    if (v == 0 || v.sign == 0) { return 1; }
-    if (v.digits == 0) { return 1; }
-    var n: u64 = ((*Vec<u32>)v.digits).len();
+    if (big == 0 || big.sign == 0 || big.digits == 0) { return 1; }
+    var n: u64 = big.digits.len();
     var acc: u64 = 0;
     var i: u64 = n;
     while (i > 0) {
         i = i - 1;
-        var limb: u64 = (u64)((*Vec<u32>)v.digits).get(i);
+        var limb: u64 = (u64)big.digits.get(i);
         if (acc > (NUMBER_MAX_U64 - limb) / NUMBER_BASE) { return 0; }
         acc = acc * NUMBER_BASE + limb;
     }
@@ -170,21 +362,13 @@ func number_abs_to_u64_checked(v: *Number, out: *u64) -> u64 {
     return 1;
 }
 
-func number_try_to_u64(v: *Number, out: *u64) -> u64 {
+func number_big_try_to_i64(big: *NumberBig, out: *i64) -> u64 {
     if (out == 0) { return 0; }
     out[0] = 0;
-    if (v == 0 || v.sign == 0) { return 1; }
-    if (v.sign < 0) { return 0; }
-    return number_abs_to_u64_checked(v, out);
-}
-
-func number_try_to_i64(v: *Number, out: *i64) -> u64 {
-    if (out == 0) { return 0; }
-    out[0] = 0;
-    if (v == 0 || v.sign == 0) { return 1; }
+    if (big == 0 || big.sign == 0) { return 1; }
     var mag: u64 = 0;
-    if (number_abs_to_u64_checked(v, &mag) == 0) { return 0; }
-    if (v.sign > 0) {
+    if (number_big_abs_to_u64_checked(big, &mag) == 0) { return 0; }
+    if (big.sign > 0) {
         if (mag > NUMBER_MAX_I64_U64) { return 0; }
         out[0] = (i64)mag;
         return 1;
@@ -198,28 +382,350 @@ func number_try_to_i64(v: *Number, out: *i64) -> u64 {
     return 1;
 }
 
+func number_big_abs_cmp(a: *NumberBig, b: *NumberBig) -> i64 {
+    var an: u64 = 0;
+    var bn: u64 = 0;
+    if (a != 0 && a.digits != 0) { an = a.digits.len(); }
+    if (b != 0 && b.digits != 0) { bn = b.digits.len(); }
+    if (an > bn) { return 1; }
+    if (an < bn) { return -1; }
+    var i: u64 = an;
+    while (i > 0) {
+        i = i - 1;
+        var av: u64 = (u64)a.digits.get(i);
+        var bv: u64 = (u64)b.digits.get(i);
+        if (av > bv) { return 1; }
+        if (av < bv) { return -1; }
+    }
+    return 0;
+}
+
+func number_big_add_abs(a: *NumberBig, b: *NumberBig) -> *NumberBig {
+    var an: u64 = 0;
+    var bn: u64 = 0;
+    if (a != 0 && a.digits != 0) { an = a.digits.len(); }
+    if (b != 0 && b.digits != 0) { bn = b.digits.len(); }
+    var n: u64 = an;
+    if (bn > n) { n = bn; }
+
+    var out: *NumberBig = number_big_new(1, n + 2);
+    var carry: u64 = 0;
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var av: u64 = 0;
+        var bv: u64 = 0;
+        if (i < an) { av = (u64)a.digits.get(i); }
+        if (i < bn) { bv = (u64)b.digits.get(i); }
+        var cur: u64 = av + bv + carry;
+        out.digits.push((u32)(cur % NUMBER_BASE));
+        carry = cur / NUMBER_BASE;
+    }
+    if (carry != 0) {
+        out.digits.push((u32)carry);
+    }
+    number_big_trim_inplace(out);
+    return out;
+}
+
+func number_big_sub_abs(a: *NumberBig, b: *NumberBig) -> *NumberBig {
+    // Preconditions: |a| >= |b|
+    var an: u64 = 0;
+    var bn: u64 = 0;
+    if (a != 0 && a.digits != 0) { an = a.digits.len(); }
+    if (b != 0 && b.digits != 0) { bn = b.digits.len(); }
+
+    var out: *NumberBig = number_big_new(1, an + 1);
+    var borrow: i64 = 0;
+    for (var i: u64 = 0; i < an; i = i + 1) {
+        var av: i64 = (i64)(u64)a.digits.get(i);
+        var bv: i64 = 0;
+        if (i < bn) { bv = (i64)(u64)b.digits.get(i); }
+        var cur: i64 = av - bv - borrow;
+        if (cur < 0) {
+            cur = cur + (i64)NUMBER_BASE;
+            borrow = 1;
+        } else {
+            borrow = 0;
+        }
+        out.digits.push((u32)(u64)cur);
+    }
+    number_big_trim_inplace(out);
+    return out;
+}
+
+func number_big_mul_abs(a: *NumberBig, b: *NumberBig) -> *NumberBig {
+    if (a == 0 || b == 0 || a.sign == 0 || b.sign == 0) {
+        var z: *NumberBig = number_big_new(0, 1);
+        return z;
+    }
+    var an: u64 = a.digits.len();
+    var bn: u64 = b.digits.len();
+    var out: *NumberBig = number_big_new(1, an + bn + 2);
+
+    for (var i0: u64 = 0; i0 < an + bn + 1; i0 = i0 + 1) {
+        out.digits.push(0);
+    }
+
+    for (var i: u64 = 0; i < an; i = i + 1) {
+        var carry: u64 = 0;
+        var av: u64 = (u64)a.digits.get(i);
+        for (var j: u64 = 0; j < bn; j = j + 1) {
+            var idx: u64 = i + j;
+            var cur: u64 = (u64)out.digits.get(idx);
+            var bv: u64 = (u64)b.digits.get(j);
+            var prod: u64 = cur + av * bv + carry;
+            out.digits.set(idx, (u32)(prod % NUMBER_BASE));
+            carry = prod / NUMBER_BASE;
+        }
+        var k: u64 = i + bn;
+        while (carry != 0) {
+            var cur2: u64 = (u64)out.digits.get(k);
+            var sum2: u64 = cur2 + carry;
+            out.digits.set(k, (u32)(sum2 % NUMBER_BASE));
+            carry = sum2 / NUMBER_BASE;
+            k = k + 1;
+        }
+    }
+
+    number_big_trim_inplace(out);
+    return out;
+}
+
+func number_big_mul_small_abs(a: *NumberBig, m: u64) -> *NumberBig {
+    if (a == 0 || a.sign == 0 || m == 0) {
+        var z: *NumberBig = number_big_new(0, 1);
+        return z;
+    }
+    var an: u64 = a.digits.len();
+    var out: *NumberBig = number_big_new(1, an + 2);
+    var carry: u64 = 0;
+    for (var i: u64 = 0; i < an; i = i + 1) {
+        var av: u64 = (u64)a.digits.get(i);
+        var cur: u64 = av * m + carry;
+        out.digits.push((u32)(cur % NUMBER_BASE));
+        carry = cur / NUMBER_BASE;
+    }
+    while (carry != 0) {
+        out.digits.push((u32)(carry % NUMBER_BASE));
+        carry = carry / NUMBER_BASE;
+    }
+    number_big_trim_inplace(out);
+    return out;
+}
+
+func number_big_div_small_abs(a: *NumberBig, m: u64) -> *NumberBig {
+    if (a == 0 || a.sign == 0 || m == 0) {
+        var z: *NumberBig = number_big_new(0, 1);
+        return z;
+    }
+    var an: u64 = a.digits.len();
+    var q: *NumberBig = number_big_new(1, an + 1);
+    for (var i0: u64 = 0; i0 < an; i0 = i0 + 1) {
+        q.digits.push(0);
+    }
+
+    var rem: u64 = 0;
+    var i: u64 = an;
+    while (i > 0) {
+        i = i - 1;
+        var cur: u64 = rem * NUMBER_BASE + (u64)a.digits.get(i);
+        var qd: u64 = cur / m;
+        rem = cur % m;
+        q.digits.set(i, (u32)qd);
+    }
+    number_big_trim_inplace(q);
+    return q;
+}
+
+func number_big_mod_small_abs(a: *NumberBig, m: u64) -> u64 {
+    if (a == 0 || a.sign == 0 || m == 0) { return 0; }
+    var an: u64 = a.digits.len();
+    var rem: u64 = 0;
+    var i: u64 = an;
+    while (i > 0) {
+        i = i - 1;
+        var cur: u64 = rem * NUMBER_BASE + (u64)a.digits.get(i);
+        rem = cur % m;
+    }
+    return rem;
+}
+
+func number_from_big_normalized(big: *NumberBig) -> Number {
+    if (big == 0) { return number_make_zero(); }
+    number_big_trim_inplace(big);
+    if (big.sign == 0) { return number_make_zero(); }
+
+    var iv: i64 = 0;
+    if (number_big_try_to_i64(big, &iv) != 0) {
+        if (number_fits_small_i64(iv) != 0) {
+            return number_make_small(iv);
+        }
+    }
+    return number_make_big_handle(big);
+}
+
+func number_to_abs_big(v: *Number) -> *NumberBig {
+    if (v == 0) {
+        var z: *NumberBig = number_big_new(0, 1);
+        return z;
+    }
+    if (number_is_small(v) != 0) {
+        var sv: i64 = number_small_value(v);
+        if (sv == 0) {
+            var z2: *NumberBig = number_big_new(0, 1);
+            return z2;
+        }
+        var mag: u64 = 0;
+        number_i64_abs_mag(sv, &mag);
+        return number_big_from_u64_raw(mag);
+    }
+    return number_big_abs_copy(number_big_ptr(v));
+}
+
+func number_signum(v: *Number) -> i64 {
+    if (v == 0) { return 0; }
+    if (number_is_small(v) != 0) {
+        var sv: i64 = number_small_value(v);
+        if (sv > 0) { return 1; }
+        if (sv < 0) { return -1; }
+        return 0;
+    }
+    var b: *NumberBig = number_big_ptr(v);
+    if (b == 0) { return 0; }
+    if (b.sign > 0) { return 1; }
+    if (b.sign < 0) { return -1; }
+    return 0;
+}
+
+func number_negated(v: *Number) -> Number {
+    if (v == 0) { return number_make_zero(); }
+    if (number_is_small(v) != 0) {
+        return number_from_i64(0 - number_small_value(v));
+    }
+    var src: *NumberBig = number_big_ptr(v);
+    if (src == 0 || src.sign == 0) { return number_make_zero(); }
+    var copy: *NumberBig = number_big_copy(src);
+    copy.sign = 0 - copy.sign;
+    return number_from_big_normalized(copy);
+}
+
+func number_abs_with_sign(v: *Number, sign: i64) -> Number {
+    if (v == 0 || sign == 0 || number_signum(v) == 0) { return number_make_zero(); }
+    if (number_is_small(v) != 0) {
+        var sv: i64 = number_small_value(v);
+        var mag: u64 = 0;
+        number_i64_abs_mag(sv, &mag);
+        if (sign < 0) {
+            if (mag <= NUMBER_MAX_I64_U64) { return number_from_i64(0 - (i64)mag); }
+            var bneg: *NumberBig = number_big_from_u64_raw(mag);
+            bneg.sign = -1;
+            return number_from_big_normalized(bneg);
+        }
+        return number_from_u64(mag);
+    }
+    var srcb: *NumberBig = number_big_ptr(v);
+    if (srcb == 0) { return number_make_zero(); }
+    var copyb: *NumberBig = number_big_abs_copy(srcb);
+    if (sign < 0) { copyb.sign = -1; }
+    else { copyb.sign = 1; }
+    return number_from_big_normalized(copyb);
+}
+
+func number_clone(src: *Number) -> Number {
+    if (src == 0) { return number_make_zero(); }
+    var out: Number = Number { src.bits };
+    if (number_is_small(src) == 0) {
+        number_big_retain(number_big_ptr(src));
+    }
+    return out;
+}
+
+func number_from_i64(v: i64) -> Number {
+    if (number_fits_small_i64(v) != 0) {
+        return number_make_small(v);
+    }
+    var big: *NumberBig = number_big_from_i64_raw(v);
+    return number_make_big_handle(big);
+}
+
+func number_from_u64(v: u64) -> Number {
+    if (v <= NUMBER_SMALL_MAX_U64) {
+        return number_make_small((i64)v);
+    }
+    var big: *NumberBig = number_big_from_u64_raw(v);
+    return number_make_big_handle(big);
+}
+
+func number_abs_cmp(a: *Number, b: *Number) -> i64 {
+    var ai: u64 = 0;
+    var bi: u64 = 0;
+
+    if (a != 0 && number_is_small(a) != 0) {
+        var amag: u64 = 0;
+        number_i64_abs_mag(number_small_value(a), &amag);
+        ai = amag;
+        if (b != 0 && number_is_small(b) != 0) {
+            var bmag: u64 = 0;
+            number_i64_abs_mag(number_small_value(b), &bmag);
+            bi = bmag;
+            if (ai > bi) { return 1; }
+            if (ai < bi) { return -1; }
+            return 0;
+        }
+    }
+
+    var aa: *NumberBig = number_to_abs_big(a);
+    var bb: *NumberBig = number_to_abs_big(b);
+    return number_big_abs_cmp(aa, bb);
+}
+
+func number_try_to_u64(v: *Number, out: *u64) -> u64 {
+    if (out == 0) { return 0; }
+    out[0] = 0;
+    if (v == 0) { return 1; }
+
+    if (number_is_small(v) != 0) {
+        var sv: i64 = number_small_value(v);
+        if (sv < 0) { return 0; }
+        out[0] = (u64)sv;
+        return 1;
+    }
+
+    var b: *NumberBig = number_big_ptr(v);
+    if (b == 0 || b.sign == 0) { return 1; }
+    if (b.sign < 0) { return 0; }
+    return number_big_abs_to_u64_checked(b, out);
+}
+
+func number_try_to_i64(v: *Number, out: *i64) -> u64 {
+    if (out == 0) { return 0; }
+    out[0] = 0;
+    if (v == 0) { return 1; }
+
+    if (number_is_small(v) != 0) {
+        out[0] = number_small_value(v);
+        return 1;
+    }
+
+    return number_big_try_to_i64(number_big_ptr(v), out);
+}
+
 func number_to_i64_lossy(v: *Number) -> i64 {
-    if (v == 0 || v.sign == 0) { return 0; }
-    var n: u64 = ((*Vec<u32>)v.digits).len();
+    var out: i64 = 0;
+    if (number_try_to_i64(v, &out) != 0) { return out; }
+
+    if (v == 0 || number_is_small(v) != 0) { return number_small_value(v); }
+    var b: *NumberBig = number_big_ptr(v);
+    if (b == 0 || b.sign == 0) { return 0; }
+
+    var n: u64 = b.digits.len();
     var acc: u64 = 0;
     var i: u64 = n;
     while (i > 0) {
         i = i - 1;
-        acc = acc * NUMBER_BASE + (u64)((*Vec<u32>)v.digits).get(i);
+        acc = acc * NUMBER_BASE + (u64)b.digits.get(i);
     }
-    if (v.sign < 0) { return 0 - (i64)acc; }
+    if (b.sign < 0) { return 0 - (i64)acc; }
     return (i64)acc;
-}
-
-func number_cmp_values(a: Number, b: Number) -> i64 {
-    if (a.sign != b.sign) {
-        if (a.sign < b.sign) { return -1; }
-        return 1;
-    }
-    if (a.sign == 0) { return 0; }
-    var cmp: i64 = number_abs_cmp(&a, &b);
-    if (a.sign > 0) { return cmp; }
-    return 0 - cmp;
 }
 
 func number_cmp_ptr(a: *Number, b: *Number) -> i64 {
@@ -228,14 +734,32 @@ func number_cmp_ptr(a: *Number, b: *Number) -> i64 {
         if (a == 0) { return -1; }
         return 1;
     }
-    if (a.sign != b.sign) {
-        if (a.sign < b.sign) { return -1; }
+
+    if (number_is_small(a) != 0 && number_is_small(b) != 0) {
+        var av: i64 = number_small_value(a);
+        var bv: i64 = number_small_value(b);
+        if (av < bv) { return -1; }
+        if (av > bv) { return 1; }
+        return 0;
+    }
+
+    var a_sign: i64 = number_signum(a);
+    var bs: i64 = number_signum(b);
+    if (a_sign != bs) {
+        if (a_sign < bs) { return -1; }
         return 1;
     }
-    if (a.sign == 0) { return 0; }
-    var cmp: i64 = number_abs_cmp(a, b);
-    if (a.sign > 0) { return cmp; }
+    if (a_sign == 0) { return 0; }
+
+    var aa: *NumberBig = number_to_abs_big(a);
+    var bb: *NumberBig = number_to_abs_big(b);
+    var cmp: i64 = number_big_abs_cmp(aa, bb);
+    if (a_sign > 0) { return cmp; }
     return 0 - cmp;
+}
+
+func number_cmp_values(a: Number, b: Number) -> i64 {
+    return number_cmp_ptr(&a, &b);
 }
 
 func number_eq_ptr(a: *Number, b: *Number) -> u64 {
@@ -248,141 +772,296 @@ func number_cmp_i64_ptr(v: *Number, rhs: i64) -> i64 {
         if (rhs > 0) { return -1; }
         return 1;
     }
-
-    var rhs_sign: i64 = 0;
-    var rhs_mag: u64 = 0;
-    if (rhs > 0) {
-        rhs_sign = 1;
-        rhs_mag = (u64)rhs;
-    } else if (rhs < 0) {
-        rhs_sign = -1;
-        rhs_mag = 0 - (u64)rhs;
+    if (number_is_small(v) != 0) {
+        var sv: i64 = number_small_value(v);
+        if (sv < rhs) { return -1; }
+        if (sv > rhs) { return 1; }
+        return 0;
     }
-
-    if (v.sign != rhs_sign) {
-        if (v.sign < rhs_sign) { return -1; }
-        return 1;
-    }
-    if (v.sign == 0) { return 0; }
-
-    var a_len: u64 = 0;
-    if (v.digits != 0) { a_len = ((*Vec<u32>)v.digits).len(); }
-    var t: u64 = rhs_mag;
-    var b0: u64 = 0;
-    var b1: u64 = 0;
-    var b2: u64 = 0;
-    var b_len: u64 = 0;
-    while (t != 0) {
-        var limb: u64 = t % NUMBER_BASE;
-        if (b_len == 0) { b0 = limb; }
-        else if (b_len == 1) { b1 = limb; }
-        else { b2 = limb; }
-        b_len = b_len + 1;
-        t = t / NUMBER_BASE;
-    }
-    if (a_len > b_len) { return v.sign; }
-    if (a_len < b_len) { return 0 - v.sign; }
-    var i: u64 = a_len;
-    while (i > 0) {
-        i = i - 1;
-        var av: u64 = (u64)((*Vec<u32>)v.digits).get(i);
-        var bv: u64 = 0;
-        if (i == 0) { bv = b0; }
-        else if (i == 1) { bv = b1; }
-        else { bv = b2; }
-        if (av > bv) { return v.sign; }
-        if (av < bv) { return 0 - v.sign; }
-    }
-    return 0;
+    var rv: Number = number_from_i64(rhs);
+    return number_cmp_ptr(v, &rv);
 }
 
 func number_add_values(a: *Number, b: *Number) -> Number {
-    if (a.sign == 0) { return number_clone(b); }
-    if (b.sign == 0) { return number_clone(a); }
-    if (a.sign == b.sign) {
-        var sum: Number = number_add_abs(a, b);
-        sum.sign = a.sign;
-        number_trim_inplace(&sum);
-        return sum;
+    var ai: i64 = 0;
+    var bi: i64 = 0;
+    var ri: i64 = 0;
+    if (number_try_to_i64(a, &ai) != 0 && number_try_to_i64(b, &bi) != 0) {
+        if (number_i64_add_checked(ai, bi, &ri) != 0) {
+            return number_from_i64(ri);
+        }
     }
 
-    var cmp: i64 = number_abs_cmp(a, b);
+    var a_sign: i64 = number_signum(a);
+    var bs: i64 = number_signum(b);
+    if (a_sign == 0) { return number_clone(b); }
+    if (bs == 0) { return number_clone(a); }
+
+    var aa: *NumberBig = number_to_abs_big(a);
+    var bb: *NumberBig = number_to_abs_big(b);
+
+    if (a_sign == bs) {
+        var sum: *NumberBig = number_big_add_abs(aa, bb);
+        sum.sign = a_sign;
+        return number_from_big_normalized(sum);
+    }
+
+    var cmp: i64 = number_big_abs_cmp(aa, bb);
     if (cmp == 0) { return number_make_zero(); }
     if (cmp > 0) {
-        var diff1: Number = number_sub_abs(a, b);
-        diff1.sign = a.sign;
-        number_trim_inplace(&diff1);
-        return diff1;
+        var diff1: *NumberBig = number_big_sub_abs(aa, bb);
+        diff1.sign = a_sign;
+        return number_from_big_normalized(diff1);
     }
-    var diff2: Number = number_sub_abs(b, a);
-    diff2.sign = b.sign;
-    number_trim_inplace(&diff2);
-    return diff2;
+    var diff2: *NumberBig = number_big_sub_abs(bb, aa);
+    diff2.sign = bs;
+    return number_from_big_normalized(diff2);
 }
 
 func number_sub_values(a: *Number, b: *Number) -> Number {
-    var neg_b: Number = number_clone(b);
-    neg_b.sign = 0 - neg_b.sign;
-    return number_add_values(a, &neg_b);
+    var ai: i64 = 0;
+    var bi: i64 = 0;
+    var ri: i64 = 0;
+    if (number_try_to_i64(a, &ai) != 0 && number_try_to_i64(b, &bi) != 0) {
+        if (number_i64_sub_checked(ai, bi, &ri) != 0) {
+            return number_from_i64(ri);
+        }
+    }
+    var neg: Number = number_negated(b);
+    return number_add_values(a, &neg);
 }
 
 func number_mul_values(a: *Number, b: *Number) -> Number {
-    if (a.sign == 0 || b.sign == 0) { return number_make_zero(); }
-    var an: u64 = ((*Vec<u32>)a.digits).len();
-    var bn: u64 = ((*Vec<u32>)b.digits).len();
-    var out: Number = Number { 1, number_vec_new(an + bn + 1) };
-    for (var i0: u64 = 0; i0 < an + bn + 1; i0 = i0 + 1) {
-        ((*Vec<u32>)out.digits).push(0);
+    var ai: i64 = 0;
+    var bi: i64 = 0;
+    var ri: i64 = 0;
+    if (number_try_to_i64(a, &ai) != 0 && number_try_to_i64(b, &bi) != 0) {
+        if (number_i64_mul_checked(ai, bi, &ri) != 0) {
+            return number_from_i64(ri);
+        }
     }
 
-    for (var i: u64 = 0; i < an; i = i + 1) {
-        var carry: u64 = 0;
-        var av: u64 = (u64)((*Vec<u32>)a.digits).get(i);
-        for (var j: u64 = 0; j < bn; j = j + 1) {
-            var cur_idx: u64 = i + j;
-            var cur: u64 = (u64)((*Vec<u32>)out.digits).get(cur_idx);
-            var bv: u64 = (u64)((*Vec<u32>)b.digits).get(j);
-            var prod: u64 = cur + av * bv + carry;
-            ((*Vec<u32>)out.digits).set(cur_idx, (u32)(prod % NUMBER_BASE));
-            carry = prod / NUMBER_BASE;
-        }
-        var k: u64 = i + bn;
-        while (carry != 0) {
-            var cur2: u64 = (u64)((*Vec<u32>)out.digits).get(k);
-            var sum2: u64 = cur2 + carry;
-            ((*Vec<u32>)out.digits).set(k, (u32)(sum2 % NUMBER_BASE));
-            carry = sum2 / NUMBER_BASE;
-            k = k + 1;
-        }
-    }
-    out.sign = a.sign * b.sign;
-    number_trim_inplace(&out);
-    return out;
+    var a_sign: i64 = number_signum(a);
+    var bs: i64 = number_signum(b);
+    if (a_sign == 0 || bs == 0) { return number_make_zero(); }
+
+    var aa: *NumberBig = number_to_abs_big(a);
+    var bb: *NumberBig = number_to_abs_big(b);
+    var out: *NumberBig = number_big_mul_abs(aa, bb);
+    out.sign = a_sign * bs;
+    return number_from_big_normalized(out);
 }
 
 func number_mul_small(a: *Number, m: u64) -> Number {
-    if (a == 0 || a.sign == 0 || m == 0) { return number_make_zero(); }
-    var an: u64 = ((*Vec<u32>)a.digits).len();
-    var out: Number = Number { 1, number_vec_new(an + 2) };
-    var carry: u64 = 0;
-    for (var i: u64 = 0; i < an; i = i + 1) {
-        var av: u64 = (u64)((*Vec<u32>)a.digits).get(i);
-        var cur: u64 = av * m + carry;
-        ((*Vec<u32>)out.digits).push((u32)(cur % NUMBER_BASE));
-        carry = cur / NUMBER_BASE;
+    if (a == 0 || m == 0) { return number_make_zero(); }
+
+    var ai: i64 = 0;
+    var ri: i64 = 0;
+    if (number_try_to_i64(a, &ai) != 0 && m <= NUMBER_MAX_I64_U64) {
+        if (number_i64_mul_checked(ai, (i64)m, &ri) != 0) {
+            return number_from_i64(ri);
+        }
     }
-    while (carry != 0) {
-        ((*Vec<u32>)out.digits).push((u32)(carry % NUMBER_BASE));
-        carry = carry / NUMBER_BASE;
-    }
-    number_trim_inplace(&out);
-    return out;
+
+    var a_sign: i64 = number_signum(a);
+    if (a_sign == 0) { return number_make_zero(); }
+    var aa: *NumberBig = number_to_abs_big(a);
+    var out: *NumberBig = number_big_mul_small_abs(aa, m);
+    out.sign = a_sign;
+    return number_from_big_normalized(out);
 }
 
 func number_abs_clone(a: *Number) -> Number {
-    var out: Number = number_clone(a);
-    if (out.sign < 0) { out.sign = 1; }
-    return out;
+    if (a == 0) { return number_make_zero(); }
+    if (number_is_small(a) != 0) {
+        var sv: i64 = number_small_value(a);
+        if (sv >= 0) { return number_make_small(sv); }
+        var mag: u64 = 0;
+        number_i64_abs_mag(sv, &mag);
+        return number_from_u64(mag);
+    }
+    var out: *NumberBig = number_big_abs_copy(number_big_ptr(a));
+    return number_from_big_normalized(out);
+}
+
+func number_abs_fits_u64(v: *Number) -> u64 {
+    var out: u64 = 0;
+    if (v == 0) { return 1; }
+    if (number_is_small(v) != 0) {
+        var mag: u64 = 0;
+        number_i64_abs_mag(number_small_value(v), &mag);
+        out = mag;
+        return 1;
+    }
+    return number_big_abs_to_u64_checked(number_big_ptr(v), &out);
+}
+
+func number_abs_to_u64(v: *Number) -> u64 {
+    var out: u64 = 0;
+    if (number_try_to_u64(v, &out) != 0) { return out; }
+    if (v == 0) { return 0; }
+    if (number_is_small(v) != 0) {
+        var mag: u64 = 0;
+        number_i64_abs_mag(number_small_value(v), &mag);
+        return mag;
+    }
+    if (number_big_abs_to_u64_checked(number_big_ptr(v), &out) != 0) { return out; }
+    return 0;
+}
+
+func number_div_small_abs(a: *Number, m: u64) -> Number {
+    if (a == 0 || m == 0) { return number_make_zero(); }
+    if (number_signum(a) == 0) { return number_make_zero(); }
+
+    if (number_is_small(a) != 0) {
+        var mag: u64 = 0;
+        number_i64_abs_mag(number_small_value(a), &mag);
+        return number_from_u64(mag / m);
+    }
+
+    var aa: *NumberBig = number_to_abs_big(a);
+    var q: *NumberBig = number_big_div_small_abs(aa, m);
+    return number_from_big_normalized(q);
+}
+
+func number_mod_small_abs(a: *Number, m: u64) -> u64 {
+    if (a == 0 || m == 0) { return 0; }
+    if (number_signum(a) == 0) { return 0; }
+
+    if (number_is_small(a) != 0) {
+        var mag: u64 = 0;
+        number_i64_abs_mag(number_small_value(a), &mag);
+        return mag % m;
+    }
+
+    var aa: *NumberBig = number_to_abs_big(a);
+    return number_big_mod_small_abs(aa, m);
+}
+
+func number_big_abs_div_shift_sub(a: *NumberBig, b: *NumberBig) -> *NumberBig {
+    if (a == 0 || b == 0 || b.sign == 0 || a.sign == 0) {
+        var z: *NumberBig = number_big_new(0, 1);
+        return z;
+    }
+
+    var cmp0: i64 = number_big_abs_cmp(a, b);
+    if (cmp0 < 0) {
+        var z2: *NumberBig = number_big_new(0, 1);
+        return z2;
+    }
+    if (cmp0 == 0) {
+        return number_big_from_u64_raw(1);
+    }
+
+    var q: *NumberBig = number_big_new(0, 1);
+    var r: *NumberBig = number_big_abs_copy(a);
+    var one: *NumberBig = number_big_from_u64_raw(1);
+
+    while (number_big_abs_cmp(r, b) >= 0) {
+        var cur: *NumberBig = number_big_abs_copy(b);
+        var mul: *NumberBig = number_big_abs_copy(one);
+        while (1) {
+            var next_cur: *NumberBig = number_big_mul_small_abs(cur, 2);
+            if (number_big_abs_cmp(next_cur, r) > 0) { break; }
+            cur = next_cur;
+            mul = number_big_mul_small_abs(mul, 2);
+        }
+        r = number_big_sub_abs(r, cur);
+        q = number_big_add_abs(q, mul);
+    }
+
+    number_big_trim_inplace(q);
+    return q;
+}
+
+func number_big_abs_mod_shift_sub(a: *NumberBig, b: *NumberBig) -> *NumberBig {
+    if (a == 0 || b == 0 || b.sign == 0 || a.sign == 0) {
+        var z: *NumberBig = number_big_new(0, 1);
+        return z;
+    }
+
+    var cmp0: i64 = number_big_abs_cmp(a, b);
+    if (cmp0 < 0) { return number_big_abs_copy(a); }
+    if (cmp0 == 0) {
+        var z2: *NumberBig = number_big_new(0, 1);
+        return z2;
+    }
+
+    var r: *NumberBig = number_big_abs_copy(a);
+    while (number_big_abs_cmp(r, b) >= 0) {
+        var cur: *NumberBig = number_big_abs_copy(b);
+        while (1) {
+            var next_cur: *NumberBig = number_big_mul_small_abs(cur, 2);
+            if (number_big_abs_cmp(next_cur, r) > 0) { break; }
+            cur = next_cur;
+        }
+        r = number_big_sub_abs(r, cur);
+    }
+
+    number_big_trim_inplace(r);
+    return r;
+}
+
+func number_div_values(a: *Number, b: *Number) -> Number {
+    if (a == 0 || b == 0 || number_signum(b) == 0) { return number_make_zero(); }
+    if (number_signum(a) == 0) { return number_make_zero(); }
+
+    var ai: i64 = 0;
+    var bi: i64 = 0;
+    if (number_try_to_i64(a, &ai) != 0 && number_try_to_i64(b, &bi) != 0 && bi != 0) {
+        return number_from_i64(ai / bi);
+    }
+
+    var a_sign: i64 = number_signum(a);
+    var bs: i64 = number_signum(b);
+
+    var aa: *NumberBig = number_to_abs_big(a);
+    var bb: *NumberBig = number_to_abs_big(b);
+
+    var q: *NumberBig = 0;
+    var bb_u64: u64 = 0;
+    if (number_big_abs_to_u64_checked(bb, &bb_u64) != 0) {
+        if (bb_u64 == 0) { return number_make_zero(); }
+        q = number_big_div_small_abs(aa, bb_u64);
+    } else {
+        q = number_big_abs_div_shift_sub(aa, bb);
+    }
+
+    if (q.sign != 0) { q.sign = a_sign * bs; }
+    return number_from_big_normalized(q);
+}
+
+func number_mod_values(a: *Number, b: *Number) -> Number {
+    if (a == 0 || b == 0 || number_signum(b) == 0) { return number_make_zero(); }
+    if (number_signum(a) == 0) { return number_make_zero(); }
+
+    var ai: i64 = 0;
+    var bi: i64 = 0;
+    if (number_try_to_i64(a, &ai) != 0 && number_try_to_i64(b, &bi) != 0 && bi != 0) {
+        return number_from_i64(ai % bi);
+    }
+
+    var a_sign: i64 = number_signum(a);
+
+    var aa: *NumberBig = number_to_abs_big(a);
+    var bb: *NumberBig = number_to_abs_big(b);
+
+    var r: Number = number_make_zero();
+    var bb_u64: u64 = 0;
+    if (number_big_abs_to_u64_checked(bb, &bb_u64) != 0) {
+        if (bb_u64 == 0) { return number_make_zero(); }
+        var rem: u64 = number_big_mod_small_abs(aa, bb_u64);
+        if (rem == 0) { return number_make_zero(); }
+        r = number_from_u64(rem);
+    } else {
+        var rr: *NumberBig = number_big_abs_mod_shift_sub(aa, bb);
+        r = number_from_big_normalized(rr);
+    }
+
+    if (a_sign < 0 && number_signum(&r) != 0) {
+        r = number_abs_with_sign(&r, -1);
+    }
+    return r;
 }
 
 func number_pow2(bits: u64) -> Number {
@@ -396,7 +1075,7 @@ func number_pow2(bits: u64) -> Number {
 func number_bit_length_abs(a: *Number) -> u64 {
     var t: Number = number_abs_clone(a);
     var bits: u64 = 0;
-    while (t.sign != 0) {
+    while (number_signum(&t) != 0) {
         t = number_div_small_abs(&t, 2);
         bits = bits + 1;
     }
@@ -404,7 +1083,7 @@ func number_bit_length_abs(a: *Number) -> u64 {
 }
 
 func number_shl_values(a: *Number, sh: u64) -> Number {
-    if (a == 0 || a.sign == 0) { return number_make_zero(); }
+    if (a == 0 || number_signum(a) == 0) { return number_make_zero(); }
     if (sh == 0) { return number_clone(a); }
 
     var av: i64 = 0;
@@ -416,13 +1095,16 @@ func number_shl_values(a: *Number, sh: u64) -> Number {
     for (var i: u64 = 0; i < sh; i = i + 1) {
         out = number_mul_small(&out, 2);
     }
-    if (out.sign != 0) { out.sign = a.sign; }
+
+    var a_sign: i64 = number_signum(a);
+    if (a_sign < 0 && number_signum(&out) != 0) {
+        out = number_abs_with_sign(&out, -1);
+    }
     return out;
 }
 
 func number_is_nonneg(a: *Number) -> u64 {
-    if (a == 0) { return 1; }
-    return a.sign >= 0;
+    return number_signum(a) >= 0;
 }
 
 func number_twos_complement_nonneg(a: *Number, width: u64) -> Number {
@@ -437,16 +1119,19 @@ func number_bitwise_nonneg_abs(a: *Number, b: *Number, mode: u64) -> Number {
     var bb: Number = number_abs_clone(b);
     var place: Number = number_from_i64(1);
     var out: Number = number_make_zero();
-    while (aa.sign != 0 || bb.sign != 0) {
+
+    while (number_signum(&aa) != 0 || number_signum(&bb) != 0) {
         var abit: u64 = number_mod_small_abs(&aa, 2);
         var bbit: u64 = number_mod_small_abs(&bb, 2);
         var obit: u64 = 0;
         if (mode == 0) { obit = abit & bbit; }
         else if (mode == 1) { obit = abit | bbit; }
         else { obit = abit ^ bbit; }
+
         if (obit != 0) {
             out = number_add_values(&out, &place);
         }
+
         aa = number_div_small_abs(&aa, 2);
         bb = number_div_small_abs(&bb, 2);
         place = number_mul_small(&place, 2);
@@ -455,7 +1140,7 @@ func number_bitwise_nonneg_abs(a: *Number, b: *Number, mode: u64) -> Number {
 }
 
 func number_from_twos_complement(tc: *Number, width: u64) -> Number {
-    if (tc == 0 || tc.sign == 0 || width == 0) { return number_make_zero(); }
+    if (tc == 0 || number_signum(tc) == 0 || width == 0) { return number_make_zero(); }
     var sign_bit: Number = number_pow2(width - 1);
     if (number_abs_cmp(tc, &sign_bit) < 0) {
         return number_abs_clone(tc);
@@ -498,26 +1183,25 @@ func number_bitxor_values(a: *Number, b: *Number) -> Number {
 }
 
 func number_bitnot_values(a: *Number) -> Number {
-    // Infinite-width two's complement identity.
-    var neg: Number = number_clone(a);
-    neg.sign = 0 - neg.sign;
+    var neg: Number = number_negated(a);
     var one: Number = number_from_i64(1);
     return number_sub_values(&neg, &one);
 }
 
 func number_shift_amount_from_number(rhs: *Number) -> u64 {
-    if (rhs == 0 || rhs.sign <= 0) { return 0; }
+    if (rhs == 0 || number_signum(rhs) <= 0) { return 0; }
     if (number_abs_fits_u64(rhs) == 0) { return NUMBER_MAX_U64; }
     return number_abs_to_u64(rhs);
 }
 
 func number_shr_one(a: *Number) -> Number {
-    if (a == 0 || a.sign == 0) { return number_make_zero(); }
-    if (a.sign > 0) { return number_div_small_abs(a, 2); }
+    if (a == 0 || number_signum(a) == 0) { return number_make_zero(); }
+    if (number_signum(a) > 0) { return number_div_small_abs(a, 2); }
+
     var two: Number = number_from_i64(2);
     var q: Number = number_div_values(a, &two);
     var r: Number = number_mod_values(a, &two);
-    if (r.sign != 0) {
+    if (number_signum(&r) != 0) {
         var one: Number = number_from_i64(1);
         q = number_sub_values(&q, &one);
     }
@@ -525,7 +1209,7 @@ func number_shr_one(a: *Number) -> Number {
 }
 
 func number_shr_values(a: *Number, sh: u64) -> Number {
-    if (a == 0 || a.sign == 0) { return number_make_zero(); }
+    if (a == 0 || number_signum(a) == 0) { return number_make_zero(); }
     if (sh == 0) { return number_clone(a); }
 
     var av: i64 = 0;
@@ -537,11 +1221,11 @@ func number_shr_values(a: *Number, sh: u64) -> Number {
         return number_from_i64(av >> sh);
     }
 
-    if (a.sign > 0) {
+    if (number_signum(a) > 0) {
         var out_pos: Number = number_abs_clone(a);
         for (var i: u64 = 0; i < sh; i = i + 1) {
             out_pos = number_div_small_abs(&out_pos, 2);
-            if (out_pos.sign == 0) { break; }
+            if (number_signum(&out_pos) == 0) { break; }
         }
         return out_pos;
     }
@@ -549,177 +1233,11 @@ func number_shr_values(a: *Number, sh: u64) -> Number {
     var pow2: Number = number_pow2(sh);
     var q: Number = number_div_values(a, &pow2);
     var r: Number = number_mod_values(a, &pow2);
-    if (r.sign != 0) {
+    if (number_signum(&r) != 0) {
         var one: Number = number_from_i64(1);
         q = number_sub_values(&q, &one);
     }
     return q;
-}
-
-func number_abs_fits_u64(v: *Number) -> u64 {
-    var x: u64 = 0;
-    return number_abs_to_u64_checked(v, &x);
-}
-
-func number_abs_to_u64(v: *Number) -> u64 {
-    if (v == 0 || v.sign == 0) { return 0; }
-    if (v.digits == 0) { return 0; }
-    var n: u64 = ((*Vec<u32>)v.digits).len();
-    if (n > 2) { return 0; }
-    var acc: u64 = 0;
-    var i: u64 = n;
-    while (i > 0) {
-        i = i - 1;
-        var limb: u64 = (u64)((*Vec<u32>)v.digits).get(i);
-        acc = acc * NUMBER_BASE + limb;
-    }
-    return acc;
-}
-
-func number_div_small_abs(a: *Number, m: u64) -> Number {
-    if (a == 0 || m == 0 || a.sign == 0) { return number_make_zero(); }
-    var an: u64 = ((*Vec<u32>)a.digits).len();
-    var qhi: *Vec<u32> = new Vec<u32>(an + 1);
-    var rem: u64 = 0;
-    var i: u64 = an;
-    while (i > 0) {
-        i = i - 1;
-        var cur: u64 = rem * NUMBER_BASE + (u64)((*Vec<u32>)a.digits).get(i);
-        var qd: u64 = cur / m;
-        rem = cur % m;
-        qhi.push((u32)qd);
-    }
-    var q: Number = Number { 1, number_vec_new(an + 1) };
-    var j: u64 = qhi.len();
-    while (j > 0) {
-        j = j - 1;
-        ((*Vec<u32>)q.digits).push(qhi.get(j));
-    }
-    number_trim_inplace(&q);
-    return q;
-}
-
-func number_mod_small_abs(a: *Number, m: u64) -> u64 {
-    if (a == 0 || m == 0 || a.sign == 0) { return 0; }
-    var an: u64 = ((*Vec<u32>)a.digits).len();
-    var rem: u64 = 0;
-    var i: u64 = an;
-    while (i > 0) {
-        i = i - 1;
-        var cur: u64 = rem * NUMBER_BASE + (u64)((*Vec<u32>)a.digits).get(i);
-        rem = cur % m;
-    }
-    return rem;
-}
-
-func number_abs_div_shift_sub(a: *Number, b: *Number) -> Number {
-    if (a == 0 || b == 0 || b.sign == 0 || a.sign == 0) { return number_make_zero(); }
-
-    var aa: Number = number_abs_clone(a);
-    var bb: Number = number_abs_clone(b);
-    var cmp0: i64 = number_abs_cmp(&aa, &bb);
-    if (cmp0 < 0) { return number_make_zero(); }
-    if (cmp0 == 0) { return number_from_i64(1); }
-
-    var q: Number = number_make_zero();
-    var r: Number = number_clone(&aa);
-    var one: Number = number_from_i64(1);
-
-    while (number_abs_cmp(&r, &bb) >= 0) {
-        var cur: Number = number_clone(&bb);
-        var mul: Number = number_clone(&one);
-        while (1) {
-            var next_cur: Number = number_mul_small(&cur, 2);
-            if (number_abs_cmp(&next_cur, &r) > 0) { break; }
-            cur = next_cur;
-            mul = number_mul_small(&mul, 2);
-        }
-        r = number_sub_abs(&r, &cur);
-        q = number_add_values(&q, &mul);
-    }
-    return q;
-}
-
-func number_abs_mod_shift_sub(a: *Number, b: *Number) -> Number {
-    if (a == 0 || b == 0 || b.sign == 0 || a.sign == 0) { return number_make_zero(); }
-
-    var aa: Number = number_abs_clone(a);
-    var bb: Number = number_abs_clone(b);
-    var cmp0: i64 = number_abs_cmp(&aa, &bb);
-    if (cmp0 < 0) { return aa; }
-    if (cmp0 == 0) { return number_make_zero(); }
-
-    var r: Number = number_clone(&aa);
-    while (number_abs_cmp(&r, &bb) >= 0) {
-        var cur: Number = number_clone(&bb);
-        while (1) {
-            var next_cur: Number = number_mul_small(&cur, 2);
-            if (number_abs_cmp(&next_cur, &r) > 0) { break; }
-            cur = next_cur;
-        }
-        r = number_sub_abs(&r, &cur);
-    }
-    return r;
-}
-
-func number_div_values(a: *Number, b: *Number) -> Number {
-    if (a == 0 || b == 0 || b.sign == 0) { return number_make_zero(); }
-    if (a.sign == 0) { return number_make_zero(); }
-
-    var ai: i64 = 0;
-    var bi: i64 = 0;
-    if (number_try_to_i64(a, &ai) != 0 && number_try_to_i64(b, &bi) != 0 && bi != 0) {
-        return number_from_i64(ai / bi);
-    }
-
-    var aa: Number = number_clone(a);
-    aa.sign = 1;
-    var bb: Number = number_clone(b);
-    bb.sign = 1;
-    if (number_abs_fits_u64(&bb) != 0) {
-        var m: u64 = number_abs_to_u64(&bb);
-        if (m == 0) { return number_make_zero(); }
-        var out_small: Number = number_div_small_abs(&aa, m);
-        if (out_small.sign != 0) { out_small.sign = a.sign * b.sign; }
-        number_trim_inplace(&out_small);
-        return out_small;
-    } else {
-        var q: Number = number_abs_div_shift_sub(&aa, &bb);
-        if (q.sign != 0) { q.sign = a.sign * b.sign; }
-        number_trim_inplace(&q);
-        return q;
-    }
-}
-
-func number_mod_values(a: *Number, b: *Number) -> Number {
-    if (a == 0 || b == 0 || b.sign == 0) { return number_make_zero(); }
-    if (a.sign == 0) { return number_make_zero(); }
-
-    var ai: i64 = 0;
-    var bi: i64 = 0;
-    if (number_try_to_i64(a, &ai) != 0 && number_try_to_i64(b, &bi) != 0 && bi != 0) {
-        return number_from_i64(ai % bi);
-    }
-
-    var aa: Number = number_clone(a);
-    aa.sign = 1;
-    var bb: Number = number_clone(b);
-    bb.sign = 1;
-    if (number_abs_fits_u64(&bb) != 0) {
-        var m: u64 = number_abs_to_u64(&bb);
-        if (m == 0) { return number_make_zero(); }
-        var rem: u64 = number_mod_small_abs(&aa, m);
-        if (rem == 0) { return number_make_zero(); }
-        var out_small: Number = number_from_i64((i64)rem);
-        if (a.sign < 0) { out_small.sign = -1; }
-        number_trim_inplace(&out_small);
-        return out_small;
-    } else {
-        var r: Number = number_abs_mod_shift_sub(&aa, &bb);
-        if (r.sign != 0 && a.sign < 0) { r.sign = -1; }
-        number_trim_inplace(&r);
-        return r;
-    }
 }
 
 func number_to_i64_checked(v: *Number, out: *i64) -> u64 {
@@ -731,7 +1249,7 @@ func number_to_u64_checked(v: *Number, out: *u64) -> u64 {
 }
 
 func number_to_str(v: *Number) -> u64 {
-    if (v == 0 || v.sign == 0) {
+    if (v == 0 || number_signum(v) == 0) {
         var z: u64 = heap_alloc(2 * sizeof(u8));
         var zu8: *u8 = (*u8)z;
         zu8[0] = 48;
@@ -741,19 +1259,19 @@ func number_to_str(v: *Number) -> u64 {
 
     var t: Number = number_abs_clone(v);
     var rev: *Vec<u8> = new Vec<u8>(32);
-    while (t.sign != 0) {
+    while (number_signum(&t) != 0) {
         var d: u64 = number_mod_small_abs(&t, 10);
         rev.push((u8)(48 + d));
         t = number_div_small_abs(&t, 10);
     }
 
     var sign_len: u64 = 0;
-    if (v.sign < 0) { sign_len = 1; }
+    if (number_signum(v) < 0) { sign_len = 1; }
     var n: u64 = rev.len();
     var out: u64 = heap_alloc((sign_len + n + 1) * sizeof(u8));
     var out_u8: *u8 = (*u8)out;
     var pos: u64 = 0;
-    if (v.sign < 0) {
+    if (number_signum(v) < 0) {
         out_u8[0] = 45;
         pos = 1;
     }
@@ -788,99 +1306,185 @@ func number_from_str(src_ptr: u64, src_len: u64) -> Number {
         var d: Number = number_from_u64((u64)(c - 48));
         out = number_add_values(&out, &d);
     }
-    if (out.sign != 0 && sign < 0) { out.sign = -1; }
+
+    if (sign < 0 && number_signum(&out) != 0) {
+        out = number_abs_with_sign(&out, -1);
+    }
     return out;
 }
 
 func number_add_box(lhs: Number, rhs: Number) -> Number {
+    if (number_is_small(&lhs) != 0 && number_is_small(&rhs) != 0) {
+        var a: i64 = number_small_value(&lhs);
+        var b: i64 = number_small_value(&rhs);
+        var r: i64 = 0;
+        if (number_i64_add_checked(a, b, &r) != 0) {
+            return number_from_i64(r);
+        }
+    }
     return number_add_values(&lhs, &rhs);
 }
 
 func number_sub_box(lhs: Number, rhs: Number) -> Number {
+    if (number_is_small(&lhs) != 0 && number_is_small(&rhs) != 0) {
+        var a: i64 = number_small_value(&lhs);
+        var b: i64 = number_small_value(&rhs);
+        var r: i64 = 0;
+        if (number_i64_sub_checked(a, b, &r) != 0) {
+            return number_from_i64(r);
+        }
+    }
     return number_sub_values(&lhs, &rhs);
 }
 
 func number_mul_box(lhs: Number, rhs: Number) -> Number {
+    if (number_is_small(&lhs) != 0 && number_is_small(&rhs) != 0) {
+        var a: i64 = number_small_value(&lhs);
+        var b: i64 = number_small_value(&rhs);
+        var r: i64 = 0;
+        if (number_i64_mul_checked(a, b, &r) != 0) {
+            return number_from_i64(r);
+        }
+    }
     return number_mul_values(&lhs, &rhs);
 }
 
 func number_div_box(lhs: Number, rhs: Number) -> Number {
+    if (number_is_small(&lhs) != 0 && number_is_small(&rhs) != 0) {
+        var a: i64 = number_small_value(&lhs);
+        var b: i64 = number_small_value(&rhs);
+        if (b != 0) {
+            return number_from_i64(a / b);
+        }
+    }
     return number_div_values(&lhs, &rhs);
 }
 
 func number_mod_box(lhs: Number, rhs: Number) -> Number {
+    if (number_is_small(&lhs) != 0 && number_is_small(&rhs) != 0) {
+        var a: i64 = number_small_value(&lhs);
+        var b: i64 = number_small_value(&rhs);
+        if (b != 0) {
+            return number_from_i64(a % b);
+        }
+    }
     return number_mod_values(&lhs, &rhs);
 }
 
 func number_bitand_box(lhs: Number, rhs: Number) -> Number {
+    if (number_is_small(&lhs) != 0 && number_is_small(&rhs) != 0) {
+        return number_from_i64(number_small_value(&lhs) & number_small_value(&rhs));
+    }
     return number_bitand_values(&lhs, &rhs);
 }
 
 func number_bitor_box(lhs: Number, rhs: Number) -> Number {
+    if (number_is_small(&lhs) != 0 && number_is_small(&rhs) != 0) {
+        return number_from_i64(number_small_value(&lhs) | number_small_value(&rhs));
+    }
     return number_bitor_values(&lhs, &rhs);
 }
 
 func number_bitxor_box(lhs: Number, rhs: Number) -> Number {
+    if (number_is_small(&lhs) != 0 && number_is_small(&rhs) != 0) {
+        return number_from_i64(number_small_value(&lhs) ^ number_small_value(&rhs));
+    }
     return number_bitxor_values(&lhs, &rhs);
 }
 
 func number_shl_box(lhs: Number, rhs: Number) -> Number {
     var sh: u64 = number_shift_amount_from_number(&rhs);
+    if (number_is_small(&lhs) != 0 && sh < 63) {
+        return number_from_i64(number_small_value(&lhs) << sh);
+    }
     return number_shl_values(&lhs, sh);
 }
 
 func number_shr_box(lhs: Number, rhs: Number) -> Number {
     var sh: u64 = number_shift_amount_from_number(&rhs);
+    if (number_is_small(&lhs) != 0) {
+        var a: i64 = number_small_value(&lhs);
+        if (sh >= 63) {
+            if (a < 0) { return number_from_i64(-1); }
+            return number_make_zero();
+        }
+        return number_from_i64(a >> sh);
+    }
     return number_shr_values(&lhs, sh);
 }
 
 func number_bitnot_box(v: Number) -> Number {
+    if (number_is_small(&v) != 0) {
+        return number_from_i64(~number_small_value(&v));
+    }
     return number_bitnot_values(&v);
 }
 
-// Compatibility symbol for compilers that may still lower Number equality to this helper.
-// Keep implementation simple and side-effect free.
 func number_eq_box(lhs: Number, rhs: Number) -> u64 {
+    if (number_is_small(&lhs) != 0 && number_is_small(&rhs) != 0) {
+        return number_small_value(&lhs) == number_small_value(&rhs);
+    }
     return number_cmp_ptr(&lhs, &rhs) == 0;
 }
 
 func number_ne_box(lhs: Number, rhs: Number) -> u64 {
+    if (number_is_small(&lhs) != 0 && number_is_small(&rhs) != 0) {
+        return number_small_value(&lhs) != number_small_value(&rhs);
+    }
     return number_cmp_ptr(&lhs, &rhs) != 0;
 }
 
 func number_lt_box(lhs: Number, rhs: Number) -> u64 {
+    if (number_is_small(&lhs) != 0 && number_is_small(&rhs) != 0) {
+        return number_small_value(&lhs) < number_small_value(&rhs);
+    }
     return number_cmp_ptr(&lhs, &rhs) < 0;
 }
 
 func number_le_box(lhs: Number, rhs: Number) -> u64 {
+    if (number_is_small(&lhs) != 0 && number_is_small(&rhs) != 0) {
+        return number_small_value(&lhs) <= number_small_value(&rhs);
+    }
     return number_cmp_ptr(&lhs, &rhs) <= 0;
 }
 
 func number_gt_box(lhs: Number, rhs: Number) -> u64 {
+    if (number_is_small(&lhs) != 0 && number_is_small(&rhs) != 0) {
+        return number_small_value(&lhs) > number_small_value(&rhs);
+    }
     return number_cmp_ptr(&lhs, &rhs) > 0;
 }
 
 func number_ge_box(lhs: Number, rhs: Number) -> u64 {
+    if (number_is_small(&lhs) != 0 && number_is_small(&rhs) != 0) {
+        return number_small_value(&lhs) >= number_small_value(&rhs);
+    }
     return number_cmp_ptr(&lhs, &rhs) >= 0;
 }
 
 func number_assign(dst: *Number, src: *Number) -> u64 {
     if (dst == 0 || src == 0) { return 0; }
-    dst.sign = src.sign;
-    dst.digits = src.digits;
+    if ((u64)dst == (u64)src) { return 0; }
+    number_release_ptr(dst);
+    dst.bits = src.bits;
+    number_retain_ptr(dst);
     return 0;
 }
 
 func number_add_assign(dst: *Number, rhs: *Number) -> u64 {
     if (dst == 0 || rhs == 0) { return 0; }
     var out: Number = number_add_values(dst, rhs);
-    return number_assign(dst, &out);
+    number_release_ptr(dst);
+    dst.bits = out.bits;
+    return 0;
 }
 
 func number_sub_assign(dst: *Number, rhs: *Number) -> u64 {
     if (dst == 0 || rhs == 0) { return 0; }
     var out: Number = number_sub_values(dst, rhs);
-    return number_assign(dst, &out);
+    number_release_ptr(dst);
+    dst.bits = out.bits;
+    return 0;
 }
 
 impl Number {
@@ -1010,9 +1614,7 @@ impl Number {
     }
 
     public func operator -(self: *Number) -> Number {
-        var out: Number = number_clone(self);
-        out.sign = 0 - out.sign;
-        return out;
+        return number_negated(self);
     }
 
     public func operator *(self: *Number, rhs: Number) -> Number {
@@ -1132,26 +1734,24 @@ impl Number {
     }
 
     public func cmp(self: *Number, rhs: Number) -> i64 {
-        return number_cmp_values(number_clone(self), rhs);
+        return number_cmp_ptr(self, &rhs);
     }
 
     public func cmp_i64(self: *Number, rhs: i64) -> i64 {
-        var rv: Number = number_from_i64(rhs);
-        return number_cmp_values(number_clone(self), rv);
+        return number_cmp_i64_ptr(self, rhs);
     }
 
     public func eq(self: *Number, rhs: Number) -> u64 {
-        return number_cmp_values(number_clone(self), rhs) == 0;
+        return number_cmp_ptr(self, &rhs) == 0;
     }
 
     public func eq_i64(self: *Number, rhs: i64) -> u64 {
-        var rv: Number = number_from_i64(rhs);
-        return number_cmp_values(number_clone(self), rv) == 0;
+        return number_cmp_i64_ptr(self, rhs) == 0;
     }
 
     public func eq_u64(self: *Number, rhs: u64) -> u64 {
         var rv: Number = number_from_u64(rhs);
-        return number_cmp_values(number_clone(self), rv) == 0;
+        return number_cmp_ptr(self, &rv) == 0;
     }
 
     public func to_i64_checked(self: *Number, out: *i64) -> u64 {
