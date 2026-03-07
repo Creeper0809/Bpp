@@ -1004,6 +1004,16 @@ func cg_expr_call(node: u64, symtab: *Symtab) -> u64 {
 
     var var_type: *TypeInfo = symtab_get_type(symtab, name_ptr, name_len);
     var is_global: u64 = is_global_var(resolved_ptr, resolved_len);
+    var tracked_closure_handle: u64 = closure_handle_is(name_ptr, name_len);
+    if (tracked_closure_handle == 0 && (resolved_ptr != name_ptr || resolved_len != name_len)) {
+        tracked_closure_handle = closure_handle_is(resolved_ptr, resolved_len);
+    }
+    if (tracked_closure_handle != 0) {
+        var callee_ident_closure: *AstNode = (*AstNode)ast_ident(name_ptr, name_len);
+        var call_ptr_expr_closure: *AstCallPtr = ast_call_ptr(callee_ident_closure, call.args_vec);
+        cg_expr_call_ptr((u64)call_ptr_expr_closure, symtab);
+        return;
+    }
     if (var_type != 0 || is_global != 0) {
         var args2: *Vec<*AstNode> = call.args_vec;
         var nargs2: u64 = 0;
@@ -2214,8 +2224,57 @@ func cg_member_emit_load_or_deref(field_desc: *FieldDesc, load_when_missing: u64
 func cg_member_emit_struct_field_at_rax(struct_def: *AstStructDef, parent_ptr: u64, parent_len: u64, member_ptr: u64, member_len: u64, load_when_missing: u64) -> u64 {
     var field_offset: u64 = 0;
     var field_desc: *FieldDesc = 0;
-    var found: u64 = struct_find_field_desc_scoped(struct_def, parent_ptr, parent_len, member_ptr, member_len, &field_offset, &field_desc);
-    if (found == 0) { return 0; }
+    var lookup_parent_ptr: u64 = parent_ptr;
+    var lookup_parent_len: u64 = parent_len;
+    if (struct_def != 0 && struct_def.is_union == 1) {
+        // union has no parent scope; field lookup is always local.
+        lookup_parent_ptr = 0;
+        lookup_parent_len = 0;
+    }
+    var found: u64 = struct_find_field_desc_scoped(struct_def, lookup_parent_ptr, lookup_parent_len, member_ptr, member_len, &field_offset, &field_desc);
+    if (found == 0 && lookup_parent_ptr != 0) {
+        found = struct_find_field_desc_scoped(struct_def, 0, 0, member_ptr, member_len, &field_offset, &field_desc);
+    }
+    if (found == 0) {
+        // Name collision fallback: prefer the newest same-name type that owns this member.
+        var all_structs: *Vec<*AstStructDef> = typeinfo_get_structs();
+        if (all_structs != 0 && struct_def != 0) {
+            var si: u64 = all_structs.len();
+            while (si > 0) {
+                si = si - 1;
+                var alt_sd: *AstStructDef = all_structs.get(si);
+                if (alt_sd == 0 || alt_sd == struct_def) { continue; }
+                if (str_eq(alt_sd.name_ptr, alt_sd.name_len, struct_def.name_ptr, struct_def.name_len) == 0) { continue; }
+                var alt_parent_ptr: u64 = lookup_parent_ptr;
+                var alt_parent_len: u64 = lookup_parent_len;
+                if (alt_sd.is_union == 1) {
+                    alt_parent_ptr = 0;
+                    alt_parent_len = 0;
+                }
+                var alt_offset: u64 = 0;
+                var alt_desc: *FieldDesc = 0;
+                var alt_found: u64 = struct_find_field_desc_scoped(alt_sd, alt_parent_ptr, alt_parent_len, member_ptr, member_len, &alt_offset, &alt_desc);
+                if (alt_found == 0 && alt_parent_ptr != 0) {
+                    alt_found = struct_find_field_desc_scoped(alt_sd, 0, 0, member_ptr, member_len, &alt_offset, &alt_desc);
+                }
+                if (alt_found != 0) {
+                    struct_def = alt_sd;
+                    field_offset = alt_offset;
+                    field_desc = alt_desc;
+                    found = 1;
+                    break;
+                }
+            }
+        }
+    }
+    if (found == 0) {
+        emit_stderr("[ERROR] unknown member: ");
+        emit_stderr_len(struct_def.name_ptr, struct_def.name_len);
+        emit_stderr(".");
+        emit_stderr_len(member_ptr, member_len);
+        emit_stderr("\n");
+        panic("Codegen error");
+    }
     if (field_desc != 0 && compiler_check_field_access(field_desc) == 0) {
         emit_stderr("[ERROR] private field access denied: ");
         emit_stderr_len(struct_def.name_ptr, struct_def.name_len);

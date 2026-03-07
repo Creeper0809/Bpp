@@ -2344,6 +2344,61 @@ func annotation_complexity_name_matches_self_call(call_ptr: u64, call_len: u64, 
     return 0;
 }
 
+func annotation_complexity_expr_is_self_receiver(expr: *AstNode) -> u64 {
+    if (expr == 0) { return 0; }
+    var kind: u64 = ast_kind(expr);
+    if (kind == AST_IDENT) {
+        var id: *AstIdent = (*AstIdent)expr;
+        if (id != 0 && id.name_ptr != 0 && id.name_len == 4 && str_eq(id.name_ptr, id.name_len, "self", 4) != 0) {
+            return 1;
+        }
+        return 0;
+    }
+    if (kind == AST_CAST) { return annotation_complexity_expr_is_self_receiver(((*AstCast)expr).expr); }
+    if (kind == AST_ADDR_OF) { return annotation_complexity_expr_is_self_receiver(((*AstAddrOf)expr).operand); }
+    if (kind == AST_DEREF) { return annotation_complexity_expr_is_self_receiver(((*AstDeref)expr).operand); }
+    if (kind == AST_DEREF8) { return annotation_complexity_expr_is_self_receiver(((*AstDeref8)expr).operand); }
+    if (kind == AST_MEMBER_ACCESS || kind == AST_SAFE_MEMBER_ACCESS) {
+        return annotation_complexity_expr_is_self_receiver(((*AstMemberAccess)expr).object);
+    }
+    if (kind == AST_INDEX || kind == AST_SAFE_INDEX) {
+        return annotation_complexity_expr_is_self_receiver(((*AstIndex)expr).base);
+    }
+    if (kind == AST_TRY) {
+        return annotation_complexity_expr_is_self_receiver(((*AstTry)expr).operand);
+    }
+    return 0;
+}
+
+func annotation_complexity_method_call_is_self_recursive(mc: *AstMethodCall, self_fn: *AstFunc) -> u64 {
+    if (mc == 0 || self_fn == 0) { return 0; }
+    if (annotation_complexity_expr_is_self_receiver(mc.receiver) == 0) { return 0; }
+
+    var owner_ptr: u64 = self_fn.impl_owner_ptr;
+    var owner_len: u64 = self_fn.impl_owner_len;
+    if (owner_ptr == 0 || owner_len == 0) {
+        var owner_info: *NameInfo = sym_get_impl_method_owner(self_fn.name_ptr, self_fn.name_len);
+        if (owner_info != 0) {
+            owner_ptr = owner_info.ptr;
+            owner_len = owner_info.len;
+        }
+    }
+    if (owner_ptr == 0 || owner_len == 0) { return 0; }
+
+    var self_method_ptr: u64 = self_fn.impl_original_name_ptr;
+    var self_method_len: u64 = self_fn.impl_original_name_len;
+    if (self_method_ptr == 0 || self_method_len == 0) {
+        self_method_ptr = self_fn.name_ptr;
+        self_method_len = self_fn.name_len;
+    }
+    if (self_method_ptr == 0 || self_method_len == 0) { return 0; }
+
+    if (str_eq(mc.method_ptr, mc.method_len, self_method_ptr, self_method_len) != 0) { return 1; }
+    if (annotation_complexity_name_matches_self_call(mc.method_ptr, mc.method_len, self_method_ptr, self_method_len) != 0) { return 1; }
+    if (annotation_complexity_name_matches_self_call(mc.method_ptr, mc.method_len, self_fn.name_ptr, self_fn.name_len) != 0) { return 1; }
+    return 0;
+}
+
 func annotation_complexity_scan_stmt(stmt: *AstNode, fn_name_ptr: u64, fn_name_len: u64, depth: u64, max_depth: *u64, self_calls: *u64) -> u64 {
     if (stmt == 0 || max_depth == 0 || self_calls == 0) { return 0; }
     var kind: u64 = ast_kind(stmt);
@@ -4154,6 +4209,20 @@ func annotation_complexity_param_is_self_like(p: *Param) -> u64 {
     return 0;
 }
 
+func annotation_complexity_method_symbol_matches(fn: *AstFunc, call_name_ptr: u64, call_name_len: u64) -> u64 {
+    if (fn == 0 || call_name_ptr == 0 || call_name_len == 0) { return 0; }
+    var orig_ptr: u64 = fn.impl_original_name_ptr;
+    var orig_len: u64 = fn.impl_original_name_len;
+    if (orig_ptr != 0 && orig_len != 0) {
+        if (str_eq(orig_ptr, orig_len, call_name_ptr, call_name_len) != 0) { return 1; }
+    }
+    if (fn.name_ptr != 0 && fn.name_len != 0) {
+        if (str_eq(fn.name_ptr, fn.name_len, call_name_ptr, call_name_len) != 0) { return 1; }
+        if (annotation_complexity_name_matches_symbol(fn.name_ptr, fn.name_len, call_name_ptr, call_name_len) != 0) { return 1; }
+    }
+    return 0;
+}
+
 func annotation_complexity_fn_accepts_call_shape(fn: *AstFunc, explicit_arg_count: u64, include_implicit_self: u64, arg_names: *Vec<*NameInfo>) -> u64 {
     if (fn == 0) { return 0; }
     var params: *Vec<*Param> = fn.params_vec;
@@ -4259,6 +4328,7 @@ func annotation_complexity_collect_time_rank_for_name(name_ptr: u64, name_len: u
         if (method_only != 0) {
             var eowner: *NameInfo = sym_get_impl_method_owner(efn.name_ptr, efn.name_len);
             if ((efn.impl_owner_ptr == 0 || efn.impl_owner_len == 0) && eowner == 0) { continue; }
+            if (annotation_complexity_method_symbol_matches(efn, name_ptr, name_len) == 0) { continue; }
         }
         if (annotation_complexity_fn_accepts_call_shape(efn, explicit_arg_count, include_implicit_self, arg_names) == 0) { continue; }
         exact_exists = 1;
@@ -4273,6 +4343,7 @@ func annotation_complexity_collect_time_rank_for_name(name_ptr: u64, name_len: u
         if (method_only != 0) {
             var powner: *NameInfo = sym_get_impl_method_owner(pfn.name_ptr, pfn.name_len);
             if ((pfn.impl_owner_ptr == 0 || pfn.impl_owner_len == 0) && powner == 0) { continue; }
+            if (annotation_complexity_method_symbol_matches(pfn, name_ptr, name_len) == 0) { continue; }
         }
         if (annotation_complexity_fn_accepts_call_shape(pfn, explicit_arg_count, include_implicit_self, arg_names) == 0) { continue; }
         if (preferred_len == 0 || pfn.name_len < preferred_len) { preferred_len = pfn.name_len; }
@@ -4287,6 +4358,7 @@ func annotation_complexity_collect_time_rank_for_name(name_ptr: u64, name_len: u
         if (method_only != 0) {
             var owner: *NameInfo = sym_get_impl_method_owner(fn.name_ptr, fn.name_len);
             if ((fn.impl_owner_ptr == 0 || fn.impl_owner_len == 0) && owner == 0) { continue; }
+            if (annotation_complexity_method_symbol_matches(fn, name_ptr, name_len) == 0) { continue; }
         }
         if (annotation_complexity_fn_accepts_call_shape(fn, explicit_arg_count, include_implicit_self, arg_names) == 0) { continue; }
         seen = 1;
@@ -4328,7 +4400,7 @@ func annotation_complexity_declared_or_budget_time_rank(fn: *AstFunc) -> u64 {
     return 0;
 }
 
-func annotation_complexity_scan_expr_external_call_summary(expr: *AstNode, self_ptr: u64, self_len: u64, out_max_rank: *u64, out_unknown: *u64, out_calls: *u64) -> u64 {
+func annotation_complexity_scan_expr_external_call_summary(expr: *AstNode, self_fn: *AstFunc, self_symtab: *HashMap<u64, *TypeInfo>, self_ptr: u64, self_len: u64, out_max_rank: *u64, out_unknown: *u64, out_calls: *u64) -> u64 {
     if (expr == 0 || out_max_rank == 0 || out_unknown == 0 || out_calls == 0) { return 0; }
     var kind: u64 = ast_kind(expr);
     var nref: AstNodeTagRef;
@@ -4353,7 +4425,7 @@ func annotation_complexity_scan_expr_external_call_summary(expr: *AstNode, self_
         if (nref.call.args_vec != 0) {
             var an: u64 = nref.call.args_vec.len();
             for (var i: u64 = 0; i < an; i++) {
-                annotation_complexity_scan_expr_external_call_summary(nref.call.args_vec.get(i), self_ptr, self_len, out_max_rank, out_unknown, out_calls);
+                annotation_complexity_scan_expr_external_call_summary(nref.call.args_vec.get(i), self_fn, self_symtab, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
             }
         }
         return 0;
@@ -4377,7 +4449,7 @@ func annotation_complexity_scan_expr_external_call_summary(expr: *AstNode, self_
         if (nref.generic_call.args_vec != 0) {
             var gn: u64 = nref.generic_call.args_vec.len();
             for (var gi: u64 = 0; gi < gn; gi++) {
-                annotation_complexity_scan_expr_external_call_summary(nref.generic_call.args_vec.get(gi), self_ptr, self_len, out_max_rank, out_unknown, out_calls);
+                annotation_complexity_scan_expr_external_call_summary(nref.generic_call.args_vec.get(gi), self_fn, self_symtab, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
             }
         }
         return 0;
@@ -4401,25 +4473,52 @@ func annotation_complexity_scan_expr_external_call_summary(expr: *AstNode, self_
         if (nref.static_generic_call.args_vec != 0) {
             var sgn: u64 = nref.static_generic_call.args_vec.len();
             for (var sgi: u64 = 0; sgi < sgn; sgi++) {
-                annotation_complexity_scan_expr_external_call_summary(nref.static_generic_call.args_vec.get(sgi), self_ptr, self_len, out_max_rank, out_unknown, out_calls);
+                annotation_complexity_scan_expr_external_call_summary(nref.static_generic_call.args_vec.get(sgi), self_fn, self_symtab, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
             }
         }
         return 0;
     }
     if (kind == AST_METHOD_CALL || kind == AST_SAFE_METHOD_CALL) {
-        if (annotation_complexity_name_matches_self_call(nref.method_call.method_ptr, nref.method_call.method_len, self_ptr, self_len) == 0) {
+        if (annotation_complexity_method_call_is_self_recursive(nref.method_call, self_fn) == 0) {
             *out_calls = *out_calls + 1;
             var method_rank: u64 = 0;
             var method_unknown: u64 = 0;
             var method_seen: u64 = 0;
             var method_argc: u64 = 0;
             if (nref.method_call.args_vec != 0) { method_argc = nref.method_call.args_vec.len(); }
-            annotation_complexity_collect_time_rank_for_name(nref.method_call.method_ptr, nref.method_call.method_len, 1, method_argc, 1, nref.method_call.arg_names_vec, &method_rank, &method_unknown, &method_seen);
-            if (method_seen == 0) {
-                annotation_complexity_collect_time_rank_for_name(nref.method_call.method_ptr, nref.method_call.method_len, 0, method_argc, 1, nref.method_call.arg_names_vec, &method_rank, &method_unknown, &method_seen);
+
+            // Prefer receiver-type-qualified method symbol to avoid suffix-based false matches.
+            var recv_ti: *TypeInfo = generic_infer_expr_type(nref.method_call.receiver, self_symtab);
+            var recv_owner_ptr: u64 = 0;
+            var recv_owner_len: u64 = 0;
+            var recv_owner_known: u64 = 0;
+            if (recv_ti != 0 && recv_ti.type_kind == TYPE_STRUCT) {
+                recv_owner_ptr = recv_ti.struct_name_ptr;
+                recv_owner_len = recv_ti.struct_name_len;
+                if ((recv_owner_ptr == 0 || recv_owner_len == 0) && recv_ti.struct_def != 0) {
+                    recv_owner_ptr = recv_ti.struct_def.name_ptr;
+                    recv_owner_len = recv_ti.struct_def.name_len;
+                }
             }
-            if (method_seen == 0) {
-                annotation_complexity_collect_time_rank_for_name(nref.method_call.method_ptr, nref.method_call.method_len, 0, method_argc, 0, nref.method_call.arg_names_vec, &method_rank, &method_unknown, &method_seen);
+            if (recv_owner_ptr != 0 && recv_owner_len != 0 && get_struct_def(recv_owner_ptr, recv_owner_len) != 0) {
+                recv_owner_known = 1;
+            }
+            if (recv_owner_ptr != 0 && recv_owner_len != 0) {
+                var resolved_method: *NameInfo = build_method_name(recv_owner_ptr, recv_owner_len, nref.method_call.method_ptr, nref.method_call.method_len);
+                if (resolved_method != 0 && resolved_method.ptr != 0 && resolved_method.len != 0) {
+                    annotation_complexity_collect_time_rank_for_name(resolved_method.ptr, resolved_method.len, 1, method_argc, 1, nref.method_call.arg_names_vec, &method_rank, &method_unknown, &method_seen);
+                    if (method_seen == 0) {
+                        annotation_complexity_collect_time_rank_for_name(resolved_method.ptr, resolved_method.len, 1, method_argc, 0, nref.method_call.arg_names_vec, &method_rank, &method_unknown, &method_seen);
+                    }
+                }
+            }
+
+            if (method_seen == 0 && recv_owner_known == 0) {
+                annotation_complexity_collect_time_rank_for_name(nref.method_call.method_ptr, nref.method_call.method_len, 1, method_argc, 1, nref.method_call.arg_names_vec, &method_rank, &method_unknown, &method_seen);
+                if (method_seen == 0) {
+                    // Method-call syntax should stay method-only; free-function fallback causes false positives.
+                    annotation_complexity_collect_time_rank_for_name(nref.method_call.method_ptr, nref.method_call.method_len, 1, method_argc, 0, nref.method_call.arg_names_vec, &method_rank, &method_unknown, &method_seen);
+                }
             }
             if (method_seen == 0) {
                 *out_unknown = *out_unknown + 1;
@@ -4428,11 +4527,11 @@ func annotation_complexity_scan_expr_external_call_summary(expr: *AstNode, self_
                 if (annotation_complexity_rank_order(method_rank) > annotation_complexity_rank_order(*out_max_rank)) { *out_max_rank = method_rank; }
             }
         }
-        annotation_complexity_scan_expr_external_call_summary(nref.method_call.receiver, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
+        annotation_complexity_scan_expr_external_call_summary(nref.method_call.receiver, self_fn, self_symtab, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
         if (nref.method_call.args_vec != 0) {
             var mn: u64 = nref.method_call.args_vec.len();
             for (var mi: u64 = 0; mi < mn; mi++) {
-                annotation_complexity_scan_expr_external_call_summary(nref.method_call.args_vec.get(mi), self_ptr, self_len, out_max_rank, out_unknown, out_calls);
+                annotation_complexity_scan_expr_external_call_summary(nref.method_call.args_vec.get(mi), self_fn, self_symtab, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
             }
         }
         return 0;
@@ -4458,35 +4557,35 @@ func annotation_complexity_scan_expr_external_call_summary(expr: *AstNode, self_
         } else {
             *out_unknown = *out_unknown + 1;
         }
-        annotation_complexity_scan_expr_external_call_summary(nref.call_ptr.callee, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
+        annotation_complexity_scan_expr_external_call_summary(nref.call_ptr.callee, self_fn, self_symtab, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
         if (nref.call_ptr.args_vec != 0) {
             var pn: u64 = nref.call_ptr.args_vec.len();
             for (var pi: u64 = 0; pi < pn; pi++) {
-                annotation_complexity_scan_expr_external_call_summary(nref.call_ptr.args_vec.get(pi), self_ptr, self_len, out_max_rank, out_unknown, out_calls);
+                annotation_complexity_scan_expr_external_call_summary(nref.call_ptr.args_vec.get(pi), self_fn, self_symtab, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
             }
         }
         return 0;
     }
 
     if (kind == AST_BINARY) {
-        annotation_complexity_scan_expr_external_call_summary(nref.binary.left, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
-        annotation_complexity_scan_expr_external_call_summary(nref.binary.right, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
+        annotation_complexity_scan_expr_external_call_summary(nref.binary.left, self_fn, self_symtab, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
+        annotation_complexity_scan_expr_external_call_summary(nref.binary.right, self_fn, self_symtab, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
         return 0;
     }
     if (kind == AST_UNARY) {
-        annotation_complexity_scan_expr_external_call_summary(nref.unary.operand, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
+        annotation_complexity_scan_expr_external_call_summary(nref.unary.operand, self_fn, self_symtab, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
         return 0;
     }
     if (kind == AST_TERNARY) {
-        annotation_complexity_scan_expr_external_call_summary(nref.ternary_expr.cond, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
-        annotation_complexity_scan_expr_external_call_summary(nref.ternary_expr.then_expr, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
-        annotation_complexity_scan_expr_external_call_summary(nref.ternary_expr.else_expr, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
+        annotation_complexity_scan_expr_external_call_summary(nref.ternary_expr.cond, self_fn, self_symtab, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
+        annotation_complexity_scan_expr_external_call_summary(nref.ternary_expr.then_expr, self_fn, self_symtab, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
+        annotation_complexity_scan_expr_external_call_summary(nref.ternary_expr.else_expr, self_fn, self_symtab, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
         return 0;
     }
     return 0;
 }
 
-func annotation_complexity_scan_stmt_external_call_summary(stmt: *AstNode, self_ptr: u64, self_len: u64, out_max_rank: *u64, out_unknown: *u64, out_calls: *u64) -> u64 {
+func annotation_complexity_scan_stmt_external_call_summary(stmt: *AstNode, self_fn: *AstFunc, self_symtab: *HashMap<u64, *TypeInfo>, self_ptr: u64, self_len: u64, out_max_rank: *u64, out_unknown: *u64, out_calls: *u64) -> u64 {
     if (stmt == 0 || out_max_rank == 0 || out_unknown == 0 || out_calls == 0) { return 0; }
     var kind: u64 = ast_kind(stmt);
     switch (kind) {
@@ -4495,62 +4594,62 @@ func annotation_complexity_scan_stmt_external_call_summary(stmt: *AstNode, self_
             if (blk.stmts_vec != 0) {
                 var bn: u64 = blk.stmts_vec.len();
                 for (var bi: u64 = 0; bi < bn; bi++) {
-                    annotation_complexity_scan_stmt_external_call_summary(blk.stmts_vec.get(bi), self_ptr, self_len, out_max_rank, out_unknown, out_calls);
+                    annotation_complexity_scan_stmt_external_call_summary(blk.stmts_vec.get(bi), self_fn, self_symtab, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
                 }
             }
             return 0;
         case AST_IF:
             var ifs: *AstIf = (*AstIf)stmt;
-            annotation_complexity_scan_expr_external_call_summary(ifs.cond, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
-            annotation_complexity_scan_stmt_external_call_summary(ifs.then_block, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
-            annotation_complexity_scan_stmt_external_call_summary(ifs.else_block, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
+            annotation_complexity_scan_expr_external_call_summary(ifs.cond, self_fn, self_symtab, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
+            annotation_complexity_scan_stmt_external_call_summary(ifs.then_block, self_fn, self_symtab, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
+            annotation_complexity_scan_stmt_external_call_summary(ifs.else_block, self_fn, self_symtab, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
             return 0;
         case AST_WHILE:
             var wl: *AstWhile = (*AstWhile)stmt;
-            annotation_complexity_scan_expr_external_call_summary(wl.cond, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
-            annotation_complexity_scan_stmt_external_call_summary(wl.body, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
+            annotation_complexity_scan_expr_external_call_summary(wl.cond, self_fn, self_symtab, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
+            annotation_complexity_scan_stmt_external_call_summary(wl.body, self_fn, self_symtab, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
             return 0;
         case AST_FOR:
             var fr: *AstFor = (*AstFor)stmt;
-            annotation_complexity_scan_stmt_external_call_summary(fr.init, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
-            annotation_complexity_scan_expr_external_call_summary(fr.cond, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
-            annotation_complexity_scan_expr_external_call_summary(fr.update, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
-            annotation_complexity_scan_stmt_external_call_summary(fr.body, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
+            annotation_complexity_scan_stmt_external_call_summary(fr.init, self_fn, self_symtab, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
+            annotation_complexity_scan_expr_external_call_summary(fr.cond, self_fn, self_symtab, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
+            annotation_complexity_scan_expr_external_call_summary(fr.update, self_fn, self_symtab, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
+            annotation_complexity_scan_stmt_external_call_summary(fr.body, self_fn, self_symtab, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
             return 0;
         case AST_DO_WHILE:
             var dw: *AstDoWhile = (*AstDoWhile)stmt;
-            annotation_complexity_scan_stmt_external_call_summary(dw.body, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
-            annotation_complexity_scan_expr_external_call_summary(dw.cond, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
+            annotation_complexity_scan_stmt_external_call_summary(dw.body, self_fn, self_symtab, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
+            annotation_complexity_scan_expr_external_call_summary(dw.cond, self_fn, self_symtab, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
             return 0;
         case AST_SWITCH:
         case AST_MATCH:
             var sw: *AstSwitch = (*AstSwitch)stmt;
-            annotation_complexity_scan_expr_external_call_summary(sw.expr, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
+            annotation_complexity_scan_expr_external_call_summary(sw.expr, self_fn, self_symtab, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
             if (sw.cases_vec != 0) {
                 var cn: u64 = sw.cases_vec.len();
                 for (var ci: u64 = 0; ci < cn; ci++) {
-                    annotation_complexity_scan_stmt_external_call_summary(sw.cases_vec.get(ci), self_ptr, self_len, out_max_rank, out_unknown, out_calls);
+                    annotation_complexity_scan_stmt_external_call_summary(sw.cases_vec.get(ci), self_fn, self_symtab, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
                 }
             }
             return 0;
         case AST_CASE:
             var cs: *AstCase = (*AstCase)stmt;
-            annotation_complexity_scan_expr_external_call_summary(cs.value, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
-            annotation_complexity_scan_stmt_external_call_summary(cs.body, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
+            annotation_complexity_scan_expr_external_call_summary(cs.value, self_fn, self_symtab, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
+            annotation_complexity_scan_stmt_external_call_summary(cs.body, self_fn, self_symtab, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
             return 0;
         case AST_DEFER:
-            annotation_complexity_scan_stmt_external_call_summary(((*AstDefer)stmt).stmt, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
+            annotation_complexity_scan_stmt_external_call_summary(((*AstDefer)stmt).stmt, self_fn, self_symtab, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
             return 0;
         case AST_VAR_DECL:
-            annotation_complexity_scan_expr_external_call_summary(((*AstVarDecl)stmt).init_expr, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
+            annotation_complexity_scan_expr_external_call_summary(((*AstVarDecl)stmt).init_expr, self_fn, self_symtab, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
             return 0;
         case AST_ASSIGN:
             var asn: *AstAssign = (*AstAssign)stmt;
-            annotation_complexity_scan_expr_external_call_summary(asn.target, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
-            annotation_complexity_scan_expr_external_call_summary(asn.value, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
+            annotation_complexity_scan_expr_external_call_summary(asn.target, self_fn, self_symtab, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
+            annotation_complexity_scan_expr_external_call_summary(asn.value, self_fn, self_symtab, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
             return 0;
         case AST_EXPR_STMT:
-            annotation_complexity_scan_expr_external_call_summary(((*AstExprStmt)stmt).expr, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
+            annotation_complexity_scan_expr_external_call_summary(((*AstExprStmt)stmt).expr, self_fn, self_symtab, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
             return 0;
         case AST_BINARY:
         case AST_UNARY:
@@ -4561,10 +4660,10 @@ func annotation_complexity_scan_stmt_external_call_summary(stmt: *AstNode, self_
         case AST_METHOD_CALL:
         case AST_SAFE_METHOD_CALL:
         case AST_CALL_PTR:
-            annotation_complexity_scan_expr_external_call_summary(stmt, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
+            annotation_complexity_scan_expr_external_call_summary(stmt, self_fn, self_symtab, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
             return 0;
         case AST_RETURN:
-            annotation_complexity_scan_expr_external_call_summary(((*AstReturn)stmt).expr, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
+            annotation_complexity_scan_expr_external_call_summary(((*AstReturn)stmt).expr, self_fn, self_symtab, self_ptr, self_len, out_max_rank, out_unknown, out_calls);
             return 0;
     }
     return 0;
@@ -4726,7 +4825,8 @@ func annotation_complexity_infer_time_rank_with_meta(fn: *AstFunc, constraints_a
     var ext_max_rank: u64 = 0;
     var ext_unknown: u64 = 0;
     var ext_calls: u64 = 0;
-    annotation_complexity_scan_stmt_external_call_summary(fn.body, fn.name_ptr, fn.name_len, &ext_max_rank, &ext_unknown, &ext_calls);
+    var ext_symtab: *HashMap<u64, *TypeInfo> = generic_build_symtab_for_func(fn);
+    annotation_complexity_scan_stmt_external_call_summary(fn.body, fn, ext_symtab, fn.name_ptr, fn.name_len, &ext_max_rank, &ext_unknown, &ext_calls);
     if (ext_max_rank == 0 && ext_unknown > 0 && annotation_complexity_has_random_like_call(fn.body) == 0) {
         // Conservative fallback: unresolved helper calls are treated as at least linear work.
         ext_max_rank = 3;
@@ -4896,10 +4996,11 @@ func annotation_complexity_validate_contract(fn: *AstFunc) -> u64 {
     var ext_rank_dbg: u64 = 0;
     if (fn != 0 && fn.body != 0) {
         var fb_dbg: u64 = annotation_complexity_constraints_max(constraints_ann);
+        var ext_symtab_dbg: *HashMap<u64, *TypeInfo> = generic_build_symtab_for_func(fn);
         annotation_complexity_collect_loop_stats(fn.body, constraints_ann, fb_dbg, &loop_total, &loop_sqrt, &loop_geo, &loop_linear);
         annotation_complexity_scan_stmt_self_call_patterns(fn.body, fn.name_ptr, fn.name_len, &recur_total_dbg, &recur_half_dbg, &recur_minus_dbg, &recur_same_dbg);
         annotation_complexity_scan_stmt(fn.body, fn.name_ptr, fn.name_len, 0, &max_depth_dbg, &self_calls_dbg);
-        annotation_complexity_scan_stmt_external_call_summary(fn.body, fn.name_ptr, fn.name_len, &ext_rank_dbg, &ext_unknown_dbg, &ext_calls_dbg);
+        annotation_complexity_scan_stmt_external_call_summary(fn.body, fn, ext_symtab_dbg, fn.name_ptr, fn.name_len, &ext_rank_dbg, &ext_unknown_dbg, &ext_calls_dbg);
     }
 
     if (debug_enabled != 0) {
