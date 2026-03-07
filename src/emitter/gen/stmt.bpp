@@ -847,8 +847,15 @@ func emit_var_decl_try_slice_init(init: u64, init_kind: u64, spec: *CgDeclTypeSp
     return 1;
 }
 
-func emit_var_decl_try_struct_copy_init(init: u64, init_kind: u64, spec: *CgDeclTypeSpec, offset: u64) -> u64 {
-    if (!(spec.type_kind == TYPE_STRUCT && spec.ptr_depth == 0 && init_kind != AST_CALL && init_kind != AST_METHOD_CALL && init_kind != AST_CALL_PTR && init_kind != AST_STRUCT_LITERAL)) {
+func emit_var_decl_try_struct_copy_init(init: u64, init_kind: u64, spec: *CgDeclTypeSpec, offset: u64, symtab: *Symtab) -> u64 {
+    if (!(spec.type_kind == TYPE_STRUCT && spec.ptr_depth == 0)) {
+        return 0;
+    }
+    if (!(init_kind == AST_IDENT || init_kind == AST_MEMBER_ACCESS || init_kind == AST_INDEX || init_kind == AST_DEREF || init_kind == AST_DEREF8)) {
+        return 0;
+    }
+    var init_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)init, symtab);
+    if (init_ti == 0 || init_ti.type_kind != TYPE_STRUCT || init_ti.ptr_depth != 0) {
         return 0;
     }
     var struct_size_copy: u64 = layout_type_sizeof(spec.type_kind, spec.ptr_depth, spec.struct_name_ptr, spec.struct_name_len);
@@ -960,7 +967,7 @@ func emit_var_decl_init_value(decl: *AstVarDecl, init: u64, spec: *CgDeclTypeSpe
     if (emit_var_decl_try_ctor_or_sret_init(init, init_kind, spec, offset, symtab) != 0) { return 1; }
     emit_var_decl_check_init_compat(decl, init, spec.type_kind, spec.ptr_depth, symtab);
     if (emit_var_decl_try_slice_init(init, init_kind, spec, offset) != 0) { return 1; }
-    if (emit_var_decl_try_struct_copy_init(init, init_kind, spec, offset) != 0) { return 1; }
+    if (emit_var_decl_try_struct_copy_init(init, init_kind, spec, offset, symtab) != 0) { return 1; }
 
     emit_expr(init);
     emit_var_decl_apply_tagged_mask_if_needed(init, spec.is_tagged, spec.ptr_depth, symtab);
@@ -1663,6 +1670,9 @@ func emit_assign_stmt(node: u64, symtab: *Symtab) -> u64 {
         var ident3: *AstIdent = (*AstIdent)target;
         target_type_info = symtab_get_type(symtab, ident3.name_ptr, ident3.name_len);
     }
+    if (target_type_info == 0) {
+        target_type_info = get_expr_type_with_symtab((*AstNode)target, symtab);
+    }
     var value_type_info: *TypeInfo = get_expr_type_with_symtab((*AstNode)value, symtab);
 
     if (emit_assign_try_slice_copy(target, target_kind, value, value_kind, symtab) != 0) {
@@ -1672,6 +1682,30 @@ func emit_assign_stmt(node: u64, symtab: *Symtab) -> u64 {
         return;
     }
     // NOTE: operator []= dispatch is temporarily disabled in assignment codegen.
+
+    if (target_type_info != 0 && target_type_info.type_kind == TYPE_STRUCT && target_type_info.ptr_depth == 0) {
+        var struct_size: u64 = layout_type_sizeof(TYPE_STRUCT, 0, target_type_info.struct_name_ptr, target_type_info.struct_name_len);
+        if (value_type_info != 0 && value_type_info.type_kind == TYPE_STRUCT && value_type_info.ptr_depth == 0 &&
+            value_kind != AST_CALL && value_kind != AST_METHOD_CALL && value_kind != AST_CALL_PTR &&
+            value_kind != AST_STRUCT_LITERAL && value_kind != AST_STACK_CTOR) {
+            emit_lvalue(target);
+            emit("    mov r8, rax\n");
+            emit_lvalue(value);
+            emit_copy_bytes_with_regs("rax", 3, "r8", 2, struct_size);
+            return;
+        }
+        emit_expr(value);
+        emit("    push rax\n");
+        emit("    push rdx\n");
+        emit_lvalue(target);
+        emit("    pop rcx\n");
+        emit("    pop rbx\n");
+        emit("    mov [rax], rbx\n");
+        if (struct_size > 8) {
+            emit("    mov [rax+8], rcx\n");
+        }
+        return;
+    }
     
     emit_expr(value);
     emit_assign_apply_tagged_mask_if_needed(target_type_info, value_type_info);

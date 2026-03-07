@@ -40,11 +40,10 @@ func stmt_internal_name(prefix_ptr: u64, prefix_len: u64, id: u64) -> *NameInfo 
 
 func stmt_is_number_type(type_kind: u64, ptr_depth: u64, struct_name_ptr: u64, struct_name_len: u64) -> u64 {
     if (type_kind != TYPE_STRUCT || ptr_depth != 0) { return 0; }
-    if (struct_name_ptr == 0 || struct_name_len != 6) { return 0; }
-    var u8v: []u8 = slice(struct_name_ptr, 6);
-    if (u8v[0] != 78 || u8v[1] != 117 || u8v[2] != 109) { return 0; }
-    if (u8v[3] != 98 || u8v[4] != 101 || u8v[5] != 114) { return 0; }
-    return 1;
+    if (struct_name_ptr == 0 || struct_name_len == 0) { return 0; }
+    if (str_eq(struct_name_ptr, struct_name_len, "Number", 6) != 0) { return 1; }
+    if (str_eq(struct_name_ptr, struct_name_len, "std_number__Number", 18) != 0) { return 1; }
+    return 0;
 }
 
 func stmt_is_integer_literal_expr(expr: *AstNode) -> u64 {
@@ -65,6 +64,77 @@ func stmt_wrap_integer_literal_number_ctor(expr: *AstNode) -> *AstNode {
     var args: *Vec<*AstNode> = new Vec<*AstNode>(1);
     args.push(expr);
     return (*AstNode)ast_call((u64)"number_from_i64", 15, args);
+}
+
+func stmt_is_number_ident_expr(p: *Parser, expr: *AstNode) -> u64 {
+    if (p == 0 || expr == 0 || ast_kind(expr) != AST_IDENT) { return 0; }
+    var idn: *AstIdent = (*AstIdent)expr;
+    var symbol: *Param = current_function_find_symbol(p, idn.name_ptr, idn.name_len);
+    if (symbol == 0) { return 0; }
+    return stmt_is_number_type(symbol.type_kind, symbol.ptr_depth, symbol.struct_name_ptr, symbol.struct_name_len);
+}
+
+func stmt_number_box_binary_name(op: u64) -> *NameInfo {
+    switch (op) {
+        case TOKEN_PLUS: return new NameInfo{"number_add_box", 14};
+        case TOKEN_MINUS: return new NameInfo{"number_sub_box", 14};
+        case TOKEN_STAR: return new NameInfo{"number_mul_box", 14};
+        case TOKEN_SLASH: return new NameInfo{"number_div_box", 14};
+        case TOKEN_PERCENT: return new NameInfo{"number_mod_box", 14};
+        case TOKEN_AMPERSAND: return new NameInfo{"number_bitand_box", 17};
+        case TOKEN_PIPE: return new NameInfo{"number_bitor_box", 16};
+        case TOKEN_CARET: return new NameInfo{"number_bitxor_box", 17};
+        case TOKEN_LSHIFT: return new NameInfo{"number_shl_box", 14};
+        case TOKEN_RSHIFT: return new NameInfo{"number_shr_box", 14};
+        case TOKEN_EQEQ: return new NameInfo{"number_eq_box", 13};
+        case TOKEN_BANGEQ: return new NameInfo{"number_ne_box", 13};
+        case TOKEN_LT: return new NameInfo{"number_lt_box", 13};
+        case TOKEN_LTEQ: return new NameInfo{"number_le_box", 13};
+        case TOKEN_GT: return new NameInfo{"number_gt_box", 13};
+        case TOKEN_GTEQ: return new NameInfo{"number_ge_box", 13};
+        default: return 0;
+    }
+}
+
+func stmt_rewrite_expr_to_number_boxed(p: *Parser, expr: *AstNode) -> *AstNode {
+    if (expr == 0) { return 0; }
+    if (stmt_is_integer_literal_expr(expr) != 0) {
+        return stmt_wrap_integer_literal_number_ctor(expr);
+    }
+    var k: u64 = ast_kind(expr);
+    if (k == AST_IDENT && stmt_is_number_ident_expr(p, expr) != 0) {
+        return expr;
+    }
+    if (k == AST_UNARY) {
+        var un: *AstUnary = (*AstUnary)expr;
+        if (un.op == TOKEN_MINUS || un.op == TOKEN_TILDE) {
+            var inner: *AstNode = stmt_rewrite_expr_to_number_boxed(p, un.operand);
+            if (inner == 0) { return expr; }
+            if (un.op == TOKEN_MINUS) {
+                var args_sub: *Vec<*AstNode> = new Vec<*AstNode>(2);
+                args_sub.push(stmt_wrap_integer_literal_number_ctor((*AstNode)ast_literal(0)));
+                args_sub.push(inner);
+                return (*AstNode)ast_call((u64)"number_sub_box", 14, args_sub);
+            }
+            var args: *Vec<*AstNode> = new Vec<*AstNode>(1);
+            args.push(inner);
+            return (*AstNode)ast_call((u64)"number_bitnot_box", 17, args);
+        }
+        return expr;
+    }
+    if (k == AST_BINARY) {
+        var bin: *AstBinary = (*AstBinary)expr;
+        var nm: *NameInfo = stmt_number_box_binary_name(bin.op);
+        if (nm == 0) { return expr; }
+        var lhs: *AstNode = stmt_rewrite_expr_to_number_boxed(p, bin.left);
+        var rhs: *AstNode = stmt_rewrite_expr_to_number_boxed(p, bin.right);
+        if (lhs == 0 || rhs == 0) { return expr; }
+        var args2: *Vec<*AstNode> = new Vec<*AstNode>(2);
+        args2.push(lhs);
+        args2.push(rhs);
+        return (*AstNode)ast_call(nm.ptr, nm.len, args2);
+    }
+    return expr;
 }
 
 func stmt_assignment_target_is_number_ident(p: *Parser, target: *AstNode) -> u64 {
@@ -100,8 +170,12 @@ func stmt_parse_var_decl(p: *Parser) -> *AstNode {
     var array_len_param_ptr: u64 = 0;
     var array_len_param_len: u64 = 0;
     var elem_typeinfo: *TypeInfo = 0;
+    var declared_number_kw: u64 = 0;
     
     if (match_tok(p, TOKEN_COLON)) {
+        if (peek_kind(p) == TOKEN_NUMBER_TYPE) {
+            declared_number_kw = 1;
+        }
         var ty_info: *TypeInfo = type_parse_ex(p);
         type_kind = ty_info.type_kind;
         ptr_depth = ty_info.ptr_depth;
@@ -137,8 +211,12 @@ func stmt_parse_var_decl(p: *Parser) -> *AstNode {
     
     if (match_tok(p, TOKEN_EQ)) {
         init = expr_parse(p);
-        if (stmt_is_number_type(type_kind, ptr_depth, struct_name_ptr, struct_name_len) != 0) {
-            init = stmt_wrap_integer_literal_number_ctor(init);
+        if (declared_number_kw != 0 || stmt_is_number_type(type_kind, ptr_depth, struct_name_ptr, struct_name_len) != 0) {
+            if (stmt_is_integer_literal_expr(init) != 0) {
+                init = stmt_wrap_integer_literal_number_ctor(init);
+            } else {
+                init = stmt_rewrite_expr_to_number_boxed(p, init);
+            }
         }
     }
     
@@ -222,7 +300,7 @@ func stmt_parse_assign_or_postfix_expr(p: *Parser, lhs: *AstNode) -> *AstNode {
         stmt_validate_assignment_target_not_enum_const(p, lhs);
         var rhs: *AstNode = expr_parse(p);
         if (stmt_assignment_target_is_number_ident(p, lhs) != 0) {
-            rhs = stmt_wrap_integer_literal_number_ctor(rhs);
+            rhs = stmt_rewrite_expr_to_number_boxed(p, rhs);
         }
         return ast_assign(lhs, rhs);
     }
@@ -281,7 +359,7 @@ func stmt_parse_assign_or_expr(p: *Parser) -> *AstNode {
         stmt_validate_assignment_target_not_enum_const(p, expr);
         var val: *AstNode = expr_parse(p);
         if (stmt_assignment_target_is_number_ident(p, expr) != 0) {
-            val = stmt_wrap_integer_literal_number_ctor(val);
+            val = stmt_rewrite_expr_to_number_boxed(p, val);
         }
         consume_tok(p, TOKEN_SEMICOLON);
         return ast_assign(expr, val);
