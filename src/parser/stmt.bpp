@@ -41,6 +41,7 @@ func stmt_internal_name(prefix_ptr: u64, prefix_len: u64, id: u64) -> *NameInfo 
 func stmt_annotation_is_line_complexity_ignore(info: *NameInfo) -> u64 {
     if (info == 0) { return 0; }
     if (annotation_name_matches(info, "complexity_ignore", 17) != 0) { return 1; }
+    if (annotation_name_matches(info, "symbolic_ignore", 15) != 0) { return 1; }
     return 0;
 }
 
@@ -61,12 +62,12 @@ func stmt_validate_line_annotations(p: *Parser, annotations: *Vec<*NameInfo>, st
             continue;
         }
         if (allow_generic_on_stmt != 0) { continue; }
-        emit_stderr("[ERROR] statement annotations only support @[complexity_ignore(...)]\n");
+        emit_stderr("[ERROR] statement annotations only support @[complexity_ignore(...)] or @[symbolic_ignore(...)]\n");
         panic_here(p, "Syntax error");
         return 0;
     }
     if (ignore_count > 1) {
-        emit_stderr("[ERROR] duplicate @[complexity_ignore] on statement\n");
+        emit_stderr("[ERROR] duplicate skip annotation on statement (@[complexity_ignore]/@[symbolic_ignore])\n");
         panic_here(p, "Syntax error");
         return 0;
     }
@@ -307,6 +308,78 @@ func stmt_is_number_ident_expr(p: *Parser, expr: *AstNode) -> u64 {
     return stmt_is_number_type(symbol.type_kind, symbol.ptr_depth, symbol.struct_name_ptr, symbol.struct_name_len);
 }
 
+func stmt_call_is_number_ctor(call: *AstCall) -> u64 {
+    if (call == 0) { return 0; }
+    var name_ptr: u64 = call.name_ptr;
+    var name_len: u64 = call.name_len;
+    var resolved: *NameInfo = resolve_name(name_ptr, name_len);
+    if (resolved != 0) {
+        name_ptr = resolved.ptr;
+        name_len = resolved.len;
+    }
+    if (str_eq(name_ptr, name_len, "number_from_i64", 15) != 0) { return 1; }
+    if (str_eq(name_ptr, name_len, "number_from_u64", 15) != 0) { return 1; }
+    if (str_eq(name_ptr, name_len, "number_from_str", 15) != 0) { return 1; }
+    if (str_eq(name_ptr, name_len, "std_number__number_from_i64", 26) != 0) { return 1; }
+    if (str_eq(name_ptr, name_len, "std_number__number_from_u64", 26) != 0) { return 1; }
+    if (str_eq(name_ptr, name_len, "std_number__number_from_str", 26) != 0) { return 1; }
+    return 0;
+}
+
+func stmt_expr_contains_number(p: *Parser, expr: *AstNode) -> u64 {
+    if (expr == 0) { return 0; }
+    if (stmt_is_number_ident_expr(p, expr) != 0) { return 1; }
+
+    var k: u64 = ast_kind(expr);
+    if (k == AST_CALL) {
+        var call: *AstCall = (*AstCall)expr;
+        if (stmt_call_is_number_ctor(call) != 0) { return 1; }
+        if (call.args_vec != 0) {
+            var n: u64 = call.args_vec.len();
+            for (var i: u64 = 0; i < n; i = i + 1) {
+                if (stmt_expr_contains_number(p, call.args_vec.get(i)) != 0) { return 1; }
+            }
+        }
+        return 0;
+    }
+    if (k == AST_UNARY) {
+        var un: *AstUnary = (*AstUnary)expr;
+        return stmt_expr_contains_number(p, un.operand);
+    }
+    if (k == AST_BINARY) {
+        var bin: *AstBinary = (*AstBinary)expr;
+        if (stmt_expr_contains_number(p, bin.left) != 0) { return 1; }
+        if (stmt_expr_contains_number(p, bin.right) != 0) { return 1; }
+        return 0;
+    }
+    if (k == AST_CAST) {
+        var cst: *AstCast = (*AstCast)expr;
+        return stmt_expr_contains_number(p, cst.expr);
+    }
+    if (k == AST_METHOD_CALL || k == AST_SAFE_METHOD_CALL) {
+        var mc: *AstMethodCall = (*AstMethodCall)expr;
+        if (stmt_expr_contains_number(p, mc.receiver) != 0) { return 1; }
+        if (mc.args_vec != 0) {
+            var m: u64 = mc.args_vec.len();
+            for (var j: u64 = 0; j < m; j = j + 1) {
+                if (stmt_expr_contains_number(p, mc.args_vec.get(j)) != 0) { return 1; }
+            }
+        }
+        return 0;
+    }
+    if (k == AST_MEMBER_ACCESS || k == AST_SAFE_MEMBER_ACCESS) {
+        var ma: *AstMemberAccess = (*AstMemberAccess)expr;
+        return stmt_expr_contains_number(p, ma.object);
+    }
+    if (k == AST_INDEX || k == AST_SAFE_INDEX) {
+        var ix: *AstIndex = (*AstIndex)expr;
+        if (stmt_expr_contains_number(p, ix.base) != 0) { return 1; }
+        if (stmt_expr_contains_number(p, ix.index) != 0) { return 1; }
+        return 0;
+    }
+    return 0;
+}
+
 func stmt_is_primitive_integer_type(type_kind: u64, ptr_depth: u64) -> u64 {
     if (ptr_depth != 0) { return 0; }
     switch (type_kind) {
@@ -335,26 +408,27 @@ func stmt_is_unsigned_integer_type(type_kind: u64, ptr_depth: u64) -> u64 {
     return 0;
 }
 
-func stmt_number_box_binary_name(op: u64) -> *NameInfo {
+func stmt_is_number_box_binary_op(op: u64) -> u64 {
     switch (op) {
-        case TOKEN_PLUS: return new NameInfo{"number_add_box", 14};
-        case TOKEN_MINUS: return new NameInfo{"number_sub_box", 14};
-        case TOKEN_STAR: return new NameInfo{"number_mul_box", 14};
-        case TOKEN_SLASH: return new NameInfo{"number_div_box", 14};
-        case TOKEN_PERCENT: return new NameInfo{"number_mod_box", 14};
-        case TOKEN_AMPERSAND: return new NameInfo{"number_bitand_box", 17};
-        case TOKEN_PIPE: return new NameInfo{"number_bitor_box", 16};
-        case TOKEN_CARET: return new NameInfo{"number_bitxor_box", 17};
-        case TOKEN_LSHIFT: return new NameInfo{"number_shl_box", 14};
-        case TOKEN_RSHIFT: return new NameInfo{"number_shr_box", 14};
-        case TOKEN_EQEQ: return new NameInfo{"number_eq_box", 13};
-        case TOKEN_BANGEQ: return new NameInfo{"number_ne_box", 13};
-        case TOKEN_LT: return new NameInfo{"number_lt_box", 13};
-        case TOKEN_LTEQ: return new NameInfo{"number_le_box", 13};
-        case TOKEN_GT: return new NameInfo{"number_gt_box", 13};
-        case TOKEN_GTEQ: return new NameInfo{"number_ge_box", 13};
-        default: return 0;
+        case TOKEN_PLUS:
+        case TOKEN_MINUS:
+        case TOKEN_STAR:
+        case TOKEN_SLASH:
+        case TOKEN_PERCENT:
+        case TOKEN_AMPERSAND:
+        case TOKEN_PIPE:
+        case TOKEN_CARET:
+        case TOKEN_LSHIFT:
+        case TOKEN_RSHIFT:
+        case TOKEN_EQEQ:
+        case TOKEN_BANGEQ:
+        case TOKEN_LT:
+        case TOKEN_LTEQ:
+        case TOKEN_GT:
+        case TOKEN_GTEQ:
+            return 1;
     }
+    return 0;
 }
 
 func stmt_rewrite_expr_to_number_boxed(p: *Parser, expr: *AstNode) -> *AstNode {
@@ -393,28 +467,20 @@ func stmt_rewrite_expr_to_number_boxed(p: *Parser, expr: *AstNode) -> *AstNode {
             var inner: *AstNode = stmt_rewrite_expr_to_number_boxed(p, un.operand);
             if (inner == 0) { return expr; }
             if (un.op == TOKEN_MINUS) {
-                var args_sub: *Vec<*AstNode> = new Vec<*AstNode>(2);
-                args_sub.push(stmt_wrap_integer_literal_number_ctor((*AstNode)ast_literal(0)));
-                args_sub.push(inner);
-                return (*AstNode)ast_call((u64)"number_sub_box", 14, args_sub);
+                var zero: *AstNode = stmt_wrap_integer_literal_number_ctor((*AstNode)ast_literal(0));
+                return ast_binary(TOKEN_MINUS, zero, inner);
             }
-            var args: *Vec<*AstNode> = new Vec<*AstNode>(1);
-            args.push(inner);
-            return (*AstNode)ast_call((u64)"number_bitnot_box", 17, args);
+            return (*AstNode)ast_unary(TOKEN_TILDE, inner);
         }
         return expr;
     }
     if (k == AST_BINARY) {
         var bin: *AstBinary = (*AstBinary)expr;
-        var nm: *NameInfo = stmt_number_box_binary_name(bin.op);
-        if (nm == 0) { return expr; }
+        if (stmt_is_number_box_binary_op(bin.op) == 0) { return expr; }
         var lhs: *AstNode = stmt_rewrite_expr_to_number_boxed(p, bin.left);
         var rhs: *AstNode = stmt_rewrite_expr_to_number_boxed(p, bin.right);
         if (lhs == 0 || rhs == 0) { return expr; }
-        var args2: *Vec<*AstNode> = new Vec<*AstNode>(2);
-        args2.push(lhs);
-        args2.push(rhs);
-        return (*AstNode)ast_call(nm.ptr, nm.len, args2);
+        return ast_binary(bin.op, lhs, rhs);
     }
     return expr;
 }
@@ -486,6 +552,12 @@ func stmt_parse_var_decl(p: *Parser) -> *AstNode {
         if (is_tagged == 1 && tag_layout_ptr != 0 && type_kind != TYPE_STRUCT && type_kind != TYPE_ARRAY && type_kind != TYPE_SLICE) {
             struct_name_ptr = 0;
             struct_name_len = 0;
+        }
+        if (declared_number_kw != 0) {
+            type_kind = TYPE_STRUCT;
+            ptr_depth = 0;
+            struct_name_ptr = type_number_struct_name_ptr();
+            struct_name_len = type_number_struct_name_len();
         }
     }
     

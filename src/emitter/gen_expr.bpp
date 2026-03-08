@@ -73,6 +73,88 @@ func cg_emit_field_load_from_rax(fd: *FieldDesc) -> u64 {
     return 0;
 }
 
+func cg_member_is_bits_field(member_ptr: u64, member_len: u64) -> u64 {
+    if (member_ptr == 0 || member_len != 4) { return 0; }
+    if (str_eq(member_ptr, member_len, "bits", 4) != 0) { return 1; }
+    return 0;
+}
+
+func cg_try_match_struct_def_by_tail(name_ptr: u64, name_len: u64) -> *AstStructDef {
+    if (name_ptr == 0 || name_len == 0) { return 0; }
+    var all_structs: *Vec<*AstStructDef> = typeinfo_get_structs();
+    if (all_structs == 0) { return 0; }
+
+    var matched: *AstStructDef = 0;
+    var matched_count: u64 = 0;
+    var n: u64 = all_structs.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var sd: *AstStructDef = all_structs.get(i);
+        if (sd == 0) { continue; }
+        var ok: u64 = 0;
+        if (str_eq(sd.name_ptr, sd.name_len, name_ptr, name_len) != 0) {
+            return sd;
+        }
+
+        if (sd.name_len > name_len + 2) {
+            var s_tail: u64 = sd.name_len - name_len;
+            var su8: []u8 = slice(sd.name_ptr, sd.name_len);
+            if (su8[s_tail - 2] == 95 && su8[s_tail - 1] == 95 &&
+                str_eq(sd.name_ptr + s_tail, name_len, name_ptr, name_len) != 0) {
+                ok = 1;
+            }
+        }
+        if (ok == 0 && name_len > sd.name_len + 2) {
+            var n_tail: u64 = name_len - sd.name_len;
+            var nu8: []u8 = slice(name_ptr, name_len);
+            if (nu8[n_tail - 2] == 95 && nu8[n_tail - 1] == 95 &&
+                str_eq(name_ptr + n_tail, sd.name_len, sd.name_ptr, sd.name_len) != 0) {
+                ok = 1;
+            }
+        }
+
+        if (ok != 0) {
+            matched = sd;
+            matched_count = matched_count + 1;
+            if (matched_count > 1) { return 0; }
+        }
+    }
+    if (matched_count == 1) { return matched; }
+    return 0;
+}
+
+func cg_hydrate_struct_def_from_type(ti: *TypeInfo) -> *AstStructDef {
+    if (ti == 0) { return 0; }
+    if (ti.struct_def != 0) {
+        if (ti.struct_name_ptr == 0 || ti.struct_name_len == 0) {
+            ti.struct_name_ptr = ti.struct_def.name_ptr;
+            ti.struct_name_len = ti.struct_def.name_len;
+        }
+        return ti.struct_def;
+    }
+    if (ti.struct_name_ptr == 0 || ti.struct_name_len == 0) { return 0; }
+
+    var struct_def: *AstStructDef = get_struct_def(ti.struct_name_ptr, ti.struct_name_len);
+    if (struct_def == 0) {
+        var resolved: *NameInfo = resolve_name(ti.struct_name_ptr, ti.struct_name_len);
+        if (resolved != 0) {
+            struct_def = get_struct_def(resolved.ptr, resolved.len);
+            if (struct_def != 0) {
+                ti.struct_name_ptr = resolved.ptr;
+                ti.struct_name_len = resolved.len;
+            }
+        }
+    }
+    if (struct_def == 0) {
+        struct_def = cg_try_match_struct_def_by_tail(ti.struct_name_ptr, ti.struct_name_len);
+    }
+    if (struct_def != 0) {
+        ti.struct_name_ptr = struct_def.name_ptr;
+        ti.struct_name_len = struct_def.name_len;
+    }
+    ti.struct_def = struct_def;
+    return struct_def;
+}
+
 func cg_require_tagged_layout_struct(tag_layout_ptr: u64, tag_layout_len: u64) -> *AstStructDef {
     var layout_info: *AstStructDef = get_struct_def(tag_layout_ptr, tag_layout_len);
     if (layout_info == 0) {
@@ -413,16 +495,7 @@ func cg_method_call_sret_to_offset(mc: *AstMethodCall, dest_offset: u64, symtab:
         recv_is_ptr = 1;
     }
 
-    if (recv_is_ptr != 0) {
-        cg_expr(receiver);
-        if (type_info.is_tagged == 1) {
-            emit_tagged_mask();
-        }
-    } else {
-        cg_lvalue(receiver);
-    }
-    emit("    push rax\n");
-    total_arg_words = total_arg_words + 1;
+    total_arg_words = total_arg_words + cg_method_push_receiver(receiver, type_info, recv_is_ptr, symtab);
 
     emit("    lea rdi, [rbp");
     emit_signed_disp(dest_offset);
@@ -1309,8 +1382,21 @@ func cg_expr_unary(node: u64, symtab: *Symtab) -> u64 {
     var operand: u64 = unary.operand;
     
     cg_expr(operand);
+    var ot: *TypeInfo = get_expr_type_with_symtab((*AstNode)operand, symtab);
+    var is_number_operand: u64 = cg_binary_is_number_type(ot);
     if (op == TOKEN_MINUS) {
-        var ot: *TypeInfo = get_expr_type_with_symtab((*AstNode)operand, symtab);
+        if (is_number_operand != 0) {
+            emit("    sub rsp, 16\n");
+            emit("    mov [rsp+8], rax\n");
+            emit("    mov rdi, 0\n");
+            emit("    call std_number__number_from_i64\n");
+            emit("    mov [rsp], rax\n");
+            emit("    lea rdi, [rsp]\n");
+            emit("    lea rsi, [rsp+8]\n");
+            emit("    call std_number__number_sub_values\n");
+            emit("    add rsp, 16\n");
+            return;
+        }
         if (ot != 0 && ot.ptr_depth == 0 && ot.type_kind == TYPE_F64) {
             emit("    mov rbx, 1\n");
             emit("    mov rcx, 63\n");
@@ -1324,10 +1410,33 @@ func cg_expr_unary(node: u64, symtab: *Symtab) -> u64 {
         emit("    neg rax\n");
     }
     else if (op == TOKEN_BANG) {
+        if (is_number_operand != 0) {
+            emit("    sub rsp, 16\n");
+            emit("    mov [rsp], rax\n");
+            emit("    mov rdi, 0\n");
+            emit("    call std_number__number_from_i64\n");
+            emit("    mov [rsp+8], rax\n");
+            emit("    lea rdi, [rsp]\n");
+            emit("    lea rsi, [rsp+8]\n");
+            emit("    call std_number__number_cmp_ptr\n");
+            emit("    add rsp, 16\n");
+            emit("    cmp rax, 0\n");
+            emit("    sete al\n");
+            emit("    movzx rax, al\n");
+            return;
+        }
         emit("    test rax, rax\n");
         emit("    setz al\n");
         emit("    movzx rax, al\n");
     } else if (op == TOKEN_TILDE) {
+        if (is_number_operand != 0) {
+            emit("    sub rsp, 8\n");
+            emit("    mov [rsp], rax\n");
+            emit("    lea rdi, [rsp]\n");
+            emit("    call std_number__number_bitnot_values\n");
+            emit("    add rsp, 8\n");
+            return;
+        }
         emit("    not rax\n");
     }
     return;
@@ -2057,7 +2166,7 @@ func cg_property_hook_find_field(member_access: *AstMemberAccess, symtab: *Symta
     if (out_obj_ti != 0) { *out_obj_ti = obj_ti; }
 
     if (obj_ti.type_kind != TYPE_STRUCT) { return 0; }
-    var struct_def: *AstStructDef = obj_ti.struct_def;
+    var struct_def: *AstStructDef = cg_hydrate_struct_def_from_type(obj_ti);
     if (struct_def == 0 && obj_ti.struct_name_ptr != 0) {
         struct_def = get_struct_def(obj_ti.struct_name_ptr, obj_ti.struct_name_len);
     }
@@ -2148,9 +2257,14 @@ func cg_safe_member_access_expr(node: u64, symtab: *Symtab) -> u64 {
         return 0;
     }
 
-    var struct_def: *AstStructDef = ot.struct_def;
+    var struct_def: *AstStructDef = cg_hydrate_struct_def_from_type(ot);
     if (struct_def == 0) {
-        emit("    ; ERROR: Struct definition not found for pointer type\n");
+        if (cg_member_is_bits_field(member_ptr, member_len) != 0) {
+            emit("    mov rax, [rax]\n");
+            cg_emit_safe_null_epilogue(label_null, label_end);
+            return 0;
+        }
+        cg_codegen_error("[ERROR] Struct definition not found for pointer type in safe member access\n");
         cg_emit_safe_null_epilogue(label_null, label_end);
         return 0;
     }
@@ -2300,9 +2414,13 @@ func cg_member_expr_ptr_struct(object: u64, ot: *TypeInfo, parent_ptr: u64, pare
     if (ot.is_tagged == 1) {
         emit_tagged_mask();
     }
-    var struct_def_ptr: *AstStructDef = ot.struct_def;
+    var struct_def_ptr: *AstStructDef = cg_hydrate_struct_def_from_type(ot);
     if (struct_def_ptr == 0) {
-        emit("    ; ERROR: Struct definition not found for pointer type\n");
+        if (cg_member_is_bits_field(member_ptr, member_len) != 0) {
+            emit("    mov rax, [rax]\n");
+            return 0;
+        }
+        cg_codegen_error("[ERROR] Struct definition not found for pointer type in member access\n");
         return 0;
     }
     cg_member_emit_struct_field_at_rax(struct_def_ptr, parent_ptr, parent_len, member_ptr, member_len, 0);
@@ -2370,9 +2488,13 @@ func cg_member_expr_deref(object: u64, symtab: *Symtab, parent_ptr: u64, parent_
         emit("    ; ERROR: Arrow operator requires pointer to struct\n");
         return 0;
     }
-    var struct_def: *AstStructDef = ti.struct_def;
+    var struct_def: *AstStructDef = cg_hydrate_struct_def_from_type(ti);
     if (struct_def == 0) {
-        emit("    ; ERROR: Struct definition not found for pointer type\n");
+        if (cg_member_is_bits_field(member_ptr, member_len) != 0) {
+            emit("    mov rax, [rax]\n");
+            return 0;
+        }
+        cg_codegen_error("[ERROR] Struct definition not found for pointer type in arrow member access\n");
         return 0;
     }
     cg_member_emit_struct_field_at_rax(struct_def, parent_ptr, parent_len, member_ptr, member_len, 0);
@@ -2385,12 +2507,13 @@ func cg_member_expr_nested(object: u64, symtab: *Symtab, parent_ptr: u64, parent
         emit("    ; ERROR: Nested member access type not found\n");
         return 0;
     }
-    if (nt.type_kind != TYPE_STRUCT || nt.struct_def == 0) {
+    var nested_struct_def: *AstStructDef = cg_hydrate_struct_def_from_type(nt);
+    if (nt.type_kind != TYPE_STRUCT || nested_struct_def == 0) {
         emit("    ; ERROR: Nested member access on non-struct\n");
         return 0;
     }
     cg_lvalue(object);
-    cg_member_emit_struct_field_at_rax(nt.struct_def, parent_ptr, parent_len, member_ptr, member_len, 1);
+    cg_member_emit_struct_field_at_rax(nested_struct_def, parent_ptr, parent_len, member_ptr, member_len, 1);
     return 0;
 }
 
@@ -2400,12 +2523,13 @@ func cg_member_expr_indexed(object: u64, symtab: *Symtab, parent_ptr: u64, paren
         emit("    ; ERROR: Indexed member access type not found\n");
         return 0;
     }
-    if (it.type_kind != TYPE_STRUCT || it.struct_def == 0) {
+    var indexed_struct_def: *AstStructDef = cg_hydrate_struct_def_from_type(it);
+    if (it.type_kind != TYPE_STRUCT || indexed_struct_def == 0) {
         emit("    ; ERROR: Indexed member access on non-struct\n");
         return 0;
     }
     cg_lvalue(object);
-    cg_member_emit_struct_field_at_rax(it.struct_def, parent_ptr, parent_len, member_ptr, member_len, 1);
+    cg_member_emit_struct_field_at_rax(indexed_struct_def, parent_ptr, parent_len, member_ptr, member_len, 1);
     return 0;
 }
 
@@ -2430,10 +2554,7 @@ func cg_member_expr_ident(object: u64, symtab: *Symtab, parent_ptr: u64, parent_
         var struct_def_g: *AstStructDef = 0;
         var gti: *TypeInfo = ginfo.typeinfo_ptr;
         if (gti != 0) {
-            if (gti.struct_def == 0 && gti.struct_name_ptr != 0) {
-                gti.struct_def = get_struct_def(gti.struct_name_ptr, gti.struct_name_len);
-            }
-            struct_def_g = gti.struct_def;
+            struct_def_g = cg_hydrate_struct_def_from_type(gti);
         }
         if (struct_def_g == 0) {
             emit("    ; ERROR: Struct definition not found in global lvalue\n");
@@ -2457,7 +2578,7 @@ func cg_member_expr_ident(object: u64, symtab: *Symtab, parent_ptr: u64, parent_
         return 0;
     }
 
-    var struct_def: *AstStructDef = var_ti.struct_def;
+    var struct_def: *AstStructDef = cg_hydrate_struct_def_from_type(var_ti);
     if (struct_def == 0) {
         emit("    ; ERROR: Struct definition not found in type_info\n");
         return 0;
@@ -2703,6 +2824,199 @@ func cg_binary_is_integer_expr(node: *AstNode) -> u64 {
     return 0;
 }
 
+func cg_method_name_is_non_number_result(method_ptr: u64, method_len: u64) -> u64 {
+    if (method_ptr == 0 || method_len == 0) { return 0; }
+    if (str_eq(method_ptr, method_len, "to_i64_checked", 14) != 0) { return 1; }
+    if (str_eq(method_ptr, method_len, "to_u64_checked", 14) != 0) { return 1; }
+    if (str_eq(method_ptr, method_len, "to_i64_lossy", 12) != 0) { return 1; }
+    if (str_eq(method_ptr, method_len, "to_str", 6) != 0) { return 1; }
+    if (str_eq(method_ptr, method_len, "cmp", 3) != 0) { return 1; }
+    if (str_eq(method_ptr, method_len, "cmp_i64", 7) != 0) { return 1; }
+    if (str_eq(method_ptr, method_len, "eq", 2) != 0) { return 1; }
+    if (str_eq(method_ptr, method_len, "eq_i64", 6) != 0) { return 1; }
+    if (str_eq(method_ptr, method_len, "eq_u64", 6) != 0) { return 1; }
+    return 0;
+}
+
+func cg_binary_expr_is_number(node: *AstNode, ti: *TypeInfo, symtab: *Symtab) -> u64 {
+    if (node == 0) { return 0; }
+    var kind: u64 = ast_kind(node);
+    if (kind == AST_METHOD_CALL || kind == AST_SAFE_METHOD_CALL) {
+        var mc: *AstMethodCall = (*AstMethodCall)node;
+        if (cg_method_name_is_non_number_result(mc.method_ptr, mc.method_len) != 0) { return 0; }
+        if (cg_binary_expr_is_number(mc.receiver, 0, symtab) != 0) { return 1; }
+    }
+    if (cg_binary_is_number_type(ti) != 0) { return 1; }
+    if (kind == AST_CAST) {
+        var c: *AstCast = (*AstCast)node;
+        return cg_binary_expr_is_number((*AstNode)c.expr, 0, symtab);
+    }
+    if (kind == AST_UNARY) {
+        var un: *AstUnary = (*AstUnary)node;
+        return cg_binary_expr_is_number(un.operand, 0, symtab);
+    }
+    if (kind == AST_BINARY) {
+        var bin: *AstBinary = (*AstBinary)node;
+        if (cg_binary_expr_is_number(bin.left, 0, symtab) != 0) { return 1; }
+        if (cg_binary_expr_is_number(bin.right, 0, symtab) != 0) { return 1; }
+        return 0;
+    }
+    if (kind == AST_IDENT && symtab != 0) {
+        var idn: *AstIdent = (*AstIdent)node;
+        var si: *TypeInfo = symtab_get_type(symtab, idn.name_ptr, idn.name_len);
+        if (si == 0) {
+            var resolved_id: *NameInfo = resolve_name(idn.name_ptr, idn.name_len);
+            if (resolved_id != 0) {
+                si = symtab_get_type(symtab, resolved_id.ptr, resolved_id.len);
+            }
+        }
+        if (si == 0 && idn.name_len > 2) {
+            var tail_start: u64 = idn.name_len;
+            for (var ti: u64 = 0; ti + 1 < idn.name_len; ti = ti + 1) {
+                var c0: u8 = ((*u8)idn.name_ptr)[ti];
+                var c1: u8 = ((*u8)idn.name_ptr)[ti + 1];
+                if (c0 == 95 && c1 == 95) { tail_start = ti + 2; }
+            }
+            if (tail_start < idn.name_len) {
+                si = symtab_get_type(symtab, idn.name_ptr + tail_start, idn.name_len - tail_start);
+            }
+        }
+        if (cg_binary_is_number_type(si) != 0) { return 1; }
+    }
+    if (kind == AST_CALL) {
+        var c0: *AstCall = (*AstCall)node;
+        var rp: u64 = c0.name_ptr;
+        var rl: u64 = c0.name_len;
+        var resolved: *NameInfo = resolve_name(c0.name_ptr, c0.name_len);
+        if (resolved != 0) {
+            rp = resolved.ptr;
+            rl = resolved.len;
+        }
+        if (str_eq(rp, rl, "number_from_i64", 15) != 0 || str_eq(rp, rl, "number_from_u64", 15) != 0 || str_eq(rp, rl, "number_from_str", 15) != 0) { return 1; }
+        if (str_eq(rp, rl, "std_number__number_from_i64", 26) != 0 || str_eq(rp, rl, "std_number__number_from_u64", 26) != 0 || str_eq(rp, rl, "std_number__number_from_str", 26) != 0) { return 1; }
+    }
+    return 0;
+}
+
+func cg_binary_is_signed_integer_type(ti: *TypeInfo) -> u64 {
+    if (ti == 0 || ti.ptr_depth != 0) { return 0; }
+    if (ti.type_kind == TYPE_I8 || ti.type_kind == TYPE_I16 || ti.type_kind == TYPE_I32 || ti.type_kind == TYPE_I64) { return 1; }
+    return 0;
+}
+
+func cg_binary_is_unsigned_integer_type(ti: *TypeInfo) -> u64 {
+    if (ti == 0 || ti.ptr_depth != 0) { return 0; }
+    if (ti.type_kind == TYPE_U8 || ti.type_kind == TYPE_U16 || ti.type_kind == TYPE_U32 || ti.type_kind == TYPE_U64 || ti.type_kind == TYPE_BOOL) { return 1; }
+    return 0;
+}
+
+func cg_binary_emit_int_rax_normalize(ti: *TypeInfo) -> u64 {
+    if (ti == 0 || ti.ptr_depth != 0) { return 0; }
+    if (ti.type_kind == TYPE_I8) { emit("    movsx rax, al\n"); return 1; }
+    if (ti.type_kind == TYPE_I16) { emit("    movsx rax, ax\n"); return 1; }
+    if (ti.type_kind == TYPE_I32) { emit("    movsxd rax, eax\n"); return 1; }
+    if (ti.type_kind == TYPE_U8 || ti.type_kind == TYPE_BOOL) { emit("    movzx eax, al\n"); return 1; }
+    if (ti.type_kind == TYPE_U16) { emit("    movzx eax, ax\n"); return 1; }
+    if (ti.type_kind == TYPE_U32) { emit("    mov eax, eax\n"); return 1; }
+    if (ti.type_kind == TYPE_I64 || ti.type_kind == TYPE_U64) { return 1; }
+    return 0;
+}
+
+func cg_binary_emit_number_from_rax(ti: *TypeInfo, node: *AstNode, symtab: *Symtab) -> u64 {
+    if (cg_binary_expr_is_number(node, ti, symtab) != 0) { return 1; }
+    if (node != 0 && ast_kind(node) == AST_IDENT) { return 1; }
+    if (node != 0 && ti != 0 && ti.ptr_depth == 0 && cg_binary_is_integer_expr(node) == 0 &&
+        (ti.type_kind == TYPE_I8 || ti.type_kind == TYPE_I16 || ti.type_kind == TYPE_I32 || ti.type_kind == TYPE_I64 ||
+         ti.type_kind == TYPE_U8 || ti.type_kind == TYPE_U16 || ti.type_kind == TYPE_U32 || ti.type_kind == TYPE_U64 || ti.type_kind == TYPE_BOOL)) {
+        return 1;
+    }
+    if (ti == 0) {
+        emit("    mov rdi, rax\n");
+        emit("    call std_number__number_from_i64\n");
+        return 1;
+    }
+    if (ti.ptr_depth != 0) {
+        emit("    mov rdi, rax\n");
+        emit("    call std_number__number_from_u64\n");
+        return 1;
+    }
+    if (cg_binary_is_signed_integer_type(ti) != 0) {
+        cg_binary_emit_int_rax_normalize(ti);
+        emit("    mov rdi, rax\n");
+        emit("    call std_number__number_from_i64\n");
+        return 1;
+    }
+    if (cg_binary_is_unsigned_integer_type(ti) != 0) {
+        cg_binary_emit_int_rax_normalize(ti);
+        emit("    mov rdi, rax\n");
+        emit("    call std_number__number_from_u64\n");
+        return 1;
+    }
+    emit("    mov rdi, rax\n");
+    emit("    call std_number__number_from_i64\n");
+    return 1;
+}
+
+func cg_binary_is_number_box_op(op: u64) -> u64 {
+    if (op == TOKEN_PLUS || op == TOKEN_MINUS || op == TOKEN_STAR || op == TOKEN_SLASH || op == TOKEN_PERCENT) { return 1; }
+    if (op == TOKEN_AMPERSAND || op == TOKEN_PIPE || op == TOKEN_CARET) { return 1; }
+    if (op == TOKEN_LSHIFT || op == TOKEN_RSHIFT) { return 1; }
+    if (op == TOKEN_EQEQ || op == TOKEN_BANGEQ || op == TOKEN_LT || op == TOKEN_LTEQ || op == TOKEN_GT || op == TOKEN_GTEQ) { return 1; }
+    return 0;
+}
+
+func cg_binary_emit_number_box_call(op: u64) -> u64 {
+    emit("    sub rsp, 16\n");
+    emit("    mov [rsp], rax\n");
+    emit("    mov [rsp+8], rbx\n");
+    emit("    lea rdi, [rsp]\n");
+    emit("    lea rsi, [rsp+8]\n");
+
+    if (op == TOKEN_PLUS) { emit("    call std_number__number_add_values\n"); emit("    add rsp, 16\n"); return 1; }
+    if (op == TOKEN_MINUS) { emit("    call std_number__number_sub_values\n"); emit("    add rsp, 16\n"); return 1; }
+    if (op == TOKEN_STAR) { emit("    call std_number__number_mul_values\n"); emit("    add rsp, 16\n"); return 1; }
+    if (op == TOKEN_SLASH) { emit("    call std_number__number_div_values\n"); emit("    add rsp, 16\n"); return 1; }
+    if (op == TOKEN_PERCENT) { emit("    call std_number__number_mod_values\n"); emit("    add rsp, 16\n"); return 1; }
+    if (op == TOKEN_AMPERSAND) { emit("    call std_number__number_bitand_values\n"); emit("    add rsp, 16\n"); return 1; }
+    if (op == TOKEN_PIPE) { emit("    call std_number__number_bitor_values\n"); emit("    add rsp, 16\n"); return 1; }
+    if (op == TOKEN_CARET) { emit("    call std_number__number_bitxor_values\n"); emit("    add rsp, 16\n"); return 1; }
+    if (op == TOKEN_LSHIFT || op == TOKEN_RSHIFT) {
+        emit("    lea rdi, [rsp+8]\n");
+        emit("    call std_number__number_shift_amount_from_number\n");
+        emit("    mov rsi, rax\n");
+        emit("    lea rdi, [rsp]\n");
+        if (op == TOKEN_LSHIFT) { emit("    call std_number__number_shl_values\n"); }
+        else { emit("    call std_number__number_shr_values\n"); }
+        emit("    add rsp, 16\n");
+        return 1;
+    }
+    if (op == TOKEN_EQEQ || op == TOKEN_BANGEQ || op == TOKEN_LT || op == TOKEN_LTEQ || op == TOKEN_GT || op == TOKEN_GTEQ) {
+        emit("    call std_number__number_cmp_ptr\n");
+        emit("    add rsp, 16\n");
+        return cg_binary_emit_cmp_from_i64(op, 0);
+    }
+    emit("    add rsp, 16\n");
+    return 0;
+}
+
+func cg_binary_emit_number_box(binary: *AstBinary, left_ti: *TypeInfo, right_ti: *TypeInfo, symtab: *Symtab, op: u64) -> u64 {
+    var left_is_number: u64 = cg_binary_expr_is_number(binary.left, left_ti, symtab);
+    var right_is_number: u64 = cg_binary_expr_is_number(binary.right, right_ti, symtab);
+    if (left_is_number == 0 && right_is_number == 0) { return 0; }
+    if (cg_binary_is_number_box_op(op) == 0) { return 0; }
+
+    cg_expr((u64)binary.left);
+    cg_binary_emit_number_from_rax(left_ti, binary.left, symtab);
+    emit("    push rax\n");
+
+    cg_expr((u64)binary.right);
+    cg_binary_emit_number_from_rax(right_ti, binary.right, symtab);
+    emit("    mov rbx, rax\n");
+    emit("    pop rax\n");
+
+    return cg_binary_emit_number_box_call(op);
+}
+
 func cg_binary_emit_cmp_from_i64(op: u64, reversed: u64) -> u64 {
     emit("    cmp rax, 0\n");
     if (reversed == 0) {
@@ -2729,8 +3043,8 @@ func cg_binary_emit_cmp_from_i64(op: u64, reversed: u64) -> u64 {
 func cg_binary_emit_number_cmp(binary: *AstBinary, left_ti: *TypeInfo, right_ti: *TypeInfo, symtab: *Symtab, op: u64) -> u64 {
     var left: *AstNode = binary.left;
     var right: *AstNode = binary.right;
-    var left_is_number: u64 = cg_binary_is_number_type(left_ti);
-    var right_is_number: u64 = cg_binary_is_number_type(right_ti);
+    var left_is_number: u64 = cg_binary_expr_is_number(left, left_ti, symtab);
+    var right_is_number: u64 = cg_binary_expr_is_number(right, right_ti, symtab);
     if (left_is_number == 0 && right_is_number == 0) { return 0; }
 
     if (left_is_number != 0 && right_is_number != 0 &&
@@ -2764,7 +3078,7 @@ func cg_binary_emit_number_cmp(binary: *AstBinary, left_ti: *TypeInfo, right_ti:
         return cg_binary_emit_cmp_from_i64(op, 1);
     }
 
-    return 0;
+    return cg_binary_emit_number_box(binary, left_ti, right_ti, symtab, op);
 }
 
 func cg_binary_expr(node: u64, symtab: *Symtab) -> u64 {
@@ -2784,10 +3098,15 @@ func cg_binary_expr(node: u64, symtab: *Symtab) -> u64 {
         return;
     }
 
+    var left_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)left, symtab);
+    var right_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)right, symtab);
+
     if (op == TOKEN_EQEQ || op == TOKEN_BANGEQ || op == TOKEN_LT || op == TOKEN_LTEQ || op == TOKEN_GT || op == TOKEN_GTEQ) {
-        var left_ti_eq: *TypeInfo = get_expr_type_with_symtab((*AstNode)left, symtab);
-        var right_ti_eq: *TypeInfo = get_expr_type_with_symtab((*AstNode)right, symtab);
-        if (cg_binary_emit_number_cmp(binary, left_ti_eq, right_ti_eq, symtab, op) != 0) {
+        if (cg_binary_emit_number_cmp(binary, left_ti, right_ti, symtab, op) != 0) {
+            return;
+        }
+    } else {
+        if (cg_binary_emit_number_box(binary, left_ti, right_ti, symtab, op) != 0) {
             return;
         }
     }
@@ -2799,8 +3118,6 @@ func cg_binary_expr(node: u64, symtab: *Symtab) -> u64 {
     emit("    mov rbx, rax\n");
     emit("    pop rax\n");
 
-    var left_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)left, symtab);
-    var right_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)right, symtab);
     var is_float: u64 = 0;
     if (left_ti != 0 && right_ti != 0) {
         if (left_ti.ptr_depth == 0 && right_ti.ptr_depth == 0 && left_ti.type_kind == TYPE_F64 && right_ti.type_kind == TYPE_F64) {
@@ -2975,9 +3292,12 @@ func cg_member_lvalue_ptr_struct(object: u64, obj_ti: *TypeInfo, parent_ptr: u64
     if (obj_ti.is_tagged == 1) {
         emit_tagged_mask();
     }
-    var struct_def_ptr: *AstStructDef = obj_ti.struct_def;
+    var struct_def_ptr: *AstStructDef = cg_hydrate_struct_def_from_type(obj_ti);
     if (struct_def_ptr == 0) {
-        emit("    ; ERROR: Struct definition not found for pointer type\n");
+        if (cg_member_is_bits_field(member_ptr, member_len) != 0) {
+            return 1;
+        }
+        cg_codegen_error("[ERROR] Struct definition not found for pointer type in member lvalue\n");
         return 0;
     }
     var field_info_ptr: CgMemberFieldOffsetInfo = cg_member_resolve_field_offset(struct_def_ptr, parent_ptr, parent_len, member_ptr, member_len);
@@ -3014,9 +3334,13 @@ func cg_member_lvalue_deref(object: u64, symtab: *Symtab, parent_ptr: u64, paren
     }
     
     // Get struct_def from pointer's base type
-    var struct_def: *AstStructDef = ti.struct_def;
+    var struct_def: *AstStructDef = cg_hydrate_struct_def_from_type(ti);
     if (struct_def == 0) {
-        emit("    ; ERROR: Struct definition not found for pointer type\n");
+        if (cg_member_is_bits_field(member_ptr, member_len) != 0) {
+            emit("    pop rax\n");
+            return 1;
+        }
+        cg_codegen_error("[ERROR] Struct definition not found for pointer type in deref member lvalue\n");
         return 1;
     }
     
@@ -3047,7 +3371,7 @@ func cg_member_lvalue_nested(object: u64, symtab: *Symtab, parent_ptr: u64, pare
         return 1;
     }
     
-    var struct_def: *AstStructDef = obj_lv_ti.struct_def;
+    var struct_def: *AstStructDef = cg_hydrate_struct_def_from_type(obj_lv_ti);
     if (struct_def == 0) {
         emit("    ; ERROR: Struct definition not found for nested lvalue\n");
         return 1;
@@ -3110,14 +3434,15 @@ func cg_member_lvalue_ident(object: u64, symtab: *Symtab, parent_ptr: u64, paren
         var struct_def_g: *AstStructDef = 0;
         var gti: *TypeInfo = ginfo.typeinfo_ptr;
         if (gti != 0) {
-            if (gti.struct_def == 0 && gti.struct_name_ptr != 0) {
-                gti.struct_def = get_struct_def(gti.struct_name_ptr, gti.struct_name_len);
-            }
-            struct_def_g = gti.struct_def;
+            struct_def_g = cg_hydrate_struct_def_from_type(gti);
         }
         if (struct_def_g == 0) {
-            emit("    ; ERROR: Struct definition not found in global lvalue\n");
-            return 1;
+            emit_stderr("[ERROR] Struct definition not found in global lvalue: ");
+            emit_stderr_len(resolved_ptr, resolved_len);
+            emit_stderr(".");
+            emit_stderr_len(member_ptr, member_len);
+            emit_stderr("\n");
+            panic("Codegen error");
         }
         var field_info_g: CgMemberFieldOffsetInfo = cg_member_resolve_field_offset(struct_def_g, parent_ptr, parent_len, member_ptr, member_len);
         if (field_info_g.found == 0) { return 1; }
@@ -3132,16 +3457,38 @@ func cg_member_lvalue_ident(object: u64, symtab: *Symtab, parent_ptr: u64, paren
     // Get variable info from symtab
     var var_offset: u64 = symtab_find(symtab, obj_name_ptr, obj_name_len);
     var var_type: *TypeInfo = symtab_get_type(symtab, obj_name_ptr, obj_name_len);
+    var inferred_type: *TypeInfo = get_expr_type_with_symtab((*AstNode)object, symtab);
+    if (inferred_type != 0) {
+        if (var_type == 0) {
+            var_type = inferred_type;
+        } else {
+            if (var_type.type_kind != TYPE_STRUCT && inferred_type.type_kind == TYPE_STRUCT) {
+                var_type = inferred_type;
+            } else {
+                if (var_type.struct_def == 0 && inferred_type.struct_def != 0) {
+                    var_type.struct_def = inferred_type.struct_def;
+                }
+                if ((var_type.struct_name_ptr == 0 || var_type.struct_name_len == 0) &&
+                    inferred_type.struct_name_ptr != 0 && inferred_type.struct_name_len != 0) {
+                    var_type.struct_name_ptr = inferred_type.struct_name_ptr;
+                    var_type.struct_name_len = inferred_type.struct_name_len;
+                }
+            }
+        }
+    }
+    var struct_def_hint: *AstStructDef = cg_hydrate_struct_def_from_type(var_type);
     
     // Get struct_def directly from type_info
     var struct_def: *AstStructDef = 0;
-    if (var_type != 0) {
-        struct_def = var_type.struct_def;
-    }
+    struct_def = struct_def_hint;
     
     if (struct_def == 0) {
-        emit("    ; ERROR: Struct definition not found in lvalue\n");
-        return 1;
+        emit_stderr("[ERROR] Struct definition not found in lvalue: ");
+        emit_stderr_len(obj_name_ptr, obj_name_len);
+        emit_stderr(".");
+        emit_stderr_len(member_ptr, member_len);
+        emit_stderr("\n");
+        panic("Codegen error");
     }
     
     var field_info3: CgMemberFieldOffsetInfo = cg_member_resolve_field_offset(struct_def, parent_ptr, parent_len, member_ptr, member_len);
@@ -3221,15 +3568,68 @@ func cg_method_push_receiver_from_tmp(tmp_offset: u64) -> u64 {
     return 1;
 }
 
-func cg_method_push_receiver(receiver: u64, recv_ti: *TypeInfo, recv_is_ptr: u64) -> u64 {
+func cg_method_receiver_is_addressable_expr_kind(kind: u64) -> u64 {
+    if (kind == AST_IDENT) { return 1; }
+    if (kind == AST_CAST) { return 1; }
+    if (kind == AST_DEREF) { return 1; }
+    if (kind == AST_DEREF8) { return 1; }
+    if (kind == AST_INDEX) { return 1; }
+    if (kind == AST_MEMBER_ACCESS) { return 1; }
+    return 0;
+}
+
+func cg_method_push_receiver(receiver: u64, recv_ti: *TypeInfo, recv_is_ptr: u64, symtab: *Symtab) -> u64 {
     if (recv_is_ptr != 0) {
         cg_expr(receiver);
         if (recv_ti != 0 && recv_ti.is_tagged == 1) {
             emit_tagged_mask();
         }
-    } else {
-        cg_lvalue(receiver);
+        emit("    push rax\n");
+        return 1;
     }
+
+    var receiver_kind: u64 = ast_kind(receiver);
+    if (cg_method_receiver_is_addressable_expr_kind(receiver_kind) != 0) {
+        cg_lvalue(receiver);
+        emit("    push rax\n");
+        return 1;
+    }
+
+    var struct_size: u64 = 8;
+    if (recv_ti != 0 && recv_ti.type_kind == TYPE_STRUCT && recv_ti.ptr_depth == 0) {
+        struct_size = sizeof_type(TYPE_STRUCT, 0, recv_ti.struct_name_ptr, recv_ti.struct_name_len);
+    }
+    if (struct_size == 0) { struct_size = 8; }
+    var tmp_offset: u64 = cg_alloc_tmp_struct(symtab, struct_size);
+
+    if (receiver_kind == AST_STACK_CTOR) {
+        cg_stack_ctor_init_to_offset((*AstStackCtor)receiver, tmp_offset, symtab);
+    } else if (receiver_kind == AST_CALL && struct_size > 16) {
+        cg_call_sret_to_offset(receiver, tmp_offset, symtab);
+    } else if (receiver_kind == AST_METHOD_CALL && struct_size > 16) {
+        cg_method_call_sret_to_offset((*AstMethodCall)receiver, tmp_offset, symtab);
+    } else {
+        cg_expr(receiver);
+        if (struct_size <= 8) {
+            emit("    mov [rbp");
+            emit_signed_disp(tmp_offset);
+            emit("], rax\n");
+        } else if (struct_size <= 16) {
+            emit("    mov [rbp");
+            emit_signed_disp(tmp_offset);
+            emit("], rax\n");
+            emit("    mov [rbp");
+            emit_signed_disp(tmp_offset + 8);
+            emit("], rdx\n");
+        } else {
+            emit_stderr("[ERROR] non-addressable large struct receiver is unsupported\n");
+            panic("Codegen error");
+        }
+    }
+
+    emit("    lea rax, [rbp");
+    emit_signed_disp(tmp_offset);
+    emit("]\n");
     emit("    push rax\n");
     return 1;
 }
@@ -3476,6 +3876,11 @@ func cg_safe_method_call_struct_ptr(method_call: *AstMethodCall, recv_ti: *TypeI
 
     var total_arg_words: u64 = cg_method_push_user_args(args, nargs, fn, 1, symtab);
     total_arg_words = total_arg_words + cg_method_push_receiver_from_tmp(tmp_offset);
+    var resolved_call_safe: *NameInfo = resolve_name(resolved_ptr, resolved_len);
+    if (resolved_call_safe != 0) {
+        resolved_ptr = resolved_call_safe.ptr;
+        resolved_len = resolved_call_safe.len;
+    }
     var stack_words: u64 = _cg_sysv_pop_arg_regs(total_arg_words);
     cg_method_emit_direct_call(resolved_ptr, resolved_len, stack_words);
 
@@ -3537,7 +3942,7 @@ func cg_method_call(node: u64, symtab: *Symtab) -> u64 {
         }
 
         total_arg_words = cg_method_push_user_args(args, nargs, 0, 0, symtab);
-        total_arg_words = total_arg_words + cg_method_push_receiver(receiver, recv_ti, 1);
+        total_arg_words = total_arg_words + cg_method_push_receiver(receiver, recv_ti, 1, symtab);
         var stack_words_t2: u64 = _cg_sysv_pop_arg_regs(total_arg_words);
         cg_method_emit_trait_vtable_call(method_index, stack_words_t2);
         return 0;
@@ -3581,6 +3986,51 @@ func cg_method_call(node: u64, symtab: *Symtab) -> u64 {
             if (ti_alt != 0) { type_info = ti_alt; }
         }
     }
+    if (type_info != 0) {
+        var hydrated: *AstStructDef = cg_hydrate_struct_def_from_type(type_info);
+        if (hydrated != 0) {
+            type_info.struct_name_ptr = hydrated.name_ptr;
+            type_info.struct_name_len = hydrated.name_len;
+            type_info.struct_def = hydrated;
+        }
+    }
+    if ((type_info == 0 || type_info.struct_name_ptr == 0 || type_info.struct_name_len == 0) &&
+        cg_binary_expr_is_number((*AstNode)receiver, recv_ti, symtab) != 0) {
+        if (type_info == 0) { type_info = new TypeInfo{}; }
+        type_info.type_kind = TYPE_STRUCT;
+        type_info.ptr_depth = 0;
+        type_info.struct_name_ptr = (u64)"std_number__Number";
+        type_info.struct_name_len = 18;
+        if (type_info.struct_def == 0) {
+            type_info.struct_def = get_struct_def(type_info.struct_name_ptr, type_info.struct_name_len);
+            if (type_info.struct_def == 0) {
+                type_info.struct_def = get_struct_def((u64)"Number", 6);
+            }
+        }
+    }
+    if (type_info == 0 || type_info.struct_name_ptr == 0 || type_info.struct_name_len == 0) {
+        var nmi: *NameInfo = compiler_build_method_name((u64)"std_number__Number", 18, method_ptr, method_len);
+        var np: u64 = nmi.ptr;
+        var nl: u64 = nmi.len;
+        var nresolved: *NameInfo = resolve_name(np, nl);
+        if (nresolved != 0) {
+            np = nresolved.ptr;
+            nl = nresolved.len;
+        }
+        if (typeinfo_find_func(np, nl) != 0 || typeinfo_find_func(nmi.ptr, nmi.len) != 0) {
+            if (type_info == 0) { type_info = new TypeInfo{}; }
+            type_info.type_kind = TYPE_STRUCT;
+            type_info.ptr_depth = 0;
+            type_info.struct_name_ptr = (u64)"std_number__Number";
+            type_info.struct_name_len = 18;
+            if (type_info.struct_def == 0) {
+                type_info.struct_def = get_struct_def((u64)"std_number__Number", 18);
+                if (type_info.struct_def == 0) {
+                    type_info.struct_def = get_struct_def((u64)"Number", 6);
+                }
+            }
+        }
+    }
     if (type_info != 0 && (type_info.struct_name_ptr == 0 || type_info.struct_name_len == 0) && type_info.struct_def != 0) {
         type_info.struct_name_ptr = type_info.struct_def.name_ptr;
         type_info.struct_name_len = type_info.struct_def.name_len;
@@ -3591,6 +4041,9 @@ func cg_method_call(node: u64, symtab: *Symtab) -> u64 {
     }
     var struct_name_ptr: u64 = type_info.struct_name_ptr;
     var struct_name_len: u64 = type_info.struct_name_len;
+    if (type_info.struct_def == 0) {
+        type_info.struct_def = get_struct_def(struct_name_ptr, struct_name_len);
+    }
 
     var resolved_ptr: u64 = 0;
     var resolved_len: u64 = 0;
@@ -3624,9 +4077,101 @@ func cg_method_call(node: u64, symtab: *Symtab) -> u64 {
             fn_direct = typeinfo_find_func(name_info.ptr, name_info.len);
         }
     }
+    if (fn_direct == 0) {
+        var maybe_number: u64 = 0;
+        if (struct_name_len == 6) {
+            if (struct_name_ptr == 0) {
+                maybe_number = 1;
+            } else if (str_eq(struct_name_ptr, struct_name_len, "Number", 6) != 0) {
+                maybe_number = 1;
+            } else {
+                var su8n: []u8 = slice(struct_name_ptr, 6);
+                if (su8n[0] == 0) { maybe_number = 1; }
+            }
+        }
+        if (maybe_number != 0) {
+            struct_name_ptr = (u64)"std_number__Number";
+            struct_name_len = 18;
+            var resolved_number_method: CompilerMethodResolveResult = compiler_resolve_method_overload(struct_name_ptr, struct_name_len, method_ptr, method_len, arg_types, nargs);
+            if (resolved_number_method.found != 0 && resolved_number_method.fn != 0) {
+                fn_direct = resolved_number_method.fn;
+                resolved_ptr = fn_direct.name_ptr;
+                resolved_len = fn_direct.name_len;
+            }
+        }
+    }
+    if (fn_direct == 0 && type_info.struct_def == 0) {
+        type_info.struct_def = get_struct_def(struct_name_ptr, struct_name_len);
+    }
+    if (fn_direct == 0 && type_info.struct_def != 0) {
+        var fn_fallback2: *AstFunc = compiler_find_method_func_in_hierarchy(type_info.struct_def, method_ptr, method_len);
+        if (fn_fallback2 != 0) {
+            fn_direct = fn_fallback2;
+            resolved_ptr = fn_fallback2.name_ptr;
+            resolved_len = fn_fallback2.name_len;
+        }
+    }
+    if (fn_direct == 0) {
+        var loose_fn: *AstFunc = typeinfo_find_func(method_ptr, method_len);
+        if (loose_fn != 0) {
+            fn_direct = loose_fn;
+            resolved_ptr = loose_fn.name_ptr;
+            resolved_len = loose_fn.name_len;
+        }
+    }
+    if (fn_direct == 0 && g_funcs_vec != 0) {
+        var fcount2: u64 = g_funcs_vec.len();
+        for (var fi2: u64 = 0; fi2 < fcount2; fi2 = fi2 + 1) {
+            var ffn2: *AstFunc = g_funcs_vec.get(fi2);
+            if (ffn2 == 0) { continue; }
+            if (ffn2.impl_owner_ptr == 0 || ffn2.impl_owner_len == 0) { continue; }
+            var owner_match2: u64 = 0;
+            if (call_name_matches_tail(struct_name_ptr, struct_name_len, ffn2.impl_owner_ptr, ffn2.impl_owner_len) != 0) {
+                owner_match2 = 1;
+            }
+            if (owner_match2 == 0 && call_name_matches_tail(ffn2.impl_owner_ptr, ffn2.impl_owner_len, struct_name_ptr, struct_name_len) != 0) {
+                owner_match2 = 1;
+            }
+            if (owner_match2 == 0) { continue; }
+            var fmethod_ptr2: u64 = ffn2.impl_original_name_ptr;
+            var fmethod_len2: u64 = ffn2.impl_original_name_len;
+            if (fmethod_ptr2 == 0 || fmethod_len2 == 0) {
+                fmethod_ptr2 = ffn2.name_ptr;
+                fmethod_len2 = ffn2.name_len;
+            }
+            if (fmethod_len2 != method_len || str_eq(fmethod_ptr2, fmethod_len2, method_ptr, method_len) == 0) { continue; }
+            var pcount2: u64 = 0;
+            if (ffn2.params_vec != 0) { pcount2 = ffn2.params_vec.len(); }
+            if (pcount2 != nargs + 1) { continue; }
+            fn_direct = ffn2;
+            resolved_ptr = ffn2.name_ptr;
+            resolved_len = ffn2.name_len;
+            break;
+        }
+    }
+    if (fn_direct == 0) {
+        emit_stderr("[ERROR] Method not found: ");
+        emit_stderr_len(struct_name_ptr, struct_name_len);
+        emit_stderr(".");
+        emit_stderr_len(method_ptr, method_len);
+        emit_stderr("\n");
+        panic("Codegen error");
+    }
     total_arg_words = cg_method_push_user_args(args, nargs, fn_direct, 1, symtab);
-    total_arg_words = total_arg_words + cg_method_push_receiver(receiver, recv_ti, recv_is_ptr);
+    total_arg_words = total_arg_words + cg_method_push_receiver(receiver, recv_ti, recv_is_ptr, symtab);
 
+    if (resolved_ptr != 0 && method_ptr != 0 && method_len != 0 &&
+        resolved_len == method_len && str_eq(resolved_ptr, resolved_len, method_ptr, method_len) != 0 &&
+        struct_name_ptr != 0 && struct_name_len != 0) {
+        var qual_name: *NameInfo = compiler_build_method_name(struct_name_ptr, struct_name_len, method_ptr, method_len);
+        resolved_ptr = qual_name.ptr;
+        resolved_len = qual_name.len;
+    }
+    var resolved_call: *NameInfo = resolve_name(resolved_ptr, resolved_len);
+    if (resolved_call != 0) {
+        resolved_ptr = resolved_call.ptr;
+        resolved_len = resolved_call.len;
+    }
     var stack_words: u64 = _cg_sysv_pop_arg_regs(total_arg_words);
 
     cg_method_emit_direct_call(resolved_ptr, resolved_len, stack_words);
