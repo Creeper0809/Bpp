@@ -2841,6 +2841,19 @@ func cg_method_name_is_non_number_result(method_ptr: u64, method_len: u64) -> u6
 func cg_binary_expr_is_number(node: *AstNode, ti: *TypeInfo, symtab: *Symtab) -> u64 {
     if (node == 0) { return 0; }
     var kind: u64 = ast_kind(node);
+    if (kind == AST_CALL && symtab != 0) {
+        var ccall: *AstCall = (*AstCall)node;
+        var callee_ti: *TypeInfo = symtab_get_type(symtab, ccall.name_ptr, ccall.name_len);
+        if (callee_ti == 0) {
+            var resolved_callee: *NameInfo = resolve_name(ccall.name_ptr, ccall.name_len);
+            if (resolved_callee != 0) {
+                callee_ti = symtab_get_type(symtab, resolved_callee.ptr, resolved_callee.len);
+            }
+        }
+        // Closure/function-handle calls are represented as primitive integers (u64 handle).
+        // Never treat those call results as Number even if upstream inference is imprecise.
+        if (callee_ti != 0 && callee_ti.ptr_depth == 0 && callee_ti.type_kind != TYPE_STRUCT) { return 0; }
+    }
     if (kind == AST_METHOD_CALL || kind == AST_SAFE_METHOD_CALL) {
         var mc: *AstMethodCall = (*AstMethodCall)node;
         if (cg_method_name_is_non_number_result(mc.method_ptr, mc.method_len) != 0) { return 0; }
@@ -3456,9 +3469,10 @@ func cg_member_lvalue_ident(object: u64, symtab: *Symtab, parent_ptr: u64, paren
     
     // Get variable info from symtab
     var var_offset: u64 = symtab_find(symtab, obj_name_ptr, obj_name_len);
-    var var_type: *TypeInfo = symtab_get_type(symtab, obj_name_ptr, obj_name_len);
+    var declared_type: *TypeInfo = symtab_get_type(symtab, obj_name_ptr, obj_name_len);
+    var var_type: *TypeInfo = declared_type;
     var inferred_type: *TypeInfo = get_expr_type_with_symtab((*AstNode)object, symtab);
-    if (inferred_type != 0) {
+    if (inferred_type != 0 && (var_offset != 0 || declared_type != 0)) {
         if (var_type == 0) {
             var_type = inferred_type;
         } else {
@@ -3477,6 +3491,41 @@ func cg_member_lvalue_ident(object: u64, symtab: *Symtab, parent_ptr: u64, paren
         }
     }
     var struct_def_hint: *AstStructDef = cg_hydrate_struct_def_from_type(var_type);
+    if (var_type == 0 && var_offset == 0) {
+        emit_stderr("[ERROR] undefined identifier: ");
+        emit_stderr_len(obj_name_ptr, obj_name_len);
+        emit_stderr("\n");
+        panic("Codegen error");
+    }
+    if (var_type == 0) {
+        emit_stderr("[ERROR] Type info not found for lvalue: ");
+        emit_stderr_len(obj_name_ptr, obj_name_len);
+        emit_stderr(".");
+        emit_stderr_len(member_ptr, member_len);
+        emit_stderr("\n");
+        panic("Codegen error");
+    }
+    if (var_offset == 0) {
+        emit_stderr("[ERROR] identifier has no stack slot in current scope: ");
+        emit_stderr_len(obj_name_ptr, obj_name_len);
+        emit_stderr("\n");
+        panic("Codegen error");
+    }
+    if (var_type.ptr_depth == 0 && var_type.type_kind == TYPE_SLICE) {
+        if (cg_member_emit_lvalue_local_slice_member(var_offset, member_ptr, member_len) != 0) {
+            return 1;
+        }
+        emit_stderr("[ERROR] unknown slice member: ");
+        emit_stderr_len(member_ptr, member_len);
+        emit_stderr("\n");
+        panic("Codegen error");
+    }
+    if (var_type.type_kind != TYPE_STRUCT) {
+        emit_stderr("[ERROR] member assignment on non-struct identifier: ");
+        emit_stderr_len(obj_name_ptr, obj_name_len);
+        emit_stderr("\n");
+        panic("Codegen error");
+    }
     
     // Get struct_def directly from type_info
     var struct_def: *AstStructDef = 0;
@@ -3986,7 +4035,7 @@ func cg_method_call(node: u64, symtab: *Symtab) -> u64 {
             if (ti_alt != 0) { type_info = ti_alt; }
         }
     }
-    if (type_info != 0) {
+    if (type_info != 0 && type_info.type_kind == TYPE_STRUCT) {
         var hydrated: *AstStructDef = cg_hydrate_struct_def_from_type(type_info);
         if (hydrated != 0) {
             type_info.struct_name_ptr = hydrated.name_ptr;
@@ -3994,7 +4043,7 @@ func cg_method_call(node: u64, symtab: *Symtab) -> u64 {
             type_info.struct_def = hydrated;
         }
     }
-    if ((type_info == 0 || type_info.struct_name_ptr == 0 || type_info.struct_name_len == 0) &&
+    if ((type_info == 0 || (type_info.type_kind == TYPE_STRUCT && (type_info.struct_name_ptr == 0 || type_info.struct_name_len == 0))) &&
         cg_binary_expr_is_number((*AstNode)receiver, recv_ti, symtab) != 0) {
         if (type_info == 0) { type_info = new TypeInfo{}; }
         type_info.type_kind = TYPE_STRUCT;
@@ -4008,7 +4057,7 @@ func cg_method_call(node: u64, symtab: *Symtab) -> u64 {
             }
         }
     }
-    if (type_info == 0 || type_info.struct_name_ptr == 0 || type_info.struct_name_len == 0) {
+    if (type_info == 0 || (type_info.type_kind == TYPE_STRUCT && (type_info.struct_name_ptr == 0 || type_info.struct_name_len == 0))) {
         var nmi: *NameInfo = compiler_build_method_name((u64)"std_number__Number", 18, method_ptr, method_len);
         var np: u64 = nmi.ptr;
         var nl: u64 = nmi.len;
