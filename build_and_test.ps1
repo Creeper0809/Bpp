@@ -3,6 +3,9 @@ param(
     [string]$CompilerPath = "",
     [string]$NasmPath = "",
     [string]$LinkerPath = "",
+    [string]$BootstrapRepository = "Creeper0809/Bpp",
+    [string]$BootstrapBaseUrl = "https://github.com",
+    [string]$BootstrapReleaseTag = "",
     [switch]$ToolchainOnly,
     [switch]$SkipTests
 )
@@ -72,6 +75,61 @@ function Find-DefaultCompiler {
         Sort-Object Name
     if ($glob) {
         return $glob[-1].FullName
+    }
+
+    return ""
+}
+
+function Get-BootstrapReleaseTag {
+    param(
+        [string]$Version,
+        [string]$ExplicitTag
+    )
+
+    if ($ExplicitTag) { return $ExplicitTag }
+    if ($Version) { return "bootstrap-$Version" }
+    return "bootstrap-bpp"
+}
+
+function Get-WindowsBootstrapAssetName {
+    param([string]$Version)
+    if (-not $Version) { $Version = "bpp" }
+    return "bpp-bootstrap-${Version}-windows-x86_64.exe"
+}
+
+function Download-BootstrapCompiler {
+    param(
+        [string]$Root,
+        [string]$Version,
+        [string]$Repository,
+        [string]$BaseUrl,
+        [string]$ReleaseTag
+    )
+
+    $assetName = Get-WindowsBootstrapAssetName -Version $Version
+    $resolvedTag = Get-BootstrapReleaseTag -Version $Version -ExplicitTag $ReleaseTag
+    $downloadUrl = "$BaseUrl/$Repository/releases/download/$resolvedTag/$assetName"
+    $toolsDir = Join-Path $Root "build-win\_tools"
+    $downloadPath = Join-Path $toolsDir $assetName
+
+    New-Item -ItemType Directory -Force -Path $toolsDir | Out-Null
+
+    if (Test-Path $downloadPath) {
+        return (Resolve-Path $downloadPath).Path
+    }
+
+    Write-Host "[INFO] Downloading Windows bootstrap compiler: $downloadUrl"
+    try {
+        Invoke-WebRequest -Uri $downloadUrl -OutFile $downloadPath -UseBasicParsing
+    } catch {
+        if (Test-Path $downloadPath) {
+            Remove-Item -Force $downloadPath -ErrorAction SilentlyContinue
+        }
+        return ""
+    }
+
+    if (Test-Path $downloadPath) {
+        return (Resolve-Path $downloadPath).Path
     }
 
     return ""
@@ -149,13 +207,28 @@ if (-not (Test-Path $CompilerPath)) {
     if ($fallbackFound) {
         $CompilerPath = $fallbackFound
     } else {
-        throw @"
+        $downloadedCompiler = Download-BootstrapCompiler `
+            -Root $RootDir `
+            -Version $Version `
+            -Repository $BootstrapRepository `
+            -BaseUrl $BootstrapBaseUrl `
+            -ReleaseTag $BootstrapReleaseTag
+        if ($downloadedCompiler) {
+            $CompilerPath = $downloadedCompiler
+        } else {
+            throw @"
 Windows hosted compiler binary was not found.
 Tried: BPP_COMPILER, bin/\${BPP_VERSION}_stage1(.exe), bin/bootstrap(.exe), bin/stage1(.exe), bin/*_stage1*
 
+Attempted bootstrap asset download:
+  Repository : $BootstrapRepository
+  Release tag: $(Get-BootstrapReleaseTag -Version $Version -ExplicitTag $BootstrapReleaseTag)
+  Asset      : $(Get-WindowsBootstrapAssetName -Version $Version)
+
 Current repository contains Linux stage binaries only.
-Provide a Windows stage compiler binary first, then rerun this script.
+Provide or publish a Windows stage compiler binary first, then rerun this script.
 "@
+        }
     }
 }
 
