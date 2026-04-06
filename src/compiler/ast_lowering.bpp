@@ -14,9 +14,15 @@ import ast;
 import types;
 
 var g_lower_parse_sugar_symtab: *HashMap<u64, *TypeInfo> = 0;
+var g_lower_parse_sugar_final_phase: u64 = 0;
 
 func lower_parse_sugar_set_symtab(symtab: *HashMap<u64, *TypeInfo>) -> u64 {
     g_lower_parse_sugar_symtab = symtab;
+    return 0;
+}
+
+func lower_parse_sugar_set_final_phase(final_phase: u64) -> u64 {
+    g_lower_parse_sugar_final_phase = final_phase;
     return 0;
 }
 
@@ -306,6 +312,190 @@ func lower_normalize_generic_call_args(gcall: *AstGenericCall) -> u64 {
     return 0;
 }
 
+func lower_call_name_matches(name_ptr: u64, name_len: u64, target_ptr: u64, target_len: u64) -> u64 {
+    if (str_eq(name_ptr, name_len, target_ptr, target_len) != 0) { return 1; }
+    if (call_name_matches_tail(name_ptr, name_len, target_ptr, target_len) != 0) { return 1; }
+    return 0;
+}
+
+func lower_call_is_direct_named(call: *AstCall, target_ptr: u64, target_len: u64) -> u64 {
+    if (call == 0 || call.origin != AST_CALL_ORIGIN_DIRECT) { return 0; }
+    return lower_call_name_matches(call.name_ptr, call.name_len, target_ptr, target_len);
+}
+
+func lower_make_empty_args_vec() -> *Vec<*AstNode> {
+    return new Vec<*AstNode>(0);
+}
+
+func lower_make_single_arg_vec(arg0: *AstNode) -> *Vec<*AstNode> {
+    var args: *Vec<*AstNode> = new Vec<*AstNode>(1);
+    args.push(arg0);
+    return args;
+}
+
+func lower_make_two_arg_vec(arg0: *AstNode, arg1: *AstNode) -> *Vec<*AstNode> {
+    var args: *Vec<*AstNode> = new Vec<*AstNode>(2);
+    args.push(arg0);
+    args.push(arg1);
+    return args;
+}
+
+func lower_make_direct_call0(name_ptr: u64, name_len: u64) -> *AstNode {
+    return (*AstNode)ast_call(name_ptr, name_len, lower_make_empty_args_vec());
+}
+
+func lower_make_direct_call1(name_ptr: u64, name_len: u64, arg0: *AstNode) -> *AstNode {
+    return (*AstNode)ast_call(name_ptr, name_len, lower_make_single_arg_vec(arg0));
+}
+
+func lower_make_direct_call2(name_ptr: u64, name_len: u64, arg0: *AstNode, arg1: *AstNode) -> *AstNode {
+    return (*AstNode)ast_call(name_ptr, name_len, lower_make_two_arg_vec(arg0, arg1));
+}
+
+func lower_make_scalar_cast(expr: *AstNode, target_type: u64) -> *AstNode {
+    return (*AstNode)ast_cast_ex(expr, target_type, 0, 0, 0, 0, 0, 0);
+}
+
+func lower_make_ast_string_literal(raw_ptr: u64, raw_len: u64) -> *AstNode {
+    var lit_ptr: u64 = heap_alloc((raw_len + 3) * sizeof(u8));
+    if (lit_ptr == 0) { return 0; }
+    var lit_u8: *u8 = (*u8)lit_ptr;
+    lit_u8[0] = 34;
+    str_copy(lit_ptr + 1, raw_ptr, raw_len);
+    lit_u8[raw_len + 1] = 34;
+    lit_u8[raw_len + 2] = 0;
+    return (*AstNode)ast_string(lit_ptr, raw_len + 2);
+}
+
+func lower_ti_is_unsigned_scalar(ti: *TypeInfo) -> u64 {
+    if (ti == 0 || ti.ptr_depth != 0) { return 0; }
+    if (ti.type_kind == TYPE_U8) { return 1; }
+    if (ti.type_kind == TYPE_U16) { return 1; }
+    if (ti.type_kind == TYPE_U32) { return 1; }
+    if (ti.type_kind == TYPE_U64) { return 1; }
+    return 0;
+}
+
+func lower_ti_is_signed_scalar(ti: *TypeInfo) -> u64 {
+    if (ti == 0 || ti.ptr_depth != 0) { return 0; }
+    if (ti.type_kind == TYPE_I8) { return 1; }
+    if (ti.type_kind == TYPE_I16) { return 1; }
+    if (ti.type_kind == TYPE_I32) { return 1; }
+    if (ti.type_kind == TYPE_I64) { return 1; }
+    return 0;
+}
+
+func lower_prepare_named_typeinfo(ti: *TypeInfo) -> *TypeInfo {
+    if (ti == 0) { return 0; }
+    if ((ti.type_kind == TYPE_STRUCT || ti.type_kind == TYPE_TRAIT) && ti.struct_def != 0) {
+        ti.struct_name_ptr = ti.struct_def.name_ptr;
+        ti.struct_name_len = ti.struct_def.name_len;
+    }
+    if (ti.type_kind != TYPE_STRUCT) { return ti; }
+    if (ti.struct_def == 0 && ti.struct_name_ptr != 0 && ti.struct_name_len != 0) {
+        var struct_def: *AstStructDef = get_struct_def(ti.struct_name_ptr, ti.struct_name_len);
+        if (struct_def == 0) {
+            var resolved_name: *NameInfo = resolve_name(ti.struct_name_ptr, ti.struct_name_len);
+            if (resolved_name != 0) {
+                struct_def = get_struct_def(resolved_name.ptr, resolved_name.len);
+                if (struct_def != 0) {
+                    ti.struct_name_ptr = resolved_name.ptr;
+                    ti.struct_name_len = resolved_name.len;
+                }
+            }
+        }
+        ti.struct_def = struct_def;
+    }
+    return ti;
+}
+
+func lower_type_has_generic_suffix(name_ptr: u64, name_len: u64) -> u64 {
+    if (name_ptr == 0 || name_len == 0) { return 0; }
+    if (sym_find_generic_suffix_index(name_ptr, name_len) < name_len) { return 1; }
+    return 0;
+}
+
+func lower_build_struct_meta_to_str_expr(name_ptr: u64, name_len: u64) -> *AstNode {
+    return lower_make_direct_call2("to_str_struct_meta", 18, lower_make_ast_string_literal("struct", 6), (*AstNode)ast_literal(6));
+}
+
+func lower_build_to_str_expr(expr: *AstNode, ti: *TypeInfo) -> *AstNode {
+    if (expr == 0 || ti == 0) { return 0; }
+
+    if (ti.ptr_depth == 1 && ti.type_kind == TYPE_U8) {
+        return expr;
+    }
+
+    if (ti.type_kind == TYPE_STRUCT || ti.type_kind == TYPE_TRAIT) {
+        ti = lower_prepare_named_typeinfo(ti);
+        if (ti.struct_name_ptr != 0 && ti.struct_name_len != 0) {
+            var resolved: CompilerMethodResolveResult = sym_resolve_method_overload_with_count_fallback(
+                ti.struct_name_ptr, ti.struct_name_len,
+                "to_str", 6,
+                0, 0
+            );
+            if (resolved.found != 0) {
+                if (check_method_access_overload(ti.struct_name_ptr, ti.struct_name_len, "to_str", 6, 0, 0) == 0) {
+                    emit_stderr("[ERROR] Cannot access overloaded operator method: ");
+                    emit_stderr_len(ti.struct_name_ptr, ti.struct_name_len);
+                    emit_stderr(".to_str\n");
+                    diag_error("Compiler error");
+                    return 0;
+                }
+                return (*AstNode)ast_method_call(expr, "to_str", 6, lower_make_empty_args_vec());
+            }
+            if (lower_type_has_generic_suffix(ti.struct_name_ptr, ti.struct_name_len) != 0 &&
+                g_lower_parse_sugar_final_phase == 0) {
+                return 0;
+            }
+        }
+
+        if (ti.ptr_depth > 0) {
+            return lower_make_direct_call1("to_str_ptr_value", 16, lower_make_scalar_cast(expr, TYPE_U64));
+        }
+        if (ti.struct_name_ptr != 0 && ti.struct_name_len != 0) {
+            return lower_build_struct_meta_to_str_expr(ti.struct_name_ptr, ti.struct_name_len);
+        }
+        if (ti.type_kind == TYPE_TRAIT) {
+            return lower_make_direct_call2("to_str_struct_meta", 18, lower_make_ast_string_literal("trait", 5), (*AstNode)ast_literal(5));
+        }
+        return lower_build_struct_meta_to_str_expr(0, 0);
+    }
+
+    if (ti.ptr_depth > 0) {
+        return lower_make_direct_call1("to_str_ptr_value", 16, lower_make_scalar_cast(expr, TYPE_U64));
+    }
+
+    if (ti.type_kind == TYPE_BOOL) {
+        return lower_make_direct_call1("to_str_bool", 11, lower_make_scalar_cast(expr, TYPE_U64));
+    }
+    if (lower_ti_is_unsigned_scalar(ti) != 0) {
+        return lower_make_direct_call1("to_str_u64", 10, lower_make_scalar_cast(expr, TYPE_U64));
+    }
+    if (lower_ti_is_signed_scalar(ti) != 0) {
+        return lower_make_direct_call1("to_str_i64", 10, lower_make_scalar_cast(expr, TYPE_I64));
+    }
+    if (ti.type_kind == TYPE_F64) {
+        return lower_make_direct_call1("to_str_f64", 10, expr);
+    }
+    if (ti.type_kind == TYPE_NULL) {
+        return lower_make_direct_call0("to_str_null", 11);
+    }
+    if (ti.type_kind == TYPE_SLICE) {
+        if (ti.elem_type_kind == TYPE_U8 && ti.elem_ptr_depth == 0) {
+            return lower_make_direct_call1("to_str_u8_slice", 15, expr);
+        }
+        return lower_make_direct_call1("to_str_slice", 12, expr);
+    }
+    if (ti.type_kind == TYPE_ARRAY) {
+        return lower_make_direct_call1("to_str_array_meta", 17, (*AstNode)ast_literal(ti.array_len));
+    }
+    if (ti.type_kind == TYPE_FUNC) {
+        return lower_make_direct_call0("to_str_func_meta", 16);
+    }
+    return 0;
+}
+
 func lower_parse_sugar_ctor_call(call: *AstCall) -> *AstNode {
     if (call == 0) { return 0; }
     if (call.origin != AST_CALL_ORIGIN_DIRECT) { return (*AstNode)call; }
@@ -430,6 +620,48 @@ func lower_magic_method_expected_call_arity(kind: u64) -> u64 {
     if (kind == COMPILER_MAGIC_METHOD_TO_STR || kind == COMPILER_MAGIC_METHOD_HASH) { return 1; }
     if (kind == COMPILER_MAGIC_METHOD_EQ || kind == COMPILER_MAGIC_METHOD_CMP) { return 2; }
     return 0;
+}
+
+func lower_parse_sugar_builtin_to_str_call(call: *AstCall) -> *AstNode {
+    if (lower_call_is_direct_named(call, "to_str", 6) == 0) { return (*AstNode)call; }
+    if (call.args_vec == 0 || call.args_vec.len() != 1) { return (*AstNode)call; }
+    if (call_has_named_args(call.arg_names_vec) != 0) { return (*AstNode)call; }
+
+    var exact_fn: *AstFunc = sym_get_func(call.name_ptr, call.name_len);
+    if (exact_fn != 0 && (exact_fn.impl_owner_ptr == 0 || exact_fn.impl_owner_len == 0)) {
+        return (*AstNode)call;
+    }
+
+    var arg: *AstNode = call.args_vec.get(0);
+    var arg_ti: *TypeInfo = generic_infer_expr_type(arg, g_lower_parse_sugar_symtab);
+    if (arg_ti == 0) { return (*AstNode)call; }
+
+    var lowered: *AstNode = lower_build_to_str_expr(arg, arg_ti);
+    if (lowered == 0) { return (*AstNode)call; }
+    return lowered;
+}
+
+func lower_parse_sugar_print_direct_call(call: *AstCall) -> *AstNode {
+    if (call == 0 || call.origin != AST_CALL_ORIGIN_DIRECT) { return (*AstNode)call; }
+    if (call.args_vec == 0 || call.args_vec.len() != 1) { return (*AstNode)call; }
+    if (call_has_named_args(call.arg_names_vec) != 0) { return (*AstNode)call; }
+
+    var emit_name_ptr: u64 = 0;
+    var emit_name_len: u64 = 0;
+    if (lower_call_name_matches(call.name_ptr, call.name_len, "print", 5) != 0) {
+        emit_name_ptr = (u64)"emit";
+        emit_name_len = 4;
+    } else if (lower_call_name_matches(call.name_ptr, call.name_len, "println", 7) != 0) {
+        emit_name_ptr = (u64)"emitln";
+        emit_name_len = 6;
+    } else {
+        return (*AstNode)call;
+    }
+
+    var to_str_call: *AstCall = ast_call("to_str", 6, lower_make_single_arg_vec(call.args_vec.get(0)));
+    var lowered_arg: *AstNode = lower_parse_sugar_expr((*AstNode)to_str_call);
+    var lowered_emit: *AstCall = ast_call(emit_name_ptr, emit_name_len, lower_make_single_arg_vec(lowered_arg));
+    return lower_parse_sugar_expr((*AstNode)lowered_emit);
 }
 
 func lower_parse_sugar_magic_direct_call(call: *AstCall) -> *AstNode {
@@ -931,7 +1163,7 @@ func lower_exc_wrap_loop_body_with_guard(body: *AstNode, ctx_ptr: u64, ctx_len: 
 
 func lower_exc_build_unhandled_throw_stmt() -> *AstNode {
     var args: *Vec<*AstNode> = new Vec<*AstNode>(3);
-    args.push((*AstNode)ast_string("unhandled throw", 15));
+    args.push(lower_make_ast_string_literal("unhandled throw", 15));
     args.push((*AstNode)ast_literal(15));
     args.push((*AstNode)ast_literal(0));
     var call: *AstCall = ast_call("debug_fail", 10, args);

@@ -169,6 +169,69 @@ persist_result_file() {
     fi
 }
 
+prepare_test_stdin_file() {
+    local test_file="$1"
+    local stdin_file="$2"
+    local stdin_raw=""
+
+    rm -f "$stdin_file"
+    stdin_raw="$(grep -m1 -E '^// Stdin:' "$test_file" | sed -E 's|^// Stdin:[[:space:]]*||' || true)"
+    if [ -z "$stdin_raw" ]; then
+        return 1
+    fi
+
+    printf '%b' "$stdin_raw" > "$stdin_file"
+    return 0
+}
+
+prepare_test_stdout_file() {
+    local test_file="$1"
+    local stdout_file="$2"
+    local stdout_raw=""
+
+    rm -f "$stdout_file"
+    stdout_raw="$(grep -m1 -E '^// Expect stdout:' "$test_file" | sed -E 's|^// Expect stdout:[[:space:]]*||' || true)"
+    if [ -z "$stdout_raw" ]; then
+        return 1
+    fi
+
+    printf '%b' "$stdout_raw" > "$stdout_file"
+    return 0
+}
+
+run_binary_silent() {
+    local bin_file="$1"
+    local stdin_file="$2"
+    if [ -n "$stdin_file" ] && [ -f "$stdin_file" ]; then
+        timeout "${TEST_TIMEOUT_SEC}s" "$bin_file" < "$stdin_file" >/dev/null 2>/dev/null
+    else
+        timeout "${TEST_TIMEOUT_SEC}s" "$bin_file" >/dev/null 2>/dev/null
+    fi
+}
+
+run_binary_capture_all() {
+    local bin_file="$1"
+    local stdin_file="$2"
+    local out_file="$3"
+    if [ -n "$stdin_file" ] && [ -f "$stdin_file" ]; then
+        timeout "${TEST_TIMEOUT_SEC}s" "$bin_file" < "$stdin_file" > "$out_file" 2>&1
+    else
+        timeout "${TEST_TIMEOUT_SEC}s" "$bin_file" > "$out_file" 2>&1
+    fi
+}
+
+run_binary_capture_split() {
+    local bin_file="$1"
+    local stdin_file="$2"
+    local out_file="$3"
+    local err_file="$4"
+    if [ -n "$stdin_file" ] && [ -f "$stdin_file" ]; then
+        timeout "${TEST_TIMEOUT_SEC}s" "$bin_file" < "$stdin_file" > "$out_file" 2>"$err_file"
+    else
+        timeout "${TEST_TIMEOUT_SEC}s" "$bin_file" > "$out_file" 2>"$err_file"
+    fi
+}
+
 detect_test_jobs() {
     if [ "$TEST_JOBS" -gt 0 ]; then
         return
@@ -389,7 +452,9 @@ run_matrix_case() {
     local expected="$7"
     local expect_compile_fail="$8"
     local expect_error_file="$9"
-    local result_file="${10}"
+    local expect_stdout_file="${10}"
+    local stdin_file="${11}"
+    local result_file="${12}"
 
     local case_tag="[$case_num] Testing $test_label ($mode $opt)"
     local case_pass=0
@@ -471,18 +536,46 @@ run_matrix_case() {
             case_fail=1
             case_status="FAIL (link)"
         else
-            timeout "${TEST_TIMEOUT_SEC}s" "$bin_file" >/dev/null 2>/dev/null
-            local exit_code="$?"
+            local expect_stdout=0
+            local exit_code=0
+            if [ -n "$expect_stdout_file" ] && [ -f "$expect_stdout_file" ]; then
+                expect_stdout=1
+                run_binary_capture_split "$bin_file" "$stdin_file" "$out_file" "$err_file"
+                exit_code="$?"
+            else
+                run_binary_silent "$bin_file" "$stdin_file"
+                exit_code="$?"
+            fi
             if [ "$exit_code" -eq "$expected" ]; then
-                case_pass=1
-                if [ "$STRESS_RUNS" -gt 0 ]; then
+                if [ "$expect_stdout" -eq 1 ] && ! cmp -s "$out_file" "$expect_stdout_file"; then
+                    persist_result_file "$out_file" "$out_file_persist"
+                    persist_result_file "$err_file" "$err_file_persist"
+                    case_fail=1
+                    case_status="FAIL (stdout mismatch)"
+                else
+                    case_pass=1
+                fi
+
+                if [ "$case_fail" -eq 0 ] && [ "$STRESS_RUNS" -gt 0 ]; then
                     local stress_ok=1
                     local i=0
                     local stress_exit=0
+                    local stress_reason="exit"
                     for ((i=1; i<=STRESS_RUNS; i++)); do
-                        timeout "${TEST_TIMEOUT_SEC}s" "$bin_file" >/dev/null 2>/dev/null
-                        stress_exit="$?"
+                        if [ "$expect_stdout" -eq 1 ]; then
+                            run_binary_capture_split "$bin_file" "$stdin_file" "$out_file" "$err_file"
+                            stress_exit="$?"
+                            if [ "$stress_exit" -eq "$expected" ] && ! cmp -s "$out_file" "$expect_stdout_file"; then
+                                stress_reason="stdout"
+                                stress_ok=0
+                                break
+                            fi
+                        else
+                            run_binary_silent "$bin_file" "$stdin_file"
+                            stress_exit="$?"
+                        fi
                         if [ "$stress_exit" -ne "$expected" ]; then
+                            stress_reason="exit"
                             stress_ok=0
                             break
                         fi
@@ -490,9 +583,17 @@ run_matrix_case() {
                     if [ "$stress_ok" -eq 1 ]; then
                         case_stress_pass=1
                     else
+                        if [ "$expect_stdout" -eq 1 ]; then
+                            persist_result_file "$out_file" "$out_file_persist"
+                            persist_result_file "$err_file" "$err_file_persist"
+                        fi
                         case_stress_fail=1
                         case_fail=$((case_fail + 1))
-                        case_status="STRESS FAIL (run=$i, exit=$stress_exit, expect=$expected)"
+                        if [ "$stress_reason" = "stdout" ]; then
+                            case_status="STRESS FAIL (run=$i, stdout mismatch)"
+                        else
+                            case_status="STRESS FAIL (run=$i, exit=$stress_exit, expect=$expected)"
+                        fi
                     fi
                 fi
 
@@ -500,10 +601,22 @@ run_matrix_case() {
                     local stability_ok=1
                     local j=0
                     local stability_exit=0
+                    local stability_reason="exit"
                     for ((j=1; j<=STABILITY_RUNS; j++)); do
-                        timeout "${TEST_TIMEOUT_SEC}s" "$bin_file" >/dev/null 2>/dev/null
-                        stability_exit="$?"
+                        if [ "$expect_stdout" -eq 1 ]; then
+                            run_binary_capture_split "$bin_file" "$stdin_file" "$out_file" "$err_file"
+                            stability_exit="$?"
+                            if [ "$stability_exit" -eq "$expected" ] && ! cmp -s "$out_file" "$expect_stdout_file"; then
+                                stability_reason="stdout"
+                                stability_ok=0
+                                break
+                            fi
+                        else
+                            run_binary_silent "$bin_file" "$stdin_file"
+                            stability_exit="$?"
+                        fi
                         if [ "$stability_exit" -ne "$expected" ]; then
+                            stability_reason="exit"
                             stability_ok=0
                             break
                         fi
@@ -511,14 +624,25 @@ run_matrix_case() {
                     if [ "$stability_ok" -eq 1 ]; then
                         case_stability_pass=1
                     else
+                        if [ "$expect_stdout" -eq 1 ]; then
+                            persist_result_file "$out_file" "$out_file_persist"
+                            persist_result_file "$err_file" "$err_file_persist"
+                        fi
                         case_stability_fail=1
                         case_fail=$((case_fail + 1))
-                        case_status="STABILITY FAIL (run=$j, exit=$stability_exit, expect=$expected)"
+                        if [ "$stability_reason" = "stdout" ]; then
+                            case_status="STABILITY FAIL (run=$j, stdout mismatch)"
+                        else
+                            case_status="STABILITY FAIL (run=$j, exit=$stability_exit, expect=$expected)"
+                        fi
                     fi
                 fi
             else
-                timeout "${TEST_TIMEOUT_SEC}s" "$bin_file" > "$out_file" 2>&1
+                if [ "$expect_stdout" -eq 0 ]; then
+                    run_binary_capture_all "$bin_file" "$stdin_file" "$out_file"
+                fi
                 persist_result_file "$out_file" "$out_file_persist"
+                persist_result_file "$err_file" "$err_file_persist"
                 case_fail=1
                 case_status="FAIL (exit=$exit_code, expect=$expected)"
             fi
@@ -730,7 +854,7 @@ for TEST_FILE in "${TEST_FILES[@]}"; do
             continue
         fi
     fi
-    CONTENT_HASH=$(awk '{if ($0 !~ /^\/\/ (Covers:|Mode:|Opt:|Expect exit code:|Expect compile fail:|Expect error contains:)/) print}' "$TEST_FILE" | md5sum | awk '{print $1}')
+    CONTENT_HASH=$(awk '{if ($0 !~ /^\/\/ (Covers:|Mode:|Opt:|Expect exit code:|Expect compile fail:|Expect error contains:|Expect stdout:|Stdin:)/) print}' "$TEST_FILE" | md5sum | awk '{print $1}')
     if [ -n "${SEEN_HASH[$CONTENT_HASH]}" ]; then
         if [ "$TEST_QUIET" -eq 0 ]; then
             echo "[SKIP] Duplicate content: $TEST_LABEL (same as ${SEEN_HASH[$CONTENT_HASH]})"
@@ -755,6 +879,14 @@ for TEST_FILE in "${TEST_FILES[@]}"; do
     if [ ! -s "$EXPECT_ERROR_FILE" ]; then
         rm -f "$EXPECT_ERROR_FILE"
         EXPECT_ERROR_FILE=""
+    fi
+    STDIN_FILE="$JOBS_DIR/${RUN_TAG}_${TEST_NAME}.stdin"
+    if ! prepare_test_stdin_file "$TEST_FILE" "$STDIN_FILE"; then
+        STDIN_FILE=""
+    fi
+    EXPECT_STDOUT_FILE="$JOBS_DIR/${RUN_TAG}_${TEST_NAME}.stdout"
+    if ! prepare_test_stdout_file "$TEST_FILE" "$EXPECT_STDOUT_FILE"; then
+        EXPECT_STDOUT_FILE=""
     fi
     if [ "$EXPECT_COMPILE_FAIL" -eq 1 ] && [ "$STRICT_FAIL_DIAGNOSTICS" -eq 1 ] && [ -z "$EXPECT_ERROR_FILE" ]; then
         echo "Error: Missing '// Expect error contains:' directive for compile-fail test: $TEST_LABEL"
@@ -785,7 +917,7 @@ for TEST_FILE in "${TEST_FILES[@]}"; do
             TOTAL=$((TOTAL + 1))
             RESULT_FILE="$JOBS_DIR/${RUN_TAG}_case_${TOTAL}.result"
             CASE_RESULT_FILES+=("$RESULT_FILE")
-            launch_job_with_limit run_matrix_case "$TOTAL" "$TEST_FILE" "$TEST_NAME" "$TEST_LABEL" "$MODE" "$OPT" "$EXPECTED" "$EXPECT_COMPILE_FAIL" "$EXPECT_ERROR_FILE" "$RESULT_FILE"
+            launch_job_with_limit run_matrix_case "$TOTAL" "$TEST_FILE" "$TEST_NAME" "$TEST_LABEL" "$MODE" "$OPT" "$EXPECTED" "$EXPECT_COMPILE_FAIL" "$EXPECT_ERROR_FILE" "$EXPECT_STDOUT_FILE" "$STDIN_FILE" "$RESULT_FILE"
         done
     done
 
@@ -803,7 +935,7 @@ for TEST_FILE in "${TEST_FILES[@]}"; do
                 TOTAL=$((TOTAL + 1))
                 RESULT_FILE="$JOBS_DIR/${RUN_TAG}_case_${TOTAL}.result"
                 CASE_RESULT_FILES+=("$RESULT_FILE")
-                launch_job_with_limit run_matrix_case "$TOTAL" "$TEST_FILE" "$TEST_NAME" "$TEST_LABEL" "$MODE" "$OPT" "$EXPECTED" "$EXPECT_COMPILE_FAIL" "$EXPECT_ERROR_FILE" "$RESULT_FILE"
+                launch_job_with_limit run_matrix_case "$TOTAL" "$TEST_FILE" "$TEST_NAME" "$TEST_LABEL" "$MODE" "$OPT" "$EXPECTED" "$EXPECT_COMPILE_FAIL" "$EXPECT_ERROR_FILE" "$EXPECT_STDOUT_FILE" "$STDIN_FILE" "$RESULT_FILE"
             done
         done
     fi
