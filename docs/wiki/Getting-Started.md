@@ -19,13 +19,20 @@ cd Bpp
 ## 3. 기본 빌드/테스트
 
 ```bash
-build_and_test.sh
+cmake -S . -B build-linux
+cmake --build build-linux --target bpp-selfhost-fast
 ```
 
 빠른 검증만 할 때:
 
 ```bash
 TEST_PROFILE=quick TEST_QUIET=1 TEST_FAST_IO=1 TEST_JOBS=4 build_and_test.sh
+```
+
+풀 self-host + 전체 테스트:
+
+```bash
+cmake --build build-linux --target bpp-selfhost
 ```
 
 ## 4. 첫 컴파일
@@ -45,6 +52,7 @@ bpp your_file.bpp
 - `nasm not found`: NASM 설치 및 PATH 확인
 - 링커 오류: 플랫폼에 맞는 링커 경로 설정 확인
 - 권한 오류: 실행 파일 권한(`chmod +x`) 점검
+- bootstrap compiler가 없으면 CMake가 GitHub release asset(`bootstrap-<version>`)을 다운로드합니다
 
 ## 다음 읽을 문서
 

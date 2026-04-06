@@ -87,6 +87,134 @@ function(bpp_resolve_nasm OUT_VAR)
     set(${OUT_VAR} "${_nasm_exe}" PARENT_SCOPE)
 endfunction()
 
+function(bpp_resolve_local_bootstrap_compiler ROOT_DIR VERSION_HINT OUT_VAR)
+    set(_candidates)
+    if(VERSION_HINT)
+        list(APPEND _candidates
+            "${ROOT_DIR}/bin/${VERSION_HINT}_stage1"
+            "${ROOT_DIR}/bin/${VERSION_HINT}_stage1.exe"
+            "${ROOT_DIR}/bin/${VERSION_HINT}_base"
+            "${ROOT_DIR}/bin/${VERSION_HINT}_base.exe"
+        )
+    endif()
+
+    list(APPEND _candidates
+        "${ROOT_DIR}/bin/stage1"
+        "${ROOT_DIR}/bin/stage1.exe"
+        "${ROOT_DIR}/bin/bootstrap"
+        "${ROOT_DIR}/bin/bootstrap.exe"
+    )
+
+    foreach(_candidate IN LISTS _candidates)
+        if(EXISTS "${_candidate}")
+            set(${OUT_VAR} "${_candidate}" PARENT_SCOPE)
+            return()
+        endif()
+    endforeach()
+
+    file(GLOB _stage1_candidates
+        "${ROOT_DIR}/bin/*_stage1"
+        "${ROOT_DIR}/bin/*_stage1.exe"
+    )
+    if(_stage1_candidates)
+        list(SORT _stage1_candidates)
+        list(GET _stage1_candidates -1 _latest_stage1)
+        set(${OUT_VAR} "${_latest_stage1}" PARENT_SCOPE)
+        return()
+    endif()
+
+    set(${OUT_VAR} "" PARENT_SCOPE)
+endfunction()
+
+function(bpp_download_bootstrap_compiler OUT_VAR)
+    if(NOT BPP_BOOTSTRAP_COMPILER)
+        set(${OUT_VAR} "" PARENT_SCOPE)
+        return()
+    endif()
+
+    if(WIN32)
+        set(_asset_name "${BPP_BOOTSTRAP_ASSET_WINDOWS}")
+        set(_asset_sha "${BPP_BOOTSTRAP_SHA256_WINDOWS}")
+    else()
+        set(_asset_name "${BPP_BOOTSTRAP_ASSET_LINUX}")
+        set(_asset_sha "${BPP_BOOTSTRAP_SHA256_LINUX}")
+    endif()
+
+    if(NOT BPP_BOOTSTRAP_REPOSITORY OR NOT BPP_BOOTSTRAP_RELEASE_TAG OR NOT _asset_name)
+        set(${OUT_VAR} "" PARENT_SCOPE)
+        return()
+    endif()
+
+    set(_tools_dir "${CMAKE_BINARY_DIR}/_tools")
+    set(_downloaded_path "${_tools_dir}/${_asset_name}")
+    set(_bootstrap_url "${BPP_BOOTSTRAP_BASE_URL}/${BPP_BOOTSTRAP_REPOSITORY}/releases/download/${BPP_BOOTSTRAP_RELEASE_TAG}/${_asset_name}")
+
+    if(NOT EXISTS "${_downloaded_path}")
+        file(MAKE_DIRECTORY "${_tools_dir}")
+        message(STATUS "Downloading BPP bootstrap compiler from ${_bootstrap_url}")
+
+        if(_asset_sha)
+            file(DOWNLOAD
+                "${_bootstrap_url}"
+                "${_downloaded_path}"
+                SHOW_PROGRESS
+                TLS_VERIFY ON
+                EXPECTED_HASH "SHA256=${_asset_sha}"
+                STATUS _download_status
+            )
+        else()
+            file(DOWNLOAD
+                "${_bootstrap_url}"
+                "${_downloaded_path}"
+                SHOW_PROGRESS
+                TLS_VERIFY ON
+                STATUS _download_status
+            )
+        endif()
+
+        list(GET _download_status 0 _download_code)
+        list(GET _download_status 1 _download_message)
+        if(NOT _download_code EQUAL 0)
+            message(FATAL_ERROR "Failed to download BPP bootstrap compiler: ${_download_message}")
+        endif()
+    endif()
+
+    if(NOT WIN32)
+        file(CHMOD "${_downloaded_path}" PERMISSIONS
+            OWNER_READ OWNER_WRITE OWNER_EXECUTE
+            GROUP_READ GROUP_EXECUTE
+            WORLD_READ WORLD_EXECUTE
+        )
+    endif()
+
+    set(${OUT_VAR} "${_downloaded_path}" PARENT_SCOPE)
+endfunction()
+
+function(bpp_resolve_bootstrap_compiler ROOT_DIR VERSION_HINT OUT_VAR)
+    if(DEFINED ENV{BPP_BASE_COMPILER} AND NOT "$ENV{BPP_BASE_COMPILER}" STREQUAL "")
+        if(EXISTS "$ENV{BPP_BASE_COMPILER}")
+            set(${OUT_VAR} "$ENV{BPP_BASE_COMPILER}" PARENT_SCOPE)
+            return()
+        endif()
+
+        message(FATAL_ERROR "BPP_BASE_COMPILER points to a missing file: $ENV{BPP_BASE_COMPILER}")
+    endif()
+
+    bpp_resolve_local_bootstrap_compiler("${ROOT_DIR}" "${VERSION_HINT}" _local_bootstrap)
+    if(_local_bootstrap)
+        set(${OUT_VAR} "${_local_bootstrap}" PARENT_SCOPE)
+        return()
+    endif()
+
+    bpp_download_bootstrap_compiler(_downloaded_bootstrap)
+    if(_downloaded_bootstrap)
+        set(${OUT_VAR} "${_downloaded_bootstrap}" PARENT_SCOPE)
+        return()
+    endif()
+
+    set(${OUT_VAR} "" PARENT_SCOPE)
+endfunction()
+
 function(bpp_resolve_linker OUT_VAR)
     if(WIN32)
         find_program(_linker_exe NAMES link.exe)

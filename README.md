@@ -45,12 +45,16 @@ Bpp/
 
 ### Linux
 ```bash
-# Build stage compiler first (required once)
-bash build_and_test.sh
+# Configure toolchain + bootstrap compiler download metadata
+cmake -S . -B build-linux
+
+# Fast self-host build via CMake (downloads bootstrap compiler release asset when needed)
+cmake --build build-linux --target bpp-selfhost-fast
+
+# Full self-host build + tests
+cmake --build build-linux --target bpp-selfhost
 
 # Install bpp launcher + compiler + std library
-cmake -S . -B build-linux
-cmake --build build-linux --target toolchain-check
 sudo cmake --install build-linux
 
 # Use globally
