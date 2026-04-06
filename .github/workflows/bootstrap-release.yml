@@ -1,0 +1,226 @@
+name: Bootstrap Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bootstrap-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      release_tag: ${{ steps.meta.outputs.release_tag }}
+      linux_asset: ${{ steps.meta.outputs.linux_asset }}
+      windows_asset: ${{ steps.meta.outputs.windows_asset }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="$(grep -E '^VERSION=' config.ini | head -n1 | cut -d'=' -f2- | tr -d '[:space:]')"
+          if [ -z "$version" ]; then
+            echo "VERSION is missing from config.ini"
+            exit 1
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "release_tag=bootstrap-$version" >> "$GITHUB_OUTPUT"
+          echo "linux_asset=bpp-bootstrap-$version-linux-x86_64" >> "$GITHUB_OUTPUT"
+          echo "windows_asset=bpp-bootstrap-$version-windows-x86_64.exe" >> "$GITHUB_OUTPUT"
+
+  linux-bootstrap:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nasm binutils coreutils
+
+      - name: Build Linux bootstrap compiler
+        run: |
+          chmod +x build_and_test.sh test/run_tests.sh
+          cmake -S . -B build-linux
+          cmake --build build-linux --target bpp-selfhost-fast
+
+      - name: Package Linux bootstrap asset
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          asset_name="${{ needs.prepare.outputs.linux_asset }}"
+          cp bin/stage1 "$asset_name"
+          chmod +x "$asset_name"
+          hash="$(sha256sum "$asset_name" | awk '{print $1}')"
+          printf '%s  %s\n' "$hash" "$asset_name" > "$asset_name.sha256"
+
+      - name: Upload Linux bootstrap artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-bootstrap
+          path: |
+            ${{ needs.prepare.outputs.linux_asset }}
+            ${{ needs.prepare.outputs.linux_asset }}.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  windows-bootstrap:
+    needs: prepare
+    runs-on: windows-latest
+    outputs:
+      has_asset: ${{ steps.seed.outputs.available }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup MSVC developer command prompt
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Configure Windows toolchain
+        run: |
+          cmake -S . -B build-win -DBPP_BOOTSTRAP_NASM=ON
+
+      - name: Export resolved toolchain paths
+        shell: pwsh
+        run: |
+          Get-Content build-win/bpp_toolchain.env | ForEach-Object {
+            if ($_ -match '^(.*?)=(.*)$') {
+              "$($matches[1])=$($matches[2])" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            }
+          }
+
+      - name: Verify Windows assembler and linker
+        run: |
+          cmake --build build-win --target toolchain-check windows-smoke
+
+      - id: seed
+        name: Check for Windows bootstrap seed asset
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $assetName = "${{ needs.prepare.outputs.windows_asset }}"
+          $releaseTag = "${{ needs.prepare.outputs.release_tag }}"
+          $available = $false
+
+          try {
+            $release = gh release view $releaseTag --repo "${{ github.repository }}" --json assets | ConvertFrom-Json
+            if ($release.assets | Where-Object { $_.name -eq $assetName }) {
+              $available = $true
+            }
+          } catch {
+            $available = $false
+          }
+
+          "available=$($available.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+          if (-not $available) {
+            $summary = @(
+              "## Windows Bootstrap Seed Missing"
+              ""
+              "- release tag: $releaseTag"
+              "- expected asset: $assetName"
+              ""
+              "Windows hosted self-build is not implemented in the current source tree."
+              "Once a seed compiler exe is uploaded under this name, this workflow will validate and republish it."
+            ) -join "`n"
+            $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          }
+
+      - name: Download and validate Windows bootstrap asset
+        if: steps.seed.outputs.available == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ./build_and_test.ps1 `
+            -SkipTests `
+            -NasmPath "$env:BPP_NASM_EXECUTABLE" `
+            -LinkerPath "$env:BPP_LINKER_EXECUTABLE" `
+            -BootstrapRepository "${{ github.repository }}" `
+            -BootstrapReleaseTag "${{ needs.prepare.outputs.release_tag }}"
+
+      - name: Package Windows bootstrap asset
+        if: steps.seed.outputs.available == 'true'
+        shell: pwsh
+        run: |
+          $assetName = "${{ needs.prepare.outputs.windows_asset }}"
+          $assetPath = Resolve-Path "build-win\_tools\$assetName"
+          Copy-Item $assetPath $assetName -Force
+
+          $hash = (Get-FileHash $assetName -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -Path "$assetName.sha256" -Value "$hash  $assetName"
+
+      - name: Upload Windows bootstrap artifact
+        if: steps.seed.outputs.available == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-bootstrap
+          path: |
+            ${{ needs.prepare.outputs.windows_asset }}
+            ${{ needs.prepare.outputs.windows_asset }}.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-release:
+    needs:
+      - prepare
+      - linux-bootstrap
+      - windows-bootstrap
+    if: needs.linux-bootstrap.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Linux bootstrap artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-bootstrap
+          path: release-assets
+
+      - name: Download Windows bootstrap artifact
+        if: needs.windows-bootstrap.outputs.has_asset == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-bootstrap
+          path: release-assets
+
+      - name: Create bootstrap release when missing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tag="${{ needs.prepare.outputs.release_tag }}"
+          version="${{ needs.prepare.outputs.version }}"
+          if gh release view "$tag" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            exit 0
+          fi
+
+          gh release create "$tag" \
+            --repo "${{ github.repository }}" \
+            --target "${GITHUB_SHA}" \
+            --title "Bootstrap $version" \
+            --notes "Bootstrap compiler assets for automated self-host builds."
+
+      - name: Upload bootstrap release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tag="${{ needs.prepare.outputs.release_tag }}"
+          gh release upload "$tag" release-assets/* --repo "${{ github.repository }}" --clobber

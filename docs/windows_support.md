@@ -57,3 +57,7 @@ or directly:
 ```
 
 If `bin/v11_stage1.exe` is missing, the script exits with an explicit bootstrap requirement message.
+
+The PowerShell runner also supports downloading a release bootstrap asset named
+`bpp-bootstrap-<version>-windows-x86_64.exe` from the `bootstrap-<version>` release tag.
+This asset currently acts as a seed binary until full Windows self-host builds are implemented.

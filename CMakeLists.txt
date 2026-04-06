@@ -45,7 +45,7 @@ set(BPP_BOOTSTRAP_RELEASE_TAG "bootstrap-${BPP_DEFAULT_VERSION}" CACHE STRING "R
 option(BPP_BOOTSTRAP_COMPILER "Automatically download a bootstrap compiler when local stage1 is missing" ON)
 set(BPP_BOOTSTRAP_ASSET_LINUX "bpp-bootstrap-${BPP_DEFAULT_VERSION}-linux-x86_64" CACHE STRING "Linux bootstrap compiler asset name")
 set(BPP_BOOTSTRAP_SHA256_LINUX "00c86d700d930eeca73633921886bdec82919c6ef9837d754e9753082b3de827" CACHE STRING "SHA256 for the Linux bootstrap compiler asset")
-set(BPP_BOOTSTRAP_ASSET_WINDOWS "" CACHE STRING "Windows bootstrap compiler asset name")
+set(BPP_BOOTSTRAP_ASSET_WINDOWS "bpp-bootstrap-${BPP_DEFAULT_VERSION}-windows-x86_64.exe" CACHE STRING "Windows bootstrap compiler asset name")
 set(BPP_BOOTSTRAP_SHA256_WINDOWS "" CACHE STRING "SHA256 for the Windows bootstrap compiler asset")
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
