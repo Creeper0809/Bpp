@@ -714,13 +714,14 @@ func param_struct_size(p: *Param) -> u64 {
 }
 
 func load_arg_ptr_to_rax(arg_word_index: u64) -> u64 {
-    if (arg_word_index < 6) {
+    var reg_limit: u64 = compiler_target_raw_arg_reg_limit();
+    if (arg_word_index < reg_limit) {
         emit("    mov rax, ");
         sysv_emit_arg_reg_name(arg_word_index);
         emit_nl();
         return 0;
     }
-    var src_offset: u64 = 16 + (arg_word_index - 6) * 8;
+    var src_offset: u64 = compiler_target_stack_arg_base_offset() + (arg_word_index - reg_limit) * 8;
     emit("    mov rax, [rbp+");
     emit_u64(src_offset);
     emit("]\n");
@@ -839,7 +840,9 @@ func emit_func_prologue(fn: *AstFunc, g_symtab: *Symtab, section_kind: u64, stac
             var sret_offset: u64 = symtab_add(g_symtab, sret_ptr, sret_len, TYPE_U64, 1, 8);
             emit("    mov [rbp");
             emit_signed_disp(sret_offset);
-            emit("], rdi\n");
+            emit("], ");
+            sysv_emit_arg_reg_name(0);
+            emit_nl();
         }
     }
     return 0;
@@ -853,18 +856,18 @@ func emit_func_epilogue() -> u64 {
     return 0;
 }
 
+// Legacy helper name retained while the backend becomes target-aware.
 func sysv_emit_arg_reg_name(idx: u64) -> u64 {
-    if (idx == 0) { emit("rdi"); return 0; }
-    if (idx == 1) { emit("rsi"); return 0; }
-    if (idx == 2) { emit("rdx"); return 0; }
-    if (idx == 3) { emit("rcx"); return 0; }
-    if (idx == 4) { emit("r8"); return 0; }
-    if (idx == 5) { emit("r9"); return 0; }
+    var reg_name: u64 = compiler_target_raw_arg_reg_name(idx);
+    var reg_len: u64 = compiler_target_raw_arg_reg_name_len(idx);
+    if (reg_name == 0 || reg_len == 0) { return 0; }
+    emit_len(reg_name, reg_len);
     return 0;
 }
 
 func sysv_store_arg_word(arg_idx: u64, dst_offset: u64) -> u64 {
-    if (arg_idx < 6) {
+    var reg_limit: u64 = compiler_target_raw_arg_reg_limit();
+    if (arg_idx < reg_limit) {
         emit("    mov [rbp");
         emit_signed_disp(dst_offset);
         emit("], ");
@@ -872,7 +875,7 @@ func sysv_store_arg_word(arg_idx: u64, dst_offset: u64) -> u64 {
         emit_nl();
         return 0;
     }
-    var src_offset: u64 = 16 + (arg_idx - 6) * 8;
+    var src_offset: u64 = compiler_target_stack_arg_base_offset() + (arg_idx - reg_limit) * 8;
     emit("    mov rax, [rbp+");
     emit_u64(src_offset);
     emit("]\n");
@@ -1184,9 +1187,55 @@ func init_globals(program: *AstProgram) -> u64 {
     return 0;
 }
 
+func emit_windows_runtime_externs() -> u64 {
+    if (compiler_target() != COMPILER_TARGET_WINDOWS_X86_64) { return 0; }
+    emitln("default rel");
+    emitln("extern GetStdHandle");
+    emitln("extern ReadFile");
+    emitln("extern WriteFile");
+    emitln("extern CreateFileA");
+    emitln("extern CloseHandle");
+    emitln("extern GetFileSizeEx");
+    emitln("extern VirtualAlloc");
+    emitln("extern CreateProcessA");
+    emitln("extern WaitForSingleObject");
+    emitln("extern GetExitCodeProcess");
+    emitln("extern ExitProcess");
+    emitln("extern GetCommandLineA");
+    emit_nl();
+    return 0;
+}
+
+func emit_windows_entry(has_runtime_init: u64, entry_ptr: u64, entry_len: u64) -> u64 {
+    emitln("default rel");
+    emitln("section .text");
+    emitln("global _start");
+    emitln("global mainCRTStartup");
+    emitln("_start:");
+    emitln("mainCRTStartup:");
+    emitln("    sub rsp, 56");
+    if (has_runtime_init != 0) {
+        emitln("    call __global_init");
+    }
+    emitln("    lea rcx, [rsp+32]");
+    emitln("    lea rdx, [rsp+40]");
+    emitln("    call std_os__os_main_args");
+    emitln("    mov rcx, [rsp+32]");
+    emitln("    mov rdx, [rsp+40]");
+    emit("    call ");
+    emit_len(entry_ptr, entry_len);
+    emit_nl();
+    emitln("    mov ecx, eax");
+    emitln("    call ExitProcess");
+    return 0;
+}
+
 func emit_entry(has_runtime_init: u64) -> u64 {
     var entry_ptr: u64 = entry_func_ptr();
     var entry_len: u64 = entry_func_len();
+    if (compiler_target() == COMPILER_TARGET_WINDOWS_X86_64) {
+        return emit_windows_entry(has_runtime_init, entry_ptr, entry_len);
+    }
     emitln("default rel");
     emitln("section .text");
     emitln("global _start");
@@ -1209,6 +1258,13 @@ func emit_entry(has_runtime_init: u64) -> u64 {
 
 func emit_trace_runtime() -> u64 {
     if (g_cg_trace_runtime_needed == 0) { return 0; }
+    if (compiler_target() == COMPILER_TARGET_WINDOWS_X86_64) {
+        emitln("\nsection .text");
+        emitln("align 16");
+        emitln("__bpp_trace_enter:");
+        emitln("    ret");
+        return 0;
+    }
     emitln("\nsection .data");
     emitln("__bpp_trace_msg: db 91,116,114,97,99,101,93,10");
     emitln("\nsection .text");
@@ -1291,6 +1347,7 @@ func program_with_sigs(prog: *AstProgram, sigs: *Vec<*AstFunc>) -> u64 {
 
     init_globals(program);
     load_consts(program.consts_vec);
+    emit_windows_runtime_externs();
     emit_functions(program, used_names, use_ssa, ssa_ctx);
     if (diag_has_errors() != 0) { return 0; }
     emit_entry(has_runtime_init);

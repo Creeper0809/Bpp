@@ -155,6 +155,80 @@ function Resolve-Tool {
     throw "$Description not found."
 }
 
+function Invoke-Link {
+    param(
+        [string]$Linker,
+        [string]$ObjectFile,
+        [string]$OutputExe,
+        [string]$ErrorFile
+    )
+
+    $args = @(
+        "/nologo",
+        "/subsystem:console",
+        "/entry:mainCRTStartup",
+        "/out:$OutputExe",
+        $ObjectFile,
+        "kernel32.lib"
+    )
+
+    & $Linker @args 2> $ErrorFile
+    return $LASTEXITCODE
+}
+
+function Invoke-CompileToAsm {
+    param(
+        [string]$Compiler,
+        [string]$SourceFile,
+        [string]$AsmFile,
+        [string]$ErrorFile
+    )
+
+    if (Test-Path $AsmFile) { Remove-Item $AsmFile -Force }
+    if (Test-Path $ErrorFile) { Remove-Item $ErrorFile -Force }
+
+    & $Compiler --target windows-x86_64 -asm $SourceFile > $AsmFile 2> $ErrorFile
+    return $LASTEXITCODE
+}
+
+function Invoke-StageBuild {
+    param(
+        [string]$Compiler,
+        [string]$SourceFile,
+        [string]$StageName,
+        [string]$BuildDir,
+        [string]$BinDir,
+        [string]$Nasm,
+        [string]$Linker
+    )
+
+    $asmFile = Join-Path $BuildDir "${StageName}.asm"
+    $objFile = Join-Path $BuildDir "${StageName}.obj"
+    $exeFile = Join-Path $BinDir "${StageName}.exe"
+    $errFile = Join-Path $BuildDir "${StageName}.err"
+
+    Write-Host "[INFO] Building ${StageName}.exe with $Compiler"
+    $compileCode = Invoke-CompileToAsm -Compiler $Compiler -SourceFile $SourceFile -AsmFile $asmFile -ErrorFile $errFile
+    if ($compileCode -ne 0) {
+        $errText = if (Test-Path $errFile) { Get-Content $errFile -Raw } else { "" }
+        throw "Compiler failed while building ${StageName}.asm (exit=$compileCode)`n$errText"
+    }
+
+    & $Nasm -f win64 -O1 $asmFile -o $objFile 2> $errFile
+    if ($LASTEXITCODE -ne 0) {
+        $errText = if (Test-Path $errFile) { Get-Content $errFile -Raw } else { "" }
+        throw "NASM failed while building ${StageName}.obj`n$errText"
+    }
+
+    $linkCode = Invoke-Link -Linker $Linker -ObjectFile $objFile -OutputExe $exeFile -ErrorFile $errFile
+    if ($linkCode -ne 0) {
+        $errText = if (Test-Path $errFile) { Get-Content $errFile -Raw } else { "" }
+        throw "Linker failed while building ${StageName}.exe`n$errText"
+    }
+
+    return $exeFile
+}
+
 $ConfigVersion = Get-OptionalConfigValue -Path $ConfigPath -Key "VERSION"
 $VersionHint = if ($env:BPP_VERSION) { $env:BPP_VERSION } elseif ($ConfigVersion) { $ConfigVersion } else { "" }
 
@@ -234,6 +308,41 @@ Provide or publish a Windows stage compiler binary first, then rerun this script
 
 Write-Host "[INFO] Compiler: $CompilerPath"
 
+$SourceFile = Join-Path $ScriptDir "src\main.bpp"
+if (-not (Test-Path $SourceFile)) {
+    throw "Compiler source not found: $SourceFile"
+}
+
+$BuildDir = Join-Path $RootDir "build\${Version}_selfhost_win"
+$BinDir = Join-Path $RootDir "bin"
+New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
+New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
+
+$Stage0Name = "${Version}_stage0"
+$Stage1Name = "${Version}_stage1"
+
+Write-Host "[INFO] Building Windows hosted compiler stages"
+$Stage0Compiler = Invoke-StageBuild `
+    -Compiler $CompilerPath `
+    -SourceFile $SourceFile `
+    -StageName $Stage0Name `
+    -BuildDir $BuildDir `
+    -BinDir $BinDir `
+    -Nasm $ResolvedNasm `
+    -Linker $ResolvedLinker
+
+$Stage1Compiler = Invoke-StageBuild `
+    -Compiler $Stage0Compiler `
+    -SourceFile $SourceFile `
+    -StageName $Stage1Name `
+    -BuildDir $BuildDir `
+    -BinDir $BinDir `
+    -Nasm $ResolvedNasm `
+    -Linker $ResolvedLinker
+
+Copy-Item -Force $Stage1Compiler (Join-Path $BinDir "stage1.exe")
+Write-Host "[INFO] Stage1: $Stage1Compiler"
+
 if ($SkipTests) {
     Write-Host "[INFO] SkipTests requested."
     exit 0
@@ -244,5 +353,5 @@ if (-not (Test-Path $TestRunner)) {
     throw "Windows test runner not found: $TestRunner"
 }
 
-& $TestRunner -CompilerPath $CompilerPath -NasmPath $ResolvedNasm -LinkerPath $ResolvedLinker
+& $TestRunner -CompilerPath $Stage1Compiler -NasmPath $ResolvedNasm -LinkerPath $ResolvedLinker
 exit $LASTEXITCODE

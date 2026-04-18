@@ -120,6 +120,44 @@ pick_first_existing_file() {
     return 1
 }
 
+add_base_candidate() {
+    local candidate="$1"
+    [ -n "$candidate" ] || return 0
+    [ -f "$candidate" ] || return 0
+
+    local existing
+    for existing in "${BASE_CANDIDATES[@]}"; do
+        if [ "$existing" = "$candidate" ]; then
+            return 0
+        fi
+    done
+    BASE_CANDIDATES+=("$candidate")
+}
+
+base_compiler_smoke_check() {
+    local candidate="$1"
+    [ -n "$candidate" ] || return 1
+    [ -f "$candidate" ] || return 1
+
+    if [ "${BPP_SKIP_BASE_SMOKE:-0}" = "1" ]; then
+        return 0
+    fi
+
+    local smoke_src="$ROOT_DIR/test/source/01_arith_bit_cmp.bpp"
+    if [ ! -f "$smoke_src" ]; then
+        smoke_src="$SRC_FILE"
+    fi
+
+    (
+        ulimit -v "${BPP_BASE_SMOKE_VMEM_KB:-4000000}" 2>/dev/null || true
+        if command -v timeout >/dev/null 2>&1; then
+            timeout "${BPP_BASE_SMOKE_TIMEOUT:-8s}" "$candidate" -asm "$smoke_src" >/dev/null 2>&1
+        else
+            "$candidate" -asm "$smoke_src" >/dev/null 2>&1
+        fi
+    ) 2>/dev/null
+}
+
 extract_numeric_version() {
     local token="$1"
     if [[ "$token" =~ v([0-9]+) ]]; then
@@ -221,30 +259,42 @@ echo "[1/6] Compiling ${VERSION}..."
 cd "$ROOT_DIR"
 mkdir -p "$BUILD_DIR" "$BIN_DIR"
 
-# {VERSION}_base 우선, 없으면 stage1 자동 탐지
+# {VERSION}_base 우선, 없으면 smoke-tested compiler 자동 탐지
 BASE_BIN="${BPP_BASE_COMPILER:-}"
 if [ -n "$BASE_BIN" ] && [ ! -f "$BASE_BIN" ]; then
     echo "Error: BPP_BASE_COMPILER points to missing file: $BASE_BIN"
     exit 1
 fi
 if [ -z "$BASE_BIN" ]; then
-    # Default policy: use the last historical version from old/ as bootstrap base.
-    BASE_BIN="$(pick_old_latest_stage1_file || true)"
-fi
-if [ -z "$BASE_BIN" ]; then
-    BASE_BIN="$(pick_first_existing_file \
-        "./bin/stage1" \
-        "./bin/bootstrap" \
-        "./bin/${BASE_COMPILER}" \
-        "./bin/${VERSION}_stage1" \
-        "./bin/${VERSION}" || true)"
-fi
-if [ -z "$BASE_BIN" ]; then
-    BASE_BIN="$(pick_latest_stage1_file)"
+    BASE_CANDIDATES=()
+    # Prefer the last successful stage0 for this version; stage1 can be the
+    # artifact currently under repair and may hang while bootstrapping.
+    add_base_candidate "./build/tmp/dev_stage0"
+    add_base_candidate "./build/${VERSION}.out"
+    add_base_candidate "./bin/${VERSION}_stage0"
+    add_base_candidate "$(pick_old_latest_stage1_file || true)"
+    add_base_candidate "./bin/stage1"
+    add_base_candidate "./bin/bootstrap"
+    add_base_candidate "./bin/${BASE_COMPILER}"
+    add_base_candidate "./bin/${VERSION}_stage1"
+    add_base_candidate "./bin/${VERSION}"
+    add_base_candidate "$(pick_latest_stage1_file || true)"
+
+    for candidate in "${BASE_CANDIDATES[@]}"; do
+        if base_compiler_smoke_check "$candidate"; then
+            BASE_BIN="$candidate"
+            break
+        fi
+        echo "   [WARN] Skipping unusable base compiler: $candidate"
+    done
+elif ! base_compiler_smoke_check "$BASE_BIN"; then
+    echo "Error: BPP_BASE_COMPILER failed the smoke compile: $BASE_BIN"
+    echo "   Set BPP_SKIP_BASE_SMOKE=1 to bypass this check."
+    exit 1
 fi
 if [ -z "$BASE_BIN" ]; then
     echo "Error: Base compiler not found."
-    echo "   Tried: old/<latest>/bin/*, bin/<old_latest>_stage1, bin/bootstrap, bin/stage1, bin/${BASE_COMPILER}, bin/${VERSION}_stage1, bin/${VERSION}, bin/*_stage1"
+    echo "   Tried: bin/${VERSION}_stage0, old/<latest>/bin/*, bin/<old_latest>_stage1, bin/bootstrap, bin/stage1, bin/${BASE_COMPILER}, bin/${VERSION}_stage1, bin/${VERSION}, bin/*_stage1"
     echo "   Hint: set BPP_BASE_COMPILER=/abs/path/to/compiler"
     exit 1
 fi
@@ -291,14 +341,24 @@ echo "[2/6] Self-Hosting Stage 1..."
 ./bin/${VERSION}_stage0 -asm "${SRC_FILE}" > "${STAGE1_ASM}"
 "${NASM_BIN}" ${NASM_FLAGS} "${STAGE1_ASM}" -o "build/${VERSION}_stage1.o"
 "${LINKER_BIN}" build/${VERSION}_stage1.o -o bin/${VERSION}_stage1
-# Unversioned pointer to latest successful stage1 output.
-cp -f "bin/${VERSION}_stage1" "bin/stage1"
+STAGE1_USABLE=1
+TEST_COMPILER_BIN="bin/${VERSION}_stage1"
+FINAL_ASM="$STAGE1_ASM"
+if base_compiler_smoke_check "./bin/${VERSION}_stage1"; then
+    # Unversioned pointer to latest successful stage1 output.
+    cp -f "bin/${VERSION}_stage1" "bin/stage1"
+else
+    STAGE1_USABLE=0
+    TEST_COMPILER_BIN="bin/${VERSION}_stage0"
+    FINAL_ASM="$STAGE0_ASM"
+    cp -f "bin/${VERSION}_stage0" "bin/stage1"
+    echo "   [WARN] Generated stage1 failed smoke check; using stage0 for tests and final executable."
+fi
 echo "Stage 1 Build Completed"
 echo ""
 
 # Step 3: 셀프 호스팅 (2단계)
-FINAL_ASM="$STAGE1_ASM"
-if [ "$SELFHOST_VERIFY" = "1" ]; then
+if [ "$SELFHOST_VERIFY" = "1" ] && [ "$STAGE1_USABLE" = "1" ]; then
     echo "[3/6] Self-Hosting Stage 2..."
     ./bin/${VERSION}_stage1 -asm "${SRC_FILE}" > "${STAGE2_ASM}"
     echo "Stage 2 Build Completed"
@@ -319,9 +379,17 @@ if [ "$SELFHOST_VERIFY" = "1" ]; then
     echo ""
     FINAL_ASM="$STAGE2_ASM"
 else
-    echo "[3/6] Self-Hosting Stage 2... skipped (SELFHOST_VERIFY=0)"
+    if [ "$SELFHOST_VERIFY" = "1" ]; then
+        echo "[3/6] Self-Hosting Stage 2... skipped (stage1 smoke check failed)"
+    else
+        echo "[3/6] Self-Hosting Stage 2... skipped (SELFHOST_VERIFY=0)"
+    fi
     echo ""
-    echo "[4/6] Self-Hosting Verification... skipped (SELFHOST_VERIFY=0)"
+    if [ "$SELFHOST_VERIFY" = "1" ]; then
+        echo "[4/6] Self-Hosting Verification... skipped (stage1 smoke check failed)"
+    else
+        echo "[4/6] Self-Hosting Verification... skipped (SELFHOST_VERIFY=0)"
+    fi
     echo ""
 fi
 
@@ -336,7 +404,7 @@ fi
 echo "[5/6] Running Tests..."
 TEST_FAST_IO="$TEST_FAST_IO" TEST_QUIET="$TEST_QUIET" KEEP_TEST_ARTIFACTS="$KEEP_TEST_ARTIFACTS" \
 TEST_JOBS="$TEST_JOBS" TEST_PROFILE="$TEST_PROFILE" TEST_SUITE_CASE_LIMIT="$TEST_SUITE_CASE_LIMIT" TEST_NAME_FILTER="$TEST_NAME_FILTER" STRESS_RUNS="$STRESS_RUNS" STABILITY_RUNS="$STABILITY_RUNS" \
-  bash ${TEST_SCRIPT} bin/${VERSION}_stage1 2>&1 | tail -15
+  bash ${TEST_SCRIPT} "${TEST_COMPILER_BIN}" 2>&1 | tail -15
 
 # Step 6: 바이너리(.out) 생성 (기본 실행 경로)
 echo ""

@@ -11,7 +11,9 @@ Windows support is split into two layers:
 
 2. Full hosted compiler/runtime layer (in progress)
 - A Windows-hosted stage compiler binary (`bin/v11_stage1.exe`)
-- Full runtime parity with Linux for process/file/memory primitives
+- Target-aware std runtime selection for `std.os`
+- Windows entry/link/test-runner plumbing (`mainCRTStartup`, `link.exe`/`lld-link`)
+- File/process/heap primitives needed by the hosted compiler are being rebuilt
 
 ## Quick Start
 
@@ -55,6 +57,12 @@ or directly:
 ```powershell
 .\test\run_tests.ps1 -CompilerPath .\bin\v11_stage1.exe
 ```
+
+`build_and_test.ps1` now uses the seed compiler to build `bin\<version>_stage0.exe`
+and `bin\<version>_stage1.exe` before running the Windows test suite.
+
+The PowerShell runner invokes the compiler with `--target windows-x86_64` so the
+Windows entry/runtime path is used consistently.
 
 If `bin/v11_stage1.exe` is missing, the script exits with an explicit bootstrap requirement message.
 

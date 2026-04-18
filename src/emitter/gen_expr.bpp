@@ -11,6 +11,7 @@ import std.str;
 import types;
 import ast;
 import compiler;
+import compiler.runtime_api;
 import emitter.emitter;
 import emitter.symtab;
 import emitter.typeinfo;
@@ -285,14 +286,11 @@ func cg_stack_ctor_emit_constructor_call(sc: *AstStackCtor, symtab: *Symtab, fn_
     emit("    push r12\n");
     total_arg_words = total_arg_words + 1;
     var stack_words: u64 = _cg_sysv_pop_arg_regs(total_arg_words);
+    var reserve_words: u64 = _cg_target_call_prepare(stack_words, 0);
     emit("    call ");
     emit_len(call_ptr, call_len);
     emit_nl();
-    if (stack_words > 0) {
-        emit("    add rsp, ");
-        emit_u64(stack_words * 8);
-        emit_nl();
-    }
+    _cg_target_call_cleanup(stack_words, reserve_words);
     return 0;
 }
 
@@ -401,17 +399,11 @@ func cg_call_sret_to_offset(call_ptr: u64, dest_offset: u64, symtab: *Symtab) ->
         }
     }
 
-    emit("    lea rdi, [rbp");
-    emit_signed_disp(dest_offset);
-    emit("]\n");
-
+    _cg_emit_sret_ptr_from_rbp(dest_offset);
     var stack_words: u64 = _cg_sysv_pop_arg_regs_sret(total_arg_words);
+    var reserve_words: u64 = _cg_target_call_prepare(stack_words, 0);
     emit_call_resolved_expr(call.name_ptr, call.name_len);
-    if (stack_words > 0) {
-        emit("    add rsp, ");
-        emit_u64(stack_words * 8);
-        emit_nl();
-    }
+    _cg_target_call_cleanup(stack_words, reserve_words);
     return 0;
 }
 
@@ -497,19 +489,13 @@ func cg_method_call_sret_to_offset(mc: *AstMethodCall, dest_offset: u64, symtab:
 
     total_arg_words = total_arg_words + cg_method_push_receiver(receiver, type_info, recv_is_ptr, symtab);
 
-    emit("    lea rdi, [rbp");
-    emit_signed_disp(dest_offset);
-    emit("]\n");
-
+    _cg_emit_sret_ptr_from_rbp(dest_offset);
     var stack_words: u64 = _cg_sysv_pop_arg_regs_sret(total_arg_words);
+    var reserve_words: u64 = _cg_target_call_prepare(stack_words, 0);
     emit("    call ");
     emit_len(resolved_ptr, resolved_len);
     emit_nl();
-    if (stack_words > 0) {
-        emit("    add rsp, ");
-        emit_u64(stack_words * 8);
-        emit_nl();
-    }
+    _cg_target_call_cleanup(stack_words, reserve_words);
     return 0;
 }
 
@@ -566,19 +552,10 @@ func get_packed_field_bit_width(struct_def: *AstStructDef, field_name_ptr: u64, 
 
 func _cg_sysv_emit_pop_arg_reg(i: u64, sret: u64) -> u64 {
     emit("    pop ");
-    if (sret == 0) {
-        if (i == 0) { emit("rdi"); }
-        else if (i == 1) { emit("rsi"); }
-        else if (i == 2) { emit("rdx"); }
-        else if (i == 3) { emit("rcx"); }
-        else if (i == 4) { emit("r8"); }
-        else if (i == 5) { emit("r9"); }
-    } else {
-        if (i == 0) { emit("rsi"); }
-        else if (i == 1) { emit("rdx"); }
-        else if (i == 2) { emit("rcx"); }
-        else if (i == 3) { emit("r8"); }
-        else if (i == 4) { emit("r9"); }
+    var reg_name: u64 = compiler_target_user_arg_reg_name(i, sret);
+    var reg_len: u64 = compiler_target_user_arg_reg_name_len(i, sret);
+    if (reg_name != 0 && reg_len != 0) {
+        emit_len(reg_name, reg_len);
     }
     emit_nl();
     return 0;
@@ -595,11 +572,52 @@ func _cg_sysv_pop_arg_regs_common(total_words: u64, reg_limit: u64, sret: u64) -
 }
 
 func _cg_sysv_pop_arg_regs(total_words: u64) -> u64 {
-    return _cg_sysv_pop_arg_regs_common(total_words, 6, 0);
+    return _cg_sysv_pop_arg_regs_common(total_words, compiler_target_user_arg_reg_limit(0), 0);
 }
 
 func _cg_sysv_pop_arg_regs_sret(total_words: u64) -> u64 {
-    return _cg_sysv_pop_arg_regs_common(total_words, 5, 1);
+    return _cg_sysv_pop_arg_regs_common(total_words, compiler_target_user_arg_reg_limit(1), 1);
+}
+
+func _cg_target_call_align_pad_words(stack_words: u64, extra_words: u64) -> u64 {
+    var shadow_words: u64 = compiler_target_call_shadow_words();
+    if (shadow_words == 0 && stack_words > 0) { return 0; }
+    var total_words: u64 = stack_words + extra_words + shadow_words;
+    if ((total_words % 2) != 0) { return 1; }
+    return 0;
+}
+
+func _cg_target_call_prepare(stack_words: u64, extra_words: u64) -> u64 {
+    var reserve_words: u64 = compiler_target_call_shadow_words() + _cg_target_call_align_pad_words(stack_words, extra_words);
+    if (reserve_words > 0) {
+        emit("    sub rsp, ");
+        emit_u64(reserve_words * 8);
+        emit_nl();
+    }
+    return reserve_words;
+}
+
+func _cg_target_call_cleanup(stack_words: u64, reserve_words: u64) -> u64 {
+    var cleanup_words: u64 = stack_words + reserve_words;
+    if (cleanup_words > 0) {
+        emit("    add rsp, ");
+        emit_u64(cleanup_words * 8);
+        emit_nl();
+    }
+    return 0;
+}
+
+func _cg_emit_sret_ptr_from_rbp(dest_offset: u64) -> u64 {
+    emit("    lea ");
+    var reg_name: u64 = compiler_target_raw_arg_reg_name(0);
+    var reg_len: u64 = compiler_target_raw_arg_reg_name_len(0);
+    if (reg_name != 0 && reg_len != 0) {
+        emit_len(reg_name, reg_len);
+    }
+    emit(", [rbp");
+    emit_signed_disp(dest_offset);
+    emit("]\n");
+    return 0;
 }
 
 func cg_push_struct_words_from_tmp(tmp_offset: u64, struct_size: u64) -> u64 {
@@ -1114,15 +1132,10 @@ func cg_expr_call(node: u64, symtab: *Symtab) -> u64 {
             }
         }
         var stack_words2: u64 = _cg_sysv_pop_arg_regs(total_arg_words2);
-
         emit("    pop rax\n");
+        var reserve_words2: u64 = _cg_target_call_prepare(stack_words2, 0);
         emit("    call rax\n");
-
-        if (stack_words2 > 0) {
-            emit("    add rsp, ");
-            emit_u64(stack_words2 * 8);
-            emit_nl();
-        }
+        _cg_target_call_cleanup(stack_words2, reserve_words2);
         return;
     }
     var fn_call_direct: *AstFunc = typeinfo_find_func(name_ptr, name_len);
@@ -1143,16 +1156,11 @@ func cg_expr_call(node: u64, symtab: *Symtab) -> u64 {
         }
     }
     var stack_words: u64 = _cg_sysv_pop_arg_regs(total_arg_words);
-
+    var reserve_words: u64 = _cg_target_call_prepare(stack_words, 0);
     emit("    call ");
     emit_len(resolved_ptr, resolved_len);
     emit_nl();
-    
-    if (stack_words > 0) {
-        emit("    add rsp, ");
-        emit_u64(stack_words * 8);
-        emit_nl();
-    }
+    _cg_target_call_cleanup(stack_words, reserve_words);
     return;
 }
 
@@ -1176,15 +1184,10 @@ func cg_expr_call_ptr(node: u64, symtab: *Symtab) -> u64 {
         }
     }
     var stack_words3: u64 = _cg_sysv_pop_arg_regs(total_arg_words3);
-
     emit("    pop rax\n");
+    var reserve_words3: u64 = _cg_target_call_prepare(stack_words3, 0);
     emit("    call rax\n");
-
-    if (stack_words3 > 0) {
-        emit("    add rsp, ");
-        emit_u64(stack_words3 * 8);
-        emit_nl();
-    }
+    _cg_target_call_cleanup(stack_words3, reserve_words3);
     return;
 }
 
@@ -3749,33 +3752,36 @@ func cg_method_push_virtual_receiver_from_tmp(tmp_offset: u64, recv_ti: *TypeInf
     return 1;
 }
 
-func cg_method_stack_cleanup(stack_words: u64) -> u64 {
-    if (stack_words > 0) {
-        emit("    add rsp, ");
-        emit_u64(stack_words * 8);
-        emit_nl();
-    }
-    return 0;
+func cg_method_stack_cleanup(stack_words: u64, reserve_words: u64) -> u64 {
+    return _cg_target_call_cleanup(stack_words, reserve_words);
 }
 
 func cg_method_emit_trait_vtable_call(method_index: u64, stack_words: u64) -> u64 {
-    emit("    mov rax, [rdi]\n");
+    emit("    mov rax, [");
+    var recv_reg_name: u64 = compiler_target_user_arg_reg_name(0, 0);
+    var recv_reg_len: u64 = compiler_target_user_arg_reg_name_len(0, 0);
+    if (recv_reg_name != 0 && recv_reg_len != 0) {
+        emit_len(recv_reg_name, recv_reg_len);
+    }
+    emit("]\n");
     if (method_index != 0) {
         emit("    add rax, ");
         emit_u64(method_index * 8);
         emit_nl();
     }
     emit("    mov rax, [rax]\n");
+    var reserve_words: u64 = _cg_target_call_prepare(stack_words, 0);
     emit("    call rax\n");
-    cg_method_stack_cleanup(stack_words);
+    cg_method_stack_cleanup(stack_words, reserve_words);
     return 0;
 }
 
 func cg_method_emit_direct_call(resolved_ptr: u64, resolved_len: u64, stack_words: u64) -> u64 {
+    var reserve_words: u64 = _cg_target_call_prepare(stack_words, 0);
     emit("    call ");
     emit_len(resolved_ptr, resolved_len);
     emit_nl();
-    cg_method_stack_cleanup(stack_words);
+    cg_method_stack_cleanup(stack_words, reserve_words);
     return 0;
 }
 

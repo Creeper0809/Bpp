@@ -36,7 +36,7 @@ function Invoke-Link {
     $args = @(
         "/nologo",
         "/subsystem:console",
-        "/entry:_start",
+        "/entry:mainCRTStartup",
         "/out:$OutputExe",
         $ObjectFile,
         "kernel32.lib"
@@ -80,19 +80,77 @@ function Read-DirectiveValues {
     return ,$values.ToArray()
 }
 
+function Get-BooleanDirectiveValue {
+    param(
+        [string[]]$Lines,
+        [string]$Pattern
+    )
+
+    $raw = (Read-DirectiveValue -Lines $Lines -Pattern $Pattern).ToLowerInvariant()
+    return ($raw -eq "1" -or $raw -eq "true" -or $raw -eq "yes")
+}
+
+function Split-CompilerArgs {
+    param([string]$Raw)
+
+    if (-not $Raw) { return @() }
+    $parts = $Raw -split '\s+'
+    return @($parts | Where-Object { $_ -ne "" })
+}
+
+function Decode-EscapedDirectiveText {
+    param([string]$Raw)
+
+    if (-not $Raw) { return "" }
+    return [System.Text.RegularExpressions.Regex]::Unescape($Raw)
+}
+
 function Invoke-TestProcess {
     param(
         [string]$ExePath,
-        [int]$Timeout
+        [int]$Timeout,
+        [string]$StdinText = ""
     )
 
-    $proc = Start-Process -FilePath $ExePath -NoNewWindow -PassThru
+    $stdoutFile = [System.IO.Path]::GetTempFileName()
+    $stderrFile = [System.IO.Path]::GetTempFileName()
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $ExePath
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.RedirectStandardInput = $true
+    $psi.CreateNoWindow = $true
+
+    $proc = New-Object System.Diagnostics.Process
+    $proc.StartInfo = $psi
+    [void]$proc.Start()
+
+    if ($StdinText -ne "") {
+        $proc.StandardInput.Write($StdinText)
+    }
+    $proc.StandardInput.Close()
+
+    $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+    $stderrTask = $proc.StandardError.ReadToEndAsync()
     $exited = $proc.WaitForExit($Timeout)
     if (-not $exited) {
         try { $proc.Kill() } catch { }
-        return 124
+        return [PSCustomObject]@{
+            ExitCode = 124
+            Stdout = ""
+            Stderr = ""
+            TimedOut = $true
+        }
     }
-    return $proc.ExitCode
+
+    $proc.WaitForExit()
+    return [PSCustomObject]@{
+        ExitCode = $proc.ExitCode
+        Stdout = $stdoutTask.Result
+        Stderr = $stderrTask.Result
+        TimedOut = $false
+    }
 }
 
 function Test-IsCrashExitCode {
@@ -257,9 +315,13 @@ foreach ($testCase in $testCases) {
     $expectedExit = 0
     if ($expectedExitRaw) { [void][int]::TryParse($expectedExitRaw, [ref]$expectedExit) }
 
-    $expectCompileFailRaw = (Read-DirectiveValue -Lines $lines -Pattern '^//\s*Expect compile fail:\s*(.+)$').ToLowerInvariant()
-    $expectCompileFail = ($expectCompileFailRaw -eq "1" -or $expectCompileFailRaw -eq "true" -or $expectCompileFailRaw -eq "yes")
+    $expectCompileFail = Get-BooleanDirectiveValue -Lines $lines -Pattern '^//\s*Expect compile fail:\s*(.+)$'
+    $compileOnly = Get-BooleanDirectiveValue -Lines $lines -Pattern '^//\s*Compile only:\s*(.+)$'
+    $compilerArgs = Split-CompilerArgs -Raw (Read-DirectiveValue -Lines $lines -Pattern '^//\s*Compiler args:\s*(.+)$')
+    $stdinText = Decode-EscapedDirectiveText -Raw (Read-DirectiveValue -Lines $lines -Pattern '^//\s*Stdin:\s*(.+)$')
+    $expectedStdout = Decode-EscapedDirectiveText -Raw (Read-DirectiveValue -Lines $lines -Pattern '^//\s*Expect stdout:\s*(.+)$')
     $expectErrContainsList = @(Read-DirectiveValues -Lines $lines -Pattern '^//\s*Expect error contains:\s*(.+)$')
+    $expectAsmContainsList = @(Read-DirectiveValues -Lines $lines -Pattern '^//\s*Expect asm contains:\s*(.+)$')
     if ($expectCompileFail -and $StrictFailDiagnostics -and $expectErrContainsList.Count -eq 0) {
         throw "Missing '// Expect error contains:' directive for compile-fail test: $displayName"
     }
@@ -274,7 +336,12 @@ foreach ($testCase in $testCases) {
     if (Test-Path $exeFile) { Remove-Item $exeFile -Force }
     if (Test-Path $errFile) { Remove-Item $errFile -Force }
 
-    & $CompilerPath -asm $testCase.Path > $asmFile 2> $errFile
+    $compilerInvocationArgs = @("--target", "windows-x86_64")
+    if ($compilerArgs.Count -gt 0) {
+        $compilerInvocationArgs += $compilerArgs
+    }
+    $compilerInvocationArgs += @("-asm", $testCase.Path)
+    & $CompilerPath @compilerInvocationArgs > $asmFile 2> $errFile
     $compileCode = $LASTEXITCODE
 
     $caseOk = $true
@@ -311,20 +378,42 @@ foreach ($testCase in $testCases) {
             $caseOk = $false
             $status = "FAIL (unexpected compile success)"
         } else {
-            & $NasmPath -f win64 -O1 $asmFile -o $objFile 2> $errFile
-            if ($LASTEXITCODE -ne 0) {
-                $caseOk = $false
-                $status = "FAIL (assemble)"
-            } else {
-                $linkCode = Invoke-Link -Linker $LinkerPath -ObjectFile $objFile -OutputExe $exeFile -ErrorFile $errFile
-                if ($linkCode -ne 0) {
+            if ($expectAsmContainsList.Count -gt 0) {
+                $asmText = Get-Content $asmFile -Raw
+                $missingAsm = @()
+                foreach ($pat in $expectAsmContainsList) {
+                    if ($asmText.IndexOf($pat, [System.StringComparison]::Ordinal) -lt 0) {
+                        $missingAsm += $pat
+                    }
+                }
+                if ($missingAsm.Count -gt 0) {
                     $caseOk = $false
-                    $status = "FAIL (link)"
+                    $status = "FAIL (asm mismatch: $($missingAsm[0]))"
+                }
+            }
+
+            if ($caseOk -and $compileOnly) {
+                $status = "PASS (compile only)"
+            } else {
+                & $NasmPath -f win64 -O1 $asmFile -o $objFile 2> $errFile
+                if ($LASTEXITCODE -ne 0) {
+                    $caseOk = $false
+                    $status = "FAIL (assemble)"
                 } else {
-                    $runExit = Invoke-TestProcess -ExePath $exeFile -Timeout $TimeoutMs
-                    if ($runExit -ne $expectedExit) {
+                    $linkCode = Invoke-Link -Linker $LinkerPath -ObjectFile $objFile -OutputExe $exeFile -ErrorFile $errFile
+                    if ($linkCode -ne 0) {
                         $caseOk = $false
-                        $status = "FAIL (exit=$runExit expect=$expectedExit)"
+                        $status = "FAIL (link)"
+                    } else {
+                        $runResult = Invoke-TestProcess -ExePath $exeFile -Timeout $TimeoutMs -StdinText $stdinText
+                        $runExit = $runResult.ExitCode
+                        if ($runExit -ne $expectedExit) {
+                            $caseOk = $false
+                            $status = "FAIL (exit=$runExit expect=$expectedExit)"
+                        } elseif ($expectedStdout -ne "" -and $runResult.Stdout -ne $expectedStdout) {
+                            $caseOk = $false
+                            $status = "FAIL (stdout mismatch)"
+                        }
                     }
                 }
             }
