@@ -455,6 +455,9 @@ run_matrix_case() {
     local expect_stdout_file="${10}"
     local stdin_file="${11}"
     local result_file="${12}"
+    local compiler_args_file="${13}"
+    local expect_asm_file="${14}"
+    local compile_only="${15}"
 
     local case_tag="[$case_num] Testing $test_label ($mode $opt)"
     local case_pass=0
@@ -485,7 +488,11 @@ run_matrix_case() {
     fi
 
     local compile_exit=0
-    $COMPILER $opt_flag $ir_flag -asm "$test_file" > "$asm_file" 2>"$err_file"
+    local -a compiler_extra_args=()
+    if [ -n "$compiler_args_file" ] && [ -f "$compiler_args_file" ]; then
+        read -r -a compiler_extra_args < "$compiler_args_file"
+    fi
+    $COMPILER $opt_flag $ir_flag "${compiler_extra_args[@]}" -asm "$test_file" > "$asm_file" 2>"$err_file"
     compile_exit="$?"
 
     if [ "$compile_exit" -ne 0 ]; then
@@ -524,9 +531,27 @@ run_matrix_case() {
             case_status="FAIL (compile exit=$compile_exit)"
         fi
     else
-        if [ "$expect_compile_fail" -eq 1 ]; then
+        local missing_asm_pat=""
+        if [ -n "$expect_asm_file" ] && [ -f "$expect_asm_file" ]; then
+            while IFS= read -r pat || [ -n "$pat" ]; do
+                if [ -z "$pat" ]; then
+                    continue
+                fi
+                if ! grep -Fq "$pat" "$asm_file"; then
+                    missing_asm_pat="$pat"
+                    break
+                fi
+            done < "$expect_asm_file"
+        fi
+        if [ -n "$missing_asm_pat" ]; then
+            case_fail=1
+            case_status="FAIL (asm mismatch: $missing_asm_pat)"
+        elif [ "$expect_compile_fail" -eq 1 ]; then
             case_fail=1
             case_status="FAIL (unexpected compile success)"
+        elif [ "$compile_only" = "1" ]; then
+            case_pass=1
+            case_status="PASS (compile only)"
         elif ! nasm -f elf64 -O1 "$asm_file" -o "$obj_file" 2>"$err_file"; then
             persist_result_file "$err_file" "$err_file_persist"
             case_fail=1
@@ -854,7 +879,7 @@ for TEST_FILE in "${TEST_FILES[@]}"; do
             continue
         fi
     fi
-    CONTENT_HASH=$(awk '{if ($0 !~ /^\/\/ (Covers:|Mode:|Opt:|Expect exit code:|Expect compile fail:|Expect error contains:|Expect stdout:|Stdin:)/) print}' "$TEST_FILE" | md5sum | awk '{print $1}')
+    CONTENT_HASH=$(awk '{if ($0 !~ /^\/\/ (Covers:|Mode:|Opt:|Compiler args:|Compile only:|Expect exit code:|Expect compile fail:|Expect error contains:|Expect asm contains:|Expect stdout:|Stdin:)/) print}' "$TEST_FILE" | md5sum | awk '{print $1}')
     if [ -n "${SEEN_HASH[$CONTENT_HASH]}" ]; then
         if [ "$TEST_QUIET" -eq 0 ]; then
             echo "[SKIP] Duplicate content: $TEST_LABEL (same as ${SEEN_HASH[$CONTENT_HASH]})"
@@ -888,6 +913,25 @@ for TEST_FILE in "${TEST_FILES[@]}"; do
     if ! prepare_test_stdout_file "$TEST_FILE" "$EXPECT_STDOUT_FILE"; then
         EXPECT_STDOUT_FILE=""
     fi
+    COMPILER_ARGS_FILE="$JOBS_DIR/${RUN_TAG}_${TEST_NAME}.args"
+    rm -f "$COMPILER_ARGS_FILE"
+    grep -m1 -E '^// Compiler args:' "$TEST_FILE" | sed -E 's|^// Compiler args:[[:space:]]*||' > "$COMPILER_ARGS_FILE" || true
+    if [ ! -s "$COMPILER_ARGS_FILE" ]; then
+        rm -f "$COMPILER_ARGS_FILE"
+        COMPILER_ARGS_FILE=""
+    fi
+    EXPECT_ASM_FILE="$JOBS_DIR/${RUN_TAG}_${TEST_NAME}.asm_expect"
+    rm -f "$EXPECT_ASM_FILE"
+    grep -E '^// Expect asm contains:' "$TEST_FILE" | sed -E 's|^// Expect asm contains:[[:space:]]*||' > "$EXPECT_ASM_FILE" || true
+    if [ ! -s "$EXPECT_ASM_FILE" ]; then
+        rm -f "$EXPECT_ASM_FILE"
+        EXPECT_ASM_FILE=""
+    fi
+    COMPILE_ONLY_RAW=$(grep -m1 -E '^// Compile only:' "$TEST_FILE" | awk -F': ' '{print $2}' | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]' || true)
+    COMPILE_ONLY=0
+    if [ "$COMPILE_ONLY_RAW" = "1" ] || [ "$COMPILE_ONLY_RAW" = "true" ] || [ "$COMPILE_ONLY_RAW" = "yes" ]; then
+        COMPILE_ONLY=1
+    fi
     if [ "$EXPECT_COMPILE_FAIL" -eq 1 ] && [ "$STRICT_FAIL_DIAGNOSTICS" -eq 1 ] && [ -z "$EXPECT_ERROR_FILE" ]; then
         echo "Error: Missing '// Expect error contains:' directive for compile-fail test: $TEST_LABEL"
         exit 1
@@ -917,7 +961,7 @@ for TEST_FILE in "${TEST_FILES[@]}"; do
             TOTAL=$((TOTAL + 1))
             RESULT_FILE="$JOBS_DIR/${RUN_TAG}_case_${TOTAL}.result"
             CASE_RESULT_FILES+=("$RESULT_FILE")
-            launch_job_with_limit run_matrix_case "$TOTAL" "$TEST_FILE" "$TEST_NAME" "$TEST_LABEL" "$MODE" "$OPT" "$EXPECTED" "$EXPECT_COMPILE_FAIL" "$EXPECT_ERROR_FILE" "$EXPECT_STDOUT_FILE" "$STDIN_FILE" "$RESULT_FILE"
+            launch_job_with_limit run_matrix_case "$TOTAL" "$TEST_FILE" "$TEST_NAME" "$TEST_LABEL" "$MODE" "$OPT" "$EXPECTED" "$EXPECT_COMPILE_FAIL" "$EXPECT_ERROR_FILE" "$EXPECT_STDOUT_FILE" "$STDIN_FILE" "$RESULT_FILE" "$COMPILER_ARGS_FILE" "$EXPECT_ASM_FILE" "$COMPILE_ONLY"
         done
     done
 
@@ -935,7 +979,7 @@ for TEST_FILE in "${TEST_FILES[@]}"; do
                 TOTAL=$((TOTAL + 1))
                 RESULT_FILE="$JOBS_DIR/${RUN_TAG}_case_${TOTAL}.result"
                 CASE_RESULT_FILES+=("$RESULT_FILE")
-                launch_job_with_limit run_matrix_case "$TOTAL" "$TEST_FILE" "$TEST_NAME" "$TEST_LABEL" "$MODE" "$OPT" "$EXPECTED" "$EXPECT_COMPILE_FAIL" "$EXPECT_ERROR_FILE" "$EXPECT_STDOUT_FILE" "$STDIN_FILE" "$RESULT_FILE"
+                launch_job_with_limit run_matrix_case "$TOTAL" "$TEST_FILE" "$TEST_NAME" "$TEST_LABEL" "$MODE" "$OPT" "$EXPECTED" "$EXPECT_COMPILE_FAIL" "$EXPECT_ERROR_FILE" "$EXPECT_STDOUT_FILE" "$STDIN_FILE" "$RESULT_FILE" "$COMPILER_ARGS_FILE" "$EXPECT_ASM_FILE" "$COMPILE_ONLY"
             done
         done
     fi

@@ -24,7 +24,7 @@ import emitter.gen.expr;
 // Block Codegen
 // ============================================
 
-var g_defer_emit_mode;
+var g_defer_emit_mode: u64;
 const LAMBDA_CLOSURE_MAGIC_STMT = 4778407454613394245;
 
 func emit_defer_stack_len() -> u64 {
@@ -265,17 +265,11 @@ func emit_stmt(node: u64) -> u64 {
 }
 
 func emit_call_resolved(name_ptr: u64, name_len: u64) -> u64 {
-    var resolved_ptr: u64 = name_ptr;
-    var resolved_len: u64 = name_len;
-    var resolved: *NameInfo = resolve_name(name_ptr, name_len);
-    if (resolved != 0) {
-        resolved_ptr = resolved.ptr;
-        resolved_len = resolved.len;
-    }
-    emit("    call ");
-    emit_len(resolved_ptr, resolved_len);
-    emit_nl();
-    return 0;
+    return _cg_emit_direct_call_resolved(name_ptr, name_len, 0, 0);
+}
+
+func emit_call_resolved_with_layout(name_ptr: u64, name_len: u64, stack_words: u64, extra_words: u64) -> u64 {
+    return _cg_emit_direct_call_resolved(name_ptr, name_len, stack_words, extra_words);
 }
 
 func emit_call_sret(call: *AstCall, dest_offset: u64, symtab: *Symtab) -> u64 {
@@ -292,17 +286,9 @@ func emit_call_sret(call: *AstCall, dest_offset: u64, symtab: *Symtab) -> u64 {
         }
     }
 
-    emit("    lea rdi, [rbp");
-    emit_signed_disp(dest_offset);
-    emit("]\n");
-
+    _cg_emit_sret_ptr_from_rbp(dest_offset);
     var stack_words: u64 = _cg_sysv_pop_arg_regs_sret(total_arg_words);
-    emit_call_resolved(call.name_ptr, call.name_len);
-    if (stack_words > 0) {
-        emit("    add rsp, ");
-        emit_u64(stack_words * 8);
-        emit_nl();
-    }
+    emit_call_resolved_with_layout(call.name_ptr, call.name_len, stack_words, 0);
     return 0;
 }
 
@@ -376,12 +362,8 @@ func emit_return_struct_large_from_call(expr: u64, symtab: *Symtab) -> u64 {
     }
     var stack_words_call: u64 = _cg_sysv_pop_arg_regs_sret(total_arg_words_call);
     emit("    pop rdi\n");
-    emit_call_resolved(call_expr.name_ptr, call_expr.name_len);
-    if (stack_words_call > 0) {
-        emit("    add rsp, ");
-        emit_u64(stack_words_call * 8);
-        emit_nl();
-    }
+    _cg_emit_mov_raw_arg_from_reg(0, "rdi", 3);
+    emit_call_resolved_with_layout(call_expr.name_ptr, call_expr.name_len, stack_words_call, 0);
     return 0;
 }
 
@@ -495,16 +477,15 @@ func emit_return_slice_try_array_heap_copy(slice_node: *AstSlice, symtab: *Symta
     emit("    jne ");
     emit_label(init_label);
     emit_nl();
-    emit("    mov rax, 12\n");
-    emit("    xor rdi, rdi\n");
-    emit("    syscall\n");
+    _cg_emit_mov_user_arg_imm_u64(0, 0, 0);
+    _cg_emit_direct_call_name("std_os__os_sys_brk", str_len("std_os__os_sys_brk"), 0, 0);
     emit("    mov [_gvar___cg_heap_brk], rax\n");
     emit_label_def(init_label);
     emit("    mov rbx, [_gvar___cg_heap_brk]\n");
     emit("    mov rdi, rbx\n");
     emit("    add rdi, r8\n");
-    emit("    mov rax, 12\n");
-    emit("    syscall\n");
+    _cg_emit_mov_user_arg_from_reg(0, 0, "rdi", 3);
+    _cg_emit_direct_call_name("std_os__os_sys_brk", str_len("std_os__os_sys_brk"), 0, 0);
     emit("    cmp rax, rdi\n");
     emit("    jb ");
     emit_label(fail_label);
@@ -823,7 +804,7 @@ func emit_var_decl_try_slice_init(init: u64, init_kind: u64, spec: *CgDeclTypeSp
         emit("], rax\n");
         return 1;
     }
-    if (init_kind == AST_CALL) {
+    if (init_kind == AST_CALL || init_kind == AST_METHOD_CALL || init_kind == AST_CALL_PTR) {
         emit_expr(init);
         emit("    mov [rbp");
         emit_signed_disp(offset);
@@ -1695,6 +1676,28 @@ func emit_assign_stmt(node: u64, symtab: *Symtab) -> u64 {
             emit_copy_bytes_with_regs("rax", 3, "r8", 2, struct_size);
             return;
         }
+        if (struct_size > 16 && value_kind == AST_CALL) {
+            var tmp_offset: u64 = emit_alloc_tmp_struct(symtab, struct_size);
+            emit_call_sret((*AstCall)value, tmp_offset, symtab);
+            emit_lvalue(target);
+            emit("    mov r8, rax\n");
+            emit("    lea rbx, [rbp");
+            emit_signed_disp(tmp_offset);
+            emit("]\n");
+            emit_copy_bytes_with_regs("rbx", 3, "r8", 2, struct_size);
+            return;
+        }
+        if (struct_size > 16 && value_kind == AST_METHOD_CALL) {
+            var tmp_offset2: u64 = emit_alloc_tmp_struct(symtab, struct_size);
+            emit_method_call_sret_to_offset((*AstMethodCall)value, tmp_offset2, symtab);
+            emit_lvalue(target);
+            emit("    mov r8, rax\n");
+            emit("    lea rbx, [rbp");
+            emit_signed_disp(tmp_offset2);
+            emit("]\n");
+            emit_copy_bytes_with_regs("rbx", 3, "r8", 2, struct_size);
+            return;
+        }
         emit_expr(value);
         emit("    push rax\n");
         emit("    push rdx\n");
@@ -1784,15 +1787,11 @@ func emit_delete_stmt(node: u64, symtab: *Symtab) -> u64 {
             emit("    je ");
             emit_label(label_closure_done_typed);
             emit_nl();
-            emit("    mov rdi, rbx\n");
-            emit("    call ");
-            emit_len(free_ptr, free_len);
-            emit_nl();
+            _cg_emit_mov_user_arg_from_reg(0, 0, "rbx", 3);
+            _cg_emit_direct_call_name(free_ptr, free_len, 0, 0);
             emit_label_def(label_closure_done_typed);
-            emit("    mov rdi, r12\n");
-            emit("    call ");
-            emit_len(free_ptr, free_len);
-            emit_nl();
+            _cg_emit_mov_user_arg_from_reg(0, 0, "r12", 3);
+            _cg_emit_direct_call_name(free_ptr, free_len, 0, 0);
             emit("    jmp ");
             emit_label(label_end);
             emit_nl();
@@ -1805,15 +1804,11 @@ func emit_delete_stmt(node: u64, symtab: *Symtab) -> u64 {
                 emit("    je ");
                 emit_label(label_closure_done_raw);
                 emit_nl();
-                emit("    mov rdi, rbx\n");
-                emit("    call ");
-                emit_len(free_ptr, free_len);
-                emit_nl();
+                _cg_emit_mov_user_arg_from_reg(0, 0, "rbx", 3);
+                _cg_emit_direct_call_name(free_ptr, free_len, 0, 0);
                 emit_label_def(label_closure_done_raw);
-                emit("    mov rdi, r12\n");
-                emit("    call ");
-                emit_len(free_ptr, free_len);
-                emit_nl();
+                _cg_emit_mov_user_arg_from_reg(0, 0, "r12", 3);
+                _cg_emit_direct_call_name(free_ptr, free_len, 0, 0);
                 emit("    jmp ");
                 emit_label(label_end);
                 emit_nl();
@@ -1839,15 +1834,11 @@ func emit_delete_stmt(node: u64, symtab: *Symtab) -> u64 {
                 emit("    je ");
                 emit_label(label_closure_env_done);
                 emit_nl();
-                emit("    mov rdi, rbx\n");
-                emit("    call ");
-                emit_len(free_ptr, free_len);
-                emit_nl();
+                _cg_emit_mov_user_arg_from_reg(0, 0, "rbx", 3);
+                _cg_emit_direct_call_name(free_ptr, free_len, 0, 0);
                 emit_label_def(label_closure_env_done);
-                emit("    mov rdi, r12\n");
-                emit("    call ");
-                emit_len(free_ptr, free_len);
-                emit_nl();
+                _cg_emit_mov_user_arg_from_reg(0, 0, "r12", 3);
+                _cg_emit_direct_call_name(free_ptr, free_len, 0, 0);
                 emit("    jmp ");
                 emit_label(label_end);
                 emit_nl();
@@ -1876,21 +1867,12 @@ func emit_delete_stmt(node: u64, symtab: *Symtab) -> u64 {
         if (sym_func_exists(name_info.ptr, name_info.len) != 0) {
             emit("    push rbx\n");
             var stack_words: u64 = _cg_sysv_pop_arg_regs(1);
-            emit("    call ");
-            emit_len(resolved_ptr, resolved_len);
-            emit_nl();
-            if (stack_words > 0) {
-                emit("    add rsp, ");
-                emit_u64(stack_words * 8);
-                emit_nl();
-            }
+            _cg_emit_direct_call_name(resolved_ptr, resolved_len, stack_words, 0);
         }
     }
 
-    emit("    mov rdi, rbx\n");
-    emit("    call ");
-    emit_len(free_ptr, free_len);
-    emit_nl();
+    _cg_emit_mov_user_arg_from_reg(0, 0, "rbx", 3);
+    _cg_emit_direct_call_name(free_ptr, free_len, 0, 0);
 
     emit_label_def(label_end);
     return 0;
@@ -2094,16 +2076,16 @@ func emit_switch_emit_string_compare(value: u64, case_label: u64) -> u64 {
     emit_expr(value);
     emitln("    sub rsp, 16");
     emitln("    mov [rsp], rax    ; s2");
-    emitln("    mov rdi, rax");
-    emit_call_resolved("str_len", 7);
+    _cg_emit_mov_user_arg_from_reg(0, 0, "rax", 3);
+    emit_call_resolved_with_layout("str_len", 7, 0, 2);
     emitln("    mov [rsp+8], rax    ; len2");
-    emitln("    mov rdi, [rsp+16]    ; s1");
-    emit_call_resolved("str_len", 7);
-    emitln("    mov rsi, rax    ; len1");
-    emitln("    mov rdi, [rsp+16]    ; s1");
-    emitln("    mov rdx, [rsp]    ; s2");
-    emitln("    mov rcx, [rsp+8]    ; len2");
-    emit_call_resolved("str_eq", 6);
+    _cg_emit_mov_user_arg_from_rsp(0, 0, 16);
+    emit_call_resolved_with_layout("str_len", 7, 0, 2);
+    _cg_emit_mov_user_arg_from_reg(1, 0, "rax", 3);
+    _cg_emit_mov_user_arg_from_rsp(0, 0, 16);
+    _cg_emit_mov_user_arg_from_rsp(2, 0, 0);
+    _cg_emit_mov_user_arg_from_rsp(3, 0, 8);
+    emit_call_resolved_with_layout("str_eq", 6, 0, 2);
     emitln("    add rsp, 16");
     emitln("    test rax, rax");
     emit("    jnz ");

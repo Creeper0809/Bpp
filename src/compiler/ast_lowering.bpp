@@ -15,6 +15,7 @@ import types;
 
 var g_lower_parse_sugar_symtab: *HashMap<u64, *TypeInfo> = 0;
 var g_lower_parse_sugar_final_phase: u64 = 0;
+var g_lower_parse_sugar_return_ti: *TypeInfo = 0;
 
 func lower_parse_sugar_set_symtab(symtab: *HashMap<u64, *TypeInfo>) -> u64 {
     g_lower_parse_sugar_symtab = symtab;
@@ -24,6 +25,15 @@ func lower_parse_sugar_set_symtab(symtab: *HashMap<u64, *TypeInfo>) -> u64 {
 func lower_parse_sugar_set_final_phase(final_phase: u64) -> u64 {
     g_lower_parse_sugar_final_phase = final_phase;
     return 0;
+}
+
+func lower_parse_sugar_set_return_typeinfo(ti: *TypeInfo) -> u64 {
+    g_lower_parse_sugar_return_ti = ti;
+    return 0;
+}
+
+func lower_parse_sugar_current_return_typeinfo() -> *TypeInfo {
+    return g_lower_parse_sugar_return_ti;
 }
 
 func lower_try_resolve_struct_name(name_ptr: u64, name_len: u64) -> CompilerResolvedStructName {
@@ -104,7 +114,6 @@ func call_fill_missing_defaults(call_name_ptr: u64, call_name_len: u64, params: 
     return 0;
 }
 
-
 func lower_normalize_call_args_for_params(call_name_ptr: u64, call_name_len: u64, params: *Vec<*Param>, params_start: u64, args: *Vec<*AstNode>, arg_names: *Vec<*NameInfo>) -> *Vec<*AstNode> {
     var input_args: *Vec<*AstNode> = args;
     if (input_args == 0) { input_args = new Vec<*AstNode>(0); }
@@ -119,12 +128,21 @@ func lower_normalize_call_args_for_params(call_name_ptr: u64, call_name_len: u64
     if (params_start > param_count) { params_start = param_count; }
     var effective_count: u64 = param_count - params_start;
 
+    var has_variadic: u64 = call_has_variadic_param(params, param_count, effective_count);
     var should_normalize: u64 = call_params_need_normalize(params, params_start, arg_names);
     if (should_normalize == 0) {
+        var simple_fixed_count: u64 = effective_count;
+        if (has_variadic != 0 && simple_fixed_count > 0) {
+            simple_fixed_count = simple_fixed_count - 1;
+        }
+        var simple_arg_count: u64 = input_args.len();
+        for (var sai: u64 = 0; sai < simple_arg_count && sai < simple_fixed_count; sai++) {
+            var simple_arg_expr: *AstNode = input_args.get(sai);
+            var simple_param: *Param = params.get(params_start + sai);
+            input_args.set(sai, lower_parse_sugar_expr_for_type(simple_arg_expr, lower_make_typeinfo_from_param(simple_param)));
+        }
         return input_args;
     }
-
-    var has_variadic: u64 = call_has_variadic_param(params, param_count, effective_count);
 
     var fixed_count: u64 = effective_count;
     if (has_variadic != 0 && fixed_count > 0) {
@@ -176,7 +194,8 @@ func lower_normalize_call_args_for_params(call_name_ptr: u64, call_name_len: u64
                 diag_error("Compiler error");
                 return 0;
             }
-            out_fixed.set(named_idx, arg_expr);
+            var named_param: *Param = params.get(params_start + named_idx);
+            out_fixed.set(named_idx, lower_parse_sugar_expr_for_type(arg_expr, lower_make_typeinfo_from_param(named_param)));
             assigned.set(named_idx, 1);
             continue;
         }
@@ -186,7 +205,8 @@ func lower_normalize_call_args_for_params(call_name_ptr: u64, call_name_len: u64
         }
 
         if (next_positional < fixed_count) {
-            out_fixed.set(next_positional, arg_expr);
+            var positional_param: *Param = params.get(params_start + next_positional);
+            out_fixed.set(next_positional, lower_parse_sugar_expr_for_type(arg_expr, lower_make_typeinfo_from_param(positional_param)));
             assigned.set(next_positional, 1);
             next_positional = next_positional + 1;
             continue;
@@ -382,6 +402,55 @@ func lower_ti_is_signed_scalar(ti: *TypeInfo) -> u64 {
     if (ti.type_kind == TYPE_I16) { return 1; }
     if (ti.type_kind == TYPE_I32) { return 1; }
     if (ti.type_kind == TYPE_I64) { return 1; }
+    return 0;
+}
+
+func lower_type_kind_is_unsigned_integer(kind: u64) -> u64 {
+    if (kind == TYPE_U8) { return 1; }
+    if (kind == TYPE_U16) { return 1; }
+    if (kind == TYPE_U32) { return 1; }
+    if (kind == TYPE_U64) { return 1; }
+    return 0;
+}
+
+func lower_type_kind_is_signed_integer(kind: u64) -> u64 {
+    if (kind == TYPE_I8) { return 1; }
+    if (kind == TYPE_I16) { return 1; }
+    if (kind == TYPE_I32) { return 1; }
+    if (kind == TYPE_I64) { return 1; }
+    return 0;
+}
+
+func lower_type_kind_is_integer(kind: u64) -> u64 {
+    if (lower_type_kind_is_unsigned_integer(kind) != 0) { return 1; }
+    if (lower_type_kind_is_signed_integer(kind) != 0) { return 1; }
+    return 0;
+}
+
+func lower_type_kind_integer_width(kind: u64) -> u64 {
+    switch (kind) {
+        case TYPE_U8:
+        case TYPE_I8:
+            return 8;
+        case TYPE_U16:
+        case TYPE_I16:
+            return 16;
+        case TYPE_U32:
+        case TYPE_I32:
+            return 32;
+        case TYPE_U64:
+        case TYPE_I64:
+            return 64;
+    }
+    return 0;
+}
+
+func lower_can_implicit_integer_widen(src_kind: u64, dst_kind: u64) -> u64 {
+    var src_width: u64 = lower_type_kind_integer_width(src_kind);
+    var dst_width: u64 = lower_type_kind_integer_width(dst_kind);
+    if (src_width == 0 || dst_width == 0 || src_width > dst_width) { return 0; }
+    if (lower_type_kind_is_unsigned_integer(src_kind) != 0 && lower_type_kind_is_unsigned_integer(dst_kind) != 0) { return 1; }
+    if (lower_type_kind_is_signed_integer(src_kind) != 0 && lower_type_kind_is_signed_integer(dst_kind) != 0) { return 1; }
     return 0;
 }
 
@@ -694,21 +763,24 @@ func lower_parse_sugar_magic_direct_call(call: *AstCall) -> *AstNode {
     return (*AstNode)ast_method_call_named(receiver, call.name_ptr, call.name_len, method_args, method_arg_names);
 }
 
+func lower_make_struct_typeinfo_if_defined(name_ptr: u64, name_len: u64) -> *TypeInfo {
+    if (get_struct_def(name_ptr, name_len) == 0) { return 0; }
+    return generic_make_typeinfo_from_fields(TYPE_STRUCT, 0, 0, name_ptr, name_len, 0, 0, 0, 0, 0, 0, 0, 0);
+}
+
+func lower_make_number_struct_typeinfo() -> *TypeInfo {
+    var local_ti: *TypeInfo = lower_make_struct_typeinfo_if_defined("Number", 6);
+    if (local_ti != 0) { return local_ti; }
+    return lower_make_struct_typeinfo_if_defined("std_number__Number", 18);
+}
+
 func lower_operator_receiver_type(expr: *AstNode) -> *TypeInfo {
     if (expr == 0) { return 0; }
     if (ast_kind(expr) == AST_CALL) {
         var c: *AstCall = (*AstCall)expr;
         if (lower_call_expr_returns_number(c) != 0) {
-            var local_name_ptr: u64 = (u64)"Number";
-            var local_name_len: u64 = 6;
-            if (get_struct_def(local_name_ptr, local_name_len) != 0) {
-                return generic_make_typeinfo_from_fields(TYPE_STRUCT, 0, 0, local_name_ptr, local_name_len, 0, 0, 0, 0, 0, 0, 0, 0);
-            }
-            var fq_name_ptr: u64 = (u64)"std_number__Number";
-            var fq_name_len: u64 = 18;
-            if (get_struct_def(fq_name_ptr, fq_name_len) != 0) {
-                return generic_make_typeinfo_from_fields(TYPE_STRUCT, 0, 0, fq_name_ptr, fq_name_len, 0, 0, 0, 0, 0, 0, 0, 0);
-            }
+            var number_ti: *TypeInfo = lower_make_number_struct_typeinfo();
+            if (number_ti != 0) { return number_ti; }
         }
     }
     var ti: *TypeInfo = generic_infer_expr_type(expr, g_lower_parse_sugar_symtab);
@@ -760,9 +832,17 @@ func lower_operator_can_dispatch(receiver: *AstNode, method_ptr: u64, method_len
 }
 
 func lower_name_is_number_type(name_ptr: u64, name_len: u64) -> u64 {
+    return lower_name_matches_aliases(name_ptr, name_len, "Number", 6, "std_number__Number", 18);
+}
+
+func lower_name_is_string_type(name_ptr: u64, name_len: u64) -> u64 {
+    return lower_name_matches_aliases(name_ptr, name_len, "string", 6, "std_string__string", 18);
+}
+
+func lower_name_matches_aliases(name_ptr: u64, name_len: u64, local_ptr: u64, local_len: u64, fq_ptr: u64, fq_len: u64) -> u64 {
     if (name_ptr == 0 || name_len == 0) { return 0; }
-    if (str_eq(name_ptr, name_len, "Number", 6) != 0) { return 1; }
-    if (str_eq(name_ptr, name_len, "std_number__Number", 18) != 0) { return 1; }
+    if (str_eq(name_ptr, name_len, local_ptr, local_len) != 0) { return 1; }
+    if (str_eq(name_ptr, name_len, fq_ptr, fq_len) != 0) { return 1; }
     return 0;
 }
 
@@ -780,9 +860,35 @@ func lower_name_is_number_builtin(name_ptr: u64, name_len: u64, base_ptr: u64, b
 }
 
 func lower_name_is_number_returning_builtin(name_ptr: u64, name_len: u64) -> u64 {
+    if (lower_name_is_number_builtin(name_ptr, name_len, (u64)"number_panic_number", 19) != 0) { return 1; }
+    if (lower_name_is_number_builtin(name_ptr, name_len, (u64)"number_make_small", 17) != 0) { return 1; }
+    if (lower_name_is_number_builtin(name_ptr, name_len, (u64)"number_make_zero", 16) != 0) { return 1; }
     if (lower_name_is_number_builtin(name_ptr, name_len, (u64)"number_from_i64", 15) != 0) { return 1; }
     if (lower_name_is_number_builtin(name_ptr, name_len, (u64)"number_from_u64", 15) != 0) { return 1; }
+    if (lower_name_is_number_builtin(name_ptr, name_len, (u64)"number_make_big_handle", 22) != 0) { return 1; }
+    if (lower_name_is_number_builtin(name_ptr, name_len, (u64)"number_from_big_normalized", 26) != 0) { return 1; }
+    if (lower_name_is_number_builtin(name_ptr, name_len, (u64)"number_negated", 14) != 0) { return 1; }
+    if (lower_name_is_number_builtin(name_ptr, name_len, (u64)"number_abs_with_sign", 20) != 0) { return 1; }
+    if (lower_name_is_number_builtin(name_ptr, name_len, (u64)"number_add_values", 17) != 0) { return 1; }
+    if (lower_name_is_number_builtin(name_ptr, name_len, (u64)"number_sub_values", 17) != 0) { return 1; }
+    if (lower_name_is_number_builtin(name_ptr, name_len, (u64)"number_mul_values", 17) != 0) { return 1; }
+    if (lower_name_is_number_builtin(name_ptr, name_len, (u64)"number_div_values", 17) != 0) { return 1; }
+    if (lower_name_is_number_builtin(name_ptr, name_len, (u64)"number_mod_values", 17) != 0) { return 1; }
+    if (lower_name_is_number_builtin(name_ptr, name_len, (u64)"number_mul_small", 16) != 0) { return 1; }
+    if (lower_name_is_number_builtin(name_ptr, name_len, (u64)"number_abs_clone", 16) != 0) { return 1; }
+    if (lower_name_is_number_builtin(name_ptr, name_len, (u64)"number_div_small_abs", 20) != 0) { return 1; }
+    if (lower_name_is_number_builtin(name_ptr, name_len, (u64)"number_pow2", 11) != 0) { return 1; }
+    if (lower_name_is_number_builtin(name_ptr, name_len, (u64)"number_shl_values", 17) != 0) { return 1; }
+    if (lower_name_is_number_builtin(name_ptr, name_len, (u64)"number_bitwise_nonneg_abs", 25) != 0) { return 1; }
+    if (lower_name_is_number_builtin(name_ptr, name_len, (u64)"number_bitwise_values", 21) != 0) { return 1; }
+    if (lower_name_is_number_builtin(name_ptr, name_len, (u64)"number_bitand_values", 20) != 0) { return 1; }
+    if (lower_name_is_number_builtin(name_ptr, name_len, (u64)"number_bitor_values", 19) != 0) { return 1; }
+    if (lower_name_is_number_builtin(name_ptr, name_len, (u64)"number_bitxor_values", 20) != 0) { return 1; }
+    if (lower_name_is_number_builtin(name_ptr, name_len, (u64)"number_bitnot_values", 20) != 0) { return 1; }
+    if (lower_name_is_number_builtin(name_ptr, name_len, (u64)"number_shr_values", 17) != 0) { return 1; }
+    if (lower_name_is_number_builtin(name_ptr, name_len, (u64)"number_clone", 12) != 0) { return 1; }
     if (lower_name_is_number_builtin(name_ptr, name_len, (u64)"number_from_str", 15) != 0) { return 1; }
+    if (lower_name_is_number_builtin(name_ptr, name_len, (u64)"number_input", 12) != 0) { return 1; }
     return 0;
 }
 
@@ -791,13 +897,26 @@ func lower_call_expr_returns_number(call: *AstCall) -> u64 {
     if (lower_name_is_number_returning_builtin(call.name_ptr, call.name_len) != 0) { return 1; }
     var resolved: *NameInfo = resolve_name(call.name_ptr, call.name_len);
     if (resolved != 0 && lower_name_is_number_returning_builtin(resolved.ptr, resolved.len) != 0) { return 1; }
+    var fn: *AstFunc = lower_find_func_signature_for_call(call.name_ptr, call.name_len);
+    if (fn != 0) {
+        var ret_ti: *TypeInfo = lower_make_typeinfo_from_func_return(fn);
+        if (lower_is_number_struct_type(ret_ti) != 0) { return 1; }
+    }
     return 0;
 }
 
 func lower_is_number_struct_type(ti: *TypeInfo) -> u64 {
+    return lower_is_struct_type_named(ti, "Number", 6, "std_number__Number", 18);
+}
+
+func lower_is_string_struct_type(ti: *TypeInfo) -> u64 {
+    return lower_is_struct_type_named(ti, "string", 6, "std_string__string", 18);
+}
+
+func lower_is_struct_type_named(ti: *TypeInfo, local_ptr: u64, local_len: u64, fq_ptr: u64, fq_len: u64) -> u64 {
     if (ti == 0 || ti.type_kind != TYPE_STRUCT || ti.ptr_depth != 0) { return 0; }
-    if (lower_name_is_number_type(ti.struct_name_ptr, ti.struct_name_len) != 0) { return 1; }
-    if (ti.struct_def != 0 && lower_name_is_number_type(ti.struct_def.name_ptr, ti.struct_def.name_len) != 0) { return 1; }
+    if (lower_name_matches_aliases(ti.struct_name_ptr, ti.struct_name_len, local_ptr, local_len, fq_ptr, fq_len) != 0) { return 1; }
+    if (ti.struct_def != 0 && lower_name_matches_aliases(ti.struct_def.name_ptr, ti.struct_def.name_len, local_ptr, local_len, fq_ptr, fq_len) != 0) { return 1; }
     return 0;
 }
 
@@ -814,11 +933,292 @@ func lower_is_integer_literal_expr(expr: *AstNode) -> u64 {
     return 0;
 }
 
+func lower_integer_literal_is_negative(expr: *AstNode) -> u64 {
+    if (expr == 0 || ast_kind(expr) != AST_UNARY) { return 0; }
+    var un: *AstUnary = (*AstUnary)expr;
+    if (un.op == TOKEN_MINUS && un.operand != 0 && ast_kind(un.operand) == AST_LITERAL) {
+        return 1;
+    }
+    return 0;
+}
+
+func lower_integer_literal_magnitude(expr: *AstNode) -> u64 {
+    if (expr == 0) { return 0; }
+    if (ast_kind(expr) == AST_LITERAL) {
+        var lit: *AstLiteral = (*AstLiteral)expr;
+        return lit.value;
+    }
+    if (lower_integer_literal_is_negative(expr) != 0) {
+        var un: *AstUnary = (*AstUnary)expr;
+        var neg_lit: *AstLiteral = (*AstLiteral)un.operand;
+        return neg_lit.value;
+    }
+    return 0;
+}
+
+func lower_unsigned_integer_max(kind: u64) -> u64 {
+    switch (kind) {
+        case TYPE_U8: return 255;
+        case TYPE_U16: return 65535;
+        case TYPE_U32: return 4294967295;
+        case TYPE_U64: return 0 - 1;
+    }
+    return 0;
+}
+
+func lower_signed_integer_positive_max(kind: u64) -> u64 {
+    switch (kind) {
+        case TYPE_I8: return 127;
+        case TYPE_I16: return 32767;
+        case TYPE_I32: return 2147483647;
+        case TYPE_I64: return 9223372036854775807;
+    }
+    return 0;
+}
+
+func lower_signed_integer_negative_max_mag(kind: u64) -> u64 {
+    switch (kind) {
+        case TYPE_I8: return 128;
+        case TYPE_I16: return 32768;
+        case TYPE_I32: return 2147483648;
+        case TYPE_I64: return 9223372036854775808;
+    }
+    return 0;
+}
+
+func lower_integer_literal_fits_type(expr: *AstNode, target_kind: u64) -> u64 {
+    if (lower_is_integer_literal_expr(expr) == 0) { return 0; }
+    var value: u64 = lower_integer_literal_magnitude(expr);
+    if (lower_type_kind_is_unsigned_integer(target_kind) != 0) {
+        if (lower_integer_literal_is_negative(expr) != 0) { return 0; }
+        if (value <= lower_unsigned_integer_max(target_kind)) { return 1; }
+        return 0;
+    }
+    if (lower_type_kind_is_signed_integer(target_kind) != 0) {
+        if (lower_integer_literal_is_negative(expr) != 0) {
+            if (value <= lower_signed_integer_negative_max_mag(target_kind)) { return 1; }
+            return 0;
+        }
+        if (value <= lower_signed_integer_positive_max(target_kind)) { return 1; }
+        return 0;
+    }
+    return 0;
+}
+
 func lower_wrap_integer_literal_to_number(expr: *AstNode) -> *AstNode {
     if (lower_is_integer_literal_expr(expr) == 0) { return 0; }
+    var ctor_ptr: u64 = (u64)"number_from_u64";
+    var ctor_len: u64 = 15;
+    if (lower_integer_literal_is_negative(expr) != 0) {
+        ctor_ptr = (u64)"number_from_i64";
+    }
     var args: *Vec<*AstNode> = new Vec<*AstNode>(1);
     args.push(expr);
-    return (*AstNode)ast_call((u64)"number_from_i64", 15, args);
+    return (*AstNode)ast_call(ctor_ptr, ctor_len, args);
+}
+
+func lower_make_cast_for_typeinfo(expr: *AstNode, expected_ti: *TypeInfo) -> *AstNode {
+    if (expr == 0 || expected_ti == 0) { return expr; }
+    return (*AstNode)ast_cast_ex(expr, expected_ti.type_kind, expected_ti.ptr_depth, expected_ti.is_tagged, expected_ti.struct_name_ptr, expected_ti.struct_name_len, expected_ti.tag_layout_ptr, expected_ti.tag_layout_len);
+}
+
+func lower_expr_already_number_semantic(expr: *AstNode, actual_ti: *TypeInfo) -> u64 {
+    if (expr == 0) { return 0; }
+    if (lower_is_number_struct_type(actual_ti) != 0) { return 1; }
+    var expr_kind: u64 = ast_kind(expr);
+    if (expr_kind == AST_CALL && lower_call_expr_returns_number((*AstCall)expr) != 0) { return 1; }
+    if (expr_kind == AST_BINARY) {
+        var bin: *AstBinary = (*AstBinary)expr;
+        if (lower_is_number_struct_type(lower_operator_receiver_type(bin.left)) != 0) { return 1; }
+        if (lower_is_number_struct_type(lower_operator_receiver_type(bin.right)) != 0) { return 1; }
+    }
+    if (expr_kind == AST_UNARY) {
+        var un: *AstUnary = (*AstUnary)expr;
+        if (lower_is_number_struct_type(lower_operator_receiver_type(un.operand)) != 0) { return 1; }
+    }
+    return 0;
+}
+
+func lower_wrap_integer_expr_to_number(expr: *AstNode, actual_ti: *TypeInfo) -> *AstNode {
+    if (expr == 0) { return 0; }
+    if (lower_is_integer_literal_expr(expr) != 0) {
+        return lower_wrap_integer_literal_to_number(expr);
+    }
+    var expr_kind: u64 = ast_kind(expr);
+    if (expr_kind == AST_STRUCT_LITERAL || expr_kind == AST_GENERIC_STRUCT_LITERAL || expr_kind == AST_STACK_CTOR || expr_kind == AST_NEW) {
+        return 0;
+    }
+    if (expr_kind == AST_CALL && lower_call_expr_returns_number((*AstCall)expr) != 0) {
+        return 0;
+    }
+    if (actual_ti == 0 || actual_ti.ptr_depth != 0) { return 0; }
+    if (lower_expr_already_number_semantic(expr, actual_ti) != 0) { return 0; }
+
+    var ctor_ptr: u64 = 0;
+    var target_kind: u64 = 0;
+    if (lower_type_kind_is_unsigned_integer(actual_ti.type_kind) != 0) {
+        ctor_ptr = (u64)"number_from_u64";
+        target_kind = TYPE_U64;
+    } else if (lower_type_kind_is_signed_integer(actual_ti.type_kind) != 0) {
+        ctor_ptr = (u64)"number_from_i64";
+        target_kind = TYPE_I64;
+    } else {
+        return 0;
+    }
+
+    var arg: *AstNode = expr;
+    if (actual_ti.type_kind != target_kind) {
+        arg = lower_make_scalar_cast(expr, target_kind);
+    }
+    var args: *Vec<*AstNode> = new Vec<*AstNode>(1);
+    args.push(arg);
+    return (*AstNode)ast_call(ctor_ptr, 15, args);
+}
+
+func lower_make_typeinfo_from_vardecl(vd: *AstVarDecl) -> *TypeInfo {
+    if (vd == 0) { return 0; }
+    var ti: *TypeInfo = generic_make_typeinfo_from_fields(vd.type_kind, vd.ptr_depth, vd.is_tagged, vd.struct_name_ptr, vd.struct_name_len, vd.tag_layout_ptr, vd.tag_layout_len, vd.elem_type_kind, vd.elem_ptr_depth, vd.array_len, vd.array_len_is_param, vd.array_len_param_ptr, vd.array_len_param_len);
+    if (ti != 0) { ti.elem_typeinfo = vd.elem_typeinfo; }
+    return ti;
+}
+
+func lower_make_typeinfo_from_param(param: *Param) -> *TypeInfo {
+    if (param == 0) { return 0; }
+    var ti: *TypeInfo = generic_make_typeinfo_from_fields(param.type_kind, param.ptr_depth, param.is_tagged, param.struct_name_ptr, param.struct_name_len, param.tag_layout_ptr, param.tag_layout_len, param.elem_type_kind, param.elem_ptr_depth, param.array_len, param.array_len_is_param, param.array_len_param_ptr, param.array_len_param_len);
+    if (ti != 0) { ti.elem_typeinfo = param.elem_typeinfo; }
+    return ti;
+}
+
+func lower_make_typeinfo_from_func_return(fn: *AstFunc) -> *TypeInfo {
+    if (fn == 0) { return 0; }
+    return generic_make_typeinfo_from_fields(fn.ret_type, fn.ret_ptr_depth, fn.ret_is_tagged, fn.ret_struct_name_ptr, fn.ret_struct_name_len, fn.ret_tag_layout_ptr, fn.ret_tag_layout_len, 0, 0, 0, 0, 0, 0);
+}
+
+func lower_is_direct_input_call(expr: *AstNode) -> *AstCall {
+    if (expr == 0 || ast_kind(expr) != AST_CALL) { return 0; }
+    var call: *AstCall = (*AstCall)expr;
+    if (call.origin != AST_CALL_ORIGIN_DIRECT) { return 0; }
+    if (str_eq(call.name_ptr, call.name_len, "input", 5) == 0) { return 0; }
+    return call;
+}
+
+func lower_input_call_as(call: *AstCall, name_ptr: u64, name_len: u64) -> *AstNode {
+    if (call == 0) { return 0; }
+    return (*AstNode)ast_call_with_origin_named(name_ptr, name_len, call.args_vec, call.arg_names_vec, AST_CALL_ORIGIN_DIRECT);
+}
+
+func lower_parse_sugar_string_literal_for_type(expr: *AstNode, expected_ti: *TypeInfo) -> *AstNode {
+    if (expr == 0 || expected_ti == 0) { return expr; }
+    if (lower_is_string_struct_type(expected_ti) == 0) { return expr; }
+
+    if (ast_kind(expr) == AST_STRING) {
+        return lower_make_direct_call1("string_from_cstr", 16, expr);
+    }
+
+    return expr;
+}
+
+func lower_parse_sugar_input_for_type(expr: *AstNode, expected_ti: *TypeInfo) -> *AstNode {
+    var call: *AstCall = lower_is_direct_input_call(expr);
+    if (call == 0 || expected_ti == 0) { return expr; }
+
+    if (lower_is_string_struct_type(expected_ti) != 0) {
+        return lower_input_call_as(call, "string_input", 12);
+    }
+
+    if (expected_ti.type_kind == TYPE_SLICE && expected_ti.ptr_depth == 0 &&
+        expected_ti.elem_type_kind == TYPE_U8 && expected_ti.elem_ptr_depth == 0) {
+        return lower_input_call_as(call, "input_slice", 11);
+    }
+
+    if (expected_ti.ptr_depth == 1 && expected_ti.type_kind == TYPE_U8) {
+        return (*AstNode)ast_cast_ex(expr, TYPE_U8, 1, 0, 0, 0, 0, 0);
+    }
+
+    if (expected_ti.ptr_depth != 0) {
+        return expr;
+    }
+
+    if (lower_is_number_struct_type(expected_ti) != 0) {
+        return lower_input_call_as(call, "number_input", 12);
+    }
+
+    switch (expected_ti.type_kind) {
+        case TYPE_BOOL:
+            return lower_input_call_as(call, "input_bool", 10);
+        case TYPE_U8:
+            return lower_input_call_as(call, "input_u8", 8);
+        case TYPE_U16:
+            return lower_input_call_as(call, "input_u16", 9);
+        case TYPE_U32:
+            return lower_input_call_as(call, "input_u32", 9);
+        case TYPE_U64:
+            return lower_input_call_as(call, "input_u64", 9);
+        case TYPE_I8:
+            return lower_input_call_as(call, "input_i8", 8);
+        case TYPE_I16:
+            return lower_input_call_as(call, "input_i16", 9);
+        case TYPE_I32:
+            return lower_input_call_as(call, "input_i32", 9);
+        case TYPE_I64:
+            return lower_input_call_as(call, "input_i64", 9);
+        case TYPE_F64:
+            return lower_input_call_as(call, "input_f64", 9);
+    }
+
+    return expr;
+}
+
+func lower_parse_sugar_numeric_for_type(expr: *AstNode, expected_ti: *TypeInfo) -> *AstNode {
+    if (expr == 0 || expected_ti == 0 || expected_ti.ptr_depth != 0) { return expr; }
+
+    var actual_ti: *TypeInfo = generic_infer_expr_type(expr, g_lower_parse_sugar_symtab);
+
+    if (lower_is_number_struct_type(expected_ti) != 0) {
+        var boxed: *AstNode = lower_wrap_integer_expr_to_number(expr, actual_ti);
+        if (boxed != 0) { return boxed; }
+        return expr;
+    }
+
+    if (lower_type_kind_is_integer(expected_ti.type_kind) != 0) {
+        if (actual_ti != 0 && actual_ti.ptr_depth == 0 && actual_ti.type_kind == expected_ti.type_kind) {
+            return expr;
+        }
+
+        if (lower_is_integer_literal_expr(expr) != 0) {
+            if (lower_integer_literal_fits_type(expr, expected_ti.type_kind) != 0) {
+                return lower_make_cast_for_typeinfo(expr, expected_ti);
+            }
+            return expr;
+        }
+
+        if (actual_ti != 0 && actual_ti.ptr_depth == 0 &&
+            lower_can_implicit_integer_widen(actual_ti.type_kind, expected_ti.type_kind) != 0) {
+            return lower_make_cast_for_typeinfo(expr, expected_ti);
+        }
+        return expr;
+    }
+
+    if (expected_ti.type_kind == TYPE_F64) {
+        if (lower_is_integer_literal_expr(expr) != 0) {
+            return lower_make_cast_for_typeinfo(expr, expected_ti);
+        }
+        if (actual_ti != 0 && actual_ti.ptr_depth == 0 &&
+            lower_type_kind_is_integer(actual_ti.type_kind) != 0) {
+            return lower_make_cast_for_typeinfo(expr, expected_ti);
+        }
+    }
+
+    return expr;
+}
+
+func lower_parse_sugar_expr_for_type(expr: *AstNode, expected_ti: *TypeInfo) -> *AstNode {
+    var string_expr: *AstNode = lower_parse_sugar_string_literal_for_type(expr, expected_ti);
+    if (string_expr != expr) { return string_expr; }
+    if (lower_is_direct_input_call(expr) != 0) {
+        return lower_parse_sugar_input_for_type(expr, expected_ti);
+    }
+    return lower_parse_sugar_numeric_for_type(expr, expected_ti);
 }
 
 func lower_parse_sugar_binary_operator(bin: *AstBinary) -> *AstNode {

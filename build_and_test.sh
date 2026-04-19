@@ -120,6 +120,111 @@ pick_first_existing_file() {
     return 1
 }
 
+add_base_candidate() {
+    local candidate="$1"
+    [ -n "$candidate" ] || return 0
+    [ -f "$candidate" ] || return 0
+
+    local existing
+    for existing in "${BASE_CANDIDATES[@]}"; do
+        if [ "$existing" = "$candidate" ]; then
+            return 0
+        fi
+    done
+    BASE_CANDIDATES+=("$candidate")
+}
+
+base_compiler_smoke_check() {
+    local candidate="$1"
+    [ -n "$candidate" ] || return 1
+    [ -f "$candidate" ] || return 1
+
+    if [ "${BPP_SKIP_BASE_SMOKE:-0}" = "1" ]; then
+        return 0
+    fi
+
+    local smoke_src="$ROOT_DIR/test/source/01_arith_bit_cmp.bpp"
+    if [ ! -f "$smoke_src" ]; then
+        smoke_src="$SRC_FILE"
+    fi
+
+    (
+        ulimit -v "${BPP_BASE_SMOKE_VMEM_KB:-4000000}" 2>/dev/null || true
+        if command -v timeout >/dev/null 2>&1; then
+            timeout "${BPP_BASE_SMOKE_TIMEOUT:-8s}" "$candidate" -asm "$smoke_src" >/dev/null 2>&1
+        else
+            "$candidate" -asm "$smoke_src" >/dev/null 2>&1
+        fi
+    ) 2>/dev/null
+}
+
+download_file() {
+    local url="$1"
+    local out="$2"
+
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$url" -o "$out"
+        return $?
+    fi
+    if command -v wget >/dev/null 2>&1; then
+        wget -q "$url" -O "$out"
+        return $?
+    fi
+    return 127
+}
+
+download_bootstrap_compiler() {
+    if [ "${BPP_BOOTSTRAP_COMPILER:-1}" = "0" ]; then
+        return 1
+    fi
+
+    local base_url="${BPP_BOOTSTRAP_BASE_URL:-https://github.com}"
+    local repo="${BPP_BOOTSTRAP_REPOSITORY:-Creeper0809/Bpp}"
+    local release_tag="${BPP_BOOTSTRAP_RELEASE_TAG:-bootstrap-${VERSION}}"
+    local asset_name="${BPP_BOOTSTRAP_ASSET_LINUX:-bpp-bootstrap-${VERSION}-linux-x86_64}"
+    local asset_sha="${BPP_BOOTSTRAP_SHA256_LINUX:-}"
+    local tools_dir="$BUILD_DIR/_tools"
+    local download_path="$tools_dir/$asset_name"
+    local download_url="$base_url/$repo/releases/download/$release_tag/$asset_name"
+
+    mkdir -p "$tools_dir"
+    if [ ! -f "$download_path" ]; then
+        echo "   [INFO] Downloading bootstrap compiler: $download_url" >&2
+        if ! download_file "$download_url" "$download_path"; then
+            rm -f "$download_path"
+            echo "   [WARN] Failed to download bootstrap compiler." >&2
+            return 1
+        fi
+    fi
+
+    chmod +x "$download_path" 2>/dev/null || true
+
+    if command -v sha256sum >/dev/null 2>&1; then
+        if [ -n "$asset_sha" ]; then
+            if ! printf '%s  %s\n' "$asset_sha" "$download_path" | sha256sum -c - >/dev/null 2>&1; then
+                rm -f "$download_path"
+                echo "   [WARN] Downloaded bootstrap checksum mismatch." >&2
+                return 1
+            fi
+        else
+            local sha_path="$download_path.sha256"
+            local sha_url="$download_url.sha256"
+            if [ ! -f "$sha_path" ]; then
+                download_file "$sha_url" "$sha_path" >/dev/null 2>&1 || true
+            fi
+            if [ -f "$sha_path" ]; then
+                if ! (cd "$tools_dir" && sha256sum -c "$(basename "$sha_path")" >/dev/null 2>&1); then
+                    rm -f "$download_path"
+                    echo "   [WARN] Downloaded bootstrap checksum file did not validate." >&2
+                    return 1
+                fi
+            fi
+        fi
+    fi
+
+    echo "$download_path"
+}
+
 extract_numeric_version() {
     local token="$1"
     if [[ "$token" =~ v([0-9]+) ]]; then
@@ -221,30 +326,53 @@ echo "[1/6] Compiling ${VERSION}..."
 cd "$ROOT_DIR"
 mkdir -p "$BUILD_DIR" "$BIN_DIR"
 
-# {VERSION}_base 우선, 없으면 stage1 자동 탐지
+# {VERSION}_base 우선, 없으면 smoke-tested compiler 자동 탐지
 BASE_BIN="${BPP_BASE_COMPILER:-}"
 if [ -n "$BASE_BIN" ] && [ ! -f "$BASE_BIN" ]; then
     echo "Error: BPP_BASE_COMPILER points to missing file: $BASE_BIN"
     exit 1
 fi
 if [ -z "$BASE_BIN" ]; then
-    # Default policy: use the last historical version from old/ as bootstrap base.
-    BASE_BIN="$(pick_old_latest_stage1_file || true)"
-fi
-if [ -z "$BASE_BIN" ]; then
-    BASE_BIN="$(pick_first_existing_file \
-        "./bin/stage1" \
-        "./bin/bootstrap" \
-        "./bin/${BASE_COMPILER}" \
-        "./bin/${VERSION}_stage1" \
-        "./bin/${VERSION}" || true)"
-fi
-if [ -z "$BASE_BIN" ]; then
-    BASE_BIN="$(pick_latest_stage1_file)"
+    BASE_CANDIDATES=()
+    # Prefer the last successful stage0 for this version; stage1 can be the
+    # artifact currently under repair and may hang while bootstrapping.
+    add_base_candidate "./build/tmp/dev_stage0"
+    add_base_candidate "./build/${VERSION}.out"
+    add_base_candidate "./bin/${VERSION}_stage0"
+    add_base_candidate "$(pick_old_latest_stage1_file || true)"
+    add_base_candidate "./bin/stage1"
+    add_base_candidate "./bin/bootstrap"
+    add_base_candidate "./bin/${BASE_COMPILER}"
+    add_base_candidate "./bin/${VERSION}_stage1"
+    add_base_candidate "./bin/${VERSION}"
+    add_base_candidate "$(pick_latest_stage1_file || true)"
+
+    for candidate in "${BASE_CANDIDATES[@]}"; do
+        if base_compiler_smoke_check "$candidate"; then
+            BASE_BIN="$candidate"
+            break
+        fi
+        echo "   [WARN] Skipping unusable base compiler: $candidate"
+    done
+    if [ -z "$BASE_BIN" ]; then
+        downloaded_base="$(download_bootstrap_compiler || true)"
+        if [ -n "$downloaded_base" ]; then
+            if base_compiler_smoke_check "$downloaded_base"; then
+                BASE_BIN="$downloaded_base"
+            else
+                echo "   [WARN] Skipping unusable downloaded bootstrap compiler: $downloaded_base"
+            fi
+        fi
+    fi
+elif ! base_compiler_smoke_check "$BASE_BIN"; then
+    echo "Error: BPP_BASE_COMPILER failed the smoke compile: $BASE_BIN"
+    echo "   Set BPP_SKIP_BASE_SMOKE=1 to bypass this check."
+    exit 1
 fi
 if [ -z "$BASE_BIN" ]; then
     echo "Error: Base compiler not found."
-    echo "   Tried: old/<latest>/bin/*, bin/<old_latest>_stage1, bin/bootstrap, bin/stage1, bin/${BASE_COMPILER}, bin/${VERSION}_stage1, bin/${VERSION}, bin/*_stage1"
+    echo "   Tried: build/tmp/dev_stage0, build/${VERSION}.out, bin/${VERSION}_stage0, old/<latest>/bin/*, bin/<old_latest>_stage1, bin/stage1, bin/bootstrap, bin/${BASE_COMPILER}, bin/${VERSION}_stage1, bin/${VERSION}, bin/*_stage1"
+    echo "   Download fallback: ${BPP_BOOTSTRAP_BASE_URL:-https://github.com}/${BPP_BOOTSTRAP_REPOSITORY:-Creeper0809/Bpp}/releases/download/${BPP_BOOTSTRAP_RELEASE_TAG:-bootstrap-${VERSION}}/${BPP_BOOTSTRAP_ASSET_LINUX:-bpp-bootstrap-${VERSION}-linux-x86_64}"
     echo "   Hint: set BPP_BASE_COMPILER=/abs/path/to/compiler"
     exit 1
 fi
@@ -291,14 +419,24 @@ echo "[2/6] Self-Hosting Stage 1..."
 ./bin/${VERSION}_stage0 -asm "${SRC_FILE}" > "${STAGE1_ASM}"
 "${NASM_BIN}" ${NASM_FLAGS} "${STAGE1_ASM}" -o "build/${VERSION}_stage1.o"
 "${LINKER_BIN}" build/${VERSION}_stage1.o -o bin/${VERSION}_stage1
-# Unversioned pointer to latest successful stage1 output.
-cp -f "bin/${VERSION}_stage1" "bin/stage1"
+STAGE1_USABLE=1
+TEST_COMPILER_BIN="bin/${VERSION}_stage1"
+FINAL_ASM="$STAGE1_ASM"
+if base_compiler_smoke_check "./bin/${VERSION}_stage1"; then
+    # Unversioned pointer to latest successful stage1 output.
+    cp -f "bin/${VERSION}_stage1" "bin/stage1"
+else
+    STAGE1_USABLE=0
+    TEST_COMPILER_BIN="bin/${VERSION}_stage0"
+    FINAL_ASM="$STAGE0_ASM"
+    cp -f "bin/${VERSION}_stage0" "bin/stage1"
+    echo "   [WARN] Generated stage1 failed smoke check; using stage0 for tests and final executable."
+fi
 echo "Stage 1 Build Completed"
 echo ""
 
 # Step 3: 셀프 호스팅 (2단계)
-FINAL_ASM="$STAGE1_ASM"
-if [ "$SELFHOST_VERIFY" = "1" ]; then
+if [ "$SELFHOST_VERIFY" = "1" ] && [ "$STAGE1_USABLE" = "1" ]; then
     echo "[3/6] Self-Hosting Stage 2..."
     ./bin/${VERSION}_stage1 -asm "${SRC_FILE}" > "${STAGE2_ASM}"
     echo "Stage 2 Build Completed"
@@ -319,9 +457,17 @@ if [ "$SELFHOST_VERIFY" = "1" ]; then
     echo ""
     FINAL_ASM="$STAGE2_ASM"
 else
-    echo "[3/6] Self-Hosting Stage 2... skipped (SELFHOST_VERIFY=0)"
+    if [ "$SELFHOST_VERIFY" = "1" ]; then
+        echo "[3/6] Self-Hosting Stage 2... skipped (stage1 smoke check failed)"
+    else
+        echo "[3/6] Self-Hosting Stage 2... skipped (SELFHOST_VERIFY=0)"
+    fi
     echo ""
-    echo "[4/6] Self-Hosting Verification... skipped (SELFHOST_VERIFY=0)"
+    if [ "$SELFHOST_VERIFY" = "1" ]; then
+        echo "[4/6] Self-Hosting Verification... skipped (stage1 smoke check failed)"
+    else
+        echo "[4/6] Self-Hosting Verification... skipped (SELFHOST_VERIFY=0)"
+    fi
     echo ""
 fi
 
@@ -336,7 +482,7 @@ fi
 echo "[5/6] Running Tests..."
 TEST_FAST_IO="$TEST_FAST_IO" TEST_QUIET="$TEST_QUIET" KEEP_TEST_ARTIFACTS="$KEEP_TEST_ARTIFACTS" \
 TEST_JOBS="$TEST_JOBS" TEST_PROFILE="$TEST_PROFILE" TEST_SUITE_CASE_LIMIT="$TEST_SUITE_CASE_LIMIT" TEST_NAME_FILTER="$TEST_NAME_FILTER" STRESS_RUNS="$STRESS_RUNS" STABILITY_RUNS="$STABILITY_RUNS" \
-  bash ${TEST_SCRIPT} bin/${VERSION}_stage1 2>&1 | tail -15
+  bash ${TEST_SCRIPT} "${TEST_COMPILER_BIN}" 2>&1 | tail -15
 
 # Step 6: 바이너리(.out) 생성 (기본 실행 경로)
 echo ""

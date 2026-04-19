@@ -45,6 +45,10 @@ Bpp/
 
 ### Linux
 ```bash
+# Target selection is plumbed through the CLI/config now, but codegen/runtime
+# are still implemented only for linux-x86_64.
+# Example: ./bin/stage1 --target linux-x86_64 hello.bpp
+
 # Configure toolchain + bootstrap compiler download metadata
 cmake -S . -B build-linux
 
@@ -72,6 +76,12 @@ cmake --build build-win --target toolchain-check windows-smoke
 # Optional: run hosted Windows test pipeline when a Windows stage compiler exists
 .\build_and_test.ps1
 ```
+
+`--target windows-x86_64` is wired through the front-end and Windows runner.
+The hosted Windows path is still being rebuilt, but the runtime/link entry
+plumbing now follows the Windows target path instead of the Linux default.
+On Windows, `build_and_test.ps1` now rebuilds `stage0.exe` and `stage1.exe`
+from the seed compiler before invoking the test runner.
 
 If `link.exe` is missing, install Visual Studio Build Tools:
 https://aka.ms/vs/17/release/vs_BuildTools.exe

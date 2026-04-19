@@ -17,6 +17,7 @@ import emitter.emitter;
 import emitter.symtab;
 import emitter.typeinfo;
 import compiler;
+import compiler.runtime_api;
 import compiler.core_utils;
 import compiler.generic.engine;
 import compiler.symbol_runtime;
@@ -24,8 +25,8 @@ import compiler.symbol_runtime;
 const SSA_CODEGEN_DEBUG = 0;
 
 var g_live_mask_map: *Vec<u64>;
-var g_last_lea_local_off;
-var g_last_lea_local_valid;
+var g_last_lea_local_off: u64;
+var g_last_lea_local_valid: u64;
 
 const SSA_LIVE_RAX = 1;
 const SSA_LIVE_RBX = 2;
@@ -314,25 +315,30 @@ func call_slice_store_emit(info_ptr: u64, addr_opr: u64, live_mask: u64) -> u64 
     var layout: SSACallStackLayout = call_prepare_stack_layout(nargs, save_words, 1);
     var reg_count: u64 = layout.reg_count;
     var stack_args: u64 = layout.stack_args;
-    var align_pad: u64 = layout.align_pad;
+    var reserve_words: u64 = layout.reserve_words;
 
     emit_push_reg(operand_value(addr_opr));
     call_emit_push_args(args_vec, nargs);
 
     call_emit_pop_arg_regs(reg_count);
+    if (reserve_words > 0) {
+        emit("    sub rsp, ");
+        emit_u64(reserve_words * 8);
+        emit_nl();
+    }
 
     call_emit_target(info.is_ptr, info.callee_reg, info.name_ptr, info.name_len);
 
     emit("    mov rbx, [rsp");
-    if (stack_args > 0) {
+    if (reserve_words + stack_args > 0) {
         emit("+");
-        emit_u64(stack_args * 8);
+        emit_u64((reserve_words + stack_args) * 8);
     }
     emit("]\n");
     emit("    mov [rbx], rax\n");
     emit("    mov [rbx+8], rdx\n");
     emit("    add rsp, ");
-    emit_u64((stack_args + 1 + align_pad) * 8);
+    emit_u64((stack_args + 1 + reserve_words) * 8);
     emit_nl();
 
     call_emit_restore_regs(save_mask, 0);
@@ -1078,12 +1084,11 @@ func call_emit_restore_regs(save_mask: u64, dest: u64) -> u64 {
 
 func call_emit_pop_arg_reg(idx: u64) -> u64 {
     emit("    pop ");
-    if (idx == 0) { emit("rdi"); }
-    else if (idx == 1) { emit("rsi"); }
-    else if (idx == 2) { emit("rdx"); }
-    else if (idx == 3) { emit("rcx"); }
-    else if (idx == 4) { emit("r8"); }
-    else if (idx == 5) { emit("r9"); }
+    var reg_name: u64 = compiler_target_user_arg_reg_name(idx, 0);
+    var reg_len: u64 = compiler_target_user_arg_reg_name_len(idx, 0);
+    if (reg_name != 0 && reg_len != 0) {
+        emit_len(reg_name, reg_len);
+    }
     emit_nl();
     return 0;
 }
@@ -1109,22 +1114,23 @@ struct SSACallStackLayout {
     public reg_count: u64;
     public stack_args: u64;
     public align_pad: u64;
+    public reserve_words: u64;
 }
 
 func call_prepare_stack_layout(nargs: u64, save_words: u64, extra_words: u64) -> SSACallStackLayout {
     var layout: SSACallStackLayout;
     var reg_count: u64 = nargs;
-    if (reg_count > 6) { reg_count = 6; }
+    var reg_limit: u64 = compiler_target_user_arg_reg_limit(0);
+    if (reg_count > reg_limit) { reg_count = reg_limit; }
     var stack_args: u64 = nargs - reg_count;
+    var shadow_words: u64 = compiler_target_call_shadow_words();
     var align_pad: u64 = 0;
-    var call_stack_words: u64 = save_words + stack_args + extra_words;
-    if ((call_stack_words % 2) != 0) {
-        emit("    sub rsp, 8\n");
-        align_pad = 1;
-    }
+    var call_stack_words: u64 = save_words + stack_args + extra_words + shadow_words;
+    if ((shadow_words != 0 || stack_args == 0) && (call_stack_words % 2) != 0) { align_pad = 1; }
     layout.reg_count = reg_count;
     layout.stack_args = stack_args;
     layout.align_pad = align_pad;
+    layout.reserve_words = shadow_words + align_pad;
     return layout;
 }
 
@@ -1133,6 +1139,55 @@ func call_emit_target(is_ptr: u64, callee_reg: u64, name_ptr: u64, name_len: u64
     if (is_ptr != 0) { emit_reg_name(callee_reg); }
     else { emit_len(name_ptr, name_len); }
     emit_nl();
+    return 0;
+}
+
+func emit_target_user_arg_reg_name(idx: u64) -> u64 {
+    var reg_name: u64 = compiler_target_user_arg_reg_name(idx, 0);
+    var reg_len: u64 = compiler_target_user_arg_reg_name_len(idx, 0);
+    if (reg_name != 0 && reg_len != 0) {
+        emit_len(reg_name, reg_len);
+    }
+    return 0;
+}
+
+func emit_target_mov_user_arg_from_reg_name(idx: u64, src_ptr: u64, src_len: u64) -> u64 {
+    emit("    mov ");
+    emit_target_user_arg_reg_name(idx);
+    emit(", ");
+    emit_len(src_ptr, src_len);
+    emit_nl();
+    return 0;
+}
+
+func emit_target_mov_user_arg_imm_u64(idx: u64, value: u64) -> u64 {
+    emit("    mov ");
+    emit_target_user_arg_reg_name(idx);
+    emit(", ");
+    emit_u64(value);
+    emit_nl();
+    return 0;
+}
+
+func emit_target_call_named(name_ptr: u64, name_len: u64, stack_words: u64, extra_words: u64) -> u64 {
+    var shadow_words: u64 = compiler_target_call_shadow_words();
+    var reserve_words: u64 = shadow_words;
+    if ((shadow_words != 0 || stack_words == 0) && ((stack_words + extra_words + reserve_words) % 2) != 0) {
+        reserve_words = reserve_words + 1;
+    }
+    if (reserve_words > 0) {
+        emit("    sub rsp, ");
+        emit_u64(reserve_words * 8);
+        emit_nl();
+    }
+    emit("    call ");
+    emit_len(name_ptr, name_len);
+    emit_nl();
+    if (stack_words + reserve_words > 0) {
+        emit("    add rsp, ");
+        emit_u64((stack_words + reserve_words) * 8);
+        emit_nl();
+    }
     return 0;
 }
 
@@ -1162,10 +1217,15 @@ func emit_call_common(
     var layout2: SSACallStackLayout = call_prepare_stack_layout(nargs, save_words, 0);
     var reg_count: u64 = layout2.reg_count;
     var stack_args: u64 = layout2.stack_args;
-    var align_pad: u64 = layout2.align_pad;
+    var reserve_words: u64 = layout2.reserve_words;
 
     call_emit_push_args(args_vec, nargs);
     call_emit_pop_arg_regs(reg_count);
+    if (reserve_words > 0) {
+        emit("    sub rsp, ");
+        emit_u64(reserve_words * 8);
+        emit_nl();
+    }
 
     call_emit_target(is_ptr, callee_reg, name_ptr, name_len);
 
@@ -1180,9 +1240,9 @@ func emit_call_common(
         }
     }
 
-    if (stack_args + align_pad > 0) {
+    if (stack_args + reserve_words > 0) {
         emit("    add rsp, ");
-        emit_u64((stack_args + align_pad) * 8);
+        emit_u64((stack_args + reserve_words) * 8);
         emit_nl();
     }
 
@@ -1805,16 +1865,15 @@ func ret_slice_heap_emit_alloc_copy_and_ret(elem_size: u64) -> u64 {
     emit("    jne ");
     emit_label(init_label);
     emit_nl();
-    emit("    mov rax, 12\n");
-    emit("    xor rdi, rdi\n");
-    emit("    syscall\n");
+    emit_target_mov_user_arg_imm_u64(0, 0);
+    emit_target_call_named("std_os__os_sys_brk", str_len("std_os__os_sys_brk"), 0, 0);
     emit("    mov [_gvar___cg_heap_brk], rax\n");
     emit_label_def(init_label);
     emit("    mov rbx, [_gvar___cg_heap_brk]\n");
     emit("    mov rdi, rbx\n");
     emit("    add rdi, r8\n");
-    emit("    mov rax, 12\n");
-    emit("    syscall\n");
+    emit_target_mov_user_arg_from_reg_name(0, "rdi", 3);
+    emit_target_call_named("std_os__os_sys_brk", str_len("std_os__os_sys_brk"), 0, 0);
     emit("    cmp rax, rdi\n");
     emit("    jb ");
     emit_label(fail_label);
@@ -2059,14 +2118,15 @@ func emit_inst_try_lea_param(op: u64, inst: *SSAInstruction) -> u64 {
     }
     if (op == SSA_OP_PARAM) {
         var idx: u64 = operand_value(inst.src1);
+        var reg_limit: u64 = compiler_target_raw_arg_reg_limit();
         emit("    mov ");
         emit_reg_name(inst.dest);
-        if (idx <= 5) {
+        if (idx < reg_limit) {
             var save_offset: u64 = 1032 + idx * 8;
             emit(", [rbp-");
             emit_u64(save_offset);
         } else {
-            var offset: u64 = 16 + (idx - 6) * 8;
+            var offset: u64 = compiler_target_stack_arg_base_offset() + (idx - reg_limit) * 8;
             emit(", [rbp+");
             emit_u64(offset);
         }
@@ -2187,12 +2247,22 @@ func func_prologue_emit(fn: *AstFunc, frame_size: u64) -> u64 {
     emit("    sub rsp, ");
     emit_u64(frame_size);
     emit_nl();
-    emit("    mov [rbp-1032], rdi\n");
-    emit("    mov [rbp-1040], rsi\n");
-    emit("    mov [rbp-1048], rdx\n");
-    emit("    mov [rbp-1056], rcx\n");
-    emit("    mov [rbp-1064], r8\n");
-    emit("    mov [rbp-1072], r9\n");
+    for (var arg_idx: u64 = 0; arg_idx < 6; arg_idx++) {
+        var save_offset: u64 = 1032 + arg_idx * 8;
+        var reg_name: u64 = compiler_target_raw_arg_reg_name(arg_idx);
+        var reg_len: u64 = compiler_target_raw_arg_reg_name_len(arg_idx);
+        if (reg_name != 0 && reg_len != 0) {
+            emit("    mov [rbp-");
+            emit_u64(save_offset);
+            emit("], ");
+            emit_len(reg_name, reg_len);
+            emit_nl();
+        } else {
+            emit("    mov qword [rbp-");
+            emit_u64(save_offset);
+            emit("], 0\n");
+        }
+    }
     return 0;
 }
 
