@@ -158,6 +158,73 @@ base_compiler_smoke_check() {
     ) 2>/dev/null
 }
 
+download_file() {
+    local url="$1"
+    local out="$2"
+
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$url" -o "$out"
+        return $?
+    fi
+    if command -v wget >/dev/null 2>&1; then
+        wget -q "$url" -O "$out"
+        return $?
+    fi
+    return 127
+}
+
+download_bootstrap_compiler() {
+    if [ "${BPP_BOOTSTRAP_COMPILER:-1}" = "0" ]; then
+        return 1
+    fi
+
+    local base_url="${BPP_BOOTSTRAP_BASE_URL:-https://github.com}"
+    local repo="${BPP_BOOTSTRAP_REPOSITORY:-Creeper0809/Bpp}"
+    local release_tag="${BPP_BOOTSTRAP_RELEASE_TAG:-bootstrap-${VERSION}}"
+    local asset_name="${BPP_BOOTSTRAP_ASSET_LINUX:-bpp-bootstrap-${VERSION}-linux-x86_64}"
+    local asset_sha="${BPP_BOOTSTRAP_SHA256_LINUX:-}"
+    local tools_dir="$BUILD_DIR/_tools"
+    local download_path="$tools_dir/$asset_name"
+    local download_url="$base_url/$repo/releases/download/$release_tag/$asset_name"
+
+    mkdir -p "$tools_dir"
+    if [ ! -f "$download_path" ]; then
+        echo "   [INFO] Downloading bootstrap compiler: $download_url" >&2
+        if ! download_file "$download_url" "$download_path"; then
+            rm -f "$download_path"
+            echo "   [WARN] Failed to download bootstrap compiler." >&2
+            return 1
+        fi
+    fi
+
+    chmod +x "$download_path" 2>/dev/null || true
+
+    if command -v sha256sum >/dev/null 2>&1; then
+        if [ -n "$asset_sha" ]; then
+            if ! printf '%s  %s\n' "$asset_sha" "$download_path" | sha256sum -c - >/dev/null 2>&1; then
+                rm -f "$download_path"
+                echo "   [WARN] Downloaded bootstrap checksum mismatch." >&2
+                return 1
+            fi
+        else
+            local sha_path="$download_path.sha256"
+            local sha_url="$download_url.sha256"
+            if [ ! -f "$sha_path" ]; then
+                download_file "$sha_url" "$sha_path" >/dev/null 2>&1 || true
+            fi
+            if [ -f "$sha_path" ]; then
+                if ! (cd "$tools_dir" && sha256sum -c "$(basename "$sha_path")" >/dev/null 2>&1); then
+                    rm -f "$download_path"
+                    echo "   [WARN] Downloaded bootstrap checksum file did not validate." >&2
+                    return 1
+                fi
+            fi
+        fi
+    fi
+
+    echo "$download_path"
+}
+
 extract_numeric_version() {
     local token="$1"
     if [[ "$token" =~ v([0-9]+) ]]; then
@@ -287,6 +354,16 @@ if [ -z "$BASE_BIN" ]; then
         fi
         echo "   [WARN] Skipping unusable base compiler: $candidate"
     done
+    if [ -z "$BASE_BIN" ]; then
+        downloaded_base="$(download_bootstrap_compiler || true)"
+        if [ -n "$downloaded_base" ]; then
+            if base_compiler_smoke_check "$downloaded_base"; then
+                BASE_BIN="$downloaded_base"
+            else
+                echo "   [WARN] Skipping unusable downloaded bootstrap compiler: $downloaded_base"
+            fi
+        fi
+    fi
 elif ! base_compiler_smoke_check "$BASE_BIN"; then
     echo "Error: BPP_BASE_COMPILER failed the smoke compile: $BASE_BIN"
     echo "   Set BPP_SKIP_BASE_SMOKE=1 to bypass this check."
@@ -294,7 +371,8 @@ elif ! base_compiler_smoke_check "$BASE_BIN"; then
 fi
 if [ -z "$BASE_BIN" ]; then
     echo "Error: Base compiler not found."
-    echo "   Tried: bin/${VERSION}_stage0, old/<latest>/bin/*, bin/<old_latest>_stage1, bin/bootstrap, bin/stage1, bin/${BASE_COMPILER}, bin/${VERSION}_stage1, bin/${VERSION}, bin/*_stage1"
+    echo "   Tried: build/tmp/dev_stage0, build/${VERSION}.out, bin/${VERSION}_stage0, old/<latest>/bin/*, bin/<old_latest>_stage1, bin/stage1, bin/bootstrap, bin/${BASE_COMPILER}, bin/${VERSION}_stage1, bin/${VERSION}, bin/*_stage1"
+    echo "   Download fallback: ${BPP_BOOTSTRAP_BASE_URL:-https://github.com}/${BPP_BOOTSTRAP_REPOSITORY:-Creeper0809/Bpp}/releases/download/${BPP_BOOTSTRAP_RELEASE_TAG:-bootstrap-${VERSION}}/${BPP_BOOTSTRAP_ASSET_LINUX:-bpp-bootstrap-${VERSION}-linux-x86_64}"
     echo "   Hint: set BPP_BASE_COMPILER=/abs/path/to/compiler"
     exit 1
 fi
