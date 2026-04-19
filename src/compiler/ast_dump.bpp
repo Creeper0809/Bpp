@@ -1,0 +1,1828 @@
+// compiler_ast_dump.b - AST text and Graphviz DOT dumps
+
+import std.io;
+import std.util;
+import std.vec;
+import std.str;
+import compiler;
+import module_utils;
+import ast;
+import types;
+
+struct AstDumpFilter {
+    public func_ptr: u64;
+    public func_len: u64;
+    public module_ptr: u64;
+    public module_len: u64;
+    public no_std: u64;
+}
+
+impl AstDumpFilter {
+    public constructor() {
+        self.func_ptr = 0;
+        self.func_len = 0;
+        self.module_ptr = 0;
+        self.module_len = 0;
+        self.no_std = 0;
+    }
+}
+
+func ast_dump_indent(depth: u64) -> u64 {
+    for (var i: u64 = 0; i < depth; i++) {
+        emit("  ");
+    }
+    return 0;
+}
+
+func ast_dump_name(ptr: u64, len: u64) -> u64 {
+    if (ptr == 0 || len == 0) {
+        emit("<anon>");
+        return 0;
+    }
+    emit_len(ptr, len);
+    return 0;
+}
+
+func ast_dump_type_base(type_kind: u64, struct_name_ptr: u64, struct_name_len: u64) -> u64 {
+    switch (type_kind) {
+        case TYPE_VOID: emit("void"); break;
+        case TYPE_U8: emit("u8"); break;
+        case TYPE_U16: emit("u16"); break;
+        case TYPE_U32: emit("u32"); break;
+        case TYPE_U64: emit("u64"); break;
+        case TYPE_I8: emit("i8"); break;
+        case TYPE_I16: emit("i16"); break;
+        case TYPE_I32: emit("i32"); break;
+        case TYPE_I64: emit("i64"); break;
+        case TYPE_F64: emit("f64"); break;
+        case TYPE_BOOL: emit("bool"); break;
+        case TYPE_PTR: emit("ptr"); break;
+        case TYPE_STRUCT:
+            emit("struct ");
+            ast_dump_name(struct_name_ptr, struct_name_len);
+            break;
+        case TYPE_GENERIC:
+            emit("generic ");
+            ast_dump_name(struct_name_ptr, struct_name_len);
+            break;
+        case TYPE_TRAIT:
+            emit("trait ");
+            ast_dump_name(struct_name_ptr, struct_name_len);
+            break;
+        case TYPE_FUNC: emit("func"); break;
+        case TYPE_NULL: emit("null"); break;
+        default:
+            emit("type#");
+            emit_u64(type_kind);
+            break;
+    }
+    return 0;
+}
+
+func ast_dump_type_core(type_kind: u64, ptr_depth: u64, struct_name_ptr: u64, struct_name_len: u64,
+                        elem_type_kind: u64, elem_ptr_depth: u64, array_len: u64,
+                        array_len_is_param: u64, array_len_param_ptr: u64, array_len_param_len: u64) -> u64 {
+    for (var i: u64 = 0; i < ptr_depth; i++) {
+        emit("*");
+    }
+    if (type_kind == TYPE_ARRAY) {
+        emit("[");
+        if (array_len_is_param != 0) {
+            ast_dump_name(array_len_param_ptr, array_len_param_len);
+        } else {
+            emit_u64(array_len);
+        }
+        emit("]");
+        ast_dump_type_core(elem_type_kind, elem_ptr_depth, struct_name_ptr, struct_name_len, 0, 0, 0, 0, 0, 0);
+        return 0;
+    }
+    if (type_kind == TYPE_SLICE) {
+        emit("[]");
+        ast_dump_type_core(elem_type_kind, elem_ptr_depth, struct_name_ptr, struct_name_len, 0, 0, 0, 0, 0, 0);
+        return 0;
+    }
+    ast_dump_type_base(type_kind, struct_name_ptr, struct_name_len);
+    return 0;
+}
+
+func ast_dump_typeinfo(ti: *TypeInfo) -> u64 {
+    if (ti == 0) {
+        emit("<unknown>");
+        return 0;
+    }
+    return ast_dump_type_core(ti.type_kind, ti.ptr_depth, ti.struct_name_ptr, ti.struct_name_len,
+                              ti.elem_type_kind, ti.elem_ptr_depth, ti.array_len,
+                              ti.array_len_is_param, ti.array_len_param_ptr, ti.array_len_param_len);
+}
+
+func ast_dump_param_type(param: *Param) -> u64 {
+    if (param == 0) {
+        emit("<unknown>");
+        return 0;
+    }
+    return ast_dump_type_core(param.type_kind, param.ptr_depth, param.struct_name_ptr, param.struct_name_len,
+                              param.elem_type_kind, param.elem_ptr_depth, param.array_len,
+                              param.array_len_is_param, param.array_len_param_ptr, param.array_len_param_len);
+}
+
+func ast_dump_field_type(field: *FieldDesc) -> u64 {
+    if (field == 0) {
+        emit("<unknown>");
+        return 0;
+    }
+    return ast_dump_type_core(field.type_kind, field.ptr_depth, field.struct_name_ptr, field.struct_name_len,
+                              field.elem_type_kind, field.elem_ptr_depth, field.array_len, 0, 0, 0);
+}
+
+func ast_dump_func_return_type(fn: *AstFunc) -> u64 {
+    if (fn == 0) {
+        emit("<unknown>");
+        return 0;
+    }
+    return ast_dump_type_core(fn.ret_type, fn.ret_ptr_depth, fn.ret_struct_name_ptr, fn.ret_struct_name_len, 0, 0, 0, 0, 0, 0);
+}
+
+func ast_dump_filter_is_active(filter: *AstDumpFilter) -> u64 {
+    if (filter == 0) { return 0; }
+    if (filter.func_ptr != 0 && filter.func_len != 0) { return 1; }
+    if (filter.module_ptr != 0 && filter.module_len != 0) { return 1; }
+    if (filter.no_std != 0) { return 1; }
+    return 0;
+}
+
+func ast_dump_filter_include_static_sections(filter: *AstDumpFilter) -> u64 {
+    if (ast_dump_filter_is_active(filter) != 0) { return 0; }
+    return 1;
+}
+
+func ast_dump_name_matches_filter(name_ptr: u64, name_len: u64, filter_ptr: u64, filter_len: u64) -> u64 {
+    if (filter_ptr == 0 || filter_len == 0) { return 1; }
+    if (name_len == filter_len && str_eq(name_ptr, name_len, filter_ptr, filter_len) != 0) { return 1; }
+    if (name_len > filter_len + 2) {
+        var suffix_start: u64 = name_len - filter_len;
+        var name_u8: []u8 = slice(name_ptr, name_len);
+        if (name_u8[suffix_start - 1] == 95 && name_u8[suffix_start - 2] == 95) {
+            if (str_eq(name_ptr + suffix_start, filter_len, filter_ptr, filter_len) != 0) { return 1; }
+        }
+    }
+    return 0;
+}
+
+func ast_dump_func_module(fn: *AstFunc) -> *NameInfo {
+    if (fn == 0 || g_compiler_ctx.func_module_map == 0) { return 0; }
+    return g_compiler_ctx.func_module_map.get(fn.name_ptr, fn.name_len);
+}
+
+func ast_dump_global_module(ginfo: *GlobalInfo) -> *NameInfo {
+    if (ginfo == 0 || g_compiler_ctx.global_module_map == 0) { return 0; }
+    return g_compiler_ctx.global_module_map.get(ginfo.name_ptr, ginfo.name_len);
+}
+
+func ast_dump_filter_accept_module(info: *NameInfo, filter: *AstDumpFilter) -> u64 {
+    if (filter == 0) { return 1; }
+    if (filter.no_std != 0 && info != 0 && module_util_is_std_path(info.ptr, info.len) != 0) {
+        return 0;
+    }
+    if (filter.module_ptr != 0 && filter.module_len != 0) {
+        if (info == 0) { return 0; }
+        if (str_eq(info.ptr, info.len, filter.module_ptr, filter.module_len) == 0) { return 0; }
+    }
+    return 1;
+}
+
+func ast_dump_filter_accept_func(fn: *AstFunc, filter: *AstDumpFilter) -> u64 {
+    if (fn == 0) { return 0; }
+    if (filter == 0) { return 1; }
+    if (filter.func_ptr != 0 && filter.func_len != 0) {
+        if (ast_dump_name_matches_filter(fn.name_ptr, fn.name_len, filter.func_ptr, filter.func_len) == 0) { return 0; }
+    }
+    return ast_dump_filter_accept_module(ast_dump_func_module(fn), filter);
+}
+
+func ast_dump_filter_accept_global(ginfo: *GlobalInfo, filter: *AstDumpFilter) -> u64 {
+    if (ginfo == 0) { return 0; }
+    if (filter == 0) { return 1; }
+    if (filter.func_ptr != 0 && filter.func_len != 0) { return 0; }
+    return ast_dump_filter_accept_module(ast_dump_global_module(ginfo), filter);
+}
+
+func ast_dump_filter_func_count(funcs: *Vec<*AstFunc>, filter: *AstDumpFilter) -> u64 {
+    if (funcs == 0) { return 0; }
+    var count: u64 = 0;
+    var n: u64 = funcs.len();
+    for (var i: u64 = 0; i < n; i++) {
+        if (ast_dump_filter_accept_func(funcs.get(i), filter) != 0) { count = count + 1; }
+    }
+    return count;
+}
+
+func ast_dump_filter_global_count(globals: *Vec<*GlobalInfo>, filter: *AstDumpFilter) -> u64 {
+    if (globals == 0) { return 0; }
+    var count: u64 = 0;
+    var n: u64 = globals.len();
+    for (var i: u64 = 0; i < n; i++) {
+        if (ast_dump_filter_accept_global(globals.get(i), filter) != 0) { count = count + 1; }
+    }
+    return count;
+}
+
+func ast_dump_op(op: u64) -> u64 {
+    switch (op) {
+        case TOKEN_PLUS: emit("+"); break;
+        case TOKEN_MINUS: emit("-"); break;
+        case TOKEN_STAR: emit("*"); break;
+        case TOKEN_SLASH: emit("/"); break;
+        case TOKEN_PERCENT: emit("%"); break;
+        case TOKEN_CARET: emit("^"); break;
+        case TOKEN_AMPERSAND: emit("&"); break;
+        case TOKEN_BANG: emit("!"); break;
+        case TOKEN_EQ: emit("="); break;
+        case TOKEN_EQEQ: emit("=="); break;
+        case TOKEN_BANGEQ: emit("!="); break;
+        case TOKEN_LT: emit("<"); break;
+        case TOKEN_GT: emit(">"); break;
+        case TOKEN_LTEQ: emit("<="); break;
+        case TOKEN_GTEQ: emit(">="); break;
+        case TOKEN_PIPE: emit("|"); break;
+        case TOKEN_LSHIFT: emit("<<"); break;
+        case TOKEN_RSHIFT: emit(">>"); break;
+        case TOKEN_ANDAND: emit("&&"); break;
+        case TOKEN_OROR: emit("||"); break;
+        case TOKEN_PLUSPLUS: emit("++"); break;
+        case TOKEN_MINUSMINUS: emit("--"); break;
+        case TOKEN_PLUS_EQ: emit("+="); break;
+        case TOKEN_MINUS_EQ: emit("-="); break;
+        case TOKEN_STAR_EQ: emit("*="); break;
+        case TOKEN_SLASH_EQ: emit("/="); break;
+        case TOKEN_PERCENT_EQ: emit("%="); break;
+        case TOKEN_TILDE: emit("~"); break;
+        default:
+            emit("op#");
+            emit_u64(op);
+            break;
+    }
+    return 0;
+}
+
+func ast_dump_node_kind_name(kind: u64) -> u64 {
+    switch (kind) {
+        case AST_LITERAL: emit("Literal"); break;
+        case AST_IDENT: emit("Ident"); break;
+        case AST_BINARY: emit("Binary"); break;
+        case AST_UNARY: emit("Unary"); break;
+        case AST_CALL: emit("Call"); break;
+        case AST_ADDR_OF: emit("AddrOf"); break;
+        case AST_DEREF: emit("Deref"); break;
+        case AST_DEREF8: emit("Deref8"); break;
+        case AST_CAST: emit("Cast"); break;
+        case AST_STRING: emit("String"); break;
+        case AST_MEMBER_ACCESS: emit("MemberAccess"); break;
+        case AST_SAFE_MEMBER_ACCESS: emit("SafeMemberAccess"); break;
+        case AST_STRUCT_LITERAL: emit("StructLiteral"); break;
+        case AST_GENERIC_STRUCT_LITERAL: emit("GenericStructLiteral"); break;
+        case AST_SIZEOF: emit("Sizeof"); break;
+        case AST_SIZEOF_EXPR: emit("SizeofExpr"); break;
+        case AST_METHOD_CALL: emit("MethodCall"); break;
+        case AST_SAFE_METHOD_CALL: emit("SafeMethodCall"); break;
+        case AST_STATIC_GENERIC_CALL: emit("StaticGenericCall"); break;
+        case AST_INDEX: emit("Index"); break;
+        case AST_SAFE_INDEX: emit("SafeIndex"); break;
+        case AST_SLICE: emit("Slice"); break;
+        case AST_CALL_PTR: emit("CallPtr"); break;
+        case AST_TRY: emit("Try"); break;
+        case AST_FLOAT: emit("Float"); break;
+        case AST_SUPER: emit("Super"); break;
+        case AST_TERNARY: emit("Ternary"); break;
+        case AST_RETURN: emit("Return"); break;
+        case AST_VAR_DECL: emit("VarDecl"); break;
+        case AST_CONST_DECL: emit("ConstDecl"); break;
+        case AST_ASSIGN: emit("Assign"); break;
+        case AST_EXPR_STMT: emit("ExprStmt"); break;
+        case AST_IF: emit("If"); break;
+        case AST_WHILE: emit("While"); break;
+        case AST_FOR: emit("For"); break;
+        case AST_DO_WHILE: emit("DoWhile"); break;
+        case AST_SWITCH: emit("Switch"); break;
+        case AST_MATCH: emit("Match"); break;
+        case AST_CASE: emit("Case"); break;
+        case AST_BREAK: emit("Break"); break;
+        case AST_CONTINUE: emit("Continue"); break;
+        case AST_BLOCK: emit("Block"); break;
+        case AST_ASM: emit("Asm"); break;
+        case AST_ALIAS: emit("Alias"); break;
+        case AST_DEFER: emit("Defer"); break;
+        case AST_DELETE: emit("Delete"); break;
+        case AST_NEW: emit("New"); break;
+        case AST_STACK_CTOR: emit("StackCtor"); break;
+        case AST_TRY_STMT: emit("TryStmt"); break;
+        case AST_THROW_STMT: emit("ThrowStmt"); break;
+        default:
+            emit("Ast#");
+            emit_u64(kind);
+            break;
+    }
+    return 0;
+}
+
+func ast_dump_child(title: u64, node: *AstNode, depth: u64) -> u64;
+
+func ast_dump_node_vec(title: u64, items: *Vec<*AstNode>, depth: u64) -> u64 {
+    ast_dump_indent(depth);
+    emit(title);
+    emit(" count=");
+    if (items == 0) {
+        emit("0\n");
+        return 0;
+    }
+    var n: u64 = items.len();
+    emit_u64(n);
+    emit("\n");
+    for (var i: u64 = 0; i < n; i++) {
+        ast_dump_node(items.get(i), depth + 1);
+    }
+    return 0;
+}
+
+func ast_dump_node(node: *AstNode, depth: u64) -> u64 {
+    if (node == 0) {
+        ast_dump_indent(depth);
+        emit("<null>\n");
+        return 0;
+    }
+
+    var kind: u64 = ast_kind(node);
+    ast_dump_indent(depth);
+    ast_dump_node_kind_name(kind);
+
+    switch (kind) {
+        case AST_LITERAL:
+            var lit: *AstLiteral = (*AstLiteral)node;
+            emit(" value=");
+            emit_u64(lit.value);
+            emit("\n");
+            break;
+        case AST_IDENT:
+            var idn: *AstIdent = (*AstIdent)node;
+            emit(" name=");
+            ast_dump_name(idn.name_ptr, idn.name_len);
+            emit("\n");
+            break;
+        case AST_STRING:
+            var st: *AstString = (*AstString)node;
+            emit(" len=");
+            emit_u64(st.str_len);
+            emit("\n");
+            break;
+        case AST_FLOAT:
+            var fl: *AstFloat = (*AstFloat)node;
+            emit(" value=");
+            ast_dump_name(fl.str_ptr, fl.str_len);
+            emit("\n");
+            break;
+        case AST_BINARY:
+            var bin: *AstBinary = (*AstBinary)node;
+            emit(" op=");
+            ast_dump_op(bin.op);
+            emit("\n");
+            ast_dump_child("left", bin.left, depth + 1);
+            ast_dump_child("right", bin.right, depth + 1);
+            break;
+        case AST_UNARY:
+            var un: *AstUnary = (*AstUnary)node;
+            emit(" op=");
+            ast_dump_op(un.op);
+            emit("\n");
+            ast_dump_child("operand", un.operand, depth + 1);
+            break;
+        case AST_CALL:
+            var call: *AstCall = (*AstCall)node;
+            emit(" name=");
+            ast_dump_name(call.name_ptr, call.name_len);
+            emit("\n");
+            ast_dump_node_vec("args", call.args_vec, depth + 1);
+            break;
+        case AST_GENERIC_CALL:
+            var gcall: *AstGenericCall = (*AstGenericCall)node;
+            emit(" name=");
+            ast_dump_name(gcall.name_ptr, gcall.name_len);
+            emit("\n");
+            ast_dump_node_vec("args", gcall.args_vec, depth + 1);
+            break;
+        case AST_STATIC_GENERIC_CALL:
+            var sgcall: *AstStaticGenericCall = (*AstStaticGenericCall)node;
+            emit(" name=");
+            ast_dump_name(sgcall.struct_name_ptr, sgcall.struct_name_len);
+            emit(".");
+            ast_dump_name(sgcall.method_ptr, sgcall.method_len);
+            emit("\n");
+            ast_dump_node_vec("args", sgcall.args_vec, depth + 1);
+            break;
+        case AST_CALL_PTR:
+            var cptr: *AstCallPtr = (*AstCallPtr)node;
+            emit("\n");
+            ast_dump_child("callee", cptr.callee, depth + 1);
+            ast_dump_node_vec("args", cptr.args_vec, depth + 1);
+            break;
+        case AST_ADDR_OF:
+            emit("\n");
+            ast_dump_child("operand", ((*AstAddrOf)node).operand, depth + 1);
+            break;
+        case AST_DEREF:
+            emit("\n");
+            ast_dump_child("operand", ((*AstDeref)node).operand, depth + 1);
+            break;
+        case AST_DEREF8:
+            emit("\n");
+            ast_dump_child("operand", ((*AstDeref8)node).operand, depth + 1);
+            break;
+        case AST_CAST:
+            var cast: *AstCast = (*AstCast)node;
+            emit(" target=");
+            ast_dump_type_core(cast.target_type, cast.target_ptr_depth, cast.struct_name_ptr, cast.struct_name_len, 0, 0, 0, 0, 0, 0);
+            emit("\n");
+            ast_dump_child("expr", cast.expr, depth + 1);
+            break;
+        case AST_MEMBER_ACCESS:
+        case AST_SAFE_MEMBER_ACCESS:
+            var mem: *AstMemberAccess = (*AstMemberAccess)node;
+            emit(" member=");
+            if (mem.parent_ptr != 0) {
+                ast_dump_name(mem.parent_ptr, mem.parent_len);
+                emit(".");
+            }
+            ast_dump_name(mem.member_ptr, mem.member_len);
+            emit("\n");
+            ast_dump_child("object", mem.object, depth + 1);
+            break;
+        case AST_METHOD_CALL:
+        case AST_SAFE_METHOD_CALL:
+            var meth: *AstMethodCall = (*AstMethodCall)node;
+            emit(" method=");
+            ast_dump_name(meth.method_ptr, meth.method_len);
+            emit("\n");
+            ast_dump_child("receiver", meth.receiver, depth + 1);
+            ast_dump_node_vec("args", meth.args_vec, depth + 1);
+            break;
+        case AST_INDEX:
+        case AST_SAFE_INDEX:
+            var ix: *AstIndex = (*AstIndex)node;
+            emit("\n");
+            ast_dump_child("base", ix.base, depth + 1);
+            ast_dump_child("index", ix.index, depth + 1);
+            break;
+        case AST_SLICE:
+            var sl: *AstSlice = (*AstSlice)node;
+            emit("\n");
+            ast_dump_child("ptr", sl.ptr_expr, depth + 1);
+            ast_dump_child("len", sl.len_expr, depth + 1);
+            break;
+        case AST_TERNARY:
+            var ter: *AstTernary = (*AstTernary)node;
+            emit("\n");
+            ast_dump_child("cond", ter.cond, depth + 1);
+            ast_dump_child("then", ter.then_expr, depth + 1);
+            ast_dump_child("else", ter.else_expr, depth + 1);
+            break;
+        case AST_SIZEOF:
+            var sz: *AstSizeof = (*AstSizeof)node;
+            emit(" type=");
+            ast_dump_type_core(sz.type_kind, sz.ptr_depth, sz.struct_name_ptr, sz.struct_name_len,
+                               sz.elem_type_kind, sz.elem_ptr_depth, sz.array_len,
+                               sz.array_len_is_param, sz.array_len_param_ptr, sz.array_len_param_len);
+            emit("\n");
+            break;
+        case AST_SIZEOF_EXPR:
+            emit("\n");
+            ast_dump_child("expr", ((*AstSizeofExpr)node).expr, depth + 1);
+            break;
+        case AST_STRUCT_LITERAL:
+            var slit: *AstStructLiteral = (*AstStructLiteral)node;
+            if (slit.struct_def != 0) {
+                emit(" name=");
+                ast_dump_name(slit.struct_def.name_ptr, slit.struct_def.name_len);
+            }
+            emit("\n");
+            ast_dump_node_vec("values", slit.values_vec, depth + 1);
+            break;
+        case AST_GENERIC_STRUCT_LITERAL:
+            var gslit: *AstGenericStructLiteral = (*AstGenericStructLiteral)node;
+            emit(" name=");
+            ast_dump_name(gslit.name_ptr, gslit.name_len);
+            emit("\n");
+            ast_dump_node_vec("values", gslit.values_vec, depth + 1);
+            break;
+        case AST_TRY:
+            emit("\n");
+            ast_dump_child("operand", ((*AstTry)node).operand, depth + 1);
+            break;
+        case AST_SUPER:
+            emit("\n");
+            break;
+        case AST_NEW:
+            var nw: *AstNew = (*AstNew)node;
+            emit(" type=");
+            ast_dump_type_core(nw.type_kind, nw.ptr_depth, nw.struct_name_ptr, nw.struct_name_len,
+                               nw.elem_type_kind, nw.elem_ptr_depth, nw.array_len,
+                               nw.array_len_is_param, nw.array_len_param_ptr, nw.array_len_param_len);
+            emit("\n");
+            ast_dump_child("literal", nw.literal_expr, depth + 1);
+            ast_dump_node_vec("ctor_args", nw.ctor_args_vec, depth + 1);
+            break;
+        case AST_STACK_CTOR:
+            var sc: *AstStackCtor = (*AstStackCtor)node;
+            emit(" type=");
+            ast_dump_type_core(sc.type_kind, sc.ptr_depth, sc.struct_name_ptr, sc.struct_name_len,
+                               sc.elem_type_kind, sc.elem_ptr_depth, sc.array_len,
+                               sc.array_len_is_param, sc.array_len_param_ptr, sc.array_len_param_len);
+            emit("\n");
+            ast_dump_node_vec("ctor_args", sc.ctor_args_vec, depth + 1);
+            break;
+        case AST_RETURN:
+            emit("\n");
+            ast_dump_child("expr", ((*AstReturn)node).expr, depth + 1);
+            break;
+        case AST_VAR_DECL:
+            var vd: *AstVarDecl = (*AstVarDecl)node;
+            emit(" name=");
+            ast_dump_name(vd.name_ptr, vd.name_len);
+            emit(" type=");
+            ast_dump_type_core(vd.type_kind, vd.ptr_depth, vd.struct_name_ptr, vd.struct_name_len,
+                               vd.elem_type_kind, vd.elem_ptr_depth, vd.array_len,
+                               vd.array_len_is_param, vd.array_len_param_ptr, vd.array_len_param_len);
+            emit("\n");
+            ast_dump_child("init", vd.init_expr, depth + 1);
+            break;
+        case AST_CONST_DECL:
+            var cd: *AstConstDecl = (*AstConstDecl)node;
+            emit(" name=");
+            ast_dump_name(cd.name_ptr, cd.name_len);
+            emit(" value=");
+            emit_u64(cd.value);
+            emit("\n");
+            break;
+        case AST_ASSIGN:
+            var asn: *AstAssign = (*AstAssign)node;
+            emit("\n");
+            ast_dump_child("target", asn.target, depth + 1);
+            ast_dump_child("value", asn.value, depth + 1);
+            break;
+        case AST_EXPR_STMT:
+            emit("\n");
+            ast_dump_child("expr", ((*AstExprStmt)node).expr, depth + 1);
+            break;
+        case AST_IF:
+            var ifs: *AstIf = (*AstIf)node;
+            emit("\n");
+            ast_dump_child("cond", ifs.cond, depth + 1);
+            ast_dump_child("then", ifs.then_block, depth + 1);
+            ast_dump_child("else", ifs.else_block, depth + 1);
+            break;
+        case AST_WHILE:
+            var wl: *AstWhile = (*AstWhile)node;
+            emit("\n");
+            ast_dump_child("cond", wl.cond, depth + 1);
+            ast_dump_child("body", wl.body, depth + 1);
+            break;
+        case AST_DO_WHILE:
+            var dw: *AstDoWhile = (*AstDoWhile)node;
+            emit("\n");
+            ast_dump_child("body", dw.body, depth + 1);
+            ast_dump_child("cond", dw.cond, depth + 1);
+            break;
+        case AST_FOR:
+            var fr: *AstFor = (*AstFor)node;
+            emit("\n");
+            ast_dump_child("init", fr.init, depth + 1);
+            ast_dump_child("cond", fr.cond, depth + 1);
+            ast_dump_child("update", fr.update, depth + 1);
+            ast_dump_child("body", fr.body, depth + 1);
+            break;
+        case AST_SWITCH:
+        case AST_MATCH:
+            var sw: *AstSwitch = (*AstSwitch)node;
+            emit("\n");
+            ast_dump_child("expr", sw.expr, depth + 1);
+            ast_dump_node_vec("cases", sw.cases_vec, depth + 1);
+            break;
+        case AST_CASE:
+            var cs: *AstCase = (*AstCase)node;
+            if (cs.is_default != 0) { emit(" default"); }
+            emit("\n");
+            ast_dump_child("value", cs.value, depth + 1);
+            ast_dump_child("body", cs.body, depth + 1);
+            break;
+        case AST_BREAK:
+        case AST_CONTINUE:
+            emit("\n");
+            break;
+        case AST_ASM:
+            var asm_node: *AstAsm = (*AstAsm)node;
+            emit(" lines=");
+            if (asm_node.text_vec == 0) { emit("0"); } else { emit_u64(asm_node.text_vec.len()); }
+            emit("\n");
+            break;
+        case AST_ALIAS:
+            var al: *AstAlias = (*AstAlias)node;
+            emit(" ");
+            ast_dump_name(al.name_ptr, al.name_len);
+            emit("=");
+            ast_dump_name(al.reg_ptr, al.reg_len);
+            emit("\n");
+            break;
+        case AST_DEFER:
+            emit("\n");
+            ast_dump_child("stmt", ((*AstDefer)node).stmt, depth + 1);
+            break;
+        case AST_DELETE:
+            emit("\n");
+            ast_dump_child("expr", ((*AstDelete)node).expr, depth + 1);
+            break;
+        case AST_THROW_STMT:
+            emit("\n");
+            ast_dump_child("expr", ((*AstThrowStmt)node).expr, depth + 1);
+            break;
+        case AST_TRY_STMT:
+            var ts: *AstTryStmt = (*AstTryStmt)node;
+            emit(" catch=");
+            ast_dump_name(ts.catch_name_ptr, ts.catch_name_len);
+            emit("\n");
+            ast_dump_child("try", ts.try_block, depth + 1);
+            ast_dump_child("catch", ts.catch_block, depth + 1);
+            ast_dump_child("finally", ts.finally_block, depth + 1);
+            break;
+        case AST_BLOCK:
+            var blk: *AstBlock = (*AstBlock)node;
+            emit(" count=");
+            if (blk.stmts_vec == 0) { emit_u64(0); } else { emit_u64(blk.stmts_vec.len()); }
+            emit("\n");
+            ast_dump_node_vec("stmts", blk.stmts_vec, depth + 1);
+            break;
+        default:
+            emit("\n");
+            break;
+    }
+    return 0;
+}
+
+func ast_dump_child(title: u64, node: *AstNode, depth: u64) -> u64 {
+    ast_dump_indent(depth);
+    emit(title);
+    emit(":\n");
+    ast_dump_node(node, depth + 1);
+    return 0;
+}
+
+func ast_dump_param(param: *Param, depth: u64) -> u64 {
+    ast_dump_indent(depth);
+    emit("Param ");
+    if (param == 0) {
+        emit("<null>\n");
+        return 0;
+    }
+    ast_dump_name(param.name_ptr, param.name_len);
+    emit(": ");
+    ast_dump_param_type(param);
+    if (param.is_variadic != 0) { emit(" variadic"); }
+    emit("\n");
+    if (param.has_default != 0 && param.default_expr != 0) {
+        ast_dump_child("default", (*AstNode)param.default_expr, depth + 1);
+    }
+    return 0;
+}
+
+func ast_dump_field(field: *FieldDesc, depth: u64) -> u64 {
+    ast_dump_indent(depth);
+    emit("Field ");
+    if (field == 0) {
+        emit("<null>\n");
+        return 0;
+    }
+    ast_dump_name(field.name_ptr, field.name_len);
+    emit(": ");
+    ast_dump_field_type(field);
+    if (field.bit_width != 0) {
+        emit(" bits=");
+        emit_u64(field.bit_width);
+    }
+    emit(" offset=");
+    emit_u64(field.offset);
+    emit("\n");
+    return 0;
+}
+
+func ast_dump_struct(def: *AstStructDef, depth: u64) -> u64 {
+    ast_dump_indent(depth);
+    emit("Struct ");
+    if (def == 0) {
+        emit("<null>\n");
+        return 0;
+    }
+    ast_dump_name(def.name_ptr, def.name_len);
+    if (def.is_union != 0) { emit(" union"); }
+    if (def.is_packed != 0) { emit(" packed"); }
+    emit("\n");
+
+    if (def.fields_vec != 0) {
+        var n: u64 = def.fields_vec.len();
+        ast_dump_indent(depth + 1);
+        emit("Fields count=");
+        emit_u64(n);
+        emit("\n");
+        for (var i: u64 = 0; i < n; i++) {
+            ast_dump_field(def.fields_vec.get(i), depth + 2);
+        }
+    }
+    return 0;
+}
+
+func ast_dump_global(ginfo: *GlobalInfo, depth: u64) -> u64 {
+    ast_dump_indent(depth);
+    emit("Global ");
+    if (ginfo == 0) {
+        emit("<null>\n");
+        return 0;
+    }
+    ast_dump_name(ginfo.name_ptr, ginfo.name_len);
+    emit(": ");
+    ast_dump_typeinfo(ginfo.typeinfo_ptr);
+    emit(" init_kind=");
+    emit_u64(ginfo.init_kind);
+    if (ginfo.init_name_ptr != 0) {
+        emit(" init_name=");
+        ast_dump_name(ginfo.init_name_ptr, ginfo.init_name_len);
+    }
+    emit("\n");
+    if (ginfo.init_expr != 0) {
+        ast_dump_child("init_expr", (*AstNode)ginfo.init_expr, depth + 1);
+    }
+    return 0;
+}
+
+func ast_dump_func(fn: *AstFunc, depth: u64) -> u64 {
+    ast_dump_indent(depth);
+    emit("Func ");
+    if (fn == 0) {
+        emit("<null>\n");
+        return 0;
+    }
+    ast_dump_name(fn.name_ptr, fn.name_len);
+    emit(" -> ");
+    ast_dump_func_return_type(fn);
+    if (fn.impl_owner_ptr != 0) {
+        emit(" impl=");
+        ast_dump_name(fn.impl_owner_ptr, fn.impl_owner_len);
+    }
+    emit("\n");
+
+    ast_dump_indent(depth + 1);
+    emit("Params count=");
+    if (fn.params_vec == 0) {
+        emit_u64(0);
+        emit("\n");
+    } else {
+        var pn: u64 = fn.params_vec.len();
+        emit_u64(pn);
+        emit("\n");
+        for (var i: u64 = 0; i < pn; i++) {
+            ast_dump_param(fn.params_vec.get(i), depth + 2);
+        }
+    }
+
+    ast_dump_child("body", fn.body, depth + 1);
+    return 0;
+}
+
+func ast_dump_program(prog: *AstProgram) -> u64 {
+    return ast_dump_program_filtered(prog, 0);
+}
+
+func ast_dump_program_filtered(prog: *AstProgram, filter: *AstDumpFilter) -> u64 {
+    if (prog == 0) {
+        emit("Program <null>\n");
+        return 0;
+    }
+    emit("Program\n");
+
+    if (ast_dump_filter_include_static_sections(filter) != 0 && prog.imports_vec != 0) {
+        var in: u64 = prog.imports_vec.len();
+        ast_dump_indent(1);
+        emit("Imports count=");
+        emit_u64(in);
+        emit("\n");
+        for (var ii: u64 = 0; ii < in; ii++) {
+            var imp: *AstImport = prog.imports_vec.get(ii);
+            ast_dump_indent(2);
+            emit("Import ");
+            ast_dump_name(imp.path_ptr, imp.path_len);
+            if (imp.symbol_ptr != 0) {
+                emit("::");
+                ast_dump_name(imp.symbol_ptr, imp.symbol_len);
+            }
+            if (imp.alias_ptr != 0) {
+                emit(" as ");
+                ast_dump_name(imp.alias_ptr, imp.alias_len);
+            }
+            emit("\n");
+        }
+    }
+
+    if (ast_dump_filter_include_static_sections(filter) != 0 && prog.structs_vec != 0) {
+        var sn: u64 = prog.structs_vec.len();
+        ast_dump_indent(1);
+        emit("Structs count=");
+        emit_u64(sn);
+        emit("\n");
+        for (var si: u64 = 0; si < sn; si++) {
+            ast_dump_struct(prog.structs_vec.get(si), 2);
+        }
+    }
+
+    if (prog.globals_vec != 0) {
+        var gn: u64 = ast_dump_filter_global_count(prog.globals_vec, filter);
+        ast_dump_indent(1);
+        emit("Globals count=");
+        emit_u64(gn);
+        emit("\n");
+        var total_gn: u64 = prog.globals_vec.len();
+        for (var gi: u64 = 0; gi < total_gn; gi++) {
+            var ginfo: *GlobalInfo = prog.globals_vec.get(gi);
+            if (ast_dump_filter_accept_global(ginfo, filter) != 0) {
+                ast_dump_global(ginfo, 2);
+            }
+        }
+    }
+
+    if (ast_dump_filter_include_static_sections(filter) != 0 && prog.consts_vec != 0) {
+        var cn: u64 = prog.consts_vec.len();
+        ast_dump_indent(1);
+        emit("Consts count=");
+        emit_u64(cn);
+        emit("\n");
+        for (var ci: u64 = 0; ci < cn; ci++) {
+            ast_dump_node((*AstNode)prog.consts_vec.get(ci), 2);
+        }
+    }
+
+    if (prog.funcs_vec != 0) {
+        var fnn: u64 = ast_dump_filter_func_count(prog.funcs_vec, filter);
+        ast_dump_indent(1);
+        emit("Funcs count=");
+        emit_u64(fnn);
+        emit("\n");
+        var total_fnn: u64 = prog.funcs_vec.len();
+        for (var fi: u64 = 0; fi < total_fnn; fi++) {
+            var fn: *AstFunc = prog.funcs_vec.get(fi);
+            if (ast_dump_filter_accept_func(fn, filter) != 0) {
+                ast_dump_func(fn, 2);
+            }
+        }
+    }
+    return 0;
+}
+
+func ast_dump_dot_escape(ptr: u64, len: u64) -> u64 {
+    if (ptr == 0 || len == 0) { return 0; }
+    var bytes: *u8 = (*u8)ptr;
+    for (var i: u64 = 0; i < len; i++) {
+        var c: u64 = bytes[i];
+        if (c == 34) {
+            emit_char(92);
+            emit_char(34);
+        } else if (c == 92) {
+            emit_char(92);
+            emit_char(92);
+        } else if (c == 10) {
+            emit_char(92);
+            emit_char(110);
+        } else {
+            emit_char(c);
+        }
+    }
+    return 0;
+}
+
+func ast_dump_dot_begin_node(id: u64) -> u64 {
+    emit("  n");
+    emit_u64(id);
+    emit(" [label=");
+    emit_char(34);
+    return 0;
+}
+
+func ast_dump_dot_end_node() -> u64 {
+    emit_char(34);
+    emit("];\n");
+    return 0;
+}
+
+func ast_dump_dot_edge(parent: u64, child: u64, label: u64) -> u64 {
+    emit("  n");
+    emit_u64(parent);
+    emit(" -> n");
+    emit_u64(child);
+    if (label != 0) {
+        emit(" [label=");
+        emit_char(34);
+        ast_dump_dot_escape(label, str_len(label));
+        emit_char(34);
+        emit("]");
+    }
+    emit(";\n");
+    return 0;
+}
+
+func ast_dump_dot_next(counter: *u64) -> u64 {
+    var id: u64 = *counter;
+    *counter = id + 1;
+    return id;
+}
+
+func ast_dump_dot_static_node(counter: *u64, parent: u64, edge_label: u64, label: u64) -> u64 {
+    var id: u64 = ast_dump_dot_next(counter);
+    ast_dump_dot_begin_node(id);
+    ast_dump_dot_escape(label, str_len(label));
+    ast_dump_dot_end_node();
+    ast_dump_dot_edge(parent, id, edge_label);
+    return id;
+}
+
+func ast_dump_dot_node(node: *AstNode, counter: *u64, parent: u64, edge_label: u64) -> u64;
+
+func ast_dump_dot_node_vec(items: *Vec<*AstNode>, counter: *u64, parent: u64, edge_label: u64) -> u64 {
+    var section: u64 = ast_dump_dot_static_node(counter, parent, edge_label, "list");
+    if (items == 0) { return section; }
+    var n: u64 = items.len();
+    for (var i: u64 = 0; i < n; i++) {
+        ast_dump_dot_node(items.get(i), counter, section, "item");
+    }
+    return section;
+}
+
+func ast_dump_dot_emit_node_label(node: *AstNode) -> u64 {
+    if (node == 0) {
+        emit("<null>");
+        return 0;
+    }
+    var kind: u64 = ast_kind(node);
+    ast_dump_node_kind_name(kind);
+    switch (kind) {
+        case AST_LITERAL:
+            emit("\\n");
+            emit_u64(((*AstLiteral)node).value);
+            break;
+        case AST_IDENT:
+            emit("\\n");
+            ast_dump_dot_escape(((*AstIdent)node).name_ptr, ((*AstIdent)node).name_len);
+            break;
+        case AST_STRING:
+            emit("\\nlen=");
+            emit_u64(((*AstString)node).str_len);
+            break;
+        case AST_FLOAT:
+            emit("\\n");
+            ast_dump_dot_escape(((*AstFloat)node).str_ptr, ((*AstFloat)node).str_len);
+            break;
+        case AST_BINARY:
+            emit("\\nop=");
+            ast_dump_op(((*AstBinary)node).op);
+            break;
+        case AST_UNARY:
+            emit("\\nop=");
+            ast_dump_op(((*AstUnary)node).op);
+            break;
+        case AST_CALL:
+            emit("\\n");
+            ast_dump_dot_escape(((*AstCall)node).name_ptr, ((*AstCall)node).name_len);
+            break;
+        case AST_GENERIC_CALL:
+            emit("\\n");
+            ast_dump_dot_escape(((*AstGenericCall)node).name_ptr, ((*AstGenericCall)node).name_len);
+            break;
+        case AST_STATIC_GENERIC_CALL:
+            var sg: *AstStaticGenericCall = (*AstStaticGenericCall)node;
+            emit("\\n");
+            ast_dump_dot_escape(sg.struct_name_ptr, sg.struct_name_len);
+            emit(".");
+            ast_dump_dot_escape(sg.method_ptr, sg.method_len);
+            break;
+        case AST_METHOD_CALL:
+        case AST_SAFE_METHOD_CALL:
+            emit("\\n");
+            ast_dump_dot_escape(((*AstMethodCall)node).method_ptr, ((*AstMethodCall)node).method_len);
+            break;
+        case AST_MEMBER_ACCESS:
+        case AST_SAFE_MEMBER_ACCESS:
+            emit("\\n");
+            ast_dump_dot_escape(((*AstMemberAccess)node).member_ptr, ((*AstMemberAccess)node).member_len);
+            break;
+        case AST_VAR_DECL:
+            emit("\\n");
+            ast_dump_dot_escape(((*AstVarDecl)node).name_ptr, ((*AstVarDecl)node).name_len);
+            break;
+        case AST_CONST_DECL:
+            emit("\\n");
+            ast_dump_dot_escape(((*AstConstDecl)node).name_ptr, ((*AstConstDecl)node).name_len);
+            break;
+        case AST_ALIAS:
+            emit("\\n");
+            ast_dump_dot_escape(((*AstAlias)node).name_ptr, ((*AstAlias)node).name_len);
+            break;
+        default:
+            break;
+    }
+    return 0;
+}
+
+func ast_dump_dot_node(node: *AstNode, counter: *u64, parent: u64, edge_label: u64) -> u64 {
+    var id: u64 = ast_dump_dot_next(counter);
+    ast_dump_dot_begin_node(id);
+    ast_dump_dot_emit_node_label(node);
+    ast_dump_dot_end_node();
+    ast_dump_dot_edge(parent, id, edge_label);
+    if (node == 0) { return id; }
+
+    var kind: u64 = ast_kind(node);
+    switch (kind) {
+        case AST_BINARY:
+            ast_dump_dot_node(((*AstBinary)node).left, counter, id, "left");
+            ast_dump_dot_node(((*AstBinary)node).right, counter, id, "right");
+            break;
+        case AST_UNARY:
+            ast_dump_dot_node(((*AstUnary)node).operand, counter, id, "operand");
+            break;
+        case AST_CALL:
+            ast_dump_dot_node_vec(((*AstCall)node).args_vec, counter, id, "args");
+            break;
+        case AST_GENERIC_CALL:
+            ast_dump_dot_node_vec(((*AstGenericCall)node).args_vec, counter, id, "args");
+            break;
+        case AST_STATIC_GENERIC_CALL:
+            ast_dump_dot_node_vec(((*AstStaticGenericCall)node).args_vec, counter, id, "args");
+            break;
+        case AST_CALL_PTR:
+            ast_dump_dot_node(((*AstCallPtr)node).callee, counter, id, "callee");
+            ast_dump_dot_node_vec(((*AstCallPtr)node).args_vec, counter, id, "args");
+            break;
+        case AST_ADDR_OF:
+            ast_dump_dot_node(((*AstAddrOf)node).operand, counter, id, "operand");
+            break;
+        case AST_DEREF:
+            ast_dump_dot_node(((*AstDeref)node).operand, counter, id, "operand");
+            break;
+        case AST_DEREF8:
+            ast_dump_dot_node(((*AstDeref8)node).operand, counter, id, "operand");
+            break;
+        case AST_CAST:
+            ast_dump_dot_node(((*AstCast)node).expr, counter, id, "expr");
+            break;
+        case AST_MEMBER_ACCESS:
+        case AST_SAFE_MEMBER_ACCESS:
+            ast_dump_dot_node(((*AstMemberAccess)node).object, counter, id, "object");
+            break;
+        case AST_METHOD_CALL:
+        case AST_SAFE_METHOD_CALL:
+            ast_dump_dot_node(((*AstMethodCall)node).receiver, counter, id, "receiver");
+            ast_dump_dot_node_vec(((*AstMethodCall)node).args_vec, counter, id, "args");
+            break;
+        case AST_INDEX:
+        case AST_SAFE_INDEX:
+            ast_dump_dot_node(((*AstIndex)node).base, counter, id, "base");
+            ast_dump_dot_node(((*AstIndex)node).index, counter, id, "index");
+            break;
+        case AST_SLICE:
+            ast_dump_dot_node(((*AstSlice)node).ptr_expr, counter, id, "ptr");
+            ast_dump_dot_node(((*AstSlice)node).len_expr, counter, id, "len");
+            break;
+        case AST_TERNARY:
+            ast_dump_dot_node(((*AstTernary)node).cond, counter, id, "cond");
+            ast_dump_dot_node(((*AstTernary)node).then_expr, counter, id, "then");
+            ast_dump_dot_node(((*AstTernary)node).else_expr, counter, id, "else");
+            break;
+        case AST_SIZEOF_EXPR:
+            ast_dump_dot_node(((*AstSizeofExpr)node).expr, counter, id, "expr");
+            break;
+        case AST_STRUCT_LITERAL:
+            ast_dump_dot_node_vec(((*AstStructLiteral)node).values_vec, counter, id, "values");
+            break;
+        case AST_GENERIC_STRUCT_LITERAL:
+            ast_dump_dot_node_vec(((*AstGenericStructLiteral)node).values_vec, counter, id, "values");
+            break;
+        case AST_TRY:
+            ast_dump_dot_node(((*AstTry)node).operand, counter, id, "operand");
+            break;
+        case AST_NEW:
+            ast_dump_dot_node(((*AstNew)node).literal_expr, counter, id, "literal");
+            ast_dump_dot_node_vec(((*AstNew)node).ctor_args_vec, counter, id, "ctor_args");
+            break;
+        case AST_STACK_CTOR:
+            ast_dump_dot_node_vec(((*AstStackCtor)node).ctor_args_vec, counter, id, "ctor_args");
+            break;
+        case AST_RETURN:
+            ast_dump_dot_node(((*AstReturn)node).expr, counter, id, "expr");
+            break;
+        case AST_VAR_DECL:
+            ast_dump_dot_node(((*AstVarDecl)node).init_expr, counter, id, "init");
+            break;
+        case AST_ASSIGN:
+            ast_dump_dot_node(((*AstAssign)node).target, counter, id, "target");
+            ast_dump_dot_node(((*AstAssign)node).value, counter, id, "value");
+            break;
+        case AST_EXPR_STMT:
+            ast_dump_dot_node(((*AstExprStmt)node).expr, counter, id, "expr");
+            break;
+        case AST_IF:
+            ast_dump_dot_node(((*AstIf)node).cond, counter, id, "cond");
+            ast_dump_dot_node(((*AstIf)node).then_block, counter, id, "then");
+            ast_dump_dot_node(((*AstIf)node).else_block, counter, id, "else");
+            break;
+        case AST_WHILE:
+            ast_dump_dot_node(((*AstWhile)node).cond, counter, id, "cond");
+            ast_dump_dot_node(((*AstWhile)node).body, counter, id, "body");
+            break;
+        case AST_DO_WHILE:
+            ast_dump_dot_node(((*AstDoWhile)node).body, counter, id, "body");
+            ast_dump_dot_node(((*AstDoWhile)node).cond, counter, id, "cond");
+            break;
+        case AST_FOR:
+            ast_dump_dot_node(((*AstFor)node).init, counter, id, "init");
+            ast_dump_dot_node(((*AstFor)node).cond, counter, id, "cond");
+            ast_dump_dot_node(((*AstFor)node).update, counter, id, "update");
+            ast_dump_dot_node(((*AstFor)node).body, counter, id, "body");
+            break;
+        case AST_SWITCH:
+        case AST_MATCH:
+            ast_dump_dot_node(((*AstSwitch)node).expr, counter, id, "expr");
+            ast_dump_dot_node_vec(((*AstSwitch)node).cases_vec, counter, id, "cases");
+            break;
+        case AST_CASE:
+            ast_dump_dot_node(((*AstCase)node).value, counter, id, "value");
+            ast_dump_dot_node(((*AstCase)node).body, counter, id, "body");
+            break;
+        case AST_DEFER:
+            ast_dump_dot_node(((*AstDefer)node).stmt, counter, id, "stmt");
+            break;
+        case AST_DELETE:
+            ast_dump_dot_node(((*AstDelete)node).expr, counter, id, "expr");
+            break;
+        case AST_THROW_STMT:
+            ast_dump_dot_node(((*AstThrowStmt)node).expr, counter, id, "expr");
+            break;
+        case AST_TRY_STMT:
+            ast_dump_dot_node(((*AstTryStmt)node).try_block, counter, id, "try");
+            ast_dump_dot_node(((*AstTryStmt)node).catch_block, counter, id, "catch");
+            ast_dump_dot_node(((*AstTryStmt)node).finally_block, counter, id, "finally");
+            break;
+        case AST_BLOCK:
+            ast_dump_dot_node_vec(((*AstBlock)node).stmts_vec, counter, id, "stmts");
+            break;
+        default:
+            break;
+    }
+    return id;
+}
+
+func ast_dump_dot_func(fn: *AstFunc, counter: *u64, parent: u64) -> u64 {
+    var id: u64 = ast_dump_dot_next(counter);
+    ast_dump_dot_begin_node(id);
+    emit("Func\\n");
+    if (fn != 0) { ast_dump_dot_escape(fn.name_ptr, fn.name_len); } else { emit("<null>"); }
+    ast_dump_dot_end_node();
+    ast_dump_dot_edge(parent, id, "func");
+    if (fn != 0) {
+        if (fn.params_vec != 0) {
+            var params_id: u64 = ast_dump_dot_static_node(counter, id, "params", "params");
+            var pn: u64 = fn.params_vec.len();
+            for (var i: u64 = 0; i < pn; i++) {
+                var p: *Param = fn.params_vec.get(i);
+                var pid: u64 = ast_dump_dot_next(counter);
+                ast_dump_dot_begin_node(pid);
+                emit("Param\\n");
+                ast_dump_dot_escape(p.name_ptr, p.name_len);
+                ast_dump_dot_end_node();
+                ast_dump_dot_edge(params_id, pid, "param");
+                if (p.has_default != 0 && p.default_expr != 0) {
+                    ast_dump_dot_node((*AstNode)p.default_expr, counter, pid, "default");
+                }
+            }
+        }
+        ast_dump_dot_node(fn.body, counter, id, "body");
+    }
+    return id;
+}
+
+func ast_dump_program_dot(prog: *AstProgram) -> u64 {
+    return ast_dump_program_dot_filtered(prog, 0);
+}
+
+func ast_dump_program_dot_filtered(prog: *AstProgram, filter: *AstDumpFilter) -> u64 {
+    emit("digraph BppAst {\n");
+    emit("  graph [rankdir=TB];\n");
+    emit("  node [shape=box, fontname=\"monospace\"];\n");
+    emit("  edge [fontname=\"monospace\"];\n");
+
+    var counter: u64 = 0;
+    var root: u64 = ast_dump_dot_next(&counter);
+    ast_dump_dot_begin_node(root);
+    emit("Program");
+    ast_dump_dot_end_node();
+
+    if (prog != 0 && ast_dump_filter_include_static_sections(filter) != 0 && prog.structs_vec != 0) {
+        var sid: u64 = ast_dump_dot_static_node(&counter, root, "structs", "structs");
+        var sn: u64 = prog.structs_vec.len();
+        for (var si: u64 = 0; si < sn; si++) {
+            var def: *AstStructDef = prog.structs_vec.get(si);
+            var did: u64 = ast_dump_dot_next(&counter);
+            ast_dump_dot_begin_node(did);
+            emit("Struct\\n");
+            ast_dump_dot_escape(def.name_ptr, def.name_len);
+            ast_dump_dot_end_node();
+            ast_dump_dot_edge(sid, did, "struct");
+            if (def.fields_vec != 0) {
+                var fields_id: u64 = ast_dump_dot_static_node(&counter, did, "fields", "fields");
+                var fn: u64 = def.fields_vec.len();
+                for (var fi: u64 = 0; fi < fn; fi++) {
+                    var field: *FieldDesc = def.fields_vec.get(fi);
+                    var fid: u64 = ast_dump_dot_next(&counter);
+                    ast_dump_dot_begin_node(fid);
+                    emit("Field\\n");
+                    ast_dump_dot_escape(field.name_ptr, field.name_len);
+                    ast_dump_dot_end_node();
+                    ast_dump_dot_edge(fields_id, fid, "field");
+                }
+            }
+        }
+    }
+
+    if (prog != 0 && prog.globals_vec != 0) {
+        var gid: u64 = ast_dump_dot_static_node(&counter, root, "globals", "globals");
+        var gn: u64 = prog.globals_vec.len();
+        for (var gi: u64 = 0; gi < gn; gi++) {
+            var g: *GlobalInfo = prog.globals_vec.get(gi);
+            if (ast_dump_filter_accept_global(g, filter) == 0) { continue; }
+            var gnode: u64 = ast_dump_dot_next(&counter);
+            ast_dump_dot_begin_node(gnode);
+            emit("Global\\n");
+            ast_dump_dot_escape(g.name_ptr, g.name_len);
+            ast_dump_dot_end_node();
+            ast_dump_dot_edge(gid, gnode, "global");
+            if (g.init_expr != 0) {
+                ast_dump_dot_node((*AstNode)g.init_expr, &counter, gnode, "init");
+            }
+        }
+    }
+
+    if (prog != 0 && ast_dump_filter_include_static_sections(filter) != 0 && prog.consts_vec != 0) {
+        var cid: u64 = ast_dump_dot_static_node(&counter, root, "consts", "consts");
+        var cn: u64 = prog.consts_vec.len();
+        for (var ci: u64 = 0; ci < cn; ci++) {
+            ast_dump_dot_node((*AstNode)prog.consts_vec.get(ci), &counter, cid, "const");
+        }
+    }
+
+    if (prog != 0 && prog.funcs_vec != 0) {
+        var fid: u64 = ast_dump_dot_static_node(&counter, root, "funcs", "funcs");
+        var fnn: u64 = prog.funcs_vec.len();
+        for (var fni: u64 = 0; fni < fnn; fni++) {
+            var fn: *AstFunc = prog.funcs_vec.get(fni);
+            if (ast_dump_filter_accept_func(fn, filter) != 0) {
+                ast_dump_dot_func(fn, &counter, fid);
+            }
+        }
+    }
+
+    emit("}\n");
+    return 0;
+}
+
+const AST_DUMP_JSON_PHASE_NODES = 0;
+const AST_DUMP_JSON_PHASE_EDGES = 1;
+
+func ast_dump_json_escape(ptr: u64, len: u64) -> u64 {
+    if (ptr == 0 || len == 0) { return 0; }
+    var bytes: *u8 = (*u8)ptr;
+    for (var i: u64 = 0; i < len; i++) {
+        var c: u64 = bytes[i];
+        if (c == 34) {
+            emit_char(92);
+            emit_char(34);
+        } else if (c == 92) {
+            emit_char(92);
+            emit_char(92);
+        } else if (c == 10) {
+            emit_char(92);
+            emit_char(110);
+        } else if (c == 13) {
+            emit_char(92);
+            emit_char(114);
+        } else if (c == 9) {
+            emit_char(92);
+            emit_char(116);
+        } else {
+            emit_char(c);
+        }
+    }
+    return 0;
+}
+
+func ast_dump_json_string(ptr: u64, len: u64) -> u64 {
+    emit_char(34);
+    ast_dump_json_escape(ptr, len);
+    emit_char(34);
+    return 0;
+}
+
+func ast_dump_json_cstring(s: u64) -> u64 {
+    if (s == 0) {
+        emit("null");
+        return 0;
+    }
+    return ast_dump_json_string(s, str_len(s));
+}
+
+func ast_dump_json_sep(first: *u64) -> u64 {
+    if (*first == 0) {
+        emit(",\n");
+    } else {
+        *first = 0;
+    }
+    return 0;
+}
+
+func ast_dump_json_next(counter: *u64) -> u64 {
+    var id: u64 = *counter;
+    *counter = id + 1;
+    return id;
+}
+
+func ast_dump_json_emit_id(id: u64) -> u64 {
+    emit("\"n");
+    emit_u64(id);
+    emit_char(34);
+    return 0;
+}
+
+func ast_dump_json_emit_edge(parent: u64, child: u64, role: u64, first: *u64) -> u64 {
+    ast_dump_json_sep(first);
+    emit("    {\"from\":");
+    ast_dump_json_emit_id(parent);
+    emit(",\"to\":");
+    ast_dump_json_emit_id(child);
+    emit(",\"role\":");
+    ast_dump_json_cstring(role);
+    emit("}");
+    return 0;
+}
+
+func ast_dump_json_emit_module_attr(info: *NameInfo) -> u64 {
+    if (info == 0) { return 0; }
+    emit(",\"module\":");
+    ast_dump_json_string(info.ptr, info.len);
+    return 0;
+}
+
+func ast_dump_json_emit_static_node(id: u64, kind: u64, label: u64, first: *u64) -> u64 {
+    ast_dump_json_sep(first);
+    emit("    {\"id\":");
+    ast_dump_json_emit_id(id);
+    emit(",\"kind\":");
+    ast_dump_json_cstring(kind);
+    emit(",\"label\":");
+    ast_dump_json_cstring(label);
+    emit("}");
+    return 0;
+}
+
+func ast_dump_json_emit_ast_label(node: *AstNode) -> u64 {
+    if (node == 0) {
+        emit(",\"label\":\"<null>\"");
+        return 0;
+    }
+    var kind: u64 = ast_kind(node);
+    switch (kind) {
+        case AST_LITERAL:
+            emit(",\"label\":\"");
+            emit_u64(((*AstLiteral)node).value);
+            emit("\",\"value\":");
+            emit_u64(((*AstLiteral)node).value);
+            break;
+        case AST_IDENT:
+            emit(",\"label\":");
+            ast_dump_json_string(((*AstIdent)node).name_ptr, ((*AstIdent)node).name_len);
+            break;
+        case AST_STRING:
+            emit(",\"label\":\"string\",\"length\":");
+            emit_u64(((*AstString)node).str_len);
+            break;
+        case AST_FLOAT:
+            emit(",\"label\":");
+            ast_dump_json_string(((*AstFloat)node).str_ptr, ((*AstFloat)node).str_len);
+            break;
+        case AST_BINARY:
+            emit(",\"label\":\"");
+            ast_dump_op(((*AstBinary)node).op);
+            emit("\",\"op\":\"");
+            ast_dump_op(((*AstBinary)node).op);
+            emit("\"");
+            break;
+        case AST_UNARY:
+            emit(",\"label\":\"");
+            ast_dump_op(((*AstUnary)node).op);
+            emit("\",\"op\":\"");
+            ast_dump_op(((*AstUnary)node).op);
+            emit("\"");
+            break;
+        case AST_CALL:
+            emit(",\"label\":");
+            ast_dump_json_string(((*AstCall)node).name_ptr, ((*AstCall)node).name_len);
+            break;
+        case AST_GENERIC_CALL:
+            emit(",\"label\":");
+            ast_dump_json_string(((*AstGenericCall)node).name_ptr, ((*AstGenericCall)node).name_len);
+            break;
+        case AST_STATIC_GENERIC_CALL:
+            var sg: *AstStaticGenericCall = (*AstStaticGenericCall)node;
+            emit(",\"label\":\"");
+            ast_dump_json_escape(sg.struct_name_ptr, sg.struct_name_len);
+            emit(".");
+            ast_dump_json_escape(sg.method_ptr, sg.method_len);
+            emit_char(34);
+            break;
+        case AST_METHOD_CALL:
+        case AST_SAFE_METHOD_CALL:
+            emit(",\"label\":");
+            ast_dump_json_string(((*AstMethodCall)node).method_ptr, ((*AstMethodCall)node).method_len);
+            break;
+        case AST_MEMBER_ACCESS:
+        case AST_SAFE_MEMBER_ACCESS:
+            emit(",\"label\":");
+            ast_dump_json_string(((*AstMemberAccess)node).member_ptr, ((*AstMemberAccess)node).member_len);
+            break;
+        case AST_VAR_DECL:
+            emit(",\"label\":");
+            ast_dump_json_string(((*AstVarDecl)node).name_ptr, ((*AstVarDecl)node).name_len);
+            break;
+        case AST_CONST_DECL:
+            emit(",\"label\":");
+            ast_dump_json_string(((*AstConstDecl)node).name_ptr, ((*AstConstDecl)node).name_len);
+            emit(",\"value\":");
+            emit_u64(((*AstConstDecl)node).value);
+            break;
+        case AST_ALIAS:
+            emit(",\"label\":");
+            ast_dump_json_string(((*AstAlias)node).name_ptr, ((*AstAlias)node).name_len);
+            break;
+        default:
+            emit(",\"label\":\"");
+            ast_dump_node_kind_name(kind);
+            emit_char(34);
+            break;
+    }
+    return 0;
+}
+
+func ast_dump_json_emit_ast_node(id: u64, node: *AstNode, first: *u64) -> u64 {
+    ast_dump_json_sep(first);
+    emit("    {\"id\":");
+    ast_dump_json_emit_id(id);
+    emit(",\"kind\":\"");
+    if (node == 0) {
+        emit("Null");
+        emit("\",\"astKind\":0");
+    } else {
+        ast_dump_node_kind_name(ast_kind(node));
+        emit("\",\"astKind\":");
+        emit_u64(ast_kind(node));
+    }
+    ast_dump_json_emit_ast_label(node);
+    emit("}");
+    return 0;
+}
+
+func ast_dump_json_ast_node(node: *AstNode, counter: *u64, parent: u64, role: u64, phase: u64, first: *u64) -> u64;
+
+func ast_dump_json_static_node(counter: *u64, parent: u64, role: u64, kind: u64, label: u64, phase: u64, first: *u64) -> u64 {
+    var id: u64 = ast_dump_json_next(counter);
+    if (phase == AST_DUMP_JSON_PHASE_NODES) {
+        ast_dump_json_emit_static_node(id, kind, label, first);
+    } else {
+        ast_dump_json_emit_edge(parent, id, role, first);
+    }
+    return id;
+}
+
+func ast_dump_json_node_vec(items: *Vec<*AstNode>, counter: *u64, parent: u64, role: u64, phase: u64, first: *u64) -> u64 {
+    var section: u64 = ast_dump_json_static_node(counter, parent, role, "List", "list", phase, first);
+    if (items == 0) { return section; }
+    var n: u64 = items.len();
+    for (var i: u64 = 0; i < n; i++) {
+        ast_dump_json_ast_node(items.get(i), counter, section, "item", phase, first);
+    }
+    return section;
+}
+
+func ast_dump_json_ast_node(node: *AstNode, counter: *u64, parent: u64, role: u64, phase: u64, first: *u64) -> u64 {
+    var id: u64 = ast_dump_json_next(counter);
+    if (phase == AST_DUMP_JSON_PHASE_NODES) {
+        ast_dump_json_emit_ast_node(id, node, first);
+    } else {
+        ast_dump_json_emit_edge(parent, id, role, first);
+    }
+    if (node == 0) { return id; }
+
+    var kind: u64 = ast_kind(node);
+    switch (kind) {
+        case AST_BINARY:
+            ast_dump_json_ast_node(((*AstBinary)node).left, counter, id, "left", phase, first);
+            ast_dump_json_ast_node(((*AstBinary)node).right, counter, id, "right", phase, first);
+            break;
+        case AST_UNARY:
+            ast_dump_json_ast_node(((*AstUnary)node).operand, counter, id, "operand", phase, first);
+            break;
+        case AST_CALL:
+            ast_dump_json_node_vec(((*AstCall)node).args_vec, counter, id, "args", phase, first);
+            break;
+        case AST_GENERIC_CALL:
+            ast_dump_json_node_vec(((*AstGenericCall)node).args_vec, counter, id, "args", phase, first);
+            break;
+        case AST_STATIC_GENERIC_CALL:
+            ast_dump_json_node_vec(((*AstStaticGenericCall)node).args_vec, counter, id, "args", phase, first);
+            break;
+        case AST_CALL_PTR:
+            ast_dump_json_ast_node(((*AstCallPtr)node).callee, counter, id, "callee", phase, first);
+            ast_dump_json_node_vec(((*AstCallPtr)node).args_vec, counter, id, "args", phase, first);
+            break;
+        case AST_ADDR_OF:
+            ast_dump_json_ast_node(((*AstAddrOf)node).operand, counter, id, "operand", phase, first);
+            break;
+        case AST_DEREF:
+            ast_dump_json_ast_node(((*AstDeref)node).operand, counter, id, "operand", phase, first);
+            break;
+        case AST_DEREF8:
+            ast_dump_json_ast_node(((*AstDeref8)node).operand, counter, id, "operand", phase, first);
+            break;
+        case AST_CAST:
+            ast_dump_json_ast_node(((*AstCast)node).expr, counter, id, "expr", phase, first);
+            break;
+        case AST_MEMBER_ACCESS:
+        case AST_SAFE_MEMBER_ACCESS:
+            ast_dump_json_ast_node(((*AstMemberAccess)node).object, counter, id, "object", phase, first);
+            break;
+        case AST_METHOD_CALL:
+        case AST_SAFE_METHOD_CALL:
+            ast_dump_json_ast_node(((*AstMethodCall)node).receiver, counter, id, "receiver", phase, first);
+            ast_dump_json_node_vec(((*AstMethodCall)node).args_vec, counter, id, "args", phase, first);
+            break;
+        case AST_INDEX:
+        case AST_SAFE_INDEX:
+            ast_dump_json_ast_node(((*AstIndex)node).base, counter, id, "base", phase, first);
+            ast_dump_json_ast_node(((*AstIndex)node).index, counter, id, "index", phase, first);
+            break;
+        case AST_SLICE:
+            ast_dump_json_ast_node(((*AstSlice)node).ptr_expr, counter, id, "ptr", phase, first);
+            ast_dump_json_ast_node(((*AstSlice)node).len_expr, counter, id, "len", phase, first);
+            break;
+        case AST_TERNARY:
+            ast_dump_json_ast_node(((*AstTernary)node).cond, counter, id, "cond", phase, first);
+            ast_dump_json_ast_node(((*AstTernary)node).then_expr, counter, id, "then", phase, first);
+            ast_dump_json_ast_node(((*AstTernary)node).else_expr, counter, id, "else", phase, first);
+            break;
+        case AST_SIZEOF_EXPR:
+            ast_dump_json_ast_node(((*AstSizeofExpr)node).expr, counter, id, "expr", phase, first);
+            break;
+        case AST_STRUCT_LITERAL:
+            ast_dump_json_node_vec(((*AstStructLiteral)node).values_vec, counter, id, "values", phase, first);
+            break;
+        case AST_GENERIC_STRUCT_LITERAL:
+            ast_dump_json_node_vec(((*AstGenericStructLiteral)node).values_vec, counter, id, "values", phase, first);
+            break;
+        case AST_TRY:
+            ast_dump_json_ast_node(((*AstTry)node).operand, counter, id, "operand", phase, first);
+            break;
+        case AST_NEW:
+            ast_dump_json_ast_node(((*AstNew)node).literal_expr, counter, id, "literal", phase, first);
+            ast_dump_json_node_vec(((*AstNew)node).ctor_args_vec, counter, id, "ctor_args", phase, first);
+            break;
+        case AST_STACK_CTOR:
+            ast_dump_json_node_vec(((*AstStackCtor)node).ctor_args_vec, counter, id, "ctor_args", phase, first);
+            break;
+        case AST_RETURN:
+            ast_dump_json_ast_node(((*AstReturn)node).expr, counter, id, "expr", phase, first);
+            break;
+        case AST_VAR_DECL:
+            ast_dump_json_ast_node(((*AstVarDecl)node).init_expr, counter, id, "init", phase, first);
+            break;
+        case AST_ASSIGN:
+            ast_dump_json_ast_node(((*AstAssign)node).target, counter, id, "target", phase, first);
+            ast_dump_json_ast_node(((*AstAssign)node).value, counter, id, "value", phase, first);
+            break;
+        case AST_EXPR_STMT:
+            ast_dump_json_ast_node(((*AstExprStmt)node).expr, counter, id, "expr", phase, first);
+            break;
+        case AST_IF:
+            ast_dump_json_ast_node(((*AstIf)node).cond, counter, id, "cond", phase, first);
+            ast_dump_json_ast_node(((*AstIf)node).then_block, counter, id, "then", phase, first);
+            ast_dump_json_ast_node(((*AstIf)node).else_block, counter, id, "else", phase, first);
+            break;
+        case AST_WHILE:
+            ast_dump_json_ast_node(((*AstWhile)node).cond, counter, id, "cond", phase, first);
+            ast_dump_json_ast_node(((*AstWhile)node).body, counter, id, "body", phase, first);
+            break;
+        case AST_DO_WHILE:
+            ast_dump_json_ast_node(((*AstDoWhile)node).body, counter, id, "body", phase, first);
+            ast_dump_json_ast_node(((*AstDoWhile)node).cond, counter, id, "cond", phase, first);
+            break;
+        case AST_FOR:
+            ast_dump_json_ast_node(((*AstFor)node).init, counter, id, "init", phase, first);
+            ast_dump_json_ast_node(((*AstFor)node).cond, counter, id, "cond", phase, first);
+            ast_dump_json_ast_node(((*AstFor)node).update, counter, id, "update", phase, first);
+            ast_dump_json_ast_node(((*AstFor)node).body, counter, id, "body", phase, first);
+            break;
+        case AST_SWITCH:
+        case AST_MATCH:
+            ast_dump_json_ast_node(((*AstSwitch)node).expr, counter, id, "expr", phase, first);
+            ast_dump_json_node_vec(((*AstSwitch)node).cases_vec, counter, id, "cases", phase, first);
+            break;
+        case AST_CASE:
+            ast_dump_json_ast_node(((*AstCase)node).value, counter, id, "value", phase, first);
+            ast_dump_json_ast_node(((*AstCase)node).body, counter, id, "body", phase, first);
+            break;
+        case AST_DEFER:
+            ast_dump_json_ast_node(((*AstDefer)node).stmt, counter, id, "stmt", phase, first);
+            break;
+        case AST_DELETE:
+            ast_dump_json_ast_node(((*AstDelete)node).expr, counter, id, "expr", phase, first);
+            break;
+        case AST_THROW_STMT:
+            ast_dump_json_ast_node(((*AstThrowStmt)node).expr, counter, id, "expr", phase, first);
+            break;
+        case AST_TRY_STMT:
+            ast_dump_json_ast_node(((*AstTryStmt)node).try_block, counter, id, "try", phase, first);
+            ast_dump_json_ast_node(((*AstTryStmt)node).catch_block, counter, id, "catch", phase, first);
+            ast_dump_json_ast_node(((*AstTryStmt)node).finally_block, counter, id, "finally", phase, first);
+            break;
+        case AST_BLOCK:
+            ast_dump_json_node_vec(((*AstBlock)node).stmts_vec, counter, id, "stmts", phase, first);
+            break;
+        default:
+            break;
+    }
+    return id;
+}
+
+func ast_dump_json_func(fn: *AstFunc, counter: *u64, parent: u64, phase: u64, first: *u64) -> u64 {
+    var id: u64 = ast_dump_json_next(counter);
+    if (phase == AST_DUMP_JSON_PHASE_NODES) {
+        ast_dump_json_sep(first);
+        emit("    {\"id\":");
+        ast_dump_json_emit_id(id);
+        emit(",\"kind\":\"Func\",\"label\":");
+        if (fn != 0) { ast_dump_json_string(fn.name_ptr, fn.name_len); } else { ast_dump_json_cstring("<null>"); }
+        ast_dump_json_emit_module_attr(ast_dump_func_module(fn));
+        emit("}");
+    } else {
+        ast_dump_json_emit_edge(parent, id, "func", first);
+    }
+    if (fn != 0) {
+        if (fn.params_vec != 0) {
+            var params_id: u64 = ast_dump_json_static_node(counter, id, "params", "Section", "params", phase, first);
+            var pn: u64 = fn.params_vec.len();
+            for (var i: u64 = 0; i < pn; i++) {
+                var p: *Param = fn.params_vec.get(i);
+                var pid: u64 = ast_dump_json_next(counter);
+                if (phase == AST_DUMP_JSON_PHASE_NODES) {
+                    ast_dump_json_sep(first);
+                    emit("    {\"id\":");
+                    ast_dump_json_emit_id(pid);
+                    emit(",\"kind\":\"Param\",\"label\":");
+                    ast_dump_json_string(p.name_ptr, p.name_len);
+                    emit("}");
+                } else {
+                    ast_dump_json_emit_edge(params_id, pid, "param", first);
+                }
+                if (p.has_default != 0 && p.default_expr != 0) {
+                    ast_dump_json_ast_node((*AstNode)p.default_expr, counter, pid, "default", phase, first);
+                }
+            }
+        }
+        ast_dump_json_ast_node(fn.body, counter, id, "body", phase, first);
+    }
+    return id;
+}
+
+func ast_dump_json_struct(def: *AstStructDef, counter: *u64, parent: u64, phase: u64, first: *u64) -> u64 {
+    var id: u64 = ast_dump_json_next(counter);
+    if (phase == AST_DUMP_JSON_PHASE_NODES) {
+        ast_dump_json_sep(first);
+        emit("    {\"id\":");
+        ast_dump_json_emit_id(id);
+        emit(",\"kind\":\"Struct\",\"label\":");
+        if (def != 0) { ast_dump_json_string(def.name_ptr, def.name_len); } else { ast_dump_json_cstring("<null>"); }
+        emit("}");
+    } else {
+        ast_dump_json_emit_edge(parent, id, "struct", first);
+    }
+    if (def != 0 && def.fields_vec != 0) {
+        var fields_id: u64 = ast_dump_json_static_node(counter, id, "fields", "Section", "fields", phase, first);
+        var n: u64 = def.fields_vec.len();
+        for (var i: u64 = 0; i < n; i++) {
+            var field: *FieldDesc = def.fields_vec.get(i);
+            var fid: u64 = ast_dump_json_next(counter);
+            if (phase == AST_DUMP_JSON_PHASE_NODES) {
+                ast_dump_json_sep(first);
+                emit("    {\"id\":");
+                ast_dump_json_emit_id(fid);
+                emit(",\"kind\":\"Field\",\"label\":");
+                ast_dump_json_string(field.name_ptr, field.name_len);
+                emit("}");
+            } else {
+                ast_dump_json_emit_edge(fields_id, fid, "field", first);
+            }
+        }
+    }
+    return id;
+}
+
+func ast_dump_json_global(g: *GlobalInfo, counter: *u64, parent: u64, phase: u64, first: *u64) -> u64 {
+    var id: u64 = ast_dump_json_next(counter);
+    if (phase == AST_DUMP_JSON_PHASE_NODES) {
+        ast_dump_json_sep(first);
+        emit("    {\"id\":");
+        ast_dump_json_emit_id(id);
+        emit(",\"kind\":\"Global\",\"label\":");
+        if (g != 0) { ast_dump_json_string(g.name_ptr, g.name_len); } else { ast_dump_json_cstring("<null>"); }
+        ast_dump_json_emit_module_attr(ast_dump_global_module(g));
+        emit("}");
+    } else {
+        ast_dump_json_emit_edge(parent, id, "global", first);
+    }
+    if (g != 0 && g.init_expr != 0) {
+        ast_dump_json_ast_node((*AstNode)g.init_expr, counter, id, "init", phase, first);
+    }
+    return id;
+}
+
+func ast_dump_json_program_phase(prog: *AstProgram, filter: *AstDumpFilter, phase: u64, first: *u64) -> u64 {
+    var counter: u64 = 0;
+    var root: u64 = ast_dump_json_next(&counter);
+    if (phase == AST_DUMP_JSON_PHASE_NODES) {
+        ast_dump_json_emit_static_node(root, "Program", "Program", first);
+    }
+
+    if (prog != 0 && ast_dump_filter_include_static_sections(filter) != 0 && prog.structs_vec != 0) {
+        var sid: u64 = ast_dump_json_static_node(&counter, root, "structs", "Section", "structs", phase, first);
+        var sn: u64 = prog.structs_vec.len();
+        for (var si: u64 = 0; si < sn; si++) {
+            ast_dump_json_struct(prog.structs_vec.get(si), &counter, sid, phase, first);
+        }
+    }
+
+    if (prog != 0 && prog.globals_vec != 0) {
+        var gid: u64 = ast_dump_json_static_node(&counter, root, "globals", "Section", "globals", phase, first);
+        var gn: u64 = prog.globals_vec.len();
+        for (var gi: u64 = 0; gi < gn; gi++) {
+            var g: *GlobalInfo = prog.globals_vec.get(gi);
+            if (ast_dump_filter_accept_global(g, filter) != 0) {
+                ast_dump_json_global(g, &counter, gid, phase, first);
+            }
+        }
+    }
+
+    if (prog != 0 && ast_dump_filter_include_static_sections(filter) != 0 && prog.consts_vec != 0) {
+        var cid: u64 = ast_dump_json_static_node(&counter, root, "consts", "Section", "consts", phase, first);
+        var cn: u64 = prog.consts_vec.len();
+        for (var ci: u64 = 0; ci < cn; ci++) {
+            ast_dump_json_ast_node((*AstNode)prog.consts_vec.get(ci), &counter, cid, "const", phase, first);
+        }
+    }
+
+    if (prog != 0 && prog.funcs_vec != 0) {
+        var fid: u64 = ast_dump_json_static_node(&counter, root, "funcs", "Section", "funcs", phase, first);
+        var fnn: u64 = prog.funcs_vec.len();
+        for (var fni: u64 = 0; fni < fnn; fni++) {
+            var fn: *AstFunc = prog.funcs_vec.get(fni);
+            if (ast_dump_filter_accept_func(fn, filter) != 0) {
+                ast_dump_json_func(fn, &counter, fid, phase, first);
+            }
+        }
+    }
+    return 0;
+}
+
+func ast_dump_program_json(prog: *AstProgram) -> u64 {
+    return ast_dump_program_json_filtered(prog, 0);
+}
+
+func ast_dump_program_json_filtered(prog: *AstProgram, filter: *AstDumpFilter) -> u64 {
+    emit("{\n");
+    emit("  \"format\":\"bpp.ast.graph.v1\",\n");
+    emit("  \"nodes\":[\n");
+    var first_nodes: u64 = 1;
+    ast_dump_json_program_phase(prog, filter, AST_DUMP_JSON_PHASE_NODES, &first_nodes);
+    emit("\n  ],\n");
+    emit("  \"edges\":[\n");
+    var first_edges: u64 = 1;
+    ast_dump_json_program_phase(prog, filter, AST_DUMP_JSON_PHASE_EDGES, &first_edges);
+    emit("\n  ]\n");
+    emit("}\n");
+    return 0;
+}

@@ -87,13 +87,20 @@ func compiler_target_call_shadow_words() -> u64 {
     return 0;
 }
 
+func compiler_api_require_active_ctx(ctx: *CompilerCtx, api_name: u64) -> u64 {
+    if (compiler_ctx_is_active(ctx) != 0) { return 1; }
+    emit_stderr("[ERROR] ");
+    emit_stderr(api_name);
+    emit_stderr(" currently requires active compiler context\n");
+    return 0;
+}
+
 func compiler_target() -> u64 {
     return compiler_target_with_ctx(compiler_ctx_current());
 }
 
 func compiler_target_with_ctx(ctx: *CompilerCtx) -> u64 {
-    if (compiler_ctx_is_active(ctx) == 0) {
-        emit_stderr("[ERROR] compiler_target_with_ctx currently requires active compiler context\n");
+    if (compiler_api_require_active_ctx(ctx, "compiler_target_with_ctx") == 0) {
         return compiler_target_default();
     }
     if (g_compiler_ctx.target == 0) { return compiler_target_default(); }
@@ -101,8 +108,7 @@ func compiler_target_with_ctx(ctx: *CompilerCtx) -> u64 {
 }
 
 func compiler_target_set_with_ctx(ctx: *CompilerCtx, target: u64) -> u64 {
-    if (compiler_ctx_is_active(ctx) == 0) {
-        emit_stderr("[ERROR] compiler_target_set_with_ctx currently requires active compiler context\n");
+    if (compiler_api_require_active_ctx(ctx, "compiler_target_set_with_ctx") == 0) {
         return 0;
     }
     if (target == 0) { target = compiler_target_default(); }
@@ -121,6 +127,52 @@ func compiler_target_supports_codegen_with_ctx(ctx: *CompilerCtx) -> u64 {
     }
     if (target == COMPILER_TARGET_LINUX_X86_64) { return 1; }
     return 0;
+}
+
+func setup_paths_apply_manifest(manifest_path: u64) -> u64 {
+    var manifest_len: u64 = str_len(manifest_path);
+    var manifest_dir: u64 = path_dirname(manifest_path, manifest_len);
+    var manifest_dir_len: u64 = str_len(manifest_dir);
+
+    var module_root_val: u64 = read_manifest_value(manifest_path, "module_root=", 12);
+    if (module_root_val != 0) {
+        g_compiler_ctx.project_dir = manifest_resolve_path(manifest_dir, manifest_dir_len, module_root_val);
+        g_compiler_ctx.project_dir_len = str_len(g_compiler_ctx.project_dir);
+    }
+
+    var std_root_val: u64 = read_manifest_value(manifest_path, "std_root=", 9);
+    if (std_root_val != 0) {
+        g_compiler_ctx.lib_dir = manifest_resolve_path(manifest_dir, manifest_dir_len, std_root_val);
+        g_compiler_ctx.lib_dir_len = str_len(g_compiler_ctx.lib_dir);
+    } else {
+        var version_val: u64 = read_manifest_value(manifest_path, "version=", 8);
+        if (version_val != 0) {
+            var v_len: u64 = str_len(version_val);
+            var version_src_rel: u64 = str_concat3(version_val, v_len, "/", 1, "src", 3);
+            g_compiler_ctx.lib_dir = manifest_resolve_path(manifest_dir, manifest_dir_len, version_src_rel);
+            g_compiler_ctx.lib_dir_len = str_len(g_compiler_ctx.lib_dir);
+        }
+    }
+
+    g_compiler_ctx.tool_nasm_path = read_manifest_value(manifest_path, "nasm_path=", 10);
+    g_compiler_ctx.tool_ld_path = read_manifest_value(manifest_path, "ld_path=", 8);
+
+    var target_val: u64 = read_manifest_value(manifest_path, "target=", 7);
+    if (target_val != 0) {
+        var target_len: u64 = str_len(target_val);
+        var parsed_target: u64 = compiler_target_parse(target_val, target_len);
+        if (parsed_target == 0) {
+            emit_stderr("[ERROR] unsupported target in bpp.toml: ");
+            emit_stderr_len(target_val, target_len);
+            emit_stderr("\n");
+            emit_stderr("[ERROR] supported targets: linux-x86_64, windows-x86_64\n");
+            diag_error("Unsupported target");
+            return 0;
+        }
+        compiler_target_set_with_ctx(&g_compiler_ctx, parsed_target);
+    }
+
+    return 1;
 }
 
 func setup_paths_with_compiler(filename: u64, filename_len: u64) -> u64 {
@@ -143,48 +195,8 @@ func setup_paths_with_compiler(filename: u64, filename_len: u64) -> u64 {
     // - nasm_path=...
     // - ld_path=...
     var manifest_path: u64 = find_manifest_path_impl(g_compiler_ctx.base_dir, g_compiler_ctx.base_dir_len);
-    if (manifest_path != 0) {
-        var manifest_len: u64 = str_len(manifest_path);
-        var manifest_dir: u64 = path_dirname(manifest_path, manifest_len);
-        var manifest_dir_len: u64 = str_len(manifest_dir);
-
-        var module_root_val: u64 = read_manifest_value(manifest_path, "module_root=", 12);
-        if (module_root_val != 0) {
-            g_compiler_ctx.project_dir = manifest_resolve_path(manifest_dir, manifest_dir_len, module_root_val);
-            g_compiler_ctx.project_dir_len = str_len(g_compiler_ctx.project_dir);
-        }
-
-        var std_root_val: u64 = read_manifest_value(manifest_path, "std_root=", 9);
-        if (std_root_val != 0) {
-            g_compiler_ctx.lib_dir = manifest_resolve_path(manifest_dir, manifest_dir_len, std_root_val);
-            g_compiler_ctx.lib_dir_len = str_len(g_compiler_ctx.lib_dir);
-        } else {
-            var version_val: u64 = read_manifest_value(manifest_path, "version=", 8);
-            if (version_val != 0) {
-                var v_len: u64 = str_len(version_val);
-                var version_src_rel: u64 = str_concat3(version_val, v_len, "/", 1, "src", 3);
-                g_compiler_ctx.lib_dir = manifest_resolve_path(manifest_dir, manifest_dir_len, version_src_rel);
-                g_compiler_ctx.lib_dir_len = str_len(g_compiler_ctx.lib_dir);
-            }
-        }
-
-        g_compiler_ctx.tool_nasm_path = read_manifest_value(manifest_path, "nasm_path=", 10);
-        g_compiler_ctx.tool_ld_path = read_manifest_value(manifest_path, "ld_path=", 8);
-
-        var target_val: u64 = read_manifest_value(manifest_path, "target=", 7);
-        if (target_val != 0) {
-            var target_len: u64 = str_len(target_val);
-            var parsed_target: u64 = compiler_target_parse(target_val, target_len);
-            if (parsed_target == 0) {
-                emit_stderr("[ERROR] unsupported target in bpp.toml: ");
-                emit_stderr_len(target_val, target_len);
-                emit_stderr("\n");
-                emit_stderr("[ERROR] supported targets: linux-x86_64, windows-x86_64\n");
-                diag_error("Unsupported target");
-                return 0;
-            }
-            compiler_target_set_with_ctx(&g_compiler_ctx, parsed_target);
-        }
+    if (manifest_path != 0 && setup_paths_apply_manifest(manifest_path) == 0) {
+        return 0;
     }
 
     if (g_compiler_ctx.lib_dir != 0 && g_compiler_ctx.lib_dir_len != 0) {
@@ -218,24 +230,21 @@ func entry_func_len() -> u64 {
 }
 
 func nasm_path_with_ctx(ctx: *CompilerCtx) -> u64 {
-    if (compiler_ctx_is_active(ctx) == 0) {
-        emit_stderr("[ERROR] nasm_path_with_ctx currently requires active compiler context\n");
+    if (compiler_api_require_active_ctx(ctx, "nasm_path_with_ctx") == 0) {
         return 0;
     }
     return g_compiler_ctx.tool_nasm_path;
 }
 
 func ld_path_with_ctx(ctx: *CompilerCtx) -> u64 {
-    if (compiler_ctx_is_active(ctx) == 0) {
-        emit_stderr("[ERROR] ld_path_with_ctx currently requires active compiler context\n");
+    if (compiler_api_require_active_ctx(ctx, "ld_path_with_ctx") == 0) {
         return 0;
     }
     return g_compiler_ctx.tool_ld_path;
 }
 
 func entry_func_ptr_with_ctx(ctx: *CompilerCtx) -> u64 {
-    if (compiler_ctx_is_active(ctx) == 0) {
-        emit_stderr("[ERROR] entry_func_ptr_with_ctx currently requires active compiler context\n");
+    if (compiler_api_require_active_ctx(ctx, "entry_func_ptr_with_ctx") == 0) {
         return (u64)"main";
     }
     if (g_compiler_ctx.entry_func_ptr != 0 && g_compiler_ctx.entry_func_len != 0) {
@@ -245,8 +254,7 @@ func entry_func_ptr_with_ctx(ctx: *CompilerCtx) -> u64 {
 }
 
 func entry_func_len_with_ctx(ctx: *CompilerCtx) -> u64 {
-    if (compiler_ctx_is_active(ctx) == 0) {
-        emit_stderr("[ERROR] entry_func_len_with_ctx currently requires active compiler context\n");
+    if (compiler_api_require_active_ctx(ctx, "entry_func_len_with_ctx") == 0) {
         return 4;
     }
     if (g_compiler_ctx.entry_func_ptr != 0 && g_compiler_ctx.entry_func_len != 0) {

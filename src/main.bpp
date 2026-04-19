@@ -12,6 +12,7 @@ import compiler.loader;
 import compiler.runtime_api;
 import compiler.pass_runner;
 import compiler.annotations;
+import compiler.ast_dump;
 import codegen;
 import opt;
 
@@ -23,7 +24,16 @@ struct Argv7 { public a0: u64; public a1: u64; public a2: u64; public a3: u64; p
 struct Argv8 { public a0: u64; public a1: u64; public a2: u64; public a3: u64; public a4: u64; public a5: u64; public a6: u64; public a7: u64; }
 struct Argv5 { public a0: u64; public a1: u64; public a2: u64; public a3: u64; public a4: u64; }
 struct Argv2 { public a0: u64; public a1: u64; }
-struct MainCliParseResult { public ok: u64; public filename: u64; public target_override: u64; }
+struct MainCliParseResult {
+    public ok: u64;
+    public filename: u64;
+    public target_override: u64;
+    public ast_filter_func_ptr: u64;
+    public ast_filter_func_len: u64;
+    public ast_filter_module_ptr: u64;
+    public ast_filter_module_len: u64;
+    public ast_filter_no_std: u64;
+}
 struct MainOutputPaths { public asm_path: u64; public obj_path: u64; public exe_path: u64; }
 
 impl Argv6 {
@@ -80,7 +90,7 @@ impl Argv2 {
 }
 
 func main_print_usage() -> u64 {
-    emit("Usage: bppc [-O0|-O1] [-dump-ir|-dump-ssa|-asm] [--target <linux-x86_64|windows-x86_64>] [--symbolic-report] [--strict-std-complexity-summary] <source.bpp>\n");
+    emit("Usage: bppc [-O0|-O1] [-dump-ast|-dump-ast-graph|-dump-ast-json|-dump-ir|-dump-ssa|-asm] [--ast-func <name>] [--ast-module <module>] [--ast-no-std] [--target <linux-x86_64|windows-x86_64>] [--symbolic-report] [--strict-std-complexity-summary] <source.bpp>\n");
     return 0;
 }
 
@@ -109,6 +119,11 @@ func main_parse_cli(argc: u64, argv_ptr: *u64) -> MainCliParseResult {
     result.ok = 0;
     result.filename = 0;
     result.target_override = 0;
+    result.ast_filter_func_ptr = 0;
+    result.ast_filter_func_len = 0;
+    result.ast_filter_module_ptr = 0;
+    result.ast_filter_module_len = 0;
+    result.ast_filter_no_std = 0;
 
     // Default flags (avoid uninitialized globals affecting codegen)
     opt_init_defaults();
@@ -138,6 +153,66 @@ func main_parse_cli(argc: u64, argv_ptr: *u64) -> MainCliParseResult {
         if (str_eq(arg, arg_len, "-dump-ssa", 9)) {
             opt_set_ir_mode(IR_SSA);
             opt_set_output_mode(OUT_IR);
+            continue;
+        }
+        if (str_eq(arg, arg_len, "-dump-ast", 9)) {
+            opt_set_output_mode(OUT_AST);
+            continue;
+        }
+        if (str_eq(arg, arg_len, "-dump-ast-graph", 15)) {
+            opt_set_output_mode(OUT_AST_GRAPH);
+            continue;
+        }
+        if (str_eq(arg, arg_len, "-dump-ast-json", 14)) {
+            opt_set_output_mode(OUT_AST_JSON);
+            continue;
+        }
+        if (str_eq(arg, arg_len, "--ast-func", 10) || str_eq(arg, arg_len, "--graph-func", 12)) {
+            if (i + 1 >= argc) {
+                emit_stderr("[ERROR] missing value for ");
+                emit_stderr_len(arg, arg_len);
+                emit_stderr("\n");
+                return result;
+            }
+            i = i + 1;
+            result.ast_filter_func_ptr = argv_ptr[i];
+            result.ast_filter_func_len = str_len(result.ast_filter_func_ptr);
+            continue;
+        }
+        if (main_has_prefix(arg, arg_len, "--ast-func=", 11) != 0) {
+            result.ast_filter_func_ptr = arg + 11;
+            result.ast_filter_func_len = arg_len - 11;
+            continue;
+        }
+        if (main_has_prefix(arg, arg_len, "--graph-func=", 13) != 0) {
+            result.ast_filter_func_ptr = arg + 13;
+            result.ast_filter_func_len = arg_len - 13;
+            continue;
+        }
+        if (str_eq(arg, arg_len, "--ast-module", 12) || str_eq(arg, arg_len, "--graph-module", 14)) {
+            if (i + 1 >= argc) {
+                emit_stderr("[ERROR] missing value for ");
+                emit_stderr_len(arg, arg_len);
+                emit_stderr("\n");
+                return result;
+            }
+            i = i + 1;
+            result.ast_filter_module_ptr = argv_ptr[i];
+            result.ast_filter_module_len = str_len(result.ast_filter_module_ptr);
+            continue;
+        }
+        if (main_has_prefix(arg, arg_len, "--ast-module=", 13) != 0) {
+            result.ast_filter_module_ptr = arg + 13;
+            result.ast_filter_module_len = arg_len - 13;
+            continue;
+        }
+        if (main_has_prefix(arg, arg_len, "--graph-module=", 15) != 0) {
+            result.ast_filter_module_ptr = arg + 15;
+            result.ast_filter_module_len = arg_len - 15;
+            continue;
+        }
+        if (str_eq(arg, arg_len, "--ast-no-std", 12) || str_eq(arg, arg_len, "--graph-no-std", 14)) {
+            result.ast_filter_no_std = 1;
             continue;
         }
         if (str_eq(arg, arg_len, "-asm", 4)) {
@@ -580,6 +655,12 @@ func main(argc: u64, argv: u64) -> u64 {
     var target: u64 = compiler_target();
     var base_name: u64 = path_basename_noext(filename, filename_len);
     var base_len: u64 = str_len(base_name);
+    var ast_filter: AstDumpFilter;
+    ast_filter.func_ptr = cli.ast_filter_func_ptr;
+    ast_filter.func_len = cli.ast_filter_func_len;
+    ast_filter.module_ptr = cli.ast_filter_module_ptr;
+    ast_filter.module_len = cli.ast_filter_module_len;
+    ast_filter.no_std = cli.ast_filter_no_std;
 
     if (out_mode == OUT_EXEC && main_host_allows_target(target) == 0) {
         emit_stderr("[ERROR] target ");
@@ -590,6 +671,15 @@ func main(argc: u64, argv: u64) -> u64 {
     }
 
     switch (out_mode) {
+        case OUT_AST:
+            ast_dump_program_filtered(merged_prog, &ast_filter);
+            break;
+        case OUT_AST_GRAPH:
+            ast_dump_program_dot_filtered(merged_prog, &ast_filter);
+            break;
+        case OUT_AST_JSON:
+            ast_dump_program_json_filtered(merged_prog, &ast_filter);
+            break;
         case OUT_IR:
             diag_reset();
             program_with_sigs_ir(merged_prog, get_func_sigs());
