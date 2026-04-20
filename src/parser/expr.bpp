@@ -120,6 +120,97 @@ func expr_parse_list_brace(p: *Parser) -> *Vec<*AstNode> {
     return values;
 }
 
+func expr_is_named_brace(p: *Parser) -> u64 {
+    // After '{', check if first field is IDENTIFIER followed by ':'
+    if (peek_kind(p) != TOKEN_IDENTIFIER) { return 0; }
+    var saved: u64 = parser_pos(p);
+    advance_tok(p);
+    var is_named: u64 = 0;
+    if (peek_kind(p) == TOKEN_COLON) { is_named = 1; }
+    parser_set_pos(p, saved);
+    return is_named;
+}
+
+func expr_find_field_index(struct_def: *AstStructDef, name_ptr: u64, name_len: u64) -> u64 {
+    var fields: *Vec<*FieldDesc> = struct_def.fields_vec;
+    if (fields == 0) { return 0 - 1; }
+    var n: u64 = fields.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var fd: *FieldDesc = fields.get(i);
+        if (str_eq(fd.name_ptr, fd.name_len, name_ptr, name_len) != 0) {
+            return i;
+        }
+    }
+    return 0 - 1;
+}
+
+func expr_parse_named_or_positional_brace(p: *Parser, struct_def: *AstStructDef) -> *Vec<*AstNode> {
+    consume_tok(p, TOKEN_LBRACE);
+
+    if (peek_kind(p) == TOKEN_RBRACE) {
+        consume_tok(p, TOKEN_RBRACE);
+        return new Vec<*AstNode>(0);
+    }
+
+    // Detect named vs positional
+    if (struct_def != 0 && expr_is_named_brace(p) != 0) {
+        // Named struct literal: {field_name: expr, ...}
+        var fields: *Vec<*FieldDesc> = struct_def.fields_vec;
+        var field_count: u64 = 0;
+        if (fields != 0) { field_count = fields.len(); }
+        var values: *Vec<*AstNode> = new Vec<*AstNode>(field_count);
+        // Initialize with 0 placeholders
+        for (var i: u64 = 0; i < field_count; i++) {
+            values.push((*AstNode)ast_literal(0));
+        }
+        var used_count: u64 = 0;
+
+        // Parse first named field
+        var ftok: *Token = peek_tok(p);
+        consume_tok(p, TOKEN_IDENTIFIER);
+        consume_tok(p, TOKEN_COLON);
+        var fval: *AstNode = expr_parse(p);
+        var fidx: u64 = expr_find_field_index(struct_def, ftok.ptr, ftok.len);
+        if (fidx == 0 - 1) {
+            emit_stderr("[ERROR] Unknown field '");
+            emit_stderr_len(ftok.ptr, ftok.len);
+            emit_stderr("' in struct literal\n");
+            panic_here(p, "Syntax error");
+        }
+        values.set(fidx, fval);
+        used_count = used_count + 1;
+
+        while (match_tok(p, TOKEN_COMMA)) {
+            if (peek_kind(p) == TOKEN_RBRACE) { break; }
+            var ntok: *Token = peek_tok(p);
+            consume_tok(p, TOKEN_IDENTIFIER);
+            consume_tok(p, TOKEN_COLON);
+            var nval: *AstNode = expr_parse(p);
+            var nidx: u64 = expr_find_field_index(struct_def, ntok.ptr, ntok.len);
+            if (nidx == 0 - 1) {
+                emit_stderr("[ERROR] Unknown field '");
+                emit_stderr_len(ntok.ptr, ntok.len);
+                emit_stderr("' in struct literal\n");
+                panic_here(p, "Syntax error");
+            }
+            values.set(nidx, nval);
+            used_count = used_count + 1;
+        }
+
+        consume_tok(p, TOKEN_RBRACE);
+        return values;
+    }
+
+    // Positional — same as before
+    var values: *Vec<*AstNode> = new Vec<*AstNode>(8);
+    values.push(expr_parse(p));
+    while (match_tok(p, TOKEN_COMMA)) {
+        values.push(expr_parse(p));
+    }
+    consume_tok(p, TOKEN_RBRACE);
+    return values;
+}
+
 func expr_resolve_struct_def(name_ptr: u64, name_len: u64) -> *AstStructDef {
     var struct_def: *AstStructDef = get_struct_def(name_ptr, name_len);
     if (struct_def != 0) { return struct_def; }
@@ -183,7 +274,7 @@ func expr_primary_identifier_struct_literal(p: *Parser, tok4: *Token) -> *AstNod
         panic_here(p, "Syntax error");
         return (*AstNode)ast_literal(0);
     }
-    var values: *Vec<*AstNode> = expr_parse_list_brace(p);
+    var values: *Vec<*AstNode> = expr_parse_named_or_positional_brace(p, struct_def);
     if (struct_def.is_union == 1 && values.len() > 1) {
         emit_stderr("[ERROR] union literal accepts at most one initializer\n");
         panic_here(p, "Syntax error");
@@ -356,7 +447,7 @@ func expr_primary_new_expr(p: *Parser) -> *AstNode {
             panic_here(p, "Syntax error");
             return (*AstNode)ast_literal(0);
         }
-        var values_new: *Vec<*AstNode> = expr_parse_list_brace(p);
+        var values_new: *Vec<*AstNode> = expr_parse_named_or_positional_brace(p, struct_def_new);
         if (struct_def_new.is_union == 1 && values_new.len() > 1) {
             emit_stderr("[ERROR] union literal accepts at most one initializer\n");
             panic_here(p, "Syntax error");
@@ -434,7 +525,7 @@ func expr_parse_primary(p: *Parser) -> *AstNode {
     defer pop_trace();
     var k: u64 = peek_kind(p);
     
-    switch (k) {
+    match (k) {
         case TOKEN_NUMBER:
             var tok: *Token = peek_tok(p);
             advance_tok(p);
@@ -648,7 +739,7 @@ func expr_postfix_from(p: *Parser, left: *AstNode) -> *AstNode {
     while (1) {
         var k: u64 = peek_kind(p);
 
-        switch (k) {
+        match (k) {
             case TOKEN_LBRACKET:
                 advance_tok(p);
                 var idx: *AstNode = expr_parse(p);
@@ -715,7 +806,7 @@ func expr_parse_postfix(p: *Parser) -> *AstNode {
 func expr_parse_unary(p: *Parser) -> *AstNode {
     var k: u64 = peek_kind(p);
     
-    switch (k) {
+    match (k) {
         case TOKEN_STAR:
             advance_tok(p);
             var operand: *AstNode = expr_parse_unary(p);
@@ -754,7 +845,7 @@ func expr_parse_mul(p: *Parser) -> *AstNode {
     
     while (1) {
         var k: u64 = peek_kind(p);
-        switch (k) {
+        match (k) {
             case TOKEN_STAR:
                 advance_tok(p);
                 var right: *AstNode = expr_parse_unary(p);
@@ -781,7 +872,7 @@ func expr_parse_add(p: *Parser) -> *AstNode {
     
     while (1) {
         var k: u64 = peek_kind(p);
-        switch (k) {
+        match (k) {
             case TOKEN_PLUS:
                 advance_tok(p);
                 var right: *AstNode = expr_parse_mul(p);
@@ -803,7 +894,7 @@ func expr_parse_shift(p: *Parser) -> *AstNode {
     
     while (1) {
         var k: u64 = peek_kind(p);
-        switch (k) {
+        match (k) {
             case TOKEN_LSHIFT:
                 advance_tok(p);
                 var right: *AstNode = expr_parse_add(p);
@@ -825,7 +916,7 @@ func expr_parse_rel(p: *Parser) -> *AstNode {
     
     while (1) {
         var k: u64 = peek_kind(p);
-        switch (k) {
+        match (k) {
             case TOKEN_LT:
                 advance_tok(p);
                 var right: *AstNode = expr_parse_shift(p);
@@ -857,7 +948,7 @@ func expr_parse_eq(p: *Parser) -> *AstNode {
     
     while (1) {
         var k: u64 = peek_kind(p);
-        switch (k) {
+        match (k) {
             case TOKEN_EQEQ:
                 advance_tok(p);
                 var right: *AstNode = expr_parse_rel(p);
@@ -879,7 +970,7 @@ func expr_parse_bitand(p: *Parser) -> *AstNode {
     
     while (1) {
         var k: u64 = peek_kind(p);
-        switch (k) {
+        match (k) {
             case TOKEN_AMPERSAND:
                 advance_tok(p);
                 var right: *AstNode = expr_parse_eq(p);
@@ -896,7 +987,7 @@ func expr_parse_bitxor(p: *Parser) -> *AstNode {
     
     while (1) {
         var k: u64 = peek_kind(p);
-        switch (k) {
+        match (k) {
             case TOKEN_CARET:
                 advance_tok(p);
                 var right: *AstNode = expr_parse_bitand(p);
@@ -913,7 +1004,7 @@ func expr_parse_bitor(p: *Parser) -> *AstNode {
     
     while (1) {
         var k: u64 = peek_kind(p);
-        switch (k) {
+        match (k) {
             case TOKEN_PIPE:
                 advance_tok(p);
                 var right: *AstNode = expr_parse_bitxor(p);
@@ -930,7 +1021,7 @@ func expr_parse_logand(p: *Parser) -> *AstNode {
 
     while (1) {
         var k: u64 = peek_kind(p);
-        switch (k) {
+        match (k) {
             case TOKEN_ANDAND:
                 advance_tok(p);
                 var right: *AstNode = expr_parse_bitor(p);
@@ -947,7 +1038,7 @@ func expr_parse_logor(p: *Parser) -> *AstNode {
 
     while (1) {
         var k: u64 = peek_kind(p);
-        switch (k) {
+        match (k) {
             case TOKEN_OROR:
                 advance_tok(p);
                 var right: *AstNode = expr_parse_logand(p);
