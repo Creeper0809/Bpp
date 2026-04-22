@@ -29,6 +29,7 @@ struct ParseSwitchArm {
     public variant_ptr: u64;
     public variant_len: u64;
     public bind_names: *Vec<*NameInfo>;
+    public bind_field_names: *Vec<*NameInfo>;
     public body: *AstNode;
 }
 
@@ -41,6 +42,7 @@ impl ParseSwitchArm {
         self.variant_ptr = 0;
         self.variant_len = 0;
         self.bind_names = 0;
+        self.bind_field_names = 0;
         self.body = 0;
     }
 }
@@ -79,17 +81,7 @@ func switch_append_block_stmts(dst: *Vec<*AstNode>, block_node: *AstNode) -> u64
 }
 
 func switch_match_build_payload_field_name(idx: u64) -> *NameInfo {
-    var prefix_ptr: u64 = (u64)"v";
-    var prefix_len: u64 = 1;
-    var idx_buf: u64 = heap_alloc(32 * sizeof(u8));
-    var idx_len: u64 = io_u64_to_ascii(idx_buf, idx);
-    var out_len: u64 = prefix_len + idx_len;
-    var out_ptr: u64 = heap_alloc((out_len + 1) * sizeof(u8));
-    var out_u8: []u8 = slice(out_ptr, out_len + 1);
-    str_copy(out_ptr, prefix_ptr, prefix_len);
-    str_copy(out_ptr + prefix_len, idx_buf, idx_len);
-    out_u8[out_len] = 0;
-    return new NameInfo{out_ptr, out_len};
+    return payload_build_field_name(idx);
 }
 
 func switch_parse_variant_case_head(p: *Parser, is_match_stmt: u64) -> *ParseSwitchArm {
@@ -117,6 +109,7 @@ func switch_parse_variant_case_head(p: *Parser, is_match_stmt: u64) -> *ParseSwi
     }
 
     var bind_names: *Vec<*NameInfo> = new Vec<*NameInfo>(expected_arity);
+    var bind_field_names: *Vec<*NameInfo> = 0;
     if (match_tok(p, TOKEN_LPAREN)) {
         if (peek_kind(p) != TOKEN_RPAREN) {
             while (1) {
@@ -126,14 +119,39 @@ func switch_parse_variant_case_head(p: *Parser, is_match_stmt: u64) -> *ParseSwi
                 }
                 var bind_tok: *Token = peek_tok(p);
                 consume_tok(p, TOKEN_IDENTIFIER);
-                bind_names.push(new NameInfo{bind_tok.ptr, bind_tok.len});
+                if (match_tok(p, TOKEN_COLON)) {
+                    // Named binding: field_name: binding_name
+                    if (bind_field_names == 0) {
+                        bind_field_names = new Vec<*NameInfo>(expected_arity);
+                    }
+                    if (peek_kind(p) != TOKEN_IDENTIFIER) {
+                        emit_stderr("[ERROR] expected binding name after ':' in named pattern\n");
+                        panic_here(p, "Syntax error");
+                    }
+                    var actual_bind: *Token = peek_tok(p);
+                    consume_tok(p, TOKEN_IDENTIFIER);
+                    bind_field_names.push(new NameInfo{bind_tok.ptr, bind_tok.len});
+                    bind_names.push(new NameInfo{actual_bind.ptr, actual_bind.len});
+                } else {
+                    // Positional binding
+                    if (bind_field_names != 0) {
+                        emit_stderr("[ERROR] cannot mix positional and named bindings in match pattern\n");
+                        panic_here(p, "Syntax error");
+                    }
+                    bind_names.push(new NameInfo{bind_tok.ptr, bind_tok.len});
+                }
                 if (match_tok(p, TOKEN_COMMA) == 0) { break; }
             }
         }
         consume_tok(p, TOKEN_RPAREN);
     }
 
-    if (bind_names.len() != expected_arity) {
+    if (bind_field_names != 0) {
+        if (bind_names.len() != bind_field_names.len()) {
+            emit_stderr("[ERROR] cannot mix positional and named bindings in match pattern\n");
+            panic_here(p, "Syntax error");
+        }
+    } else if (bind_names.len() != expected_arity) {
         emit_stderr("[ERROR] match variant payload arity mismatch: ");
         emit_stderr_len(enum_tok.ptr, enum_tok.len);
         emit_stderr(".");
@@ -157,6 +175,7 @@ func switch_parse_variant_case_head(p: *Parser, is_match_stmt: u64) -> *ParseSwi
     arm.variant_ptr = variant_tok.ptr;
     arm.variant_len = variant_tok.len;
     arm.bind_names = bind_names;
+    arm.bind_field_names = bind_field_names;
     return arm;
 }
 
@@ -306,33 +325,11 @@ func switch_validate_variant_exhaustive(p: *Parser, arms: *Vec<*ParseSwitchArm>,
 }
 
 func switch_find_payload_field_desc(struct_def: *AstStructDef, field_ptr: u64, field_len: u64) -> *FieldDesc {
-    if (struct_def == 0 || struct_def.fields_vec == 0) { return 0; }
-    var n: u64 = struct_def.fields_vec.len();
-    for (var i: u64 = 0; i < n; i++) {
-        var field: *FieldDesc = struct_def.fields_vec.get(i);
-        if (str_eq(field.name_ptr, field.name_len, field_ptr, field_len) != 0) {
-            return field;
-        }
-    }
-    return 0;
+    return payload_find_field_desc(struct_def, field_ptr, field_len);
 }
 
 func switch_build_binding_decl(name_ptr: u64, name_len: u64, field_expr: *AstNode, field_desc: *FieldDesc) -> *AstVarDecl {
-    var decl: *AstVarDecl = ast_var_decl(name_ptr, name_len, TYPE_U64, 0, field_expr);
-    if (field_desc == 0) { return decl; }
-
-    decl.type_kind = field_desc.type_kind;
-    decl.ptr_depth = field_desc.ptr_depth;
-    decl.is_tagged = field_desc.is_tagged;
-    decl.struct_name_ptr = field_desc.struct_name_ptr;
-    decl.struct_name_len = field_desc.struct_name_len;
-    decl.tag_layout_ptr = field_desc.tag_layout_ptr;
-    decl.tag_layout_len = field_desc.tag_layout_len;
-    decl.elem_type_kind = field_desc.elem_type_kind;
-    decl.elem_ptr_depth = field_desc.elem_ptr_depth;
-    decl.array_len = field_desc.array_len;
-    decl.elem_typeinfo = field_desc.elem_typeinfo;
-    return decl;
+    return payload_build_binding_decl(name_ptr, name_len, field_expr, field_desc);
 }
 
 func switch_variant_arm_with_bindings(p: *Parser, tmp_name_ptr: u64, tmp_name_len: u64, arm: *ParseSwitchArm) -> *AstNode {
@@ -369,8 +366,19 @@ func switch_variant_arm_with_bindings(p: *Parser, tmp_name_ptr: u64, tmp_name_le
 
             for (var i: u64 = 0; i < bn; i++) {
                 var bind: *NameInfo = arm.bind_names.get(i);
-                var field_name: *NameInfo = switch_match_build_payload_field_name(i);
+                var field_name: *NameInfo = 0;
+                if (arm.bind_field_names != 0) {
+                    field_name = arm.bind_field_names.get(i);
+                } else {
+                    field_name = switch_match_build_payload_field_name(i);
+                }
                 var field_desc: *FieldDesc = switch_find_payload_field_desc(payload_struct, field_name.ptr, field_name.len);
+                if (field_desc == 0 && arm.bind_field_names != 0) {
+                    emit_stderr("[ERROR] unknown field '");
+                    emit_stderr_len(field_name.ptr, field_name.len);
+                    emit_stderr("' in variant payload\n");
+                    panic_here(p, "Syntax error");
+                }
                 var field_expr: *AstNode = (*AstNode)ast_member_access((*AstNode)ast_deref((*AstNode)ast_ident(payload_tmp.ptr, payload_tmp.len)), field_name.ptr, field_name.len);
                 then_stmts.push((*AstNode)switch_build_binding_decl(bind.ptr, bind.len, field_expr, field_desc));
             }
@@ -402,6 +410,12 @@ func switch_lower_pattern_match(p: *Parser, expr: *AstNode, arms: *Vec<*ParseSwi
 
     if (is_match_stmt != 0 && enum_ptr != 0) {
         switch_validate_variant_exhaustive(p, arms, enum_ptr, enum_len);
+    }
+    if (is_match_stmt != 0 && enum_ptr == 0) {
+        if (switch_has_default_arm(arms) == 0) {
+            emit_stderr("[ERROR] match statement on non-enum type requires a default arm\n");
+            panic_here(p, "Syntax error");
+        }
     }
 
     var tmp_id: u64 = next_generated_id(p);
