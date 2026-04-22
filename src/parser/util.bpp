@@ -109,6 +109,7 @@ func token_kind_name(kind: u64) -> u64 {
         case TOKEN_CONSTRUCTOR: return "'constructor'";
         case TOKEN_DESTRUCTOR: return "'destructor'";
         case TOKEN_OPERATOR: return "'operator'";
+        case TOKEN_PROPERTY: return "'property'";
         case TOKEN_IMPORT: return "'import'";
         case TOKEN_STRUCT: return "'struct'";
         case TOKEN_UNION: return "'union'";
@@ -150,17 +151,17 @@ func has_errors(p: *Parser) -> u64 {
 
 func set_recovery_mode(p: *Parser, enabled: u64, max_errors: u64) -> u64 {
     if (p == 0) { return 0; }
-    p.recovery_enabled = enabled;
+    parser_set_u64_slot(p, 12, enabled);
     if (max_errors == 0) { max_errors = 20; }
-    p.max_errors = max_errors;
-    p.error_limit_reached = 0;
+    parser_set_u64_slot(p, 15, max_errors);
+    parser_set_u64_slot(p, 16, 0);
     return 0;
 }
 
 func record_error(p: *Parser) -> u64 {
     if (p == 0) { return 0; }
     if (p.error_limit_reached != 0) { return p.error_count; }
-    p.error_count = p.error_count + 1;
+    parser_set_u64_slot(p, 14, p.error_count + 1);
     return p.error_count;
 }
 
@@ -171,7 +172,7 @@ func finalize_parse_error(p: *Parser) -> u64 {
             if (p.error_limit_reached == 0) {
                 diag_emit_error_tag("parse", "P1099", "parser error limit reached; aborting parse");
             }
-            p.error_limit_reached = 1;
+            parser_set_u64_slot(p, 16, 1);
             recover_sync(p);
             return 0;
         }
@@ -209,7 +210,7 @@ func recover_sync(p: *Parser) -> u64 {
         }
         return 0;
     }
-    p.recovering = 1;
+    parser_set_u64_slot(p, 13, 1);
 
     // Ensure forward progress first.
     if (peek_kind(p) != TOKEN_EOF) {
@@ -228,7 +229,7 @@ func recover_sync(p: *Parser) -> u64 {
         advance_tok(p);
     }
 
-    p.recovering = 0;
+    parser_set_u64_slot(p, 13, 0);
     return 0;
 }
 
@@ -354,7 +355,7 @@ func char_literal_value(p: *Parser, tok: *Token) -> u64 {
     return 0;
 }
 
-// Shared payload binding helpers for match/switch
+// Shared payload binding helpers for match payload lowering.
 func payload_build_field_name(idx: u64) -> *NameInfo {
     var prefix_ptr: u64 = (u64)"v";
     var prefix_len: u64 = 1;
@@ -382,79 +383,90 @@ func payload_find_field_desc(struct_def: *AstStructDef, field_ptr: u64, field_le
 }
 
 func payload_build_binding_decl(name_ptr: u64, name_len: u64, field_expr: *AstNode, field_desc: *FieldDesc) -> *AstVarDecl {
-    var decl: *AstVarDecl = ast_var_decl(name_ptr, name_len, TYPE_U64, 0, field_expr);
-    if (field_desc == 0) { return decl; }
-    decl.type_kind = field_desc.type_kind;
-    decl.ptr_depth = field_desc.ptr_depth;
-    decl.is_tagged = field_desc.is_tagged;
-    decl.struct_name_ptr = field_desc.struct_name_ptr;
-    decl.struct_name_len = field_desc.struct_name_len;
-    decl.tag_layout_ptr = field_desc.tag_layout_ptr;
-    decl.tag_layout_len = field_desc.tag_layout_len;
-    decl.elem_type_kind = field_desc.elem_type_kind;
-    decl.elem_ptr_depth = field_desc.elem_ptr_depth;
-    decl.array_len = field_desc.array_len;
-    decl.elem_typeinfo = field_desc.elem_typeinfo;
-    return decl;
+    if (field_desc == 0) {
+        return new AstVarDecl{AST_VAR_DECL, name_ptr, name_len, TYPE_U64, 0, 0, field_expr, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    }
+    return new AstVarDecl{
+        AST_VAR_DECL,
+        name_ptr,
+        name_len,
+        field_desc.type_kind,
+        field_desc.ptr_depth,
+        field_desc.is_tagged,
+        field_expr,
+        field_desc.struct_name_ptr,
+        field_desc.struct_name_len,
+        field_desc.tag_layout_ptr,
+        field_desc.tag_layout_len,
+        field_desc.elem_type_kind,
+        field_desc.elem_ptr_depth,
+        field_desc.array_len,
+        0,
+        0,
+        0,
+        field_desc.elem_typeinfo,
+        0
+    };
 }
 
 // Parser structure: [tokens_vec, cur]
 
+func parser_slots(p: *Parser) -> *u64 {
+    return (*u64)p;
+}
+
+func parser_set_u64_slot(p: *Parser, idx: u64, value: u64) -> u64 {
+    if (p == 0) { return 0; }
+    parser_slots(p)[idx] = value;
+    return 0;
+}
+
+func parser_set_ptr_slot(p: *Parser, idx: u64, value: u64) -> u64 {
+    if (p == 0) { return 0; }
+    parser_slots(p)[idx] = value;
+    return 0;
+}
+
 func new_parser(tokens: *Vec<*Token>) -> *Parser {
-    var p: *Parser = new Parser();
-    p.tokens_vec = tokens;
-    p.cur = 0;
-    p.pending_gt_active = 0;
-    p.pending_gt_tok = 0;
-    p.peek_cache_valid = 0;
-    p.peek_cache_pos = 0;
-    p.peek_cache_tok = 0;
-    p.recovery_enabled = 1;
-    p.recovering = 0;
-    p.error_count = 0;
-    p.max_errors = 20;
-    p.error_limit_reached = 0;
-    p.fn_param_scope_stack = 0;
-    p.fn_local_scope_stack = 0;
-    return p;
+    return new Parser{tokens, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 20, 0, 0, 0, 999999999, 0};
 }
 
 func clone_param_for_local_scope(src: *Param) -> *Param {
     if (src == 0) { return 0; }
-    var out: *Param = new Param();
-    out.name_ptr = src.name_ptr;
-    out.name_len = src.name_len;
-    out.type_kind = src.type_kind;
-    out.ptr_depth = src.ptr_depth;
-    out.is_tagged = src.is_tagged;
-    out.struct_name_ptr = src.struct_name_ptr;
-    out.struct_name_len = src.struct_name_len;
-    out.tag_layout_ptr = src.tag_layout_ptr;
-    out.tag_layout_len = src.tag_layout_len;
-    out.elem_type_kind = src.elem_type_kind;
-    out.elem_ptr_depth = src.elem_ptr_depth;
-    out.array_len = src.array_len;
-    out.array_len_is_param = src.array_len_is_param;
-    out.array_len_param_ptr = src.array_len_param_ptr;
-    out.array_len_param_len = src.array_len_param_len;
-    out.elem_typeinfo = src.elem_typeinfo;
-    out.is_variadic = src.is_variadic;
-    out.has_default = src.has_default;
-    out.default_expr = src.default_expr;
-    return out;
+    return new Param{
+        src.name_ptr,
+        src.name_len,
+        src.type_kind,
+        src.ptr_depth,
+        src.is_tagged,
+        src.struct_name_ptr,
+        src.struct_name_len,
+        src.tag_layout_ptr,
+        src.tag_layout_len,
+        src.elem_type_kind,
+        src.elem_ptr_depth,
+        src.array_len,
+        src.array_len_is_param,
+        src.array_len_param_ptr,
+        src.array_len_param_len,
+        src.elem_typeinfo,
+        src.is_variadic,
+        src.has_default,
+        src.default_expr
+    };
 }
 
 func push_function_param_scope(p: *Parser, params: *Vec<*Param>) -> u64 {
     if (p == 0 || params == 0) { return 0; }
     if (p.fn_param_scope_stack == 0) {
-        p.fn_param_scope_stack = new Vec<*Vec<*Param>>(8);
+        parser_set_ptr_slot(p, 17, (u64)new Vec<*Vec<*Param>>{heap_alloc((8) * sizeof(*Vec<*Param>)), 0, (8)});
     }
     p.fn_param_scope_stack.push(params);
 
     if (p.fn_local_scope_stack == 0) {
-        p.fn_local_scope_stack = new Vec<*Vec<*Param>>(8);
+        parser_set_ptr_slot(p, 18, (u64)new Vec<*Vec<*Param>>{heap_alloc((8) * sizeof(*Vec<*Param>)), 0, (8)});
     }
-    var local_scope: *Vec<*Param> = new Vec<*Param>(params.len() + 8);
+    var local_scope: *Vec<*Param> = new Vec<*Param>{heap_alloc((params.len() + 8) * sizeof(*Param)), 0, (params.len() + 8)};
     var n: u64 = params.len();
     for (var i: u64 = 0; i < n; i++) {
         local_scope.push(clone_param_for_local_scope(params.get(i)));
@@ -534,26 +546,27 @@ func register_local_decl(p: *Parser, decl: *AstVarDecl) -> u64 {
     var locals: *Vec<*Param> = p.fn_local_scope_stack.get(top_idx);
     if (locals == 0) { return 0; }
 
-    var out: *Param = new Param();
-    out.name_ptr = decl.name_ptr;
-    out.name_len = decl.name_len;
-    out.type_kind = decl.type_kind;
-    out.ptr_depth = decl.ptr_depth;
-    out.is_tagged = decl.is_tagged;
-    out.struct_name_ptr = decl.struct_name_ptr;
-    out.struct_name_len = decl.struct_name_len;
-    out.tag_layout_ptr = decl.tag_layout_ptr;
-    out.tag_layout_len = decl.tag_layout_len;
-    out.elem_type_kind = decl.elem_type_kind;
-    out.elem_ptr_depth = decl.elem_ptr_depth;
-    out.array_len = decl.array_len;
-    out.array_len_is_param = decl.array_len_is_param;
-    out.array_len_param_ptr = decl.array_len_param_ptr;
-    out.array_len_param_len = decl.array_len_param_len;
-    out.elem_typeinfo = decl.elem_typeinfo;
-    out.is_variadic = 0;
-    out.has_default = 0;
-    out.default_expr = 0;
+    var out: *Param = new Param{
+        decl.name_ptr,
+        decl.name_len,
+        decl.type_kind,
+        decl.ptr_depth,
+        decl.is_tagged,
+        decl.struct_name_ptr,
+        decl.struct_name_len,
+        decl.tag_layout_ptr,
+        decl.tag_layout_len,
+        decl.elem_type_kind,
+        decl.elem_ptr_depth,
+        decl.array_len,
+        decl.array_len_is_param,
+        decl.array_len_param_ptr,
+        decl.array_len_param_len,
+        decl.elem_typeinfo,
+        0,
+        0,
+        0
+    };
     locals.push(out);
     return 0;
 }
@@ -585,9 +598,9 @@ func peek_tok(p: *Parser) -> *Token {
     }
     if (parser.cur >= parser.tokens_vec.len()) { return 0; }
     var tok: *Token = parser.tokens_vec.get(parser.cur);
-    parser.peek_cache_valid = 1;
-    parser.peek_cache_pos = parser.cur;
-    parser.peek_cache_tok = tok;
+    parser_set_u64_slot(parser, 4, 1);
+    parser_set_u64_slot(parser, 5, parser.cur);
+    parser_set_ptr_slot(parser, 6, (u64)tok);
     return tok;
 }
 
@@ -601,16 +614,16 @@ func peek_kind(p: *Parser) -> u64 {
 func advance_tok(p: *Parser) -> u64 {
     var parser: *Parser = p;
     if (parser.pending_gt_active != 0) {
-        parser.pending_gt_active = 0;
-        parser.pending_gt_tok = 0;
-        parser.peek_cache_valid = 0;
+        parser_set_u64_slot(parser, 2, 0);
+        parser_set_ptr_slot(parser, 3, 0);
+        parser_set_u64_slot(parser, 4, 0);
         return 0;
     }
     var n: u64 = parser.tokens_vec.len();
     if (parser.cur < n) {
-        parser.cur = parser.cur + 1;
+        parser_set_u64_slot(parser, 1, parser.cur + 1);
     }
-    parser.peek_cache_valid = 0;
+    parser_set_u64_slot(parser, 4, 0);
 }
 
 func parser_pos(p: *Parser) -> u64 {
@@ -620,10 +633,10 @@ func parser_pos(p: *Parser) -> u64 {
 
 func parser_set_pos(p: *Parser, pos: u64) {
     var parser: *Parser = p;
-    parser.cur = pos;
-    parser.pending_gt_active = 0;
-    parser.pending_gt_tok = 0;
-    parser.peek_cache_valid = 0;
+    parser_set_u64_slot(parser, 1, pos);
+    parser_set_u64_slot(parser, 2, 0);
+    parser_set_ptr_slot(parser, 3, 0);
+    parser_set_u64_slot(parser, 4, 0);
 }
 
 func prev_tok(p: *Parser) -> *Token {
@@ -664,10 +677,10 @@ func consume_generic_gt(p: *Parser) -> u64 {
     if (k == TOKEN_RSHIFT) {
         var t: *Token = peek_tok(p);
         var pending: *Token = tok_new(TOKEN_GT, t.ptr + 1, 1, t.line, t.col + 1);
-        parser.pending_gt_active = 1;
-        parser.pending_gt_tok = pending;
-        parser.cur = parser.cur + 1;
-        parser.peek_cache_valid = 0;
+        parser_set_u64_slot(parser, 2, 1);
+        parser_set_ptr_slot(parser, 3, (u64)pending);
+        parser_set_u64_slot(parser, 1, parser.cur + 1);
+        parser_set_u64_slot(parser, 4, 0);
         return 0;
     }
     var tok2: *Token = peek_tok(p);
@@ -718,7 +731,7 @@ func consume_annotation_group(p: *Parser) -> *Vec<*NameInfo> {
     consume_tok(p, TOKEN_AT);
     consume_tok(p, TOKEN_LBRACKET);
 
-    var names: *Vec<*NameInfo> = new Vec<*NameInfo>(2);
+    var names: *Vec<*NameInfo> = new Vec<*NameInfo>{heap_alloc((2) * sizeof(*NameInfo)), 0, (2)};
     while (1) {
         var name_tok: *Token = peek_tok(p);
         if (peek_kind(p) != TOKEN_IDENTIFIER) {
@@ -741,7 +754,7 @@ func consume_annotation_group(p: *Parser) -> *Vec<*NameInfo> {
 func annotations_append(dst: *Vec<*NameInfo>, src: *Vec<*NameInfo>) -> *Vec<*NameInfo> {
     if (src == 0) { return dst; }
     if (dst == 0) {
-        dst = new Vec<*NameInfo>(src.len() + 1);
+        dst = new Vec<*NameInfo>{heap_alloc((src.len() + 1) * sizeof(*NameInfo)), 0, (src.len() + 1)};
     }
     var n: u64 = src.len();
     for (var i: u64 = 0; i < n; i++) {
@@ -1022,16 +1035,16 @@ func num_val(p: *Parser, tok: *Token) -> u64 {
 }
 
 func generated_funcs_begin(p: *Parser) -> u64 {
-    p.generated_funcs = new Vec<u64>(8);
-    p.generated_globals = new Vec<u64>(8);
-    p.generated_id_counter = 0;
+    parser_set_ptr_slot(p, 8, (u64)new Vec<u64>{heap_alloc((8) * sizeof(u64)), 0, (8)});
+    parser_set_ptr_slot(p, 9, (u64)new Vec<u64>{heap_alloc((8) * sizeof(u64)), 0, (8)});
+    parser_set_u64_slot(p, 10, 0);
     return 0;
 }
 
 func generated_funcs_push(p: *Parser, func_ptr: u64) -> u64 {
     if (func_ptr == 0) { return 0; }
     if (p.generated_funcs == 0) {
-        p.generated_funcs = new Vec<u64>(8);
+        parser_set_ptr_slot(p, 8, (u64)new Vec<u64>{heap_alloc((8) * sizeof(u64)), 0, (8)});
     }
     p.generated_funcs.push(func_ptr);
     return 0;
@@ -1039,14 +1052,14 @@ func generated_funcs_push(p: *Parser, func_ptr: u64) -> u64 {
 
 func generated_funcs_take(p: *Parser) -> *Vec<u64> {
     var out: *Vec<u64> = p.generated_funcs;
-    p.generated_funcs = 0;
+    parser_set_ptr_slot(p, 8, 0);
     return out;
 }
 
 func generated_globals_push(p: *Parser, global_ptr: u64) -> u64 {
     if (global_ptr == 0) { return 0; }
     if (p.generated_globals == 0) {
-        p.generated_globals = new Vec<u64>(8);
+        parser_set_ptr_slot(p, 9, (u64)new Vec<u64>{heap_alloc((8) * sizeof(u64)), 0, (8)});
     }
     p.generated_globals.push(global_ptr);
     return 0;
@@ -1054,11 +1067,11 @@ func generated_globals_push(p: *Parser, global_ptr: u64) -> u64 {
 
 func generated_globals_take(p: *Parser) -> *Vec<u64> {
     var out: *Vec<u64> = p.generated_globals;
-    p.generated_globals = 0;
+    parser_set_ptr_slot(p, 9, 0);
     return out;
 }
 
 func next_generated_id(p: *Parser) -> u64 {
-    p.generated_id_counter = p.generated_id_counter + 1;
+    parser_set_u64_slot(p, 10, p.generated_id_counter + 1);
     return p.generated_id_counter;
 }

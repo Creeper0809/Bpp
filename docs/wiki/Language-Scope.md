@@ -16,6 +16,7 @@
   - core language
   - compiler-known prelude
   - annotation layer
+- property hook은 더 이상 annotation layer에 속하지 않으며, core language의 member access 규칙으로 다룹니다.
 - annotation layer는 현재 다음 두 역할을 가집니다.
   - decorator: 선언을 감싸는 변환
   - metadata: 분석/제약/도구용 정보

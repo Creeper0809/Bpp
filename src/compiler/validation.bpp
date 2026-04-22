@@ -17,9 +17,8 @@ import types;
 import ast;
 
 func property_hook_emit_field_error(field: *FieldDesc, msg: u64) -> u64 {
-    emit_stderr("[ERROR] ");
-    emit_stderr(msg);
-    emit_stderr(": ");
+    diag_emit_error_tag("validation", "field-hook", msg);
+    emit_stderr("[NOTE] field: ");
     if (field != 0) {
         emit_stderr_len(field.owner_struct_ptr, field.owner_struct_len);
         emit_stderr(".");
@@ -27,7 +26,7 @@ func property_hook_emit_field_error(field: *FieldDesc, msg: u64) -> u64 {
     } else {
         emit_stderr("<field>");
     }
-    emit_stderr("\n");
+    emit_stderr_nl();
     diag_note_error();
     return 0;
 }
@@ -102,54 +101,14 @@ func property_hook_parse_field_annotations(field: *FieldDesc) -> u64 {
             return 0;
         }
 
-        var is_setter: u64 = 0;
-        var is_getter: u64 = 0;
-        if (str_eq(ann.name_ptr, ann.name_len, "setter", 6) != 0) { is_setter = 1; }
-        if (str_eq(ann.name_ptr, ann.name_len, "getter", 6) != 0) { is_getter = 1; }
-        if (is_setter == 0 && is_getter == 0) {
-            property_hook_emit_field_error(field, "unsupported field annotation");
+        if (str_eq(ann.name_ptr, ann.name_len, "setter", 6) != 0 ||
+            str_eq(ann.name_ptr, ann.name_len, "getter", 6) != 0) {
+            property_hook_emit_field_error(field, "field hooks no longer use annotation syntax");
+            diag_emit_help("write property(...) before the access modifier, e.g. property(setter) public value: i32;");
             return 0;
         }
-
-        var args_n: u64 = 0;
-        if (ann.args_vec != 0) { args_n = ann.args_vec.len(); }
-        var hook_mode: u64 = FIELD_HOOK_NONE;
-        var hook_ptr: u64 = 0;
-        var hook_len: u64 = 0;
-
-        if (args_n == 0) {
-            hook_mode = FIELD_HOOK_AUTO;
-        } else if (args_n == 1) {
-            var arg0: *CompilerAnnotationArg = ann.args_vec.get(0);
-            if (arg0 == 0 || arg0.key_ptr != 0 || arg0.kind != COMPILER_ANN_ARG_IDENT || arg0.ident_ptr == 0 || arg0.ident_len == 0) {
-                property_hook_emit_field_error(field, "hook annotation argument must be a function identifier");
-                return 0;
-            }
-            hook_mode = FIELD_HOOK_MANUAL;
-            hook_ptr = arg0.ident_ptr;
-            hook_len = arg0.ident_len;
-        } else {
-            property_hook_emit_field_error(field, "hook annotation accepts at most one argument");
-            return 0;
-        }
-
-        if (is_setter != 0) {
-            if (field.setter_hook_mode != FIELD_HOOK_NONE) {
-                property_hook_emit_field_error(field, "duplicate @[setter] annotation");
-                return 0;
-            }
-            field.setter_hook_mode = hook_mode;
-            field.setter_hook_ptr = hook_ptr;
-            field.setter_hook_len = hook_len;
-        } else {
-            if (field.getter_hook_mode != FIELD_HOOK_NONE) {
-                property_hook_emit_field_error(field, "duplicate @[getter] annotation");
-                return 0;
-            }
-            field.getter_hook_mode = hook_mode;
-            field.getter_hook_ptr = hook_ptr;
-            field.getter_hook_len = hook_len;
-        }
+        property_hook_emit_field_error(field, "field annotations are not supported here");
+        return 0;
     }
     return 1;
 }
@@ -158,8 +117,6 @@ func property_hook_validate_manual_setter(field: *FieldDesc) -> u64 {
     if (field == 0) { return 1; }
     if (field.setter_hook_mode != FIELD_HOOK_MANUAL) { return 1; }
     var any_name_match: u64 = 0;
-    var picked_ptr: u64 = 0;
-    var picked_len: u64 = 0;
 
     if (g_compiler_ctx.all_funcs != 0) {
         var n: u64 = g_compiler_ctx.all_funcs.len();
@@ -168,21 +125,35 @@ func property_hook_validate_manual_setter(field: *FieldDesc) -> u64 {
             if (fn == 0) { continue; }
             if (property_hook_name_matches(fn.name_ptr, fn.name_len, field.setter_hook_ptr, field.setter_hook_len) == 0) { continue; }
             any_name_match = 1;
-            picked_ptr = fn.name_ptr;
-            picked_len = fn.name_len;
-            break;
+            var params: *Vec<*Param> = fn.params_vec;
+            if (params == 0 || params.len() != 2) { continue; }
+            var p0: *Param = params.get(0);
+            var p1: *Param = params.get(1);
+            if (property_hook_validate_self_param(field, p0) == 0) { continue; }
+            if (property_hook_field_matches_param(field, p1) == 0) { continue; }
+            if (fn.ret_type != TYPE_VOID || fn.ret_ptr_depth != 0) { continue; }
+            field.setter_hook_ptr = fn.name_ptr;
+            field.setter_hook_len = fn.name_len;
+            return 1;
         }
     }
-    if (picked_ptr == 0 && g_compiler_ctx.all_func_sigs != 0) {
+    if (g_compiler_ctx.all_func_sigs != 0) {
         var sn: u64 = g_compiler_ctx.all_func_sigs.len();
         for (var j: u64 = 0; j < sn; j++) {
             var sig: *AstFunc = g_compiler_ctx.all_func_sigs.get(j);
             if (sig == 0) { continue; }
             if (property_hook_name_matches(sig.name_ptr, sig.name_len, field.setter_hook_ptr, field.setter_hook_len) == 0) { continue; }
             any_name_match = 1;
-            picked_ptr = sig.name_ptr;
-            picked_len = sig.name_len;
-            break;
+            var sparams: *Vec<*Param> = sig.params_vec;
+            if (sparams == 0 || sparams.len() != 2) { continue; }
+            var sp0: *Param = sparams.get(0);
+            var sp1: *Param = sparams.get(1);
+            if (property_hook_validate_self_param(field, sp0) == 0) { continue; }
+            if (property_hook_field_matches_param(field, sp1) == 0) { continue; }
+            if (sig.ret_type != TYPE_VOID || sig.ret_ptr_depth != 0) { continue; }
+            field.setter_hook_ptr = sig.name_ptr;
+            field.setter_hook_len = sig.name_len;
+            return 1;
         }
     }
 
@@ -190,11 +161,8 @@ func property_hook_validate_manual_setter(field: *FieldDesc) -> u64 {
         property_hook_emit_field_error(field, "setter hook function not found");
         return 0;
     }
-    if (picked_ptr != 0 && picked_len != 0) {
-        field.setter_hook_ptr = picked_ptr;
-        field.setter_hook_len = picked_len;
-    }
-    return 1;
+    property_hook_emit_field_error(field, "setter hook signature mismatch");
+    return 0;
 }
 
 func property_hook_validate_manual_getter(field: *FieldDesc) -> u64 {
@@ -242,11 +210,11 @@ func property_hook_validate_manual_getter(field: *FieldDesc) -> u64 {
         return 0;
     }
     property_hook_emit_field_error(field, "getter hook signature mismatch");
-    return 1;
+    return 0;
 }
 
 func property_hook_create_value_param(field: *FieldDesc) -> *Param {
-    var p: *Param = new Param();
+    var p: *Param = new Param{};
     p.name_ptr = (u64)"val";
     p.name_len = 3;
     p.type_kind = field.type_kind;
@@ -273,21 +241,21 @@ func property_hook_create_auto_setter(field: *FieldDesc) -> u64 {
         return 0;
     }
 
-    var params: *Vec<*Param> = new Vec<*Param>(2);
-    var self_param: *Param = new Param();
+    var params: *Vec<*Param> = new Vec<*Param>{heap_alloc((2) * sizeof(*Param)), 0, (2)};
+    var self_param: *Param = new Param{};
     self_param.set_as_self_param(field.owner_struct_ptr, field.owner_struct_len);
     params.push(self_param);
     params.push(property_hook_create_value_param(field));
 
-    var stmts: *Vec<*AstNode> = new Vec<*AstNode>(1);
+    var stmts: *Vec<*AstNode> = new Vec<*AstNode>{heap_alloc((1) * sizeof(*AstNode)), 0, (1)};
     var target: *AstNode = ast_raw_member_access((*AstNode)ast_ident("self", 4), field.name_ptr, field.name_len);
     var value: *AstNode = ast_ident("val", 3);
     stmts.push((*AstNode)ast_assign(target, value));
     var body: *AstNode = (*AstNode)ast_block(stmts);
 
     var fn: *AstFunc = ast_func_ex(name.ptr, name.len, params, TYPE_VOID, 0, 0, 0, 0, 0, 0, body);
-    if (g_compiler_ctx.all_funcs == 0) { g_compiler_ctx.all_funcs = new Vec<*AstFunc>(8); }
-    if (g_compiler_ctx.all_func_sigs == 0) { g_compiler_ctx.all_func_sigs = new Vec<*AstFunc>(8); }
+    if (g_compiler_ctx.all_funcs == 0) { g_compiler_ctx.all_funcs = new Vec<*AstFunc>{heap_alloc((8) * sizeof(*AstFunc)), 0, (8)}; }
+    if (g_compiler_ctx.all_func_sigs == 0) { g_compiler_ctx.all_func_sigs = new Vec<*AstFunc>{heap_alloc((8) * sizeof(*AstFunc)), 0, (8)}; }
     g_compiler_ctx.all_funcs.push(fn);
     g_compiler_ctx.all_func_sigs.push(annotation_clone_sig(fn, fn.name_ptr, fn.name_len));
     sym_invalidate_func_lookup();
@@ -320,19 +288,19 @@ func property_hook_create_auto_getter(field: *FieldDesc) -> u64 {
         ret_tag_len = 0;
     }
 
-    var params: *Vec<*Param> = new Vec<*Param>(1);
-    var self_param: *Param = new Param();
+    var params: *Vec<*Param> = new Vec<*Param>{heap_alloc((1) * sizeof(*Param)), 0, (1)};
+    var self_param: *Param = new Param{};
     self_param.set_as_self_param(field.owner_struct_ptr, field.owner_struct_len);
     params.push(self_param);
 
-    var stmts: *Vec<*AstNode> = new Vec<*AstNode>(1);
+    var stmts: *Vec<*AstNode> = new Vec<*AstNode>{heap_alloc((1) * sizeof(*AstNode)), 0, (1)};
     var value: *AstNode = ast_raw_member_access((*AstNode)ast_ident("self", 4), field.name_ptr, field.name_len);
     stmts.push((*AstNode)ast_return(value));
     var body: *AstNode = (*AstNode)ast_block(stmts);
 
     var fn: *AstFunc = ast_func_ex(name.ptr, name.len, params, ret_type, ret_ptr_depth, ret_is_tagged, ret_struct_ptr, ret_struct_len, ret_tag_ptr, ret_tag_len, body);
-    if (g_compiler_ctx.all_funcs == 0) { g_compiler_ctx.all_funcs = new Vec<*AstFunc>(8); }
-    if (g_compiler_ctx.all_func_sigs == 0) { g_compiler_ctx.all_func_sigs = new Vec<*AstFunc>(8); }
+    if (g_compiler_ctx.all_funcs == 0) { g_compiler_ctx.all_funcs = new Vec<*AstFunc>{heap_alloc((8) * sizeof(*AstFunc)), 0, (8)}; }
+    if (g_compiler_ctx.all_func_sigs == 0) { g_compiler_ctx.all_func_sigs = new Vec<*AstFunc>{heap_alloc((8) * sizeof(*AstFunc)), 0, (8)}; }
     g_compiler_ctx.all_funcs.push(fn);
     g_compiler_ctx.all_func_sigs.push(annotation_clone_sig(fn, fn.name_ptr, fn.name_len));
     sym_invalidate_func_lookup();
@@ -371,7 +339,8 @@ func validate_global_function_name_collisions_core() -> u64 {
     var func_n: u64 = g_compiler_ctx.all_funcs.len();
     var global_n: u64 = g_compiler_ctx.all_globals.len();
     var cap: u64 = (func_n * 2) + 16;
-    var top_level_funcs: *HashMap<u64, u64> = new HashMap<u64, u64>(cap);
+    var top_level_funcs: *HashMap<u64, u64> = new HashMap<u64, u64>{0, 0, 0};
+    top_level_funcs.ensure_capacity(cap);
 
     for (var fi: u64 = 0; fi < func_n; fi++) {
         var fn: *AstFunc = g_compiler_ctx.all_funcs.get(fi);
@@ -487,32 +456,36 @@ func apply_annotations() -> u64 {
         var entry_count: u64 = annotation_count_name(fn.annotations_vec, "entry", 5);
         if (entry_count > 0) {
             if (fn.impl_owner_ptr != 0 && fn.impl_owner_len != 0) {
-                emit_stderr("[ERROR] @[entry] is only allowed on top-level functions\n");
+                diag_emit_error_tag("validation", "entry", "@[entry] is only allowed on top-level functions");
+                diag_emit_note("move the entry function out of the impl block");
                 diag_note_error();
                 continue;
             }
             var entry_param_n: u64 = 0;
             if (fn.params_vec != 0) { entry_param_n = fn.params_vec.len(); }
             if (entry_param_n != 0) {
-                emit_stderr("[ERROR] @[entry] function must not declare parameters: ");
+                diag_emit_error_tag("validation", "entry", "@[entry] function must not declare parameters");
+                emit_stderr("[NOTE] function: ");
                 emit_stderr_len(fn.name_ptr, fn.name_len);
-                emit_stderr("\n");
+                emit_stderr_nl();
                 diag_note_error();
                 continue;
             }
             if (entry_count > 1) {
-                emit_stderr("[ERROR] duplicate @[entry] annotation on function: ");
+                diag_emit_error_tag("validation", "entry", "duplicate @[entry] annotation on function");
+                emit_stderr("[NOTE] function: ");
                 emit_stderr_len(fn.name_ptr, fn.name_len);
-                emit_stderr("\n");
+                emit_stderr_nl();
                 diag_note_error();
                 continue;
             }
             if (entry_ptr != 0 && str_eq(entry_ptr, entry_len, fn.name_ptr, fn.name_len) == 0) {
-                emit_stderr("[ERROR] multiple @[entry] functions are not allowed: ");
+                diag_emit_error_tag("validation", "entry", "multiple @[entry] functions are not allowed");
+                emit_stderr("[NOTE] entries: ");
                 emit_stderr_len(entry_ptr, entry_len);
                 emit_stderr(" and ");
                 emit_stderr_len(fn.name_ptr, fn.name_len);
-                emit_stderr("\n");
+                emit_stderr_nl();
                 diag_note_error();
                 continue;
             }
@@ -528,9 +501,10 @@ func apply_annotations() -> u64 {
             is_impl_method = 1;
         }
         if (fn.body == 0) {
-            emit_stderr("[ERROR] function decorator requires a function body: ");
+            diag_emit_error_tag("validation", "decorator", "function decorator requires a function body");
+            emit_stderr("[NOTE] function: ");
             emit_stderr_len(fn.name_ptr, fn.name_len);
-            emit_stderr("\n");
+            emit_stderr_nl();
             diag_note_error();
             continue;
         }
@@ -544,9 +518,10 @@ func apply_annotations() -> u64 {
             var deco0: *NameInfo = decorators.get(di0);
             var sig0: *AstFunc = lower_find_func_signature_for_call(deco0.ptr, deco0.len);
             if (sig0 == 0) {
-                emit_stderr("[ERROR] unresolved decorator function: ");
+                diag_emit_error_tag("validation", "decorator", "unresolved decorator function");
+                emit_stderr("[NOTE] decorator: ");
                 emit_stderr_len(deco0.ptr, deco0.len);
-                emit_stderr("\n");
+                emit_stderr_nl();
                 diag_note_error();
                 decorators_valid = 0;
                 continue;
@@ -600,9 +575,10 @@ func apply_annotations() -> u64 {
             var deco: *NameInfo = decorators.get(di);
             var deco_sig: *AstFunc = lower_find_func_signature_for_call(deco.ptr, deco.len);
             if (deco_sig == 0) {
-                emit_stderr("[ERROR] unresolved decorator function: ");
+                diag_emit_error_tag("validation", "decorator", "unresolved decorator function");
+                emit_stderr("[NOTE] decorator: ");
                 emit_stderr_len(deco.ptr, deco.len);
-                emit_stderr("\n");
+                emit_stderr_nl();
                 diag_note_error();
                 break;
             }
@@ -634,7 +610,8 @@ func apply_annotations() -> u64 {
             if (keep_impl_metadata != 0) {
                 sym_register_impl_method_ex(wrapper_fn.name_ptr, wrapper_fn.name_len, method_owner_ptr, method_owner_len, method_access);
                 if (g_compiler_ctx.impl_method_funcs == 0) {
-                    g_compiler_ctx.impl_method_funcs = new HashMap<u64, *AstFunc>(64);
+                    g_compiler_ctx.impl_method_funcs = new HashMap<u64, *AstFunc>{0, 0, 0};
+                    g_compiler_ctx.impl_method_funcs.ensure_capacity(64);
                 }
                 g_compiler_ctx.impl_method_funcs.put(wrapper_fn.name_ptr, wrapper_fn.name_len, wrapper_fn);
             }
@@ -660,7 +637,7 @@ func finalize_abst_methods() -> u64 {
         if (diag_should_stop_pass() != 0) { break; }
         var sd: *AstStructDef = g_compiler_ctx.all_structs_vec.get(si);
         if (sd == 0 || sd.parents_vec == 0) { continue; }
-        var required: *Vec<*NameInfo> = new Vec<*NameInfo>(8);
+        var required: *Vec<*NameInfo> = new Vec<*NameInfo>{heap_alloc((8) * sizeof(*NameInfo)), 0, (8)};
         vdispatch_collect_abst_methods_recursive(sd, required);
         var rn: u64 = required.len();
         for (var ri: u64 = 0; ri < rn; ri++) {
@@ -675,7 +652,8 @@ func finalize_abst_methods() -> u64 {
 
 func validate_direct_impl_calls_with_ctx(ctx: *CompilerCtx) -> u64 {
     if (compiler_ctx_is_active(ctx) == 0) {
-        emit_stderr("[ERROR] validate_direct_impl_calls_with_ctx requires active compiler context\n");
+        diag_emit_error_tag("validation", "internal", "validate_direct_impl_calls_with_ctx requires active compiler context");
+        diag_note_error();
         return 1;
     }
     return validate_direct_impl_calls_core();
@@ -683,7 +661,8 @@ func validate_direct_impl_calls_with_ctx(ctx: *CompilerCtx) -> u64 {
 
 func validate_impl_overrides_with_ctx(ctx: *CompilerCtx) -> u64 {
     if (compiler_ctx_is_active(ctx) == 0) {
-        emit_stderr("[ERROR] validate_impl_overrides_with_ctx requires active compiler context\n");
+        diag_emit_error_tag("validation", "internal", "validate_impl_overrides_with_ctx requires active compiler context");
+        diag_note_error();
         return 1;
     }
     return validate_impl_overrides_core();
@@ -691,7 +670,8 @@ func validate_impl_overrides_with_ctx(ctx: *CompilerCtx) -> u64 {
 
 func validate_finalize_abst_methods_with_ctx(ctx: *CompilerCtx) -> u64 {
     if (compiler_ctx_is_active(ctx) == 0) {
-        emit_stderr("[ERROR] validate_finalize_abst_methods_with_ctx requires active compiler context\n");
+        diag_emit_error_tag("validation", "internal", "validate_finalize_abst_methods_with_ctx requires active compiler context");
+        diag_note_error();
         return 1;
     }
     return finalize_abst_methods();
@@ -699,7 +679,8 @@ func validate_finalize_abst_methods_with_ctx(ctx: *CompilerCtx) -> u64 {
 
 func validate_finalize_traits_with_ctx(ctx: *CompilerCtx) -> u64 {
     if (compiler_ctx_is_active(ctx) == 0) {
-        emit_stderr("[ERROR] validate_finalize_traits_with_ctx requires active compiler context\n");
+        diag_emit_error_tag("validation", "internal", "validate_finalize_traits_with_ctx requires active compiler context");
+        diag_note_error();
         return 1;
     }
     return finalize_traits();
@@ -707,7 +688,8 @@ func validate_finalize_traits_with_ctx(ctx: *CompilerCtx) -> u64 {
 
 func validate_apply_annotations_with_ctx(ctx: *CompilerCtx) -> u64 {
     if (compiler_ctx_is_active(ctx) == 0) {
-        emit_stderr("[ERROR] validate_apply_annotations_with_ctx requires active compiler context\n");
+        diag_emit_error_tag("validation", "internal", "validate_apply_annotations_with_ctx requires active compiler context");
+        diag_note_error();
         return 1;
     }
     return apply_annotations();

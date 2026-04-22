@@ -24,7 +24,8 @@ var g_defer_emit_mode: u64;
 
 func cg_defer_stack_len() -> u64 {
     var stack: *Vec<*AstNode> = emitter_get_defer_stack();
-    return stack.?len();
+    if (stack == 0) { return 0; }
+    return stack.len();
 }
 
 func cg_defer_mark_block_begin() -> u64 {
@@ -200,7 +201,7 @@ func cg_stmt(node: u64) -> u64 {
             cg_for_stmt(node);
             return;
         case AST_SWITCH:
-            cg_switch_stmt(node);
+            cg_match_stmt(node);
             return;
         case AST_BREAK:
             cg_stmt_break();
@@ -274,7 +275,7 @@ func cg_ensure_heap_brk_global() -> u64 {
     var globals: *Vec<*GlobalInfo> = emitter_get_globals();
     if (globals == 0) { return 0; }
     if (is_global_var("__cg_heap_brk", 13) != 0) { return 0; }
-    var ginfo: *GlobalInfo = new GlobalInfo();
+    var ginfo: *GlobalInfo = new GlobalInfo{};
     ginfo.name_ptr = "__cg_heap_brk";
     ginfo.name_len = 13;
     ginfo.typeinfo_ptr = typeinfo_make(TYPE_U64, 0);
@@ -859,7 +860,7 @@ func cg_var_decl_stmt(node: u64, symtab: *Symtab, g_structs_vec: *Vec<*AstStruct
     var name_ptr: u64 = decl.name_ptr;
     var name_len: u64 = decl.name_len;
     var init: u64 = decl.init_expr;
-    var spec: *CgDeclTypeSpec = new CgDeclTypeSpec();
+    var spec: *CgDeclTypeSpec = new CgDeclTypeSpec{};
     spec.type_kind = decl.type_kind;
     spec.ptr_depth = decl.ptr_depth;
     spec.is_tagged = decl.is_tagged;
@@ -1275,7 +1276,7 @@ func cg_assign_try_index_setter(target: u64, value: u64, symtab: *Symtab) -> u64
     if (get_struct_def(struct_ptr, struct_len) == 0) { return 0; }
 
     var method: *NameInfo = compiler_operator_index_set_name();
-    var arg_types: *Vec<*TypeInfo> = new Vec<*TypeInfo>(2);
+    var arg_types: *Vec<*TypeInfo> = new Vec<*TypeInfo>{heap_alloc((2) * sizeof(*TypeInfo)), 0, (2)};
     arg_types.push(get_expr_type_with_symtab((*AstNode)ix.index, symtab));
     arg_types.push(get_expr_type_with_symtab((*AstNode)value, symtab));
     var resolved: CompilerMethodResolveResult = sym_resolve_method_overload_with_count_fallback(struct_ptr, struct_len, method.ptr, method.len, arg_types, 2);
@@ -1290,7 +1291,7 @@ func cg_assign_try_index_setter(target: u64, value: u64, symtab: *Symtab) -> u64
         panic("Codegen error");
     }
 
-    var args: *Vec<*AstNode> = new Vec<*AstNode>(2);
+    var args: *Vec<*AstNode> = new Vec<*AstNode>{heap_alloc((2) * sizeof(*AstNode)), 0, (2)};
     args.push(ix.index);
     args.push((*AstNode)value);
     var setter_call: *AstMethodCall = ast_method_call(ix.base, method.ptr, method.len, args);
@@ -1582,12 +1583,12 @@ func cg_for_stmt(node: u64) -> u64 {
     emit_label_def(end_label);
 }
 
-func cg_switch_stmt(node: u64) -> u64 {
-    var switch_stmt: *AstSwitch = (*AstSwitch)node;
-    var expr: u64 = switch_stmt.expr;
-    var cases: *Vec<u64> = switch_stmt.cases_vec;
+func cg_match_stmt(node: u64) -> u64 {
+    var match_stmt: *AstSwitch = (*AstSwitch)node;
+    var expr: u64 = match_stmt.expr;
+    var cases: *Vec<u64> = match_stmt.cases_vec;
     
-    // Evaluate switch expression once
+    // Evaluate match expression once
     cg_expr(expr);
     
     var end_label: u64 = new_label();
@@ -1647,9 +1648,9 @@ func cg_switch_stmt(node: u64) -> u64 {
     }
     
     if (use_jump_table == 1) {
-        cg_switch_jump_table(cases, min_val, max_val, end_label, has_default);
+        cg_match_jump_table(cases, min_val, max_val, end_label, has_default);
     } else {
-        cg_switch_linear(cases, end_label, has_default);
+        cg_match_linear(cases, end_label, has_default);
     }
     
     cg_defer_pop_loop_marker();
@@ -1659,8 +1660,8 @@ func cg_switch_stmt(node: u64) -> u64 {
     emit_label_def(end_label);
 }
 
-// Linear comparison switch (original behavior, improved)
-func cg_switch_emit_string_compare(value: u64, case_label: u64) -> u64 {
+// Linear comparison for match dispatch.
+func cg_match_emit_string_compare(value: u64, case_label: u64) -> u64 {
     cg_expr(value);
     emitln("    sub rsp, 16");
     emitln("    mov [rsp], rax    ; s2");
@@ -1682,8 +1683,8 @@ func cg_switch_emit_string_compare(value: u64, case_label: u64) -> u64 {
     return 0;
 }
 
-func cg_switch_emit_int_compare(value: u64, case_label: u64) -> u64 {
-    emitln("    mov rax, [rsp]    ; reload switch value");
+func cg_match_emit_int_compare(value: u64, case_label: u64) -> u64 {
+    emitln("    mov rax, [rsp]    ; reload match value");
     emitln("    push rax");
     cg_expr(value);
     emit("    mov rbx, rax\n");
@@ -1695,7 +1696,7 @@ func cg_switch_emit_int_compare(value: u64, case_label: u64) -> u64 {
     return 0;
 }
 
-func cg_switch_emit_case_bodies(cases: *Vec<u64>, case_labels: *Vec<u64>) -> u64 {
+func cg_match_emit_case_bodies(cases: *Vec<u64>, case_labels: *Vec<u64>) -> u64 {
     var num_cases: u64 = cases.len();
     for (var i: u64 = 0; i < num_cases; i++) {
         var case_stmt: *AstCase = (*AstCase)cases.get(i);
@@ -1705,12 +1706,12 @@ func cg_switch_emit_case_bodies(cases: *Vec<u64>, case_labels: *Vec<u64>) -> u64
     return 0;
 }
 
-func cg_switch_linear(cases: *Vec<u64>, end_label: u64, has_default: u64) -> u64 {
-    emitln("    push rax    ; switch value");
+func cg_match_linear(cases: *Vec<u64>, end_label: u64, has_default: u64) -> u64 {
+    emitln("    push rax    ; match value");
 
     var num_cases: u64 = cases.len();
     var default_label: u64 = 0;
-    var case_labels: *Vec<u64> = new Vec<u64>(num_cases);
+    var case_labels: *Vec<u64> = new Vec<u64>{heap_alloc((num_cases) * sizeof(u64)), 0, (num_cases)};
     for (var i: u64 = 0; i < num_cases; i++) {
         var case_stmt: *AstCase = (*AstCase)cases.get(i);
         var case_label: u64 = new_label();
@@ -1722,9 +1723,9 @@ func cg_switch_linear(cases: *Vec<u64>, end_label: u64, has_default: u64) -> u64
 
         var value: u64 = case_stmt.value;
         if (ast_kind(value) == AST_STRING) {
-            cg_switch_emit_string_compare(value, case_label);
+            cg_match_emit_string_compare(value, case_label);
         } else {
-            cg_switch_emit_int_compare(value, case_label);
+            cg_match_emit_int_compare(value, case_label);
         }
     }
 
@@ -1736,12 +1737,12 @@ func cg_switch_linear(cases: *Vec<u64>, end_label: u64, has_default: u64) -> u64
     }
     emit_nl();
 
-    cg_switch_emit_case_bodies(cases, case_labels);
-    emit("    add rsp, 8    ; pop switch value\n");
+    cg_match_emit_case_bodies(cases, case_labels);
+    emit("    add rsp, 8    ; pop match value\n");
 }
 
-// Jump table switch (optimized for dense integer ranges)
-func cg_switch_jump_table(cases: *Vec<u64>, min_val: i64, max_val: i64, end_label: u64, has_default: u64) -> u64 {
+// Jump table match dispatch for dense integer ranges.
+func cg_match_jump_table(cases: *Vec<u64>, min_val: i64, max_val: i64, end_label: u64, has_default: u64) -> u64 {
     var num_cases: u64 = cases.len();
     var range: i64 = max_val - min_val + 1;
     var range_u64: u64 = (u64)range;
@@ -1749,8 +1750,8 @@ func cg_switch_jump_table(cases: *Vec<u64>, min_val: i64, max_val: i64, end_labe
     var default_label: u64 = end_label;
     
     // Create case label mapping
-    var case_labels: *Vec<u64> = new Vec<u64>(num_cases);
-    var value_to_label: *Vec<u64> = new Vec<u64>(range_u64);
+    var case_labels: *Vec<u64> = new Vec<u64>{heap_alloc((num_cases) * sizeof(u64)), 0, (num_cases)};
+    var value_to_label: *Vec<u64> = new Vec<u64>{heap_alloc((range_u64) * sizeof(u64)), 0, (range_u64)};
     
     // Initialize all table entries to default
     for (var j: u64 = 0; j < range_u64; j++) {
@@ -1786,7 +1787,7 @@ func cg_switch_jump_table(cases: *Vec<u64>, min_val: i64, max_val: i64, end_labe
     }
     
     // Generate bounds check and jump table lookup
-    emit("    ; Jump table switch (range: ");
+    emit("    ; Jump table match dispatch (range: ");
     emit_i64(min_val);
     emit(" to ");
     emit_i64(max_val);

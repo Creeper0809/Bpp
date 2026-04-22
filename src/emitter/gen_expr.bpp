@@ -13,6 +13,7 @@ import ast;
 import compiler;
 import compiler.runtime_api;
 import compiler.core_utils;
+import compiler.symbol_runtime;
 import emitter.emitter;
 import emitter.symtab;
 import emitter.typeinfo;
@@ -23,7 +24,8 @@ import emitter.typeinfo;
 
 func _cg_find_global_info(name_ptr: u64, name_len: u64) -> *GlobalInfo {
     var globals: *Vec<*GlobalInfo> = emitter_get_globals();
-    var n: u64 = globals.?len();
+    var n: u64 = 0;
+    if (globals != 0) { n = globals.len(); }
     for (var i: u64 = 0; i < n; i++) {
         var ginfo: *GlobalInfo = globals.get(i);
         if (str_eq(ginfo.name_ptr, ginfo.name_len, name_ptr, name_len)) { return ginfo; }
@@ -219,6 +221,8 @@ func cg_resolve_constructor_call(struct_ptr: u64, struct_len: u64, args: *Vec<*A
     var resolved: CompilerMethodResolveResult = compiler_method_resolve_none();
     var method_ptr: u64 = (u64)"constructor";
     var method_len: u64 = 11;
+    var arg_count_hint: u64 = 0;
+    if (args != 0) { arg_count_hint = args.len(); }
     var base_len: u64 = compiler_find_generic_suffix_index(struct_ptr, struct_len);
     var suffix_len: u64 = struct_len - base_len;
     var name_info: *NameInfo = compiler_build_method_name_base(struct_ptr, base_len, method_ptr, method_len, suffix_len);
@@ -258,6 +262,14 @@ func cg_resolve_constructor_call(struct_ptr: u64, struct_len: u64, args: *Vec<*A
                 resolved.owner_len = fn_ctor.impl_owner_len;
             }
             resolved.access = compiler_get_impl_method_access(name_info.ptr, name_info.len);
+        }
+    }
+    if (resolved.found == 0 || resolved.fn == 0) {
+        var overload_resolved: CompilerMethodResolveResult = sym_resolve_method_overload_with_count_fallback(
+            struct_ptr, struct_len, method_ptr, method_len, 0, arg_count_hint
+        );
+        if (overload_resolved.found != 0 && overload_resolved.fn != 0) {
+            resolved = overload_resolved;
         }
     }
     if (resolved.found == 0 || resolved.fn == 0) {
@@ -324,6 +336,9 @@ func cg_stack_ctor_call_at_r12(sc: *AstStackCtor, symtab: *Symtab) -> u64 {
 
     cg_emit_trait_vptr_init_at_r12(sc.struct_name_ptr, sc.struct_name_len);
     var resolved_ctor: CompilerMethodResolveResult = cg_resolve_constructor_call(sc.struct_name_ptr, sc.struct_name_len, sc.ctor_args_vec, symtab, "stack ctor", 10);
+    if (resolved_ctor.found == 0 || resolved_ctor.fn == 0) {
+        return 0;
+    }
     var call_ptr: u64 = resolved_ctor.fn.name_ptr;
     var call_len: u64 = resolved_ctor.fn.name_len;
     var alias_name: *NameInfo = resolve_name(call_ptr, call_len);
@@ -1004,7 +1019,8 @@ func cg_try_emit_value_load(value_desc: *FieldDesc, value_off: u64) -> u64 {
         emit("]\n");
         return;
     }
-    emit_stderr("[ERROR] try value size too large for expression result\n");
+    diag_emit_error_tag("codegen", "try", "try value size too large for expression result");
+    diag_emit_help("return the try payload through a destination slot or reduce the payload size");
     panic("Codegen error");
 }
 
@@ -1014,7 +1030,8 @@ func cg_try_expr(node: u64, symtab: *Symtab) -> u64 {
 
     var opt_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)operand, symtab);
     if (opt_ti == 0) {
-        emit_stderr("[ERROR] try operand type not found\n");
+        diag_emit_error_tag("codegen", "try", "try operand type not found");
+        diag_emit_help("ensure the try operand has a resolved type before code generation");
         panic("Codegen error");
     }
     var try_kind: u64 = compiler_try_kind_from_typeinfo(opt_ti);
@@ -1042,7 +1059,8 @@ func cg_try_expr(node: u64, symtab: *Symtab) -> u64 {
 
     var struct_def: *AstStructDef = compiler_try_resolve_struct_def(opt_ti);
     if (struct_def == 0) {
-        emit_stderr("[ERROR] try operand struct definition not found\n");
+        diag_emit_error_tag("codegen", "try", "try operand struct definition not found");
+        diag_emit_labelled_name("try struct: ", opt_ti.struct_name_ptr, opt_ti.struct_name_len);
         panic("Codegen error");
     }
 
@@ -1058,7 +1076,8 @@ func cg_try_expr(node: u64, symtab: *Symtab) -> u64 {
 
     var value_desc: *FieldDesc = get_field_desc(struct_def, value_ptr, value_len);
     if (value_desc == 0) {
-        emit_stderr("[ERROR] try value field not found\n");
+        diag_emit_error_tag("codegen", "try", "try value field not found");
+        diag_emit_labelled_member("expected field: ", struct_def.name_ptr, struct_def.name_len, value_ptr, value_len);
         panic("Codegen error");
     }
 
@@ -2217,7 +2236,7 @@ func cg_property_hook_emit_getter(member_access: *AstMemberAccess, symtab: *Symt
     if (field_desc == 0 || field_desc.getter_hook_mode == FIELD_HOOK_NONE) { return 0; }
     if (field_desc.getter_hook_ptr == 0 || field_desc.getter_hook_len == 0) { return 0; }
 
-    var args: *Vec<*AstNode> = new Vec<*AstNode>(1);
+    var args: *Vec<*AstNode> = new Vec<*AstNode>{heap_alloc((1) * sizeof(*AstNode)), 0, (1)};
     args.push(cg_property_hook_build_self_arg(member_access, obj_ti));
     var call_node: *AstCall = ast_call_with_origin(field_desc.getter_hook_ptr, field_desc.getter_hook_len, args, AST_CALL_ORIGIN_DIRECT);
     cg_expr((*AstNode)call_node);
@@ -2233,7 +2252,7 @@ func cg_property_hook_emit_setter(member_access: *AstMemberAccess, value: *AstNo
     if (field_desc == 0 || field_desc.setter_hook_mode == FIELD_HOOK_NONE) { return 0; }
     if (field_desc.setter_hook_ptr == 0 || field_desc.setter_hook_len == 0) { return 0; }
 
-    var args: *Vec<*AstNode> = new Vec<*AstNode>(2);
+    var args: *Vec<*AstNode> = new Vec<*AstNode>{heap_alloc((2) * sizeof(*AstNode)), 0, (2)};
     args.push(cg_property_hook_build_self_arg(member_access, obj_ti));
     args.push(value);
     var call_node: *AstCall = ast_call_with_origin(field_desc.setter_hook_ptr, field_desc.setter_hook_len, args, AST_CALL_ORIGIN_DIRECT);
@@ -3527,9 +3546,8 @@ func cg_member_lvalue_ident(object: u64, symtab: *Symtab, parent_ptr: u64, paren
     }
     var struct_def_hint: *AstStructDef = cg_hydrate_struct_def_from_type(var_type);
     if (var_type == 0 && var_offset == 0) {
-        emit_stderr("[ERROR] undefined identifier: ");
-        emit_stderr_len(obj_name_ptr, obj_name_len);
-        emit_stderr("\n");
+        diag_emit_error_tag("codegen", "name-resolution", "undefined identifier");
+        diag_emit_labelled_name("identifier: ", obj_name_ptr, obj_name_len);
         panic("Codegen error");
     }
     if (var_type == 0) {
@@ -3541,24 +3559,21 @@ func cg_member_lvalue_ident(object: u64, symtab: *Symtab, parent_ptr: u64, paren
         panic("Codegen error");
     }
     if (var_offset == 0) {
-        emit_stderr("[ERROR] identifier has no stack slot in current scope: ");
-        emit_stderr_len(obj_name_ptr, obj_name_len);
-        emit_stderr("\n");
+        diag_emit_error_tag("codegen", "name-resolution", "identifier has no stack slot in current scope");
+        diag_emit_labelled_name("identifier: ", obj_name_ptr, obj_name_len);
         panic("Codegen error");
     }
     if (var_type.ptr_depth == 0 && var_type.type_kind == TYPE_SLICE) {
         if (cg_member_emit_lvalue_local_slice_member(var_offset, member_ptr, member_len) != 0) {
             return 1;
         }
-        emit_stderr("[ERROR] unknown slice member: ");
-        emit_stderr_len(member_ptr, member_len);
-        emit_stderr("\n");
+        diag_emit_error_tag("codegen", "slice-member", "unknown slice member");
+        diag_emit_labelled_name("member: ", member_ptr, member_len);
         panic("Codegen error");
     }
     if (var_type.type_kind != TYPE_STRUCT) {
-        emit_stderr("[ERROR] member assignment on non-struct identifier: ");
-        emit_stderr_len(obj_name_ptr, obj_name_len);
-        emit_stderr("\n");
+        diag_emit_error_tag("codegen", "member-access", "member assignment on non-struct identifier");
+        diag_emit_labelled_name("identifier: ", obj_name_ptr, obj_name_len);
         panic("Codegen error");
     }
     
@@ -4083,7 +4098,7 @@ func cg_method_call(node: u64, symtab: *Symtab) -> u64 {
     }
     if ((type_info == 0 || type_info.type_kind != TYPE_STRUCT || (type_info.struct_name_ptr == 0 || type_info.struct_name_len == 0)) &&
         cg_binary_expr_is_number((*AstNode)receiver, recv_ti, symtab) != 0) {
-        if (type_info == 0) { type_info = new TypeInfo{}; }
+        if (type_info == 0) { type_info = new TypeInfo{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}; }
         type_info.type_kind = TYPE_STRUCT;
         type_info.ptr_depth = 0;
         type_info.struct_name_ptr = (u64)"std_number__Number";
@@ -4105,7 +4120,7 @@ func cg_method_call(node: u64, symtab: *Symtab) -> u64 {
             nl = nresolved.len;
         }
         if (typeinfo_find_func(np, nl) != 0 || typeinfo_find_func(nmi.ptr, nmi.len) != 0) {
-            if (type_info == 0) { type_info = new TypeInfo{}; }
+            if (type_info == 0) { type_info = new TypeInfo{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}; }
             type_info.type_kind = TYPE_STRUCT;
             type_info.ptr_depth = 0;
             type_info.struct_name_ptr = (u64)"std_number__Number";
