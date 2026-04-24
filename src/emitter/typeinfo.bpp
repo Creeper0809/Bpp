@@ -1115,10 +1115,16 @@ func typeinfo_method_call_ret(mc: *AstMethodCall, symtab: *Symtab, is_safe: u64)
     }
 
     if (recv_ti.type_kind != TYPE_STRUCT) { return typeinfo_make(TYPE_I64, 0); }
+    var recv_owner_ptr: u64 = recv_ti.struct_name_ptr;
+    var recv_owner_len: u64 = recv_ti.struct_name_len;
+    if (recv_ti.struct_def != 0) {
+        recv_owner_ptr = recv_ti.struct_def.name_ptr;
+        recv_owner_len = recv_ti.struct_def.name_len;
+    }
 
-    if (check_method_access_overload(recv_ti.struct_name_ptr, recv_ti.struct_name_len, mc.method_ptr, mc.method_len, arg_types, arg_count_hint) == 0) {
+    if (check_method_access_overload(recv_owner_ptr, recv_owner_len, mc.method_ptr, mc.method_len, arg_types, arg_count_hint) == 0) {
         emit_stderr("[ERROR] private method access denied: ");
-        emit_stderr_len(recv_ti.struct_name_ptr, recv_ti.struct_name_len);
+        emit_stderr_len(recv_owner_ptr, recv_owner_len);
         emit_stderr(".");
         emit_stderr_len(mc.method_ptr, mc.method_len);
         emit_stderr("\n");
@@ -1152,17 +1158,33 @@ func typeinfo_method_call_ret(mc: *AstMethodCall, symtab: *Symtab, is_safe: u64)
         }
     }
 
-    var resolved_method: CompilerMethodResolveResult = sym_resolve_method_overload(recv_ti.struct_name_ptr, recv_ti.struct_name_len, mc.method_ptr, mc.method_len, arg_types, arg_count_hint);
+    var resolved_method: CompilerMethodResolveResult = sym_resolve_method_overload_with_count_fallback(recv_owner_ptr, recv_owner_len, mc.method_ptr, mc.method_len, arg_types, arg_count_hint);
     var fn: *AstFunc = 0;
     if (resolved_method.found != 0) {
         fn = resolved_method.fn;
     }
     if (fn == 0 && recv_struct_def != 0) {
-        fn = find_method_func_in_hierarchy(recv_struct_def, mc.method_ptr, mc.method_len);
+        fn = find_method_func_in_hierarchy_with_arg_count(recv_struct_def, mc.method_ptr, mc.method_len, arg_count_hint);
     }
     if (fn == 0) {
-        var name_info: *NameInfo = build_method_name(recv_ti.struct_name_ptr, recv_ti.struct_name_len, mc.method_ptr, mc.method_len);
+        if (recv_struct_def != 0) {
+            var field_desc: *FieldDesc = find_struct_field_desc_scoped(recv_struct_def, 0, 0, mc.method_ptr, mc.method_len);
+            if (field_desc != 0 && field_desc.type_kind == TYPE_FUNC) {
+                var fn_ti: *TypeInfo = typeinfo_from_field_desc(field_desc, 0);
+                if (fn_ti != 0 && fn_ti.type_kind == TYPE_FUNC) {
+                    var sig_ti: *TypeInfo = fn_ti;
+                    if (fn_ti.elem_typeinfo != 0 && fn_ti.elem_typeinfo.type_kind == TYPE_FUNC) {
+                        sig_ti = fn_ti.elem_typeinfo;
+                    }
+                    if (sig_ti.fn_ret_typeinfo != 0) { return typeinfo_clone(sig_ti.fn_ret_typeinfo); }
+                    return typeinfo_make(TYPE_I64, 0);
+                }
+            }
+        }
+        var name_info: *NameInfo = build_method_name(recv_owner_ptr, recv_owner_len, mc.method_ptr, mc.method_len);
         fn = typeinfo_find_func(name_info.ptr, name_info.len);
+        if (fn == 0) { fn = sym_get_func(name_info.ptr, name_info.len); }
+        if (fn == 0) { fn = sym_get_impl_method_func(name_info.ptr, name_info.len); }
     }
     if (fn == 0) { return typeinfo_make(TYPE_I64, 0); }
     if (is_safe != 0 && fn.ret_type == TYPE_STRUCT && fn.ret_ptr_depth == 0) {
@@ -1524,12 +1546,18 @@ func typeinfo_from_member_access_expr(member_access: *AstMemberAccess, symtab: *
     if (obj_ti.ptr_depth > 0 && obj_ti.is_tagged == 1 && obj_ti.tag_layout_ptr != 0) {
         return typeinfo_make(TYPE_U64, 0);
     }
-    if (obj_ti.type_kind != TYPE_STRUCT || obj_ti.struct_def == 0) { return 0; }
-    var field: *FieldDesc = typeinfo_find_field_desc_scoped(obj_ti.struct_def, member_access.parent_ptr, member_access.parent_len, member_access.member_ptr, member_access.member_len);
+    if (obj_ti.type_kind != TYPE_STRUCT) { return 0; }
+    var struct_def: *AstStructDef = obj_ti.struct_def;
+    if (struct_def == 0 && obj_ti.struct_name_ptr != 0 && obj_ti.struct_name_len != 0) {
+        struct_def = get_struct_def(obj_ti.struct_name_ptr, obj_ti.struct_name_len);
+        if (struct_def != 0) { obj_ti.struct_def = struct_def; }
+    }
+    if (struct_def == 0) { return 0; }
+    var field: *FieldDesc = typeinfo_find_field_desc_scoped(struct_def, member_access.parent_ptr, member_access.parent_len, member_access.member_ptr, member_access.member_len);
     if (field == 0) { return 0; }
     if (check_field_access(field) == 0) {
         emit_stderr("[ERROR] private field access denied: ");
-        emit_stderr_len(obj_ti.struct_def.name_ptr, obj_ti.struct_def.name_len);
+        emit_stderr_len(struct_def.name_ptr, struct_def.name_len);
         emit_stderr(".");
         emit_stderr_len(member_access.member_ptr, member_access.member_len);
         emit_stderr("\n");
@@ -1540,6 +1568,39 @@ func typeinfo_from_member_access_expr(member_access: *AstMemberAccess, symtab: *
 
 func typeinfo_from_unary_expr(unary: *AstUnary, symtab: *Symtab) -> *TypeInfo {
     if (unary == 0) { return typeinfo_make(TYPE_I64, 0); }
+    var operand_ti_overload: *TypeInfo = get_expr_type_with_symtab(unary.operand, symtab);
+    if (operand_ti_overload != 0 && operand_ti_overload.ptr_depth == 0 && operand_ti_overload.type_kind == TYPE_STRUCT) {
+        var owner_ptr: u64 = operand_ti_overload.struct_name_ptr;
+        var owner_len: u64 = operand_ti_overload.struct_name_len;
+        if (operand_ti_overload.struct_def != 0) {
+            owner_ptr = operand_ti_overload.struct_def.name_ptr;
+            owner_len = operand_ti_overload.struct_def.name_len;
+        }
+        if (owner_ptr != 0 && owner_len != 0) {
+            var method_name: *NameInfo = compiler_operator_unary_name(unary.op);
+            if (method_name != 0) {
+                var resolved_method: CompilerMethodResolveResult = sym_resolve_method_overload_with_count_fallback(
+                    owner_ptr, owner_len, method_name.ptr, method_name.len, 0, 0);
+                if (resolved_method.found != 0 && resolved_method.fn != 0) {
+                    return typeinfo_from_func_ret(resolved_method.fn, 0);
+                }
+            }
+            if (unary.op == TOKEN_MINUS) {
+                // Some older overload paths still lower unary `-x` through the
+                // same method family used by binary subtraction. Keep typeinfo
+                // aligned with SSA lowering so receiver-method chains like
+                // `(-num).to_str()` retain the struct result type.
+                var compat_name: *NameInfo = compiler_operator_binary_name(unary.op);
+                if (compat_name != 0) {
+                    var compat_resolved: CompilerMethodResolveResult = sym_resolve_method_overload_with_count_fallback(
+                        owner_ptr, owner_len, compat_name.ptr, compat_name.len, 0, 0);
+                    if (compat_resolved.found != 0 && compat_resolved.fn != 0) {
+                        return typeinfo_from_func_ret(compat_resolved.fn, 0);
+                    }
+                }
+            }
+        }
+    }
     if (unary.op == TOKEN_MINUS || unary.op == TOKEN_PLUS) {
         var operand_ti: *TypeInfo = get_expr_type_with_symtab(unary.operand, symtab);
         if (operand_ti != 0 && operand_ti.ptr_depth == 0 && operand_ti.type_kind == TYPE_F64) {
@@ -1627,15 +1688,11 @@ func get_expr_type_with_symtab(node: *AstNode, symtab: *Symtab) -> *TypeInfo {
         if (symtab != 0) {
             local_call_ti = symtab_get_type(symtab, call_name_ptr, call_name_len);
         }
-        var call_global: *GlobalInfo = sym_find_global_info(resolved_call_ptr, resolved_call_len);
-        if (call_global == 0 && (resolved_call_ptr != call_name_ptr || resolved_call_len != call_name_len)) {
-            call_global = sym_find_global_info(call_name_ptr, call_name_len);
-        }
         var call_closure: u64 = closure_handle_is(call_name_ptr, call_name_len);
         if (call_closure == 0 && (resolved_call_ptr != call_name_ptr || resolved_call_len != call_name_len)) {
             call_closure = closure_handle_is(resolved_call_ptr, resolved_call_len);
         }
-        if (call_closure != 0 || local_call_ti != 0 || call_global != 0) {
+        if (call_closure != 0 || local_call_ti != 0) {
             var callee_ident_cp: *AstNode = ast_ident(call_name_ptr, call_name_len);
             var call_ptr_cp: *AstCallPtr = ast_call_ptr(callee_ident_cp, nref.call.args_vec);
             return typeinfo_from_call_ptr_expr(call_ptr_cp, symtab);
@@ -1643,6 +1700,15 @@ func get_expr_type_with_symtab(node: *AstNode, symtab: *Symtab) -> *TypeInfo {
 
         var fn_call: *AstFunc = typeinfo_find_func(nref.call.name_ptr, nref.call.name_len);
         if (fn_call != 0) { return typeinfo_from_func_ret(fn_call, 0); }
+        var call_global: *GlobalInfo = sym_find_global_info(resolved_call_ptr, resolved_call_len);
+        if (call_global == 0 && (resolved_call_ptr != call_name_ptr || resolved_call_len != call_name_len)) {
+            call_global = sym_find_global_info(call_name_ptr, call_name_len);
+        }
+        if (call_global != 0) {
+            var callee_ident_cp2: *AstNode = ast_ident(call_name_ptr, call_name_len);
+            var call_ptr_cp2: *AstCallPtr = ast_call_ptr(callee_ident_cp2, nref.call.args_vec);
+            return typeinfo_from_call_ptr_expr(call_ptr_cp2, symtab);
+        }
         return typeinfo_make(TYPE_I64, 0);
     }
     if (kind == AST_CALL_PTR) { return typeinfo_from_call_ptr_expr(nref.call_ptr, symtab); }

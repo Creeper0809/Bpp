@@ -20,11 +20,13 @@ import run as to_ssa from ssa.mem2reg;
 
 var g_symbolic_report_enabled: u64 = 0;
 var g_complexity_require_std_summaries: u64 = 0;
+var g_complexity_surface_contract_map: *HashMap<u64, *Vec<*NameInfo>> = 0;
 
 struct AnnComplexitySSASummary {
     public fn_ptr: u64;
     public fn_len: u64;
     public local_rank: u64;
+    public callee_rank: u64;
     public total_rank: u64;
     public conf: u64;
     public unresolved_calls: u64;
@@ -41,6 +43,7 @@ impl AnnComplexitySSASummary {
         self.fn_ptr = 0;
         self.fn_len = 0;
         self.local_rank = 0;
+        self.callee_rank = 0;
         self.total_rank = 0;
         self.conf = 0;
         self.unresolved_calls = 0;
@@ -127,6 +130,131 @@ func annotation_complexity_canonicalize_parsed_name(parsed: *CompilerAnnotationP
         parsed.name_ptr = alias_ptr;
         parsed.name_len = alias_len;
         return 1;
+    }
+    return 0;
+}
+
+func annotation_surface_contract_prepare() -> u64 {
+    if (g_complexity_surface_contract_map == 0) {
+        g_complexity_surface_contract_map = new HashMap<u64, *Vec<*NameInfo>>{0, 0, 0};
+        g_complexity_surface_contract_map.ensure_capacity(64);
+    }
+    return 1;
+}
+
+func annotation_register_surface_contract_annotations(name_ptr: u64, name_len: u64, annotations: *Vec<*NameInfo>) -> u64 {
+    if (name_ptr == 0 || name_len == 0 || annotations == 0) { return 0; }
+    if (annotation_surface_contract_prepare() == 0) { return 0; }
+    g_complexity_surface_contract_map.put(name_ptr, name_len, annotations);
+    return 1;
+}
+
+func annotation_surface_contract_annotations_for(fn: *AstFunc) -> *Vec<*NameInfo> {
+    if (fn == 0 || fn.name_ptr == 0 || fn.name_len == 0) { return 0; }
+    if (fn.annotations_vec != 0) { return fn.annotations_vec; }
+    if (g_complexity_surface_contract_map == 0) { return 0; }
+    return g_complexity_surface_contract_map.get(fn.name_ptr, fn.name_len);
+}
+
+func annotation_surface_contract_annotations_registered(name_ptr: u64, name_len: u64) -> *Vec<*NameInfo> {
+    if (name_ptr == 0 || name_len == 0 || g_complexity_surface_contract_map == 0) { return 0; }
+    return g_complexity_surface_contract_map.get(name_ptr, name_len);
+}
+
+func annotation_emit_contract_origin(parsed: *CompilerAnnotationParsed) -> u64 {
+    if (parsed == 0) { return 0; }
+    if (parsed.raw_ptr != 0 && parsed.raw_len != 0) {
+        diag_emit_labelled_text("contract origin: ", parsed.raw_ptr, parsed.raw_len);
+        return 0;
+    }
+    if (parsed.name_ptr != 0 && parsed.name_len != 0) {
+        diag_emit_labelled_name("contract origin: ", parsed.name_ptr, parsed.name_len);
+    }
+    return 0;
+}
+
+func annotation_emit_complexity_contract_origins(annotations: *Vec<*NameInfo>) -> u64 {
+    if (annotations == 0) { return 0; }
+    var n: u64 = annotations.len();
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var info: *NameInfo = annotations.get(i);
+        if (info == 0) { continue; }
+        var ann: *CompilerAnnotationParsed = annotation_parse(info);
+        if (ann == 0 || ann.parse_ok == 0) { continue; }
+        annotation_complexity_canonicalize_parsed_name(ann);
+        if (annotation_is_complexity_contract_name(ann.name_ptr, ann.name_len) == 0) { continue; }
+        annotation_emit_contract_origin(ann);
+    }
+    return 0;
+}
+
+func annotation_validate_surface_contract_annotations(fn: *AstFunc, annotations: *Vec<*NameInfo>) -> u64 {
+    if (annotations == 0) { return 1; }
+    var saw_contract: u64 = 0;
+    var n: u64 = annotations.len();
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var info: *NameInfo = annotations.get(i);
+        if (info == 0 || info.ptr == 0 || info.len == 0) { continue; }
+        var ann: *CompilerAnnotationParsed = annotation_parse(info);
+        if (ann == 0 || ann.parse_ok == 0) {
+            diag_emit_error_tag("validation", "contract-surface", "malformed surface contract annotation");
+            if (fn != 0) {
+                diag_emit_labelled_name("function: ", fn.name_ptr, fn.name_len);
+            }
+            diag_emit_labelled_text("annotation: ", info.ptr, info.len);
+            diag_emit_help("surface contract metadata must preserve parseable annotation text after decoration");
+            diag_note_error();
+            return 0;
+        }
+        annotation_complexity_canonicalize_parsed_name(ann);
+        if (annotation_is_complexity_contract_name(ann.name_ptr, ann.name_len) == 0) {
+            diag_emit_error_tag("validation", "contract-surface", "non-complexity annotation escaped into complexity surface metadata");
+            if (fn != 0) {
+                diag_emit_labelled_name("function: ", fn.name_ptr, fn.name_len);
+            }
+            annotation_emit_contract_origin(ann);
+            diag_emit_help("surface contract metadata should only carry complexity-family annotations");
+            diag_note_error();
+            return 0;
+        }
+        saw_contract = 1;
+    }
+    if (saw_contract == 0) {
+        diag_emit_error_tag("validation", "contract-surface", "surface contract metadata is empty after annotation expansion");
+        if (fn != 0) {
+            diag_emit_labelled_name("function: ", fn.name_ptr, fn.name_len);
+        }
+        diag_emit_help("decorated public surfaces should keep at least one complexity-family annotation when contract metadata is registered");
+        diag_note_error();
+        return 0;
+    }
+    return 1;
+}
+
+func annotation_has_complexity_contract_annotation(fn: *AstFunc) -> u64 {
+    if (fn == 0 || fn.annotations_vec == 0) { return 0; }
+    var n: u64 = fn.annotations_vec.len();
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var info: *NameInfo = fn.annotations_vec.get(i);
+        if (info == 0) { continue; }
+        var ann: *CompilerAnnotationParsed = annotation_parse(info);
+        if (ann == 0 || ann.parse_ok == 0) { continue; }
+        annotation_complexity_canonicalize_parsed_name(ann);
+        if (annotation_is_complexity_contract_name(ann.name_ptr, ann.name_len) != 0) { return 1; }
+    }
+    return 0;
+}
+
+func annotation_complexity_get_single_in_vec(annotations: *Vec<*NameInfo>, name_ptr: u64, name_len: u64) -> *CompilerAnnotationParsed {
+    if (annotations == 0) { return 0; }
+    var n: u64 = annotations.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var info: *NameInfo = annotations.get(i);
+        if (info == 0) { continue; }
+        var ann: *CompilerAnnotationParsed = annotation_parse(info);
+        if (ann == 0 || ann.parse_ok == 0) { continue; }
+        annotation_complexity_canonicalize_parsed_name(ann);
+        if (str_eq(ann.name_ptr, ann.name_len, name_ptr, name_len) != 0) { return ann; }
     }
     return 0;
 }
@@ -4987,7 +5115,16 @@ func annotation_complexity_ssa_collect_call(summary: *AnnComplexitySSASummary, i
         if (annotation_complexity_name_matches_self_call(ci.name_ptr, ci.name_len, summary.fn_ptr, summary.fn_len) != 0) {
             summary.self_calls = summary.self_calls + 1;
         } else {
-            summary.unresolved_calls = summary.unresolved_calls + 1;
+            var call_rank: u64 = 0;
+            var call_unknown: u64 = 0;
+            var call_seen: u64 = 0;
+            annotation_complexity_collect_time_rank_for_name(ci.name_ptr, ci.name_len, 0, ci.nargs, 0, 0, &call_rank, &call_unknown, &call_seen);
+            if (call_seen != 0 && call_rank != 0) {
+                summary.callee_rank = annotation_complexity_rank_pick_heavier(summary.callee_rank, call_rank);
+                if (call_unknown != 0) { summary.unresolved_calls = summary.unresolved_calls + 1; }
+            } else {
+                summary.unresolved_calls = summary.unresolved_calls + 1;
+            }
         }
         return 0;
     }
@@ -5020,7 +5157,16 @@ func annotation_complexity_ssa_collect_call(summary: *AnnComplexitySSASummary, i
         if (annotation_complexity_name_matches_self_call(si.name_ptr, si.name_len, summary.fn_ptr, summary.fn_len) != 0) {
             summary.self_calls = summary.self_calls + 1;
         } else {
-            summary.unresolved_calls = summary.unresolved_calls + 1;
+            var slice_rank: u64 = 0;
+            var slice_unknown: u64 = 0;
+            var slice_seen: u64 = 0;
+            annotation_complexity_collect_time_rank_for_name(si.name_ptr, si.name_len, 0, si.nargs, 0, 0, &slice_rank, &slice_unknown, &slice_seen);
+            if (slice_seen != 0 && slice_rank != 0) {
+                summary.callee_rank = annotation_complexity_rank_pick_heavier(summary.callee_rank, slice_rank);
+                if (slice_unknown != 0) { summary.unresolved_calls = summary.unresolved_calls + 1; }
+            } else {
+                summary.unresolved_calls = summary.unresolved_calls + 1;
+            }
         }
         return 0;
     }
@@ -5093,6 +5239,10 @@ func annotation_complexity_ssa_build_summary(ssa_fn: *SSAFunction) -> *AnnComple
 
     summary.local_rank = annotation_complexity_ssa_local_rank(summary.loop_depth, summary.backedge_count);
     summary.total_rank = summary.local_rank;
+    if (summary.callee_rank != 0) {
+        summary.total_rank = annotation_complexity_rank_mul(summary.total_rank, summary.callee_rank);
+        if (summary.total_rank == 0) { summary.total_rank = summary.callee_rank; }
+    }
     if (summary.self_calls >= 2) { summary.total_rank = annotation_complexity_rank_pick_heavier(summary.total_rank, 7); }
     else if (summary.self_calls == 1) { summary.total_rank = annotation_complexity_rank_pick_heavier(summary.total_rank, 3); }
     if (summary.unresolved_calls != 0) { summary.conf = ANN_COMPLEXITY_CONF_UNKNOWN; }
@@ -5154,6 +5304,201 @@ func annotation_complexity_ssa_infer_time_rank(fn: *AstFunc, out_conf: *u64) -> 
     if (summary == 0) { return 0; }
     if (out_conf != 0) { *out_conf = summary.conf; }
     return summary.total_rank;
+}
+
+func annotation_complexity_ssa_find_function(ctx: *SSAContext, name_ptr: u64, name_len: u64) -> *SSAFunction {
+    if (ctx == 0 || name_ptr == 0 || name_len == 0) { return 0; }
+    var funcs: []*SSAFunction = ctx.funcs;
+    var n: u64 = slice_len(funcs);
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var fn: *SSAFunction = funcs[i];
+        if (fn == 0 || fn.name_ptr == 0 || fn.name_len == 0) { continue; }
+        if (str_eq(fn.name_ptr, fn.name_len, name_ptr, name_len) != 0) { return fn; }
+    }
+    return 0;
+}
+
+func annotation_complexity_ssa_fn_has_insts(ssa_fn: *SSAFunction) -> u64 {
+    if (ssa_fn == 0) { return 0; }
+    var blocks: []*SSABlock = ssa_fn.blocks;
+    var n: u64 = slice_len(blocks);
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var block: *SSABlock = blocks[i];
+        if (block == 0) { continue; }
+        if (block.phi_head != 0 || block.inst_head != 0) { return 1; }
+    }
+    return 0;
+}
+
+func annotation_complexity_ssa_summary_from_ctx(ctx: *SSAContext, fn: *AstFunc) -> *AnnComplexitySSASummary {
+    if (ctx == 0 || fn == 0 || fn.name_ptr == 0 || fn.name_len == 0) { return 0; }
+    var ssa_fn: *SSAFunction = annotation_complexity_ssa_find_function(ctx, fn.name_ptr, fn.name_len);
+    if (ssa_fn == 0) { return 0; }
+    if (annotation_complexity_ssa_fn_has_insts(ssa_fn) == 0) { return 0; }
+    return annotation_complexity_ssa_build_summary(ssa_fn);
+}
+
+func annotation_complexity_emit_preservation_rank(label: u64, rank: u64) -> u64 {
+    emit_stderr("[NOTE] ");
+    emit_stderr(label);
+    emit_stderr(annotation_complexity_rank_name(rank));
+    emit_stderr_nl();
+    return 0;
+}
+
+func annotation_complexity_emit_preservation_conf(label: u64, conf: u64) -> u64 {
+    emit_stderr("[NOTE] ");
+    emit_stderr(label);
+    emit_stderr(annotation_complexity_confidence_name(conf));
+    emit_stderr_nl();
+    return 0;
+}
+
+func annotation_complexity_emit_preservation_error(fn: *AstFunc, summary: *AnnComplexitySSASummary, contract_annotations: *Vec<*NameInfo>, contract_label: u64, limit_rank: u64) -> u64 {
+    diag_emit_error_tag("ssa-preservation", "complexity", "complexity contract not preserved after SSA/codegen");
+    if (fn != 0) {
+        diag_emit_labelled_name("function: ", fn.name_ptr, fn.name_len);
+    }
+    if (contract_label != 0) {
+        diag_emit_note(contract_label);
+    }
+    annotation_emit_complexity_contract_origins(contract_annotations);
+    annotation_complexity_emit_preservation_rank("ssa inferred time rank: ", summary.total_rank);
+    annotation_complexity_emit_preservation_rank("contract time rank: ", limit_rank);
+    if (summary != 0) {
+        annotation_complexity_emit_preservation_conf("ssa confidence: ", summary.conf);
+        diag_emit_labelled_u64("ssa loop depth: ", summary.loop_depth);
+        diag_emit_labelled_u64("ssa backedges: ", summary.backedge_count);
+        diag_emit_labelled_u64("ssa call count: ", summary.call_count);
+        diag_emit_labelled_u64("ssa unresolved calls: ", summary.unresolved_calls);
+    }
+    diag_emit_help("make the final callable surface preserve the declared complexity, or relax the explicit complexity contract");
+    diag_note_error();
+    return 0;
+}
+
+func annotation_complexity_emit_missing_ssa_error(fn: *AstFunc, contract_annotations: *Vec<*NameInfo>, msg: u64, detail: u64) -> u64 {
+    diag_emit_error_tag("ssa-preservation", "complexity", msg);
+    if (fn != 0) {
+        diag_emit_labelled_name("function: ", fn.name_ptr, fn.name_len);
+    }
+    annotation_emit_complexity_contract_origins(contract_annotations);
+    if (detail != 0) {
+        diag_emit_note(detail);
+    }
+    diag_emit_help("ensure the final callable surface reaches analyzable SSA form, or relax the explicit complexity contract");
+    diag_note_error();
+    return 0;
+}
+
+func annotation_complexity_preservation_allow_ast_fallback(fn: *AstFunc, contract_annotations: *Vec<*NameInfo>, summary: *AnnComplexitySSASummary, declared_time_rank: u64, limit_rank: u64) -> u64 {
+    if (fn == 0 || summary == 0 || limit_rank == 0) { return 0; }
+    if (summary.conf != ANN_COMPLEXITY_CONF_HEURISTIC && summary.conf != ANN_COMPLEXITY_CONF_UNKNOWN) { return 0; }
+
+    var constraints_ann: *CompilerAnnotationParsed = annotation_complexity_get_single_in_vec(contract_annotations, "constraints", 11);
+    var ast_conf: u64 = ANN_COMPLEXITY_CONF_UNKNOWN;
+    var ast_rank: u64 = annotation_complexity_infer_time_rank_with_meta(fn, constraints_ann, 0, 0, &ast_conf);
+    var ast_compare_rank: u64 = ast_rank;
+    if (declared_time_rank != 0 &&
+        annotation_complexity_rank_order(declared_time_rank) > annotation_complexity_rank_order(ast_compare_rank)) {
+        ast_compare_rank = declared_time_rank;
+    }
+    if (ast_compare_rank == 0) { ast_compare_rank = declared_time_rank; }
+    if (ast_compare_rank == 0) { return 0; }
+    if (annotation_complexity_rank_exceeds(ast_compare_rank, limit_rank) == 0) { return 1; }
+    return 0;
+}
+
+func annotation_validate_complexity_preservation_ssa(ctx: *SSAContext) -> u64 {
+    if (ctx == 0 || g_compiler_ctx.all_funcs == 0) { return 1; }
+    var n: u64 = g_compiler_ctx.all_funcs.len();
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        if (diag_should_stop_pass() != 0) { return 0; }
+        var fn: *AstFunc = g_compiler_ctx.all_funcs.get(i);
+        if (fn == 0 || fn.body == 0) { continue; }
+
+        var contract_annotations: *Vec<*NameInfo> = annotation_surface_contract_annotations_for(fn);
+        if (contract_annotations == 0) { continue; }
+
+        var ignore_ann: *CompilerAnnotationParsed = annotation_complexity_get_single_in_vec(contract_annotations, "complexity_ignore", 17);
+        if (ignore_ann != 0) { continue; }
+
+        var complexity_ann: *CompilerAnnotationParsed = annotation_complexity_get_single_in_vec(contract_annotations, "complexity", 10);
+        var budget_ann: *CompilerAnnotationParsed = annotation_complexity_get_single_in_vec(contract_annotations, "complexity_budget", 17);
+        if (complexity_ann == 0 && budget_ann == 0) { continue; }
+
+        var ssa_fn: *SSAFunction = annotation_complexity_ssa_find_function(ctx, fn.name_ptr, fn.name_len);
+        var summary: *AnnComplexitySSASummary = annotation_complexity_ssa_summary_from_ctx(ctx, fn);
+        if (summary == 0) {
+            if (ssa_fn == 0) {
+                annotation_complexity_emit_missing_ssa_error(fn, contract_annotations,
+                    "complexity contract could not be re-verified after SSA/codegen",
+                    "ssa function: missing");
+                return 0;
+            }
+            if (annotation_complexity_ssa_fn_has_insts(ssa_fn) == 0) {
+                annotation_complexity_emit_missing_ssa_error(fn, contract_annotations,
+                    "complexity contract could not be re-verified after SSA/codegen",
+                    "ssa function: no analyzable instructions");
+                return 0;
+            }
+            annotation_complexity_emit_missing_ssa_error(fn, contract_annotations,
+                "complexity contract could not be summarized after SSA/codegen",
+                "ssa summary: missing");
+            return 0;
+        }
+
+        var declared_time_rank: u64 = 0;
+        if (complexity_ann != 0) {
+            var declared_time_arg: *CompilerAnnotationArg = annotation_complexity_find_time_arg(complexity_ann);
+            if (declared_time_arg != 0 && declared_time_arg.kind == 3) {
+                declared_time_rank = annotation_complexity_rank_from_expr(declared_time_arg.string_ptr, declared_time_arg.string_len);
+            }
+        }
+        if (declared_time_rank != 0 &&
+            annotation_complexity_rank_exceeds(summary.total_rank, declared_time_rank) != 0 &&
+            annotation_complexity_preservation_allow_ast_fallback(fn, contract_annotations, summary, declared_time_rank, declared_time_rank) == 0) {
+            annotation_complexity_emit_preservation_error(fn, summary, contract_annotations,
+                "violated contract: complexity.time on final SSA/codegen surface",
+                declared_time_rank);
+            return 0;
+        }
+
+        var budget_time_rank: u64 = 0;
+        if (budget_ann != 0) {
+            var budget_time_arg: *CompilerAnnotationArg = annotation_complexity_find_time_arg(budget_ann);
+            if (budget_time_arg != 0 && budget_time_arg.kind == 3) {
+                budget_time_rank = annotation_complexity_rank_from_expr(budget_time_arg.string_ptr, budget_time_arg.string_len);
+            }
+        }
+        var debug_ann: *CompilerAnnotationParsed = annotation_complexity_get_single_in_vec(contract_annotations, "complexity_debug", 16);
+        if (debug_ann != 0) {
+            emit_stderr("[COMPLEXITY_SSA_PRESERVE] function=");
+            emit_stderr_len(fn.name_ptr, fn.name_len);
+            emit_stderr(" ssa_time=");
+            emit_stderr(annotation_complexity_rank_name(summary.total_rank));
+            emit_stderr(" ssa_callee=");
+            emit_stderr(annotation_complexity_rank_name(summary.callee_rank));
+            emit_stderr(" ssa_conf=");
+            emit_stderr(annotation_complexity_confidence_name(summary.conf));
+            emit_stderr(" contract_time=");
+            if (declared_time_rank != 0) { emit_stderr(annotation_complexity_rank_name(declared_time_rank)); }
+            else { emit_stderr("none"); }
+            emit_stderr(" budget_time=");
+            if (budget_time_rank != 0) { emit_stderr(annotation_complexity_rank_name(budget_time_rank)); }
+            else { emit_stderr("none"); }
+            emit_stderr("\n");
+        }
+        if (budget_time_rank != 0 &&
+            annotation_complexity_rank_exceeds(summary.total_rank, budget_time_rank) != 0 &&
+            annotation_complexity_preservation_allow_ast_fallback(fn, contract_annotations, summary, declared_time_rank, budget_time_rank) == 0) {
+            annotation_complexity_emit_preservation_error(fn, summary, contract_annotations,
+                "violated contract: complexity_budget.time on final SSA/codegen surface",
+                budget_time_rank);
+            return 0;
+        }
+    }
+    return 1;
 }
 
 func annotation_complexity_budget_slack_multiplier(mode: u64, conf: u64) -> u64 {
@@ -7090,6 +7435,36 @@ func annotation_clone_params(params: *Vec<*Param>) -> *Vec<*Param> {
     for (var i: u64 = 0; i < n; i++) {
         out.push(module_util_clone_param(params.get(i)));
     }
+    return out;
+}
+
+func annotation_is_complexity_contract_name(name_ptr: u64, name_len: u64) -> u64 {
+    if (name_ptr == 0 || name_len == 0) { return 0; }
+    if (str_eq(name_ptr, name_len, "complexity", 10) != 0) { return 1; }
+    if (str_eq(name_ptr, name_len, "complexity_input", 16) != 0) { return 1; }
+    if (str_eq(name_ptr, name_len, "complexity_budget", 17) != 0) { return 1; }
+    if (str_eq(name_ptr, name_len, "complexity_memo", 15) != 0) { return 1; }
+    if (str_eq(name_ptr, name_len, "complexity_ignore", 17) != 0) { return 1; }
+    if (str_eq(name_ptr, name_len, "complexity_debug", 16) != 0) { return 1; }
+    if (str_eq(name_ptr, name_len, "constraints", 11) != 0) { return 1; }
+    if (str_eq(name_ptr, name_len, "time_limit", 10) != 0) { return 1; }
+    return 0;
+}
+
+func annotation_clone_complexity_contract_annotations(annotations: *Vec<*NameInfo>) -> *Vec<*NameInfo> {
+    if (annotations == 0) { return 0; }
+    var n: u64 = annotations.len();
+    var out: *Vec<*NameInfo> = new Vec<*NameInfo>{heap_alloc((n + 1) * sizeof(*NameInfo)), 0, (n + 1)};
+    for (var i: u64 = 0; i < n; i++) {
+        var info: *NameInfo = annotations.get(i);
+        if (info == 0 || info.ptr == 0 || info.len == 0) { continue; }
+        var parsed: *CompilerAnnotationParsed = annotation_parse(info);
+        if (parsed == 0 || parsed.parse_ok == 0 || parsed.name_ptr == 0 || parsed.name_len == 0) { continue; }
+        annotation_complexity_canonicalize_parsed_name(parsed);
+        if (annotation_is_complexity_contract_name(parsed.name_ptr, parsed.name_len) == 0) { continue; }
+        out.push(new NameInfo{info.ptr, info.len});
+    }
+    if (out.len() == 0) { return 0; }
     return out;
 }
 

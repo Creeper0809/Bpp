@@ -6,6 +6,137 @@ import ssa.datastruct;
 import ssa.core;
 import std.util;
 
+func align_up_8(value: u64) -> u64 {
+    var rem: u64 = value % 8;
+    if (rem == 0) { return value; }
+    return value + (8 - rem);
+}
+
+func decode_lea_local_offset_phys(enc: u64) -> i64 {
+    var bias: u64 = 4611686018427387904; // 1<<62
+    return (i64)(enc - bias);
+}
+
+func max_existing_local_need(fn: *SSAFunction) -> u64 {
+    if (fn == 0) { return 1088; }
+    var required: u64 = 1088;
+    var blocks: []*SSABlock = fn.blocks;
+    var bcount: u64 = slice_len(blocks);
+    for (var bi: u64 = 0; bi < bcount; bi++) {
+        var b: *SSABlock = blocks[bi];
+        if (b == 0) { continue; }
+        var cur: *SSAInstruction = b.inst_head;
+        while (cur != 0) {
+            if (op_of(cur) == SSA_OP_LEA_LOCAL) {
+                var off: i64 = decode_lea_local_offset_phys(operand_value(cur.src1));
+                if (off < 0) {
+                    var need: u64 = (u64)(0 - off);
+                    if (need > required) { required = need; }
+                }
+            }
+            cur = cur.next;
+        }
+    }
+    return align_up_8(required);
+}
+
+func max_reg_id_lower_phys(fn: *SSAFunction) -> u64 {
+    if (fn == 0) { return 0; }
+    var max_id: u64 = 0;
+    var blocks: []*SSABlock = fn.blocks;
+    var bcount: u64 = slice_len(blocks);
+    for (var bi: u64 = 0; bi < bcount; bi++) {
+        var b: *SSABlock = blocks[bi];
+        if (b == 0) { continue; }
+
+        var phi: *SSAInstruction = b.phi_head;
+        while (phi != 0) {
+            if (phi.dest > max_id) { max_id = phi.dest; }
+            phi = phi.next;
+        }
+
+        var cur: *SSAInstruction = b.inst_head;
+        while (cur != 0) {
+            if (cur.dest > max_id) { max_id = cur.dest; }
+            if (cur.src1 != 0 && operand_is_const(cur.src1) == 0) {
+                var src1_reg: u64 = operand_value(cur.src1);
+                if (src1_reg > max_id) { max_id = src1_reg; }
+            }
+            if (cur.src2 != 0 && operand_is_const(cur.src2) == 0) {
+                var src2_reg: u64 = operand_value(cur.src2);
+                if (src2_reg > max_id) { max_id = src2_reg; }
+            }
+            cur = cur.next;
+        }
+    }
+    return max_id;
+}
+
+func max_var_id_lower_phys(fn: *SSAFunction) -> u64 {
+    if (fn == 0) { return 0; }
+    var max_id: u64 = 0;
+    var blocks: []*SSABlock = fn.blocks;
+    var bcount: u64 = slice_len(blocks);
+    for (var bi: u64 = 0; bi < bcount; bi++) {
+        var b: *SSABlock = blocks[bi];
+        if (b == 0) { continue; }
+        var cur: *SSAInstruction = b.inst_head;
+        while (cur != 0) {
+            var op: u64 = op_of(cur);
+            if (op == SSA_OP_LOAD || op == SSA_OP_STORE) {
+                var var_id: u64 = operand_value(cur.src1);
+                if (var_id > max_id) { max_id = var_id; }
+            }
+            cur = cur.next;
+        }
+    }
+    return max_id;
+}
+
+func insert_before_inst(block: *SSABlock, cur: *SSAInstruction, inst: *SSAInstruction) -> u64 {
+    if (block == 0 || cur == 0 || inst == 0) { return 0; }
+    var prev_inst: *SSAInstruction = (*SSAInstruction)cur.prev;
+    inst.next = cur;
+    set_prev(inst, prev_inst);
+    if (prev_inst != 0) {
+        prev_inst.next = inst;
+    } else {
+        block.inst_head = inst;
+    }
+    set_prev(cur, inst);
+    return 0;
+}
+
+func lower_pseudo_mem_inst(ctx: *SSAContext, block: *SSABlock, cur: *SSAInstruction, next_reg_ptr: *u64, slot_needs: *u64, slot_count: u64) -> u64 {
+    if (ctx == 0 || block == 0 || cur == 0 || next_reg_ptr == 0 || slot_needs == 0) { return 0; }
+    var op: u64 = op_of(cur);
+    if (op != SSA_OP_LOAD && op != SSA_OP_STORE) { return 0; }
+
+    var var_id: u64 = operand_value(cur.src1);
+    if (var_id == 0 || var_id >= slot_count) { return 0; }
+    var need: u64 = slot_needs[var_id];
+    if (need == 0) { return 0; }
+
+    var addr_reg: u64 = *next_reg_ptr;
+    *next_reg_ptr = addr_reg + 1;
+    var signed_off: i64 = 0 - (i64)need;
+    var bias: u64 = 4611686018427387904; // 1<<62
+    var enc: u64 = (u64)(signed_off + (i64)bias);
+    var lea_ptr: *SSAInstruction = create_inst(ctx, SSA_OP_LEA_LOCAL, addr_reg, operand_const(enc), 0);
+    insert_before_inst(block, cur, lea_ptr);
+
+    if (op == SSA_OP_LOAD) {
+        set_op(cur, SSA_OP_LOAD64);
+        cur.src1 = operand_reg(addr_reg);
+        cur.src2 = 0;
+        return 1;
+    }
+
+    set_op(cur, SSA_OP_STORE64);
+    cur.src1 = operand_reg(addr_reg);
+    return 1;
+}
+
 func run(ctx: *SSAContext) -> u64 {
     push_trace("run", "ssa_lower_phys.b", __LINE__);
     defer pop_trace();
@@ -14,29 +145,45 @@ func run(ctx: *SSAContext) -> u64 {
     var n: u64 = slice_len(funcs);
     for (var i: u64 = 0; i < n; i++) {
         var fn: *SSAFunction = funcs[i];
+        if (fn == 0) { continue; }
+
+        var max_var: u64 = max_var_id_lower_phys(fn);
+        var slot_count: u64 = max_var + 1;
+        var slot_needs: *u64 = (*u64)heap_alloc(slot_count * sizeof(u64));
+        for (var si: u64 = 0; si < slot_count; si++) {
+            slot_needs[si] = 0;
+        }
+        var next_need: u64 = max_existing_local_need(fn);
+        for (var var_id: u64 = 1; var_id <= max_var; var_id++) {
+            next_need = next_need + 8;
+            slot_needs[var_id] = next_need;
+        }
+
+        var next_reg: u64 = max_reg_id_lower_phys(fn) + 1;
 
         var blocks: []*SSABlock = fn.blocks;
         var bcount: u64 = slice_len(blocks);
         for (var bi: u64 = 0; bi < bcount; bi++) {
             var b: *SSABlock = blocks[bi];
+            if (b == 0) { continue; }
 
             var cur: *SSAInstruction = b.inst_head;
             while (cur != 0) {
+                var next: *SSAInstruction = cur.next;
                 var op: u64 = op_of(cur);
 
                 if (op == SSA_OP_COPY) {
-                    var src: u64 = operand_value(cur.src1);
-                    if (cur.dest == src) {
-                        set_op(cur, SSA_OP_NOP);
+                    if (cur.src1 != 0 && operand_is_const(cur.src1) == 0) {
+                        var src: u64 = operand_value(cur.src1);
+                        if (cur.dest == src) {
+                            set_op(cur, SSA_OP_NOP);
+                        }
                     }
                 }
 
-                if (op == SSA_OP_LOAD || op == SSA_OP_STORE) {
-                    // mem2reg 이후에는 남지 않아야 함. 안전하게 NOP 처리.
-                    set_op(cur, SSA_OP_NOP);
-                }
+                if (op == SSA_OP_LOAD || op == SSA_OP_STORE) {}
 
-                cur = cur.next;
+                cur = next;
             }
 
         }

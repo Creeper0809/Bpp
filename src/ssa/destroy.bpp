@@ -7,6 +7,134 @@ import std.util;
 import ssa.datastruct;
 import ssa.core;
 
+func destroy_call_args_len(args_vec: *Vec<u64>, nargs: u64) -> u64 {
+    var n: u64 = nargs;
+    if (n == 0 && args_vec != 0) { n = args_vec.len(); }
+    return n;
+}
+
+func destroy_mark_used(used: *u64, used_len: u64, reg: u64) -> u64 {
+    if (used == 0 || reg == 0 || reg >= used_len) { return 0; }
+    used[reg] = 1;
+    return 0;
+}
+
+func destroy_mark_call_uses(used: *u64, used_len: u64, info_ptr: u64, op: u64) -> u64 {
+    if (op == SSA_OP_CALL) {
+        var info: *SSACallInfo = (*SSACallInfo)info_ptr;
+        var n: u64 = destroy_call_args_len(info.args_vec, info.nargs);
+        for (var i: u64 = 0; i < n; i++) {
+            destroy_mark_used(used, used_len, info.args_vec.get(i));
+        }
+        return 0;
+    }
+    if (op == SSA_OP_CALL_PTR) {
+        var info_ptrp: *SSACallPtrInfo = (*SSACallPtrInfo)info_ptr;
+        destroy_mark_used(used, used_len, info_ptrp.callee_reg);
+        var n2: u64 = destroy_call_args_len(info_ptrp.args_vec, info_ptrp.nargs);
+        for (var j: u64 = 0; j < n2; j++) {
+            destroy_mark_used(used, used_len, info_ptrp.args_vec.get(j));
+        }
+        return 0;
+    }
+    if (op == SSA_OP_CALL_SLICE_STORE) {
+        var info_s: *SSACallSliceStoreInfo = (*SSACallSliceStoreInfo)info_ptr;
+        if (info_s.is_ptr > 1) {
+            var info_call: *SSACallInfo = (*SSACallInfo)info_ptr;
+            var n3: u64 = destroy_call_args_len(info_call.args_vec, info_call.nargs);
+            for (var k: u64 = 0; k < n3; k++) {
+                destroy_mark_used(used, used_len, info_call.args_vec.get(k));
+            }
+            return 0;
+        }
+        if (info_s.is_ptr != 0) {
+            destroy_mark_used(used, used_len, info_s.callee_reg);
+        }
+        var n4: u64 = destroy_call_args_len(info_s.args_vec, info_s.nargs);
+        for (var m: u64 = 0; m < n4; m++) {
+            destroy_mark_used(used, used_len, info_s.args_vec.get(m));
+        }
+        return 0;
+    }
+    return 0;
+}
+
+func destroy_collect_used_regs(fn: *SSAFunction, used: *u64, used_len: u64) -> u64 {
+    if (fn == 0 || used == 0 || used_len == 0) { return 0; }
+    var blocks: []*SSABlock = fn.blocks;
+    var n: u64 = slice_len(blocks);
+    for (var i: u64 = 0; i < n; i++) {
+        var b: *SSABlock = blocks[i];
+        if (b == 0) { continue; }
+
+        var phi: *SSAInstruction = b.phi_head;
+        while (phi != 0) {
+            var args: *SSAPhiArg = (*SSAPhiArg)phi.src1;
+            while (args != 0) {
+                destroy_mark_used(used, used_len, args.val);
+                args = args.next;
+            }
+            phi = phi.next;
+        }
+
+        var cur: *SSAInstruction = b.inst_head;
+        while (cur != 0) {
+            var op: u64 = op_of(cur);
+            if (op == SSA_OP_CALL || op == SSA_OP_CALL_PTR || op == SSA_OP_CALL_SLICE_STORE) {
+                destroy_mark_call_uses(used, used_len, operand_value(cur.src1), op);
+            } else {
+                if (cur.src1 != 0 && operand_is_const(cur.src1) == 0) {
+                    destroy_mark_used(used, used_len, operand_value(cur.src1));
+                }
+            }
+            if (cur.src2 != 0 && operand_is_const(cur.src2) == 0) {
+                destroy_mark_used(used, used_len, operand_value(cur.src2));
+            }
+            cur = cur.next;
+        }
+    }
+    return 0;
+}
+
+func destroy_prune_dead_phis(fn: *SSAFunction) -> u64 {
+    if (fn == 0) { return 0; }
+    var changed: u64 = 1;
+    while (changed != 0) {
+        changed = 0;
+        var max_id: u64 = max_reg(fn);
+        if (max_id == 0) { return 0; }
+        var used: *u64 = (*u64)heap_alloc((max_id + 1) * sizeof(u64));
+        for (var ui: u64 = 0; ui <= max_id; ui++) {
+            used[ui] = 0;
+        }
+        destroy_collect_used_regs(fn, used, max_id + 1);
+
+        var blocks: []*SSABlock = fn.blocks;
+        var n: u64 = slice_len(blocks);
+        for (var bi: u64 = 0; bi < n; bi++) {
+            var b: *SSABlock = blocks[bi];
+            if (b == 0) { continue; }
+            var prev: *SSAInstruction = 0;
+            var phi: *SSAInstruction = b.phi_head;
+            while (phi != 0) {
+                var next: *SSAInstruction = phi.next;
+                if (phi.dest != 0 && phi.dest <= max_id && used[phi.dest] == 0) {
+                    if (prev == 0) {
+                        b.phi_head = next;
+                    } else {
+                        prev.next = next;
+                    }
+                    changed = 1;
+                } else {
+                    prev = phi;
+                }
+                phi = next;
+            }
+        }
+    }
+    return 0;
+}
+
 struct SSASplitEdge {
     public pred: *SSABlock;
     public dst: *SSABlock;
@@ -142,6 +270,11 @@ struct SSADestroyPhiSrc {
     public src: u64;
 }
 
+struct SSADestroyConstInfo {
+    public known: u64;
+    public value: u64;
+}
+
 func find_phi_src(phi: *SSAInstruction, pred_id: u64) -> SSADestroyPhiSrc {
     var result: SSADestroyPhiSrc;
     result.found = 0;
@@ -158,13 +291,87 @@ func find_phi_src(phi: *SSAInstruction, pred_id: u64) -> SSADestroyPhiSrc {
     return result;
 }
 
-func emit_copy(ctx: *SSAContext, block: *SSABlock, dst: u64, src: u64) -> u64 {
-    var inst_ptr: *SSAInstruction = create_inst(ctx, SSA_OP_COPY, dst, operand_reg(src), 0);
+func destroy_collect_const_defs(fn: *SSAFunction, known_ptr: *u64, value_ptr: *u64, len: u64) -> u64 {
+    if (fn == 0 || known_ptr == 0 || value_ptr == 0 || len == 0) { return 0; }
+    var blocks: []*SSABlock = fn.blocks;
+    var n: u64 = slice_len(blocks);
+    for (var bi: u64 = 0; bi < n; bi++) {
+        var block: *SSABlock = blocks[bi];
+        if (block == 0) { continue; }
+        var cur: *SSAInstruction = block.inst_head;
+        while (cur != 0) {
+            var op: u64 = op_of(cur);
+            if (cur.dest != 0 && cur.dest < len) {
+                if (op == SSA_OP_CONST && operand_is_const(cur.src1) != 0) {
+                    known_ptr[cur.dest] = 1;
+                    value_ptr[cur.dest] = operand_value(cur.src1);
+                } else if (op == SSA_OP_COPY && operand_is_const(cur.src1) != 0) {
+                    known_ptr[cur.dest] = 1;
+                    value_ptr[cur.dest] = operand_value(cur.src1);
+                }
+            }
+            cur = cur.next;
+        }
+    }
+    return 0;
+}
+
+func destroy_const_info(src: u64, known_ptr: *u64, value_ptr: *u64, len: u64) -> SSADestroyConstInfo {
+    var info: SSADestroyConstInfo;
+    info.known = 0;
+    info.value = 0;
+    if (src == 0) {
+        // Phi lowering uses r0 as an "undef/zero" placeholder on some edges.
+        // Do not forward that sentinel as a real register operand.
+        info.known = 1;
+        info.value = 0;
+        return info;
+    }
+    if (known_ptr == 0 || value_ptr == 0 || src >= len) { return info; }
+    if (known_ptr[src] != 0) {
+        info.known = 1;
+        info.value = value_ptr[src];
+    }
+    return info;
+}
+
+func emit_copy(ctx: *SSAContext, block: *SSABlock, dst: u64, src: u64, known_ptr: *u64, value_ptr: *u64, known_len: u64) -> u64 {
+    var src_opr: u64 = operand_reg(src);
+    var const_info: SSADestroyConstInfo = destroy_const_info(src, known_ptr, value_ptr, known_len);
+    if (const_info.known != 0) {
+        src_opr = operand_const(const_info.value);
+    }
+    var inst_ptr: *SSAInstruction = create_inst(ctx, SSA_OP_COPY, dst, src_opr, 0);
     insert_before_terminator(block, inst_ptr);
     return 0;
 }
 
-func emit_parallel_copies(ctx: *SSAContext, block: *SSABlock, dsts: *Vec<u64>, srcs: *Vec<u64>, next_reg_ptr: *u64) -> u64 {
+func redirect_terminator_target(block: *SSABlock, old_id: u64, new_id: u64) -> u64 {
+    if (block == 0) { return 0; }
+    var term: *SSAInstruction = block.inst_tail;
+    if (term == 0) { return 0; }
+    var op: u64 = op_of(term);
+    if (op == SSA_OP_JMP) {
+        if (term.src1 != 0 && operand_is_const(term.src1) != 0 && operand_value(term.src1) == old_id) {
+            term.src1 = operand_const(new_id);
+            return 1;
+        }
+        return 0;
+    }
+    if (op == SSA_OP_BR) {
+        if (term.dest != 0 && operand_is_const(term.dest) != 0 && operand_value(term.dest) == old_id) {
+            term.dest = operand_const(new_id);
+            return 1;
+        }
+        if (term.src2 != 0 && operand_is_const(term.src2) != 0 && operand_value(term.src2) == old_id) {
+            term.src2 = operand_const(new_id);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+func emit_parallel_copies(ctx: *SSAContext, block: *SSABlock, dsts: *Vec<u64>, srcs: *Vec<u64>, next_reg_ptr: *u64, known_ptr: *u64, value_ptr: *u64, known_len: u64) -> u64 {
     var n: u64 = dsts.len();
     if (n == 0) { return 0; }
 
@@ -188,16 +395,16 @@ func emit_parallel_copies(ctx: *SSAContext, block: *SSABlock, dsts: *Vec<u64>, s
                 continue;
             }
 
-            var src_pending_as_dst: u64 = 0;
+            var dst_needed_as_src: u64 = 0;
             for (var j: u64 = 0; j < n; j++) {
-                if (active.get(j) == 0) { continue; }
-                if (dsts.get(j) == src) {
-                    src_pending_as_dst = 1;
+                if (j == i || active.get(j) == 0) { continue; }
+                if (srcs.get(j) == dst) {
+                    dst_needed_as_src = 1;
                     break;
                 }
             }
-            if (src_pending_as_dst == 0) {
-                emit_copy(ctx, block, dst, src);
+            if (dst_needed_as_src == 0) {
+                emit_copy(ctx, block, dst, src, known_ptr, value_ptr, known_len);
                 active.set(i, 0);
                 remain = remain - 1;
                 progressed = 1;
@@ -217,13 +424,13 @@ func emit_parallel_copies(ctx: *SSAContext, block: *SSABlock, dsts: *Vec<u64>, s
         var cycle_src: u64 = srcs.get(pick);
         var tmp: u64 = *next_reg_ptr;
         *next_reg_ptr = tmp + 1;
-        emit_copy(ctx, block, tmp, cycle_src);
+        emit_copy(ctx, block, tmp, cycle_src, known_ptr, value_ptr, known_len);
         srcs.set(pick, tmp);
     }
     return 0;
 }
 
-func process_block(ctx: *SSAContext, fn: *SSAFunction, block: *SSABlock, next_reg_ptr: *u64) -> u64 {
+func process_block(ctx: *SSAContext, fn: *SSAFunction, block: *SSABlock, next_reg_ptr: *u64, known_ptr: *u64, value_ptr: *u64, known_len: u64) -> u64 {
     push_trace("process_block", "ssa_destroy.b", __LINE__);
     defer pop_trace();
     if (block == 0 || block.phi_head == 0) { return 0; }
@@ -243,6 +450,9 @@ func process_block(ctx: *SSAContext, fn: *SSAFunction, block: *SSABlock, next_re
             var split: *SSABlock = get_split(split_edges, pred, block);
             if (split == 0) {
                 split = create_block(ctx, fn);
+                var jmp_ptr: *SSAInstruction = create_inst(ctx, SSA_OP_JMP, 0, operand_const(block.id), 0);
+                append_inst(split, jmp_ptr);
+                redirect_terminator_target(pred, block.id, split.id);
                 replace_succ(pred, block, split);
                 replace_pred(block, pred, split);
                 add_pred(split, pred);
@@ -267,7 +477,7 @@ func process_block(ctx: *SSAContext, fn: *SSAFunction, block: *SSABlock, next_re
             }
             phi = phi.next;
         }
-        emit_parallel_copies(ctx, emit_block, dsts, srcs, next_reg_ptr);
+        emit_parallel_copies(ctx, emit_block, dsts, srcs, next_reg_ptr, known_ptr, value_ptr, known_len);
     }
 
     block.phi_head = 0;
@@ -282,7 +492,16 @@ func run(ctx: *SSAContext) -> u64 {
     var n: u64 = slice_len(funcs);
     for (var i: u64 = 0; i < n; i++) {
         var fn: *SSAFunction = funcs[i];
+        destroy_prune_dead_phis(fn);
         var next_reg: u64 = max_reg(fn) + 1;
+        var known_len: u64 = next_reg + 1;
+        var const_known: *u64 = (*u64)heap_alloc(known_len * sizeof(u64));
+        var const_values: *u64 = (*u64)heap_alloc(known_len * sizeof(u64));
+        for (var zi: u64 = 0; zi < known_len; zi++) {
+            const_known[zi] = 0;
+            const_values[zi] = 0;
+        }
+        destroy_collect_const_defs(fn, const_known, const_values, known_len);
 
         // NOTE:
         // process_block may split critical edges and append new blocks via create_block().
@@ -293,7 +512,7 @@ func run(ctx: *SSAContext) -> u64 {
             var cur_blocks: []*SSABlock = fn.blocks;
             var cur_count: u64 = slice_len(cur_blocks);
             if (bi >= cur_count) { break; }
-            process_block(ctx, fn, cur_blocks[bi], &next_reg);
+            process_block(ctx, fn, cur_blocks[bi], &next_reg, const_known, const_values, known_len);
         }
     }
     return 0;
