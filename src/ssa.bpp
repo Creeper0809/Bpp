@@ -103,3 +103,127 @@ func build_program(prog: *AstProgram) -> *SSAContext {
     sym_clear_current_access_struct();
     return ssa_ctx_ptr;
 }
+
+func ssa_contract_name_has_prefix(name_ptr: u64, name_len: u64, prefix: u64, prefix_len: u64) -> u64 {
+    if (name_ptr == 0 || name_len == 0 || prefix == 0 || prefix_len == 0) { return 0; }
+    if (name_len < prefix_len) { return 0; }
+    return str_eq(name_ptr, prefix_len, prefix, prefix_len) != 0;
+}
+
+func ssa_contract_is_generated_decorator_name(name_ptr: u64, name_len: u64) -> u64 {
+    if (ssa_contract_name_has_prefix(name_ptr, name_len, "__ann_orig__", 11) != 0) { return 1; }
+    if (ssa_contract_name_has_prefix(name_ptr, name_len, "__ann_wrap__", 11) != 0) { return 1; }
+    return 0;
+}
+
+func ssa_contract_emit_generated_error(fn: *SSAFunction, msg: u64, help: u64) -> u64 {
+    diag_emit_error_tag("ssa-preservation", "decorator", msg);
+    if (fn != 0) {
+        diag_emit_labelled_name("function: ", fn.name_ptr, fn.name_len);
+    }
+    if (help != 0) {
+        diag_emit_help(help);
+    }
+    diag_error("SSA preservation error");
+    return 0;
+}
+
+func ssa_contract_direct_symbol_ok(name_ptr: u64, name_len: u64) -> u64 {
+    if (name_ptr == 0 || name_len == 0) { return 0; }
+    if (sym_func_exists(name_ptr, name_len) != 0) { return 1; }
+    if (ssa_contract_is_generated_decorator_name(name_ptr, name_len) != 0) { return 1; }
+    return 0;
+}
+
+func ssa_contract_func_has_insts(fn: *SSAFunction) -> u64 {
+    if (fn == 0) { return 0; }
+    var blocks: []*SSABlock = fn.blocks;
+    var bcount: u64 = slice_len(blocks);
+    for (var bi: u64 = 0; bi < bcount; bi++) {
+        var block: *SSABlock = blocks[bi];
+        if (block == 0) { continue; }
+        if (block.phi_head != 0 || block.inst_head != 0) { return 1; }
+    }
+    return 0;
+}
+
+func ssa_contract_validate_named_target(fn: *SSAFunction, name_ptr: u64, name_len: u64, label: u64) -> u64 {
+    if (name_ptr == 0 || name_len == 0) {
+        ssa_contract_emit_generated_error(fn,
+            "generated contract function contains empty direct symbol target in SSA",
+            "SSA lowering must preserve direct call and function-reference targets for generated wrappers");
+        if (label != 0) { diag_emit_note(label); }
+        return 0;
+    }
+    if (ssa_contract_direct_symbol_ok(name_ptr, name_len) == 0) {
+        ssa_contract_emit_generated_error(fn,
+            "generated contract function contains unresolved direct symbol in SSA",
+            "ensure annotation lowering resolves direct calls and function references before SSA/codegen");
+        if (label != 0) { diag_emit_note(label); }
+        diag_emit_labelled_name("symbol: ", name_ptr, name_len);
+        return 0;
+    }
+    return 1;
+}
+
+func ssa_contract_validate_inst(fn: *SSAFunction, inst: *SSAInstruction) -> u64 {
+    if (fn == 0 || inst == 0) { return 1; }
+    var op: u64 = op_of(inst);
+    if (op == SSA_OP_CALL) {
+        var info: *SSACallInfo = (*SSACallInfo)operand_value(inst.src1);
+        return ssa_contract_validate_named_target(fn, info.name_ptr, info.name_len, "direct call target");
+    }
+    if (op == SSA_OP_CALL_SLICE_STORE) {
+        var info: *SSACallSliceStoreInfo = (*SSACallSliceStoreInfo)operand_value(inst.src1);
+        if (info.is_ptr > 1) {
+            var info_call: *SSACallInfo = (*SSACallInfo)operand_value(inst.src1);
+            return ssa_contract_validate_named_target(fn, info_call.name_ptr, info_call.name_len, "slice-store direct call target");
+        }
+        if (info.is_ptr == 0) {
+            return ssa_contract_validate_named_target(fn, info.name_ptr, info.name_len, "slice-store direct call target");
+        }
+        return 1;
+    }
+    if (op == SSA_OP_LEA_FUNC) {
+        var info2: *PtrLen = (*PtrLen)operand_value(inst.src1);
+        return ssa_contract_validate_named_target(fn, info2.ptr, info2.len, "function reference target");
+    }
+    return 1;
+}
+
+func validate_contract_preservation_ssa(ctx: *SSAContext) -> u64 {
+    if (ctx == 0) { return 0; }
+    var funcs: []*SSAFunction = ctx.funcs;
+    var fn_count: u64 = slice_len(funcs);
+    for (var fi: u64 = 0; fi < fn_count; fi++) {
+        if (diag_should_stop_pass() != 0) { return 1; }
+        var fn: *SSAFunction = funcs[fi];
+        if (fn == 0) { continue; }
+        if (ssa_contract_is_generated_decorator_name(fn.name_ptr, fn.name_len) == 0) { continue; }
+        if (ssa_contract_func_has_insts(fn) == 0) { continue; }
+        var module_info: *NameInfo = sym_get_func_module(fn.name_ptr, fn.name_len);
+        if (module_info == 0) {
+            ssa_contract_emit_generated_error(fn,
+                "generated contract function lost module ownership before SSA/codegen",
+                "generated wrappers must inherit the original public function module before SSA lowering");
+            return 1;
+        }
+        var blocks: []*SSABlock = fn.blocks;
+        var bcount: u64 = slice_len(blocks);
+        for (var bi: u64 = 0; bi < bcount; bi++) {
+            var block: *SSABlock = blocks[bi];
+            if (block == 0) { continue; }
+            var phi: *SSAInstruction = block.phi_head;
+            while (phi != 0) {
+                if (ssa_contract_validate_inst(fn, phi) == 0) { return 1; }
+                phi = phi.next;
+            }
+            var cur: *SSAInstruction = block.inst_head;
+            while (cur != 0) {
+                if (ssa_contract_validate_inst(fn, cur) == 0) { return 1; }
+                cur = cur.next;
+            }
+        }
+    }
+    return 0;
+}

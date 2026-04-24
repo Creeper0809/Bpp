@@ -3789,6 +3789,59 @@ func member_access_try_call_ptr_fp(ctx: *BuilderCtx, node: u64, m: *AstMemberAcc
     return attempt;
 }
 
+func ssa_property_hook_find_field(ctx: *BuilderCtx, member_access: *AstMemberAccess, out_obj_ti: **TypeInfo) -> *FieldDesc {
+    if (ctx == 0 || member_access == 0 || ctx.symtab == 0) { return 0; }
+    if (out_obj_ti != 0) { *out_obj_ti = 0; }
+
+    var obj_ti: *TypeInfo = get_expr_type_with_symtab(member_access.object, ctx.symtab);
+    if (obj_ti == 0) { return 0; }
+    if (out_obj_ti != 0) { *out_obj_ti = obj_ti; }
+    if (obj_ti.type_kind != TYPE_STRUCT) { return 0; }
+
+    var struct_def: *AstStructDef = obj_ti.struct_def;
+    if (struct_def == 0 && obj_ti.struct_name_ptr != 0 && obj_ti.struct_name_len != 0) {
+        struct_def = get_struct_def(obj_ti.struct_name_ptr, obj_ti.struct_name_len);
+    }
+    if (struct_def == 0) { return 0; }
+
+    return typeinfo_find_field_desc_scoped(struct_def, member_access.parent_ptr, member_access.parent_len, member_access.member_ptr, member_access.member_len);
+}
+
+func ssa_property_hook_build_self_arg(member_access: *AstMemberAccess, obj_ti: *TypeInfo) -> *AstNode {
+    if (member_access == 0 || obj_ti == 0) { return 0; }
+    if (obj_ti.ptr_depth > 0) {
+        return member_access.object;
+    }
+    return (*AstNode)ast_addr_of(member_access.object);
+}
+
+func ssa_property_hook_build_getter_call(ctx: *BuilderCtx, member_access: *AstMemberAccess) -> *AstCall {
+    if (ctx == 0 || member_access == 0 || member_access.is_raw != 0) { return 0; }
+
+    var obj_ti: *TypeInfo = 0;
+    var field_desc: *FieldDesc = ssa_property_hook_find_field(ctx, member_access, &obj_ti);
+    if (field_desc == 0 || field_desc.getter_hook_mode == FIELD_HOOK_NONE) { return 0; }
+    if (field_desc.getter_hook_ptr == 0 || field_desc.getter_hook_len == 0) { return 0; }
+
+    var args: *Vec<*AstNode> = new Vec<*AstNode>{heap_alloc((1) * sizeof(*AstNode)), 0, (1)};
+    args.push(ssa_property_hook_build_self_arg(member_access, obj_ti));
+    return ast_call_with_origin(field_desc.getter_hook_ptr, field_desc.getter_hook_len, args, AST_CALL_ORIGIN_DIRECT);
+}
+
+func ssa_property_hook_build_setter_call(ctx: *BuilderCtx, member_access: *AstMemberAccess, value: *AstNode) -> *AstCall {
+    if (ctx == 0 || member_access == 0 || value == 0 || member_access.is_raw != 0) { return 0; }
+
+    var obj_ti: *TypeInfo = 0;
+    var field_desc: *FieldDesc = ssa_property_hook_find_field(ctx, member_access, &obj_ti);
+    if (field_desc == 0 || field_desc.setter_hook_mode == FIELD_HOOK_NONE) { return 0; }
+    if (field_desc.setter_hook_ptr == 0 || field_desc.setter_hook_len == 0) { return 0; }
+
+    var args: *Vec<*AstNode> = new Vec<*AstNode>{heap_alloc((2) * sizeof(*AstNode)), 0, (2)};
+    args.push(ssa_property_hook_build_self_arg(member_access, obj_ti));
+    args.push(value);
+    return ast_call_with_origin(field_desc.setter_hook_ptr, field_desc.setter_hook_len, args, AST_CALL_ORIGIN_DIRECT);
+}
+
 func expr_member_access(ctx: *BuilderCtx, node: u64) -> u64 {
     var m: *AstMemberAccess = (*AstMemberAccess)node;
     var obj: u64 = m.object;
@@ -3810,6 +3863,11 @@ func expr_member_access(ctx: *BuilderCtx, node: u64) -> u64 {
                 return build_const(ctx, scoped_const_expr.value);
             }
         }
+    }
+
+    var property_getter_call: *AstCall = ssa_property_hook_build_getter_call(ctx, m);
+    if (property_getter_call != 0) {
+        return build_expr(ctx, (*AstNode)property_getter_call);
     }
 
     var attempt: BuilderMemberAccessAttempt = member_access_try_call(ctx, node, m, obj, obj_kind);
@@ -5046,6 +5104,13 @@ func stmt_assign(ctx: *BuilderCtx, node: u64) -> u64 {
     }
     if (assign_addr_taken_ident(ctx, asn) != 0) {
         return 0;
+    }
+    if (target_kind == AST_MEMBER_ACCESS) {
+        var property_setter_call: *AstCall = ssa_property_hook_build_setter_call(ctx, (*AstMemberAccess)asn.target, (*AstNode)asn.value);
+        if (property_setter_call != 0) {
+            build_expr(ctx, (*AstNode)property_setter_call);
+            return 0;
+        }
     }
     // NOTE: operator []= dispatch is temporarily disabled in SSA assignment lowering.
     var target_meta: BuilderAssignTargetMeta = assign_load_target_struct_meta(ctx, asn, target_kind);

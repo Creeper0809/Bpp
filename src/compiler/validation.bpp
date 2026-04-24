@@ -705,6 +705,315 @@ func validate_apply_annotations_with_ctx(ctx: *CompilerCtx) -> u64 {
     return apply_annotations();
 }
 
+func contract_preservation_name_has_prefix(name_ptr: u64, name_len: u64, prefix_ptr: u64, prefix_len: u64) -> u64 {
+    if (name_ptr == 0 || name_len < prefix_len) { return 0; }
+    return str_eq(name_ptr, prefix_len, prefix_ptr, prefix_len) != 0;
+}
+
+func contract_preservation_is_generated_decorator_name(name_ptr: u64, name_len: u64) -> u64 {
+    if (contract_preservation_name_has_prefix(name_ptr, name_len, "__ann_orig__", 11) != 0) { return 1; }
+    if (contract_preservation_name_has_prefix(name_ptr, name_len, "__ann_wrap__", 11) != 0) { return 1; }
+    return 0;
+}
+
+func contract_preservation_emit_generated_func_error(fn: *AstFunc, msg: u64, help: u64) -> u64 {
+    diag_emit_error_tag("validation", "contract-preservation", msg);
+    if (fn != 0) {
+        diag_emit_labelled_name("function: ", fn.name_ptr, fn.name_len);
+    }
+    if (help != 0) {
+        diag_emit_help(help);
+    }
+    diag_note_error();
+    return 0;
+}
+
+func contract_preservation_direct_func_symbol_ok(name_ptr: u64, name_len: u64) -> u64 {
+    if (name_ptr == 0 || name_len == 0) { return 0; }
+    if (resolve_name(name_ptr, name_len) != 0) { return 1; }
+    if (contract_preservation_is_generated_decorator_name(name_ptr, name_len) != 0) { return 1; }
+    return 0;
+}
+
+func contract_preservation_validate_expr(node: *AstNode, owner: *AstFunc) -> u64 {
+    if (node == 0 || diag_should_stop_pass() != 0) { return 1; }
+    var kind: u64 = ast_kind(node);
+    var nref: AstNodeTagRef;
+    nref.node = node;
+    match (kind) {
+        case AST_BINARY:
+            if (contract_preservation_validate_expr(nref.binary.left, owner) == 0) { return 0; }
+            return contract_preservation_validate_expr(nref.binary.right, owner);
+        case AST_UNARY:
+            return contract_preservation_validate_expr(nref.unary.operand, owner);
+        case AST_ADDR_OF:
+            return contract_preservation_validate_expr(nref.addr_of.operand, owner);
+        case AST_DEREF:
+            return contract_preservation_validate_expr(nref.deref.operand, owner);
+        case AST_DEREF8:
+            return contract_preservation_validate_expr(nref.deref8.operand, owner);
+        case AST_CAST:
+            return contract_preservation_validate_expr(nref.cast_expr.expr, owner);
+        case AST_MEMBER_ACCESS:
+        case AST_SAFE_MEMBER_ACCESS:
+            return contract_preservation_validate_expr(nref.member_access.object, owner);
+        case AST_METHOD_CALL:
+        case AST_SAFE_METHOD_CALL:
+            if (contract_preservation_validate_expr(nref.method_call.receiver, owner) == 0) { return 0; }
+            if (nref.method_call.args_vec != 0) {
+                var ma_n: u64 = nref.method_call.args_vec.len();
+                for (var mi: u64 = 0; mi < ma_n; mi++) {
+                    if (contract_preservation_validate_expr(nref.method_call.args_vec.get(mi), owner) == 0) { return 0; }
+                }
+            }
+            return 1;
+        case AST_INDEX:
+        case AST_SAFE_INDEX:
+            if (contract_preservation_validate_expr(nref.index_expr.base, owner) == 0) { return 0; }
+            return contract_preservation_validate_expr(nref.index_expr.index, owner);
+        case AST_SLICE:
+            if (contract_preservation_validate_expr(nref.slice_expr.ptr_expr, owner) == 0) { return 0; }
+            return contract_preservation_validate_expr(nref.slice_expr.len_expr, owner);
+        case AST_TRY:
+            return contract_preservation_validate_expr(nref.try_expr.operand, owner);
+        case AST_STRUCT_LITERAL:
+            if (nref.struct_lit.values_vec != 0) {
+                var sv_n: u64 = nref.struct_lit.values_vec.len();
+                for (var svi: u64 = 0; svi < sv_n; svi++) {
+                    if (contract_preservation_validate_expr(nref.struct_lit.values_vec.get(svi), owner) == 0) { return 0; }
+                }
+            }
+            return 1;
+        case AST_GENERIC_STRUCT_LITERAL:
+            if (nref.generic_struct_lit.values_vec != 0) {
+                var gsv_n: u64 = nref.generic_struct_lit.values_vec.len();
+                for (var gsvi: u64 = 0; gsvi < gsv_n; gsvi++) {
+                    if (contract_preservation_validate_expr(nref.generic_struct_lit.values_vec.get(gsvi), owner) == 0) { return 0; }
+                }
+            }
+            return 1;
+        case AST_CALL:
+            var call: *AstCall = nref.call;
+            if (sym_func_exists(call.name_ptr, call.name_len) == 0 || contract_preservation_direct_func_symbol_ok(call.name_ptr, call.name_len) == 0) {
+                contract_preservation_emit_generated_func_error(owner,
+                    "generated decorator function contains unresolved direct call",
+                    "generated wrappers must keep module-aware direct calls resolvable after annotation expansion");
+                diag_emit_labelled_name("callee: ", call.name_ptr, call.name_len);
+                return 0;
+            }
+            if (call.args_vec != 0) {
+                var ca_n: u64 = call.args_vec.len();
+                for (var ci: u64 = 0; ci < ca_n; ci++) {
+                    if (contract_preservation_validate_expr(call.args_vec.get(ci), owner) == 0) { return 0; }
+                }
+            }
+            return 1;
+        case AST_GENERIC_CALL:
+            var gcall: *AstGenericCall = nref.generic_call;
+            if (sym_func_exists(gcall.name_ptr, gcall.name_len) == 0 || contract_preservation_direct_func_symbol_ok(gcall.name_ptr, gcall.name_len) == 0) {
+                contract_preservation_emit_generated_func_error(owner,
+                    "generated decorator function contains unresolved direct call",
+                    "generated wrappers must keep module-aware direct calls resolvable after annotation expansion");
+                diag_emit_labelled_name("callee: ", gcall.name_ptr, gcall.name_len);
+                return 0;
+            }
+            if (gcall.args_vec != 0) {
+                var gc_n: u64 = gcall.args_vec.len();
+                for (var gci: u64 = 0; gci < gc_n; gci++) {
+                    if (contract_preservation_validate_expr(gcall.args_vec.get(gci), owner) == 0) { return 0; }
+                }
+            }
+            return 1;
+        case AST_CALL_PTR:
+            var cp: *AstCallPtr = nref.call_ptr;
+            if (contract_preservation_validate_expr(cp.callee, owner) == 0) { return 0; }
+            if (cp.args_vec != 0) {
+                var cp_n: u64 = cp.args_vec.len();
+                for (var cpi: u64 = 0; cpi < cp_n; cpi++) {
+                    if (contract_preservation_validate_expr(cp.args_vec.get(cpi), owner) == 0) { return 0; }
+                }
+            }
+            return 1;
+        case AST_IDENT:
+            var idn: *AstIdent = nref.ident;
+            if (sym_func_exists(idn.name_ptr, idn.name_len) != 0 && contract_preservation_direct_func_symbol_ok(idn.name_ptr, idn.name_len) == 0) {
+                contract_preservation_emit_generated_func_error(owner,
+                    "generated decorator function lost direct function symbol resolution",
+                    "ensure generated wrappers inherit the original function module context before code generation");
+                diag_emit_labelled_name("symbol: ", idn.name_ptr, idn.name_len);
+                return 0;
+            }
+            return 1;
+    }
+    return 1;
+}
+
+func contract_preservation_validate_stmt(node: *AstNode, owner: *AstFunc) -> u64 {
+    if (node == 0 || diag_should_stop_pass() != 0) { return 1; }
+    var kind: u64 = ast_kind(node);
+    var nref: AstNodeTagRef;
+    nref.node = node;
+    match (kind) {
+        case AST_RETURN:
+            return contract_preservation_validate_expr(nref.ret_stmt.expr, owner);
+        case AST_VAR_DECL:
+            return contract_preservation_validate_expr(nref.var_decl.init_expr, owner);
+        case AST_CONST_DECL:
+            return contract_preservation_validate_expr(nref.const_decl.value, owner);
+        case AST_ASSIGN:
+            if (contract_preservation_validate_expr(nref.assign_stmt.target, owner) == 0) { return 0; }
+            return contract_preservation_validate_expr(nref.assign_stmt.value, owner);
+        case AST_EXPR_STMT:
+            return contract_preservation_validate_expr(nref.expr_stmt.expr, owner);
+        case AST_DEFER:
+            return contract_preservation_validate_stmt(nref.defer_stmt.stmt, owner);
+        case AST_IF:
+            if (contract_preservation_validate_expr(nref.if_stmt.cond, owner) == 0) { return 0; }
+            if (contract_preservation_validate_stmt(nref.if_stmt.then_block, owner) == 0) { return 0; }
+            return contract_preservation_validate_stmt(nref.if_stmt.else_block, owner);
+        case AST_WHILE:
+            if (contract_preservation_validate_expr(nref.while_stmt.cond, owner) == 0) { return 0; }
+            return contract_preservation_validate_stmt(nref.while_stmt.body, owner);
+        case AST_DO_WHILE:
+            if (contract_preservation_validate_stmt(nref.do_while_stmt.body, owner) == 0) { return 0; }
+            return contract_preservation_validate_expr(nref.do_while_stmt.cond, owner);
+        case AST_FOR:
+            if (contract_preservation_validate_stmt(nref.for_stmt.init, owner) == 0) { return 0; }
+            if (contract_preservation_validate_expr(nref.for_stmt.cond, owner) == 0) { return 0; }
+            if (contract_preservation_validate_stmt(nref.for_stmt.update, owner) == 0) { return 0; }
+            return contract_preservation_validate_stmt(nref.for_stmt.body, owner);
+        case AST_SWITCH:
+        case AST_MATCH:
+            if (contract_preservation_validate_expr(nref.switch_stmt.expr, owner) == 0) { return 0; }
+            if (nref.switch_stmt.cases_vec != 0) {
+                var cs_n: u64 = nref.switch_stmt.cases_vec.len();
+                for (var csi: u64 = 0; csi < cs_n; csi++) {
+                    var cs: *AstCase = nref.switch_stmt.cases_vec.get(csi);
+                    if (cs == 0) { continue; }
+                    if (cs.is_default == 0 && contract_preservation_validate_expr(cs.value, owner) == 0) { return 0; }
+                    if (contract_preservation_validate_stmt(cs.body, owner) == 0) { return 0; }
+                }
+            }
+            return 1;
+        case AST_BLOCK:
+            if (nref.block_stmt.stmts_vec != 0) {
+                var st_n: u64 = nref.block_stmt.stmts_vec.len();
+                for (var si: u64 = 0; si < st_n; si++) {
+                    if (contract_preservation_validate_stmt(nref.block_stmt.stmts_vec.get(si), owner) == 0) { return 0; }
+                }
+            }
+            return 1;
+    }
+    return 1;
+}
+
+func contract_preservation_validate_generated_function(fn: *AstFunc) -> u64 {
+    if (fn == 0) { return 1; }
+    if (contract_preservation_is_generated_decorator_name(fn.name_ptr, fn.name_len) == 0) { return 1; }
+    if (fn.body == 0) {
+        contract_preservation_emit_generated_func_error(fn,
+            "generated decorator function is missing its function body",
+            "decorator lowering must keep generated wrapper bodies intact through later passes");
+        return 0;
+    }
+    var module_info: *NameInfo = sym_get_func_module(fn.name_ptr, fn.name_len);
+    if (module_info == 0) {
+        contract_preservation_emit_generated_func_error(fn,
+            "generated decorator function lost module ownership",
+            "generated wrappers must inherit the original public function module before later passes run");
+        return 0;
+    }
+    var prev_module_ptr: u64 = g_compiler_ctx.current_module_ptr;
+    var prev_module_len: u64 = g_compiler_ctx.current_module_len;
+    g_compiler_ctx.current_module_ptr = module_info.ptr;
+    g_compiler_ctx.current_module_len = module_info.len;
+    var ok: u64 = contract_preservation_validate_stmt(fn.body, fn);
+    g_compiler_ctx.current_module_ptr = prev_module_ptr;
+    g_compiler_ctx.current_module_len = prev_module_len;
+    return ok;
+}
+
+func contract_preservation_validate_property_hooks() -> u64 {
+    if (g_compiler_ctx.all_structs_vec == 0) { return 1; }
+    var sn: u64 = g_compiler_ctx.all_structs_vec.len();
+    for (var si: u64 = 0; si < sn; si++) {
+        if (diag_should_stop_pass() != 0) { return 0; }
+        var sd: *AstStructDef = g_compiler_ctx.all_structs_vec.get(si);
+        if (sd == 0 || sd.fields_vec == 0) { continue; }
+        var fn: u64 = sd.fields_vec.len();
+        for (var fi: u64 = 0; fi < fn; fi++) {
+            var field: *FieldDesc = sd.fields_vec.get(fi);
+            if (field == 0) { continue; }
+            if (field.setter_hook_ptr != 0 && field.setter_hook_len != 0 && sym_func_exists(field.setter_hook_ptr, field.setter_hook_len) == 0) {
+                property_hook_emit_field_error(field, "setter contract was not preserved after annotation expansion");
+                property_hook_emit_setter_contract(field);
+                diag_emit_help("property setter hooks must still resolve to a callable function after decorator lowering");
+                return 0;
+            }
+            if (field.getter_hook_ptr != 0 && field.getter_hook_len != 0 && sym_func_exists(field.getter_hook_ptr, field.getter_hook_len) == 0) {
+                property_hook_emit_field_error(field, "getter contract was not preserved after annotation expansion");
+                property_hook_emit_getter_contract(field);
+                diag_emit_help("property getter hooks must still resolve to a callable function after decorator lowering");
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
+func contract_preservation_validate_entry() -> u64 {
+    if (g_compiler_ctx.entry_func_ptr == 0 || g_compiler_ctx.entry_func_len == 0) { return 1; }
+    if (sym_func_exists(g_compiler_ctx.entry_func_ptr, g_compiler_ctx.entry_func_len) == 0) {
+        diag_emit_error_tag("validation", "contract-preservation", "entry contract was not preserved after annotation expansion");
+        diag_emit_labelled_name("entry: ", g_compiler_ctx.entry_func_ptr, g_compiler_ctx.entry_func_len);
+        diag_emit_help("the final entry surface must remain a callable top-level function after decoration");
+        diag_note_error();
+        return 0;
+    }
+    var entry_fn: *AstFunc = sym_get_func(g_compiler_ctx.entry_func_ptr, g_compiler_ctx.entry_func_len);
+    if (entry_fn == 0) {
+        diag_emit_error_tag("validation", "contract-preservation", "entry function metadata is missing after annotation expansion");
+        diag_emit_labelled_name("entry: ", g_compiler_ctx.entry_func_ptr, g_compiler_ctx.entry_func_len);
+        diag_emit_help("entry lookup should still map to a concrete top-level function after decorator expansion");
+        diag_note_error();
+        return 0;
+    }
+    var entry_param_n: u64 = 0;
+    if (entry_fn.params_vec != 0) { entry_param_n = entry_fn.params_vec.len(); }
+    if (entry_param_n != 0) {
+        diag_emit_error_tag("validation", "contract-preservation", "entry function contract drifted after annotation expansion");
+        diag_emit_labelled_name("entry: ", entry_fn.name_ptr, entry_fn.name_len);
+        diag_emit_help("the final entry surface must remain zero-argument after decorator expansion");
+        diag_note_error();
+        return 0;
+    }
+    return 1;
+}
+
+func validate_contract_preservation() -> u64 {
+    if (contract_preservation_validate_property_hooks() == 0) { return 1; }
+    if (g_compiler_ctx.all_funcs != 0) {
+        var n: u64 = g_compiler_ctx.all_funcs.len();
+        for (var i: u64 = 0; i < n; i++) {
+            if (diag_should_stop_pass() != 0) { return 1; }
+            if (contract_preservation_validate_generated_function(g_compiler_ctx.all_funcs.get(i)) == 0) {
+                return 1;
+            }
+        }
+    }
+    if (contract_preservation_validate_entry() == 0) { return 1; }
+    return 0;
+}
+
+func validate_contract_preservation_with_ctx(ctx: *CompilerCtx) -> u64 {
+    if (compiler_ctx_is_active(ctx) == 0) {
+        diag_emit_error_tag("validation", "internal", "validate_contract_preservation_with_ctx requires active compiler context");
+        diag_note_error();
+        return 1;
+    }
+    return validate_contract_preservation();
+}
+
 func validate_direct_impl_calls_pass() -> u64 {
     return validate_direct_impl_calls_with_ctx(compiler_ctx_current());
 }

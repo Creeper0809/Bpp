@@ -113,6 +113,16 @@ func <decorator>(next: u64, <target-params...>) -> <target-ret>
    - 따라서 decorated override/magic method도 method lookup과 override contract를 잃지 않습니다.
 5. `@[entry]`와 decorator를 함께 쓰면, entry target은 최종 public wrapper surface를 가리킵니다.
    - 즉 entry function도 decorator를 통해 감싸진 최종 실행 경로로 진입합니다.
+6. annotation expansion 뒤에는 contract preservation pass가 다시 한 번 실행됩니다.
+   - generated wrapper/original function이 module ownership을 잃지 않았는지
+   - wrapper body의 direct call이 여전히 resolvable한지
+   - final entry surface가 callable zero-arg 함수로 남아 있는지
+   를 확인합니다.
+7. SSA/codegen 직전에도 generated contract function을 한 번 더 검증합니다.
+   - direct `call`
+   - direct `call_slice_store`
+   - `lea_func` function reference
+   가 여전히 유효한 symbol target을 가리키는지 확인합니다.
 
 ### Invalid Examples
 
