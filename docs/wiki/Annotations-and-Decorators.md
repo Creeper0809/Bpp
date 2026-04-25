@@ -125,10 +125,17 @@ func <decorator>(next: u64, <target-params...>) -> <target-ret>
    - `lea_func` function reference
    가 여전히 유효한 symbol target을 가리키는지 확인합니다.
 8. complexity-family annotation이 붙은 final callable surface는 SSA summary로 다시 검증됩니다.
+9. 이 재검증은 현재 `time`과 `space` rank를 포함하며, wrapper surface에서 더 무거워진 계약은 preservation 오류가 납니다.
+10. 관련 diagnostics는 shared contract-surface metadata를 사용해 function/module/surface kind/contract family와 declared/budget rank를 같은 형식으로 출력합니다.
    - declared `complexity.time`
    - `complexity_budget.time`
    - missing SSA summary
    를 contract preservation 관점에서 다시 확인합니다.
+11. backend 직전에는 lowered contract boundary verifier가 한 번 더 실행됩니다.
+   - module ownership
+   - std/prelude module ownership
+   - final SSA complexity summary
+   를 확인한 뒤 backend emission으로 넘어갑니다.
 
 ### Invalid Examples
 

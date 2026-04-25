@@ -22,13 +22,25 @@ var g_symbolic_report_enabled: u64 = 0;
 var g_complexity_require_std_summaries: u64 = 0;
 var g_complexity_surface_contract_map: *HashMap<u64, *Vec<*NameInfo>> = 0;
 
+const ANN_CONTRACT_SURFACE_PUBLIC = 1;
+const ANN_CONTRACT_SURFACE_GENERATED = 2;
+const ANN_CONTRACT_FAMILY_COMPLEXITY = 1;
+const ANN_CONTRACT_FAMILY_DECORATOR = 2;
+const ANN_CONTRACT_FAMILY_PROPERTY = 4;
+const ANN_CONTRACT_FAMILY_ENTRY = 8;
+const ANN_CONTRACT_FAMILY_PRELUDE = 16;
+
 struct AnnComplexitySSASummary {
     public fn_ptr: u64;
     public fn_len: u64;
     public local_rank: u64;
     public callee_rank: u64;
     public total_rank: u64;
+    public local_space_rank: u64;
+    public callee_space_rank: u64;
+    public total_space_rank: u64;
     public conf: u64;
+    public space_conf: u64;
     public unresolved_calls: u64;
     public call_count: u64;
     public self_calls: u64;
@@ -36,6 +48,8 @@ struct AnnComplexitySSASummary {
     public phi_count: u64;
     public backedge_count: u64;
     public loop_depth: u64;
+    public heap_like_calls: u64;
+    public ret_slice_heap_count: u64;
 }
 
 impl AnnComplexitySSASummary {
@@ -45,7 +59,11 @@ impl AnnComplexitySSASummary {
         self.local_rank = 0;
         self.callee_rank = 0;
         self.total_rank = 0;
+        self.local_space_rank = 0;
+        self.callee_space_rank = 0;
+        self.total_space_rank = 0;
         self.conf = 0;
+        self.space_conf = 0;
         self.unresolved_calls = 0;
         self.call_count = 0;
         self.self_calls = 0;
@@ -53,6 +71,76 @@ impl AnnComplexitySSASummary {
         self.phi_count = 0;
         self.backedge_count = 0;
         self.loop_depth = 0;
+        self.heap_like_calls = 0;
+        self.ret_slice_heap_count = 0;
+    }
+}
+
+struct AnnContractSurfaceMeta {
+    public fn_ptr: u64;
+    public fn_len: u64;
+    public module_ptr: u64;
+    public module_len: u64;
+    public surface_kind: u64;
+    public family_mask: u64;
+    public contract_count: u64;
+    public declared_time_rank: u64;
+    public declared_space_rank: u64;
+    public budget_time_rank: u64;
+    public budget_space_rank: u64;
+}
+
+impl AnnContractSurfaceMeta {
+    public constructor() {
+        self.fn_ptr = 0;
+        self.fn_len = 0;
+        self.module_ptr = 0;
+        self.module_len = 0;
+        self.surface_kind = 0;
+        self.family_mask = 0;
+        self.contract_count = 0;
+        self.declared_time_rank = 0;
+        self.declared_space_rank = 0;
+        self.budget_time_rank = 0;
+        self.budget_space_rank = 0;
+    }
+}
+
+struct AnnLoweredContractBoundary {
+    public family_mask: u64;
+    public requires_module_ownership: u64;
+    public requires_direct_symbol_resolution: u64;
+    public requires_complexity_summary: u64;
+    public requires_std_module: u64;
+    public requires_callable_body: u64;
+    public requires_public_surface: u64;
+    public requires_zero_arg_entry: u64;
+}
+
+impl AnnLoweredContractBoundary {
+    public constructor() {
+        self.family_mask = 0;
+        self.requires_module_ownership = 0;
+        self.requires_direct_symbol_resolution = 0;
+        self.requires_complexity_summary = 0;
+        self.requires_std_module = 0;
+        self.requires_callable_body = 0;
+        self.requires_public_surface = 0;
+        self.requires_zero_arg_entry = 0;
+    }
+}
+
+struct AnnLoweredContractEntry {
+    public owner_fn: *AstFunc;
+    public surface: *AnnContractSurfaceMeta;
+    public boundary: *AnnLoweredContractBoundary;
+}
+
+impl AnnLoweredContractEntry {
+    public constructor() {
+        self.owner_fn = 0;
+        self.surface = 0;
+        self.boundary = 0;
     }
 }
 
@@ -184,6 +272,407 @@ func annotation_emit_complexity_contract_origins(annotations: *Vec<*NameInfo>) -
         annotation_complexity_canonicalize_parsed_name(ann);
         if (annotation_is_complexity_contract_name(ann.name_ptr, ann.name_len) == 0) { continue; }
         annotation_emit_contract_origin(ann);
+    }
+    return 0;
+}
+
+func annotation_contract_surface_kind_name(kind: u64) -> u64 {
+    if (kind == ANN_CONTRACT_SURFACE_GENERATED) { return "generated-wrapper"; }
+    return "public-callable";
+}
+
+func annotation_contract_surface_mark_family(surface: *AnnContractSurfaceMeta, family_mask: u64) -> u64 {
+    if (surface == 0 || family_mask == 0) { return 0; }
+    surface.family_mask = surface.family_mask | family_mask;
+    return 0;
+}
+
+func annotation_contract_surface_has_complexity_annotations(annotations: *Vec<*NameInfo>) -> u64 {
+    if (annotations == 0) { return 0; }
+    var n: u64 = annotations.len();
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var info: *NameInfo = annotations.get(i);
+        if (info == 0) { continue; }
+        var ann: *CompilerAnnotationParsed = annotation_parse(info);
+        if (ann == 0 || ann.parse_ok == 0) { continue; }
+        annotation_complexity_canonicalize_parsed_name(ann);
+        if (annotation_is_complexity_contract_name(ann.name_ptr, ann.name_len) != 0) { return 1; }
+    }
+    return 0;
+}
+
+func annotation_contract_surface_matches_property_hook(name_ptr: u64, name_len: u64) -> u64 {
+    if (name_ptr == 0 || name_len == 0 || g_compiler_ctx.all_structs_vec == 0) { return 0; }
+    var sn: u64 = g_compiler_ctx.all_structs_vec.len();
+    for (var si: u64 = 0; si < sn; si = si + 1) {
+        var sd: *AstStructDef = g_compiler_ctx.all_structs_vec.get(si);
+        if (sd == 0 || sd.fields_vec == 0) { continue; }
+        var fn: u64 = sd.fields_vec.len();
+        for (var fi: u64 = 0; fi < fn; fi = fi + 1) {
+            var field: *FieldDesc = sd.fields_vec.get(fi);
+            if (field == 0) { continue; }
+            if (field.getter_hook_ptr != 0 && field.getter_hook_len != 0 &&
+                str_eq(name_ptr, name_len, field.getter_hook_ptr, field.getter_hook_len) != 0) {
+                return 1;
+            }
+            if (field.setter_hook_ptr != 0 && field.setter_hook_len != 0 &&
+                str_eq(name_ptr, name_len, field.setter_hook_ptr, field.setter_hook_len) != 0) {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+func annotation_contract_surface_is_prelude_name(name_ptr: u64, name_len: u64) -> u64 {
+    if (name_ptr == 0 || name_len == 0) { return 0; }
+    if (str_eq(name_ptr, name_len, "string_input", 12) != 0) { return 1; }
+    if (str_eq(name_ptr, name_len, "number_input", 12) != 0) { return 1; }
+    if (str_eq(name_ptr, name_len, "input_slice", 11) != 0) { return 1; }
+    if (str_eq(name_ptr, name_len, "input_bool", 10) != 0) { return 1; }
+    if (str_eq(name_ptr, name_len, "string_from_cstr", 16) != 0) { return 1; }
+    if (str_eq(name_ptr, name_len, "print", 5) != 0) { return 1; }
+    if (str_eq(name_ptr, name_len, "println", 7) != 0) { return 1; }
+    if (str_eq(name_ptr, name_len, "emit", 4) != 0) { return 1; }
+    if (str_eq(name_ptr, name_len, "emitln", 6) != 0) { return 1; }
+    if (annotation_complexity_prefix_match(name_ptr, name_len, "input_", 6) != 0) { return 1; }
+    if (annotation_complexity_prefix_match(name_ptr, name_len, "to_str_", 7) != 0) { return 1; }
+    return 0;
+}
+
+func annotation_contract_surface_is_prelude_in_module(name_ptr: u64, name_len: u64, module_ptr: u64, module_len: u64) -> u64 {
+    if (annotation_contract_surface_is_prelude_name(name_ptr, name_len) == 0) { return 0; }
+    if (module_ptr == 0 || module_len == 0) { return 0; }
+    return annotation_complexity_is_std_module(module_ptr, module_len);
+}
+
+func annotation_contract_surface_emit_family_notes(family_mask: u64) -> u64 {
+    if ((family_mask & ANN_CONTRACT_FAMILY_COMPLEXITY) != 0) {
+        diag_emit_note("contract family: complexity");
+    }
+    if ((family_mask & ANN_CONTRACT_FAMILY_DECORATOR) != 0) {
+        diag_emit_note("contract family: decorator");
+    }
+    if ((family_mask & ANN_CONTRACT_FAMILY_PROPERTY) != 0) {
+        diag_emit_note("contract family: property");
+    }
+    if ((family_mask & ANN_CONTRACT_FAMILY_ENTRY) != 0) {
+        diag_emit_note("contract family: entry");
+    }
+    if ((family_mask & ANN_CONTRACT_FAMILY_PRELUDE) != 0) {
+        diag_emit_note("contract family: compiler-known prelude");
+    }
+    return 0;
+}
+
+func annotation_contract_surface_for_name(name_ptr: u64, name_len: u64) -> *AnnContractSurfaceMeta {
+    if (name_ptr == 0 || name_len == 0) { return 0; }
+    var fn: *AstFunc = sym_get_func(name_ptr, name_len);
+    if (fn != 0) {
+        return annotation_contract_surface_for_fn(fn);
+    }
+
+    var out: *AnnContractSurfaceMeta = new AnnContractSurfaceMeta{};
+    out.fn_ptr = name_ptr;
+    out.fn_len = name_len;
+    out.surface_kind = ANN_CONTRACT_SURFACE_PUBLIC;
+    var module_info: *NameInfo = sym_get_func_module(name_ptr, name_len);
+    if (module_info != 0) {
+        out.module_ptr = module_info.ptr;
+        out.module_len = module_info.len;
+    }
+    if (g_compiler_ctx.entry_func_ptr != 0 && g_compiler_ctx.entry_func_len != 0 &&
+        str_eq(name_ptr, name_len, g_compiler_ctx.entry_func_ptr, g_compiler_ctx.entry_func_len) != 0) {
+        annotation_contract_surface_mark_family(out, ANN_CONTRACT_FAMILY_ENTRY);
+    }
+    if (annotation_contract_surface_matches_property_hook(name_ptr, name_len) != 0) {
+        annotation_contract_surface_mark_family(out, ANN_CONTRACT_FAMILY_PROPERTY);
+    }
+    if (annotation_contract_surface_is_prelude_in_module(name_ptr, name_len, out.module_ptr, out.module_len) != 0) {
+        annotation_contract_surface_mark_family(out, ANN_CONTRACT_FAMILY_PRELUDE);
+    }
+    return out;
+}
+
+func annotation_contract_surface_for_fn(fn: *AstFunc) -> *AnnContractSurfaceMeta {
+    if (fn == 0) { return 0; }
+    var annotations: *Vec<*NameInfo> = annotation_surface_contract_annotations_for(fn);
+    if (annotations == 0) {
+        annotations = annotation_surface_contract_annotations_registered(fn.name_ptr, fn.name_len);
+    }
+    return annotation_contract_surface_from_fn(fn, annotations);
+}
+
+func annotation_contract_surface_from_fn(fn: *AstFunc, annotations: *Vec<*NameInfo>) -> *AnnContractSurfaceMeta {
+    if (fn == 0) { return 0; }
+    var out: *AnnContractSurfaceMeta = new AnnContractSurfaceMeta{};
+    out.fn_ptr = fn.name_ptr;
+    out.fn_len = fn.name_len;
+    if (annotations != 0) { out.contract_count = annotations.len(); }
+    var module_info: *NameInfo = annotation_complexity_module_for_func(fn);
+    if (module_info != 0) {
+        out.module_ptr = module_info.ptr;
+        out.module_len = module_info.len;
+    }
+    if (annotation_complexity_fn_is_generated_wrapper(fn) != 0) {
+        out.surface_kind = ANN_CONTRACT_SURFACE_GENERATED;
+    } else {
+        out.surface_kind = ANN_CONTRACT_SURFACE_PUBLIC;
+    }
+    if (annotation_contract_surface_has_complexity_annotations(annotations) != 0) {
+        annotation_contract_surface_mark_family(out, ANN_CONTRACT_FAMILY_COMPLEXITY);
+    }
+    if (annotation_complexity_fn_is_generated_wrapper(fn) != 0) {
+        annotation_contract_surface_mark_family(out, ANN_CONTRACT_FAMILY_DECORATOR);
+    } else {
+        var decorators: *Vec<*NameInfo> = annotation_collect_decorators(fn);
+        if (decorators != 0 && decorators.len() != 0) {
+            annotation_contract_surface_mark_family(out, ANN_CONTRACT_FAMILY_DECORATOR);
+        }
+    }
+    if (annotation_contract_surface_matches_property_hook(fn.name_ptr, fn.name_len) != 0) {
+        annotation_contract_surface_mark_family(out, ANN_CONTRACT_FAMILY_PROPERTY);
+    }
+    if (g_compiler_ctx.entry_func_ptr != 0 && g_compiler_ctx.entry_func_len != 0 &&
+        str_eq(fn.name_ptr, fn.name_len, g_compiler_ctx.entry_func_ptr, g_compiler_ctx.entry_func_len) != 0) {
+        annotation_contract_surface_mark_family(out, ANN_CONTRACT_FAMILY_ENTRY);
+    }
+    if (annotation_contract_surface_is_prelude_in_module(fn.name_ptr, fn.name_len, out.module_ptr, out.module_len) != 0) {
+        annotation_contract_surface_mark_family(out, ANN_CONTRACT_FAMILY_PRELUDE);
+    }
+
+    var complexity_ann: *CompilerAnnotationParsed = annotation_complexity_get_single_in_vec(annotations, "complexity", 10);
+    if (complexity_ann != 0) {
+        var declared_time_arg: *CompilerAnnotationArg = annotation_complexity_find_time_arg(complexity_ann);
+        if (declared_time_arg != 0 && declared_time_arg.kind == 3) {
+            out.declared_time_rank = annotation_complexity_rank_from_expr(declared_time_arg.string_ptr, declared_time_arg.string_len);
+        }
+        var declared_space_arg: *CompilerAnnotationArg = annotation_complexity_find_named_arg(complexity_ann, "space", 5);
+        if (declared_space_arg != 0 && declared_space_arg.kind == 3) {
+            out.declared_space_rank = annotation_complexity_rank_from_expr(declared_space_arg.string_ptr, declared_space_arg.string_len);
+        }
+    }
+
+    var budget_ann: *CompilerAnnotationParsed = annotation_complexity_get_single_in_vec(annotations, "complexity_budget", 17);
+    if (budget_ann != 0) {
+        var budget_time_arg: *CompilerAnnotationArg = annotation_complexity_find_time_arg(budget_ann);
+        if (budget_time_arg != 0 && budget_time_arg.kind == 3) {
+            out.budget_time_rank = annotation_complexity_rank_from_expr(budget_time_arg.string_ptr, budget_time_arg.string_len);
+        }
+        var budget_space_arg: *CompilerAnnotationArg = annotation_complexity_find_named_arg(budget_ann, "space", 5);
+        if (budget_space_arg != 0 && budget_space_arg.kind == 3) {
+            out.budget_space_rank = annotation_complexity_rank_from_expr(budget_space_arg.string_ptr, budget_space_arg.string_len);
+        }
+    }
+    return out;
+}
+
+func annotation_lowered_contract_entry_from_fn(fn: *AstFunc) -> *AnnLoweredContractEntry {
+    if (fn == 0) { return 0; }
+    var surface: *AnnContractSurfaceMeta = annotation_contract_surface_for_fn(fn);
+    if (surface == 0 || surface.family_mask == 0) { return 0; }
+    var boundary: *AnnLoweredContractBoundary = annotation_lowered_contract_boundary_from_surface(surface);
+    if (boundary == 0) { return 0; }
+    var entry: *AnnLoweredContractEntry = new AnnLoweredContractEntry{};
+    entry.owner_fn = fn;
+    entry.surface = surface;
+    entry.boundary = boundary;
+    return entry;
+}
+
+func annotation_collect_lowered_contract_entries(program: *AstProgram) -> *Vec<*AnnLoweredContractEntry> {
+    if (program == 0 || program.funcs_vec == 0) { return 0; }
+    var cap: u64 = program.funcs_vec.len();
+    if (cap < 8) { cap = 8; }
+    var out: *Vec<*AnnLoweredContractEntry> = new Vec<*AnnLoweredContractEntry>{heap_alloc((cap) * sizeof(*AnnLoweredContractEntry)), 0, (cap)};
+    var n: u64 = program.funcs_vec.len();
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var fn: *AstFunc = program.funcs_vec.get(i);
+        var entry: *AnnLoweredContractEntry = annotation_lowered_contract_entry_from_fn(fn);
+        if (entry != 0) { out.push(entry); }
+    }
+    return out;
+}
+
+func annotation_emit_contract_surface_notes(surface: *AnnContractSurfaceMeta) -> u64 {
+    if (surface == 0) { return 0; }
+    if (surface.fn_ptr != 0 && surface.fn_len != 0) {
+        diag_emit_labelled_name("function: ", surface.fn_ptr, surface.fn_len);
+    }
+    if (surface.module_ptr != 0 && surface.module_len != 0) {
+        diag_emit_labelled_name("module: ", surface.module_ptr, surface.module_len);
+    }
+    diag_emit_labelled_cstr("contract surface: ", annotation_contract_surface_kind_name(surface.surface_kind));
+    annotation_contract_surface_emit_family_notes(surface.family_mask);
+    diag_emit_labelled_u64("contract annotation count: ", surface.contract_count);
+    if (surface.declared_time_rank != 0) {
+        diag_emit_labelled_cstr("declared complexity.time: ", annotation_complexity_rank_name(surface.declared_time_rank));
+    }
+    if (surface.declared_space_rank != 0) {
+        diag_emit_labelled_cstr("declared complexity.space: ", annotation_complexity_rank_name(surface.declared_space_rank));
+    }
+    if (surface.budget_time_rank != 0) {
+        diag_emit_labelled_cstr("declared complexity_budget.time: ", annotation_complexity_rank_name(surface.budget_time_rank));
+    }
+    if (surface.budget_space_rank != 0) {
+        diag_emit_labelled_cstr("declared complexity_budget.space: ", annotation_complexity_rank_name(surface.budget_space_rank));
+    }
+    return 0;
+}
+
+func annotation_lowered_contract_boundary_from_surface(surface: *AnnContractSurfaceMeta) -> *AnnLoweredContractBoundary {
+    if (surface == 0) { return 0; }
+    var out: *AnnLoweredContractBoundary = new AnnLoweredContractBoundary{};
+    out.family_mask = surface.family_mask;
+    if ((surface.family_mask & ANN_CONTRACT_FAMILY_COMPLEXITY) != 0 ||
+        (surface.family_mask & ANN_CONTRACT_FAMILY_DECORATOR) != 0 ||
+        (surface.family_mask & ANN_CONTRACT_FAMILY_ENTRY) != 0 ||
+        (surface.family_mask & ANN_CONTRACT_FAMILY_PRELUDE) != 0) {
+        out.requires_module_ownership = 1;
+    }
+    if ((surface.family_mask & ANN_CONTRACT_FAMILY_DECORATOR) != 0 ||
+        (surface.family_mask & ANN_CONTRACT_FAMILY_PROPERTY) != 0 ||
+        (surface.family_mask & ANN_CONTRACT_FAMILY_ENTRY) != 0) {
+        out.requires_direct_symbol_resolution = 1;
+    }
+    if ((surface.family_mask & ANN_CONTRACT_FAMILY_COMPLEXITY) != 0) {
+        out.requires_complexity_summary = 1;
+    }
+    if ((surface.family_mask & ANN_CONTRACT_FAMILY_PRELUDE) != 0) {
+        out.requires_std_module = 1;
+    }
+    if ((surface.family_mask & ANN_CONTRACT_FAMILY_DECORATOR) != 0 ||
+        (surface.family_mask & ANN_CONTRACT_FAMILY_PROPERTY) != 0 ||
+        (surface.family_mask & ANN_CONTRACT_FAMILY_ENTRY) != 0 ||
+        (surface.family_mask & ANN_CONTRACT_FAMILY_PRELUDE) != 0) {
+        out.requires_callable_body = 1;
+    }
+    if ((surface.family_mask & ANN_CONTRACT_FAMILY_PROPERTY) != 0 ||
+        (surface.family_mask & ANN_CONTRACT_FAMILY_ENTRY) != 0 ||
+        (surface.family_mask & ANN_CONTRACT_FAMILY_PRELUDE) != 0) {
+        out.requires_public_surface = 1;
+    }
+    if ((surface.family_mask & ANN_CONTRACT_FAMILY_ENTRY) != 0) {
+        out.requires_zero_arg_entry = 1;
+    }
+    return out;
+}
+
+func annotation_emit_lowered_contract_boundary_notes(boundary: *AnnLoweredContractBoundary) -> u64 {
+    if (boundary == 0) { return 0; }
+    annotation_contract_surface_emit_family_notes(boundary.family_mask);
+    if (boundary.requires_module_ownership != 0) {
+        diag_emit_note("lowered boundary: requires module ownership");
+    }
+    if (boundary.requires_direct_symbol_resolution != 0) {
+        diag_emit_note("lowered boundary: requires direct symbol resolution");
+    }
+    if (boundary.requires_complexity_summary != 0) {
+        diag_emit_note("lowered boundary: requires SSA complexity summary");
+    }
+    if (boundary.requires_std_module != 0) {
+        diag_emit_note("lowered boundary: requires std/prelude module ownership");
+    }
+    if (boundary.requires_callable_body != 0) {
+        diag_emit_note("lowered boundary: requires callable function body");
+    }
+    if (boundary.requires_public_surface != 0) {
+        diag_emit_note("lowered boundary: requires public callable surface");
+    }
+    if (boundary.requires_zero_arg_entry != 0) {
+        diag_emit_note("lowered boundary: requires zero-argument entry surface");
+    }
+    return 0;
+}
+
+func annotation_emit_lowered_contract_boundary_error(surface: *AnnContractSurfaceMeta, boundary: *AnnLoweredContractBoundary, msg: u64, help: u64) -> u64 {
+    diag_emit_error_tag("codegen", "contract-boundary", msg);
+    annotation_emit_contract_surface_notes(surface);
+    annotation_emit_lowered_contract_boundary_notes(boundary);
+    if (help != 0) { diag_emit_help(help); }
+    diag_note_error();
+    return 1;
+}
+
+func annotation_validate_lowered_contract_boundary(program: *AstProgram, ctx: *SSAContext) -> u64 {
+    var entries: *Vec<*AnnLoweredContractEntry> = annotation_collect_lowered_contract_entries(program);
+    if (entries == 0) { return 0; }
+    var n: u64 = entries.len();
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        if (diag_should_stop_pass() != 0) { return 1; }
+        var entry: *AnnLoweredContractEntry = entries.get(i);
+        if (entry == 0 || entry.owner_fn == 0 || entry.surface == 0 || entry.boundary == 0) { continue; }
+        var fn: *AstFunc = entry.owner_fn;
+        var surface: *AnnContractSurfaceMeta = entry.surface;
+        var boundary: *AnnLoweredContractBoundary = entry.boundary;
+        var module_info: *NameInfo = sym_get_func_module(fn.name_ptr, fn.name_len);
+        if (boundary.requires_module_ownership != 0 && module_info == 0) {
+            return annotation_emit_lowered_contract_boundary_error(
+                surface,
+                boundary,
+                "lowered contract boundary lost module ownership before backend emission",
+                "contract-aware lowered surfaces should still carry module ownership before a backend consumes them"
+            );
+        }
+        if (boundary.requires_std_module != 0) {
+            if (module_info == 0 || annotation_complexity_is_std_module(module_info.ptr, module_info.len) == 0) {
+                return annotation_emit_lowered_contract_boundary_error(
+                    surface,
+                    boundary,
+                    "compiler-known prelude contract drifted outside std/prelude module boundary",
+                    "prelude-lowered surfaces should still resolve to std-owned helper functions before backend lowering"
+                );
+            }
+        }
+        if (boundary.requires_callable_body != 0 && fn.body == 0) {
+            return annotation_emit_lowered_contract_boundary_error(
+                surface,
+                boundary,
+                "lowered contract boundary lost callable function body before backend emission",
+                "contract-bearing lowered surfaces should still resolve to a concrete callable body before backend lowering"
+            );
+        }
+        if (boundary.requires_public_surface != 0 && surface.surface_kind != ANN_CONTRACT_SURFACE_PUBLIC) {
+            return annotation_emit_lowered_contract_boundary_error(
+                surface,
+                boundary,
+                "lowered contract boundary drifted away from the public callable surface",
+                "property, entry, and compiler-known prelude contracts should remain attached to the final public callable surface"
+            );
+        }
+        if (boundary.requires_direct_symbol_resolution != 0) {
+            if (resolve_name(fn.name_ptr, fn.name_len) == 0 && sym_func_exists(fn.name_ptr, fn.name_len) == 0) {
+                return annotation_emit_lowered_contract_boundary_error(
+                    surface,
+                    boundary,
+                    "lowered contract boundary lost direct symbol resolution before backend emission",
+                    "contract-bearing lowered surfaces should still be directly resolvable by symbol name before backend lowering"
+                );
+            }
+        }
+        if (boundary.requires_zero_arg_entry != 0) {
+            var param_n: u64 = 0;
+            if (fn.params_vec != 0) { param_n = fn.params_vec.len(); }
+            if (param_n != 0) {
+                return annotation_emit_lowered_contract_boundary_error(
+                    surface,
+                    boundary,
+                    "entry contract drifted before backend emission",
+                    "entry surfaces should remain zero-argument all the way through lowered contract verification"
+                );
+            }
+        }
+        if (boundary.requires_complexity_summary != 0) {
+            var summary: *AnnComplexitySSASummary = annotation_complexity_ssa_summary_from_ctx(ctx, fn);
+            if (summary == 0) {
+                return annotation_emit_lowered_contract_boundary_error(
+                    surface,
+                    boundary,
+                    "lowered contract boundary is missing SSA complexity summary",
+                    "complexity contracts should still have a final SSA summary before backend lowering"
+                );
+            }
+        }
     }
     return 0;
 }
@@ -5098,6 +5587,107 @@ func annotation_complexity_ssa_local_rank(loop_depth: u64, backedges: u64) -> u6
     return 6;
 }
 
+func annotation_complexity_ssa_local_space_rank(loop_depth: u64, heap_like_calls: u64, ret_slice_heap_count: u64) -> u64 {
+    if (heap_like_calls == 0 && ret_slice_heap_count == 0) { return 1; }
+    if (loop_depth <= 1) { return 3; }
+    if (loop_depth == 2) { return 5; }
+    return 6;
+}
+
+func annotation_complexity_declared_or_budget_space_rank(fn: *AstFunc) -> u64 {
+    if (fn == 0) { return 0; }
+    var ann_c: *CompilerAnnotationParsed = annotation_complexity_get_single(fn, "complexity", 10);
+    if (ann_c != 0) {
+        var s_c: *CompilerAnnotationArg = annotation_complexity_find_named_arg(ann_c, "space", 5);
+        if (s_c != 0 && s_c.kind == 3) {
+            var r_c: u64 = annotation_complexity_rank_from_expr(s_c.string_ptr, s_c.string_len);
+            if (r_c != 0) { return r_c; }
+        }
+    }
+    var ann_b: *CompilerAnnotationParsed = annotation_complexity_get_single(fn, "complexity_budget", 17);
+    if (ann_b != 0) {
+        var s_b: *CompilerAnnotationArg = annotation_complexity_find_named_arg(ann_b, "space", 5);
+        if (s_b != 0 && s_b.kind == 3) {
+            var r_b: u64 = annotation_complexity_rank_from_expr(s_b.string_ptr, s_b.string_len);
+            if (r_b != 0) { return r_b; }
+        }
+    }
+    return 0;
+}
+
+func annotation_complexity_collect_space_rank_for_name(name_ptr: u64, name_len: u64, method_only: u64, explicit_arg_count: u64, include_implicit_self: u64, arg_names: *Vec<*NameInfo>, out_rank: *u64, out_unknown: *u64, out_seen: *u64) -> u64 {
+    if (out_rank != 0) { *out_rank = 0; }
+    if (out_unknown != 0) { *out_unknown = 0; }
+    if (out_seen != 0) { *out_seen = 0; }
+    if (name_ptr == 0 || name_len == 0 || g_compiler_ctx.all_funcs == 0) {
+        if (out_unknown != 0) { *out_unknown = 1; }
+        return 0;
+    }
+
+    var max_rank: u64 = 0;
+    var unknown_hit: u64 = 0;
+    var seen: u64 = 0;
+    var n: u64 = g_compiler_ctx.all_funcs.len();
+    var exact_exists: u64 = 0;
+    var preferred_len: u64 = 0;
+    for (var ei: u64 = 0; ei < n; ei = ei + 1) {
+        var efn: *AstFunc = g_compiler_ctx.all_funcs.get(ei);
+        if (efn == 0 || efn.name_ptr == 0 || efn.name_len == 0) { continue; }
+        if (str_eq(efn.name_ptr, efn.name_len, name_ptr, name_len) == 0) { continue; }
+        if (method_only != 0) {
+            var eowner: *NameInfo = sym_get_impl_method_owner(efn.name_ptr, efn.name_len);
+            if ((efn.impl_owner_ptr == 0 || efn.impl_owner_len == 0) && eowner == 0) { continue; }
+            if (annotation_complexity_method_symbol_matches(efn, name_ptr, name_len) == 0) { continue; }
+        }
+        if (annotation_complexity_fn_accepts_call_shape(efn, explicit_arg_count, include_implicit_self, arg_names) == 0) { continue; }
+        exact_exists = 1;
+        break;
+    }
+
+    for (var pi: u64 = 0; pi < n; pi = pi + 1) {
+        var pfn: *AstFunc = g_compiler_ctx.all_funcs.get(pi);
+        if (pfn == 0 || pfn.name_ptr == 0 || pfn.name_len == 0) { continue; }
+        if (annotation_complexity_name_matches_symbol(pfn.name_ptr, pfn.name_len, name_ptr, name_len) == 0) { continue; }
+        if (exact_exists != 0 && str_eq(pfn.name_ptr, pfn.name_len, name_ptr, name_len) == 0) { continue; }
+        if (method_only != 0) {
+            var powner: *NameInfo = sym_get_impl_method_owner(pfn.name_ptr, pfn.name_len);
+            if ((pfn.impl_owner_ptr == 0 || pfn.impl_owner_len == 0) && powner == 0) { continue; }
+            if (annotation_complexity_method_symbol_matches(pfn, name_ptr, name_len) == 0) { continue; }
+        }
+        if (annotation_complexity_fn_accepts_call_shape(pfn, explicit_arg_count, include_implicit_self, arg_names) == 0) { continue; }
+        if (preferred_len == 0 || pfn.name_len < preferred_len) { preferred_len = pfn.name_len; }
+    }
+
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var fn: *AstFunc = g_compiler_ctx.all_funcs.get(i);
+        if (fn == 0 || fn.name_ptr == 0 || fn.name_len == 0) { continue; }
+        if (annotation_complexity_name_matches_symbol(fn.name_ptr, fn.name_len, name_ptr, name_len) == 0) { continue; }
+        if (exact_exists != 0 && str_eq(fn.name_ptr, fn.name_len, name_ptr, name_len) == 0) { continue; }
+        if (preferred_len != 0 && fn.name_len != preferred_len) { continue; }
+        if (method_only != 0) {
+            var owner: *NameInfo = sym_get_impl_method_owner(fn.name_ptr, fn.name_len);
+            if ((fn.impl_owner_ptr == 0 || fn.impl_owner_len == 0) && owner == 0) { continue; }
+            if (annotation_complexity_method_symbol_matches(fn, name_ptr, name_len) == 0) { continue; }
+        }
+        if (annotation_complexity_fn_accepts_call_shape(fn, explicit_arg_count, include_implicit_self, arg_names) == 0) { continue; }
+        seen = 1;
+        var r: u64 = annotation_complexity_declared_or_budget_space_rank(fn);
+        if (r == 0) {
+            unknown_hit = 1;
+        } else if (annotation_complexity_rank_order(r) > annotation_complexity_rank_order(max_rank)) {
+            max_rank = r;
+        }
+    }
+
+    if (out_rank != 0) { *out_rank = max_rank; }
+    if (out_unknown != 0) {
+        if (seen == 0 || unknown_hit != 0) { *out_unknown = 1; }
+        else { *out_unknown = 0; }
+    }
+    if (out_seen != 0) { *out_seen = seen; }
+    return seen;
+}
+
 func annotation_complexity_ssa_collect_call(summary: *AnnComplexitySSASummary, inst: *SSAInstruction) -> u64 {
     if (summary == 0 || inst == 0) { return 0; }
     var op: u64 = op_of(inst);
@@ -5125,6 +5715,23 @@ func annotation_complexity_ssa_collect_call(summary: *AnnComplexitySSASummary, i
             } else {
                 summary.unresolved_calls = summary.unresolved_calls + 1;
             }
+
+            var space_rank: u64 = 0;
+            var space_unknown: u64 = 0;
+            var space_seen: u64 = 0;
+            annotation_complexity_collect_space_rank_for_name(ci.name_ptr, ci.name_len, 0, ci.nargs, 0, 0, &space_rank, &space_unknown, &space_seen);
+            if (space_seen != 0 && space_rank != 0) {
+                summary.callee_space_rank = annotation_complexity_rank_pick_heavier(summary.callee_space_rank, space_rank);
+            }
+            if (space_unknown != 0) { summary.space_conf = ANN_COMPLEXITY_CONF_UNKNOWN; }
+            if (annotation_complexity_name_contains_token(ci.name_ptr, ci.name_len, "alloc", 5) != 0 ||
+                annotation_complexity_name_contains_token(ci.name_ptr, ci.name_len, "reserve", 7) != 0 ||
+                annotation_complexity_name_contains_token(ci.name_ptr, ci.name_len, "resize", 6) != 0 ||
+                annotation_complexity_name_contains_token(ci.name_ptr, ci.name_len, "capacity", 8) != 0 ||
+                annotation_complexity_name_contains_token(ci.name_ptr, ci.name_len, "grow", 4) != 0) {
+                summary.heap_like_calls = summary.heap_like_calls + 1;
+                summary.local_space_rank = annotation_complexity_rank_pick_heavier(summary.local_space_rank, 3);
+            }
         }
         return 0;
     }
@@ -5132,26 +5739,31 @@ func annotation_complexity_ssa_collect_call(summary: *AnnComplexitySSASummary, i
         summary.call_count = summary.call_count + 1;
         summary.call_ptr_count = summary.call_ptr_count + 1;
         summary.unresolved_calls = summary.unresolved_calls + 1;
+        summary.space_conf = ANN_COMPLEXITY_CONF_UNKNOWN;
         return 0;
     }
     if (op == SSA_OP_CALL_SLICE_STORE) {
         summary.call_count = summary.call_count + 1;
         if (operand_is_const(inst.src1) == 0) {
             summary.unresolved_calls = summary.unresolved_calls + 1;
+            summary.space_conf = ANN_COMPLEXITY_CONF_UNKNOWN;
             return 0;
         }
         var si: *SSACallSliceStoreInfo = (*SSACallSliceStoreInfo)operand_value(inst.src1);
         if (si == 0) {
             summary.unresolved_calls = summary.unresolved_calls + 1;
+            summary.space_conf = ANN_COMPLEXITY_CONF_UNKNOWN;
             return 0;
         }
         if (si.is_ptr != 0) {
             summary.call_ptr_count = summary.call_ptr_count + 1;
             summary.unresolved_calls = summary.unresolved_calls + 1;
+            summary.space_conf = ANN_COMPLEXITY_CONF_UNKNOWN;
             return 0;
         }
         if (si.name_ptr == 0 || si.name_len == 0) {
             summary.unresolved_calls = summary.unresolved_calls + 1;
+            summary.space_conf = ANN_COMPLEXITY_CONF_UNKNOWN;
             return 0;
         }
         if (annotation_complexity_name_matches_self_call(si.name_ptr, si.name_len, summary.fn_ptr, summary.fn_len) != 0) {
@@ -5167,7 +5779,30 @@ func annotation_complexity_ssa_collect_call(summary: *AnnComplexitySSASummary, i
             } else {
                 summary.unresolved_calls = summary.unresolved_calls + 1;
             }
+
+            var space_rank2: u64 = 0;
+            var space_unknown2: u64 = 0;
+            var space_seen2: u64 = 0;
+            annotation_complexity_collect_space_rank_for_name(si.name_ptr, si.name_len, 0, si.nargs, 0, 0, &space_rank2, &space_unknown2, &space_seen2);
+            if (space_seen2 != 0 && space_rank2 != 0) {
+                summary.callee_space_rank = annotation_complexity_rank_pick_heavier(summary.callee_space_rank, space_rank2);
+            }
+            if (space_unknown2 != 0) { summary.space_conf = ANN_COMPLEXITY_CONF_UNKNOWN; }
+            if (annotation_complexity_name_contains_token(si.name_ptr, si.name_len, "alloc", 5) != 0 ||
+                annotation_complexity_name_contains_token(si.name_ptr, si.name_len, "reserve", 7) != 0 ||
+                annotation_complexity_name_contains_token(si.name_ptr, si.name_len, "resize", 6) != 0 ||
+                annotation_complexity_name_contains_token(si.name_ptr, si.name_len, "capacity", 8) != 0 ||
+                annotation_complexity_name_contains_token(si.name_ptr, si.name_len, "grow", 4) != 0) {
+                summary.heap_like_calls = summary.heap_like_calls + 1;
+                summary.local_space_rank = annotation_complexity_rank_pick_heavier(summary.local_space_rank, 3);
+            }
         }
+        return 0;
+    }
+    if (op == SSA_OP_RET_SLICE_HEAP) {
+        summary.ret_slice_heap_count = summary.ret_slice_heap_count + 1;
+        summary.heap_like_calls = summary.heap_like_calls + 1;
+        summary.local_space_rank = annotation_complexity_rank_pick_heavier(summary.local_space_rank, 3);
         return 0;
     }
     return 0;
@@ -5184,7 +5819,10 @@ func annotation_complexity_ssa_build_summary(ssa_fn: *SSAFunction) -> *AnnComple
     if (bn == 0) {
         summary.local_rank = 1;
         summary.total_rank = 1;
+        summary.local_space_rank = 1;
+        summary.total_space_rank = 1;
         summary.conf = ANN_COMPLEXITY_CONF_PROVEN;
+        summary.space_conf = ANN_COMPLEXITY_CONF_PROVEN;
         return summary;
     }
 
@@ -5248,6 +5886,20 @@ func annotation_complexity_ssa_build_summary(ssa_fn: *SSAFunction) -> *AnnComple
     if (summary.unresolved_calls != 0) { summary.conf = ANN_COMPLEXITY_CONF_UNKNOWN; }
     else if (summary.call_count == 0 && summary.backedge_count == 0) { summary.conf = ANN_COMPLEXITY_CONF_PROVEN; }
     else { summary.conf = ANN_COMPLEXITY_CONF_HEURISTIC; }
+
+    summary.local_space_rank = annotation_complexity_rank_pick_heavier(
+        summary.local_space_rank,
+        annotation_complexity_ssa_local_space_rank(summary.loop_depth, summary.heap_like_calls, summary.ret_slice_heap_count));
+    if (summary.local_space_rank == 0) { summary.local_space_rank = 1; }
+    summary.total_space_rank = summary.local_space_rank;
+    if (summary.callee_space_rank != 0) {
+        summary.total_space_rank = annotation_complexity_rank_pick_heavier(summary.total_space_rank, summary.callee_space_rank);
+    }
+    if (summary.total_space_rank == 0) { summary.total_space_rank = 1; }
+    if (summary.space_conf == ANN_COMPLEXITY_CONF_UNKNOWN) {}
+    else if (summary.call_ptr_count != 0) { summary.space_conf = ANN_COMPLEXITY_CONF_UNKNOWN; }
+    else if (summary.heap_like_calls == 0 && summary.ret_slice_heap_count == 0 && summary.callee_space_rank == 0) { summary.space_conf = ANN_COMPLEXITY_CONF_PROVEN; }
+    else { summary.space_conf = ANN_COMPLEXITY_CONF_HEURISTIC; }
     return summary;
 }
 
@@ -5355,10 +6007,9 @@ func annotation_complexity_emit_preservation_conf(label: u64, conf: u64) -> u64 
 }
 
 func annotation_complexity_emit_preservation_error(fn: *AstFunc, summary: *AnnComplexitySSASummary, contract_annotations: *Vec<*NameInfo>, contract_label: u64, limit_rank: u64) -> u64 {
+    var surface: *AnnContractSurfaceMeta = annotation_contract_surface_from_fn(fn, contract_annotations);
     diag_emit_error_tag("ssa-preservation", "complexity", "complexity contract not preserved after SSA/codegen");
-    if (fn != 0) {
-        diag_emit_labelled_name("function: ", fn.name_ptr, fn.name_len);
-    }
+    annotation_emit_contract_surface_notes(surface);
     if (contract_label != 0) {
         diag_emit_note(contract_label);
     }
@@ -5377,11 +6028,33 @@ func annotation_complexity_emit_preservation_error(fn: *AstFunc, summary: *AnnCo
     return 0;
 }
 
-func annotation_complexity_emit_missing_ssa_error(fn: *AstFunc, contract_annotations: *Vec<*NameInfo>, msg: u64, detail: u64) -> u64 {
-    diag_emit_error_tag("ssa-preservation", "complexity", msg);
-    if (fn != 0) {
-        diag_emit_labelled_name("function: ", fn.name_ptr, fn.name_len);
+func annotation_complexity_emit_space_preservation_error(fn: *AstFunc, summary: *AnnComplexitySSASummary, contract_annotations: *Vec<*NameInfo>, contract_label: u64, limit_rank: u64) -> u64 {
+    var surface: *AnnContractSurfaceMeta = annotation_contract_surface_from_fn(fn, contract_annotations);
+    diag_emit_error_tag("ssa-preservation", "complexity", "complexity space contract not preserved after SSA/codegen");
+    annotation_emit_contract_surface_notes(surface);
+    if (contract_label != 0) {
+        diag_emit_note(contract_label);
     }
+    annotation_emit_complexity_contract_origins(contract_annotations);
+    annotation_complexity_emit_preservation_rank("ssa inferred space rank: ", summary.total_space_rank);
+    annotation_complexity_emit_preservation_rank("contract space rank: ", limit_rank);
+    if (summary != 0) {
+        annotation_complexity_emit_preservation_conf("ssa space confidence: ", summary.space_conf);
+        diag_emit_labelled_u64("ssa heap-like calls: ", summary.heap_like_calls);
+        diag_emit_labelled_u64("ssa ret_slice_heap count: ", summary.ret_slice_heap_count);
+        diag_emit_labelled_u64("ssa loop depth: ", summary.loop_depth);
+        diag_emit_labelled_u64("ssa call count: ", summary.call_count);
+        diag_emit_labelled_u64("ssa unresolved calls: ", summary.unresolved_calls);
+    }
+    diag_emit_help("make the final callable surface preserve the declared space complexity, or relax the explicit space contract");
+    diag_note_error();
+    return 0;
+}
+
+func annotation_complexity_emit_missing_ssa_error(fn: *AstFunc, contract_annotations: *Vec<*NameInfo>, msg: u64, detail: u64) -> u64 {
+    var surface: *AnnContractSurfaceMeta = annotation_contract_surface_from_fn(fn, contract_annotations);
+    diag_emit_error_tag("ssa-preservation", "complexity", msg);
+    annotation_emit_contract_surface_notes(surface);
     annotation_emit_complexity_contract_origins(contract_annotations);
     if (detail != 0) {
         diag_emit_note(detail);
@@ -5404,6 +6077,25 @@ func annotation_complexity_preservation_allow_ast_fallback(fn: *AstFunc, contrac
         ast_compare_rank = declared_time_rank;
     }
     if (ast_compare_rank == 0) { ast_compare_rank = declared_time_rank; }
+    if (ast_compare_rank == 0) { return 0; }
+    if (annotation_complexity_rank_exceeds(ast_compare_rank, limit_rank) == 0) { return 1; }
+    return 0;
+}
+
+func annotation_complexity_preservation_allow_ast_space_fallback(fn: *AstFunc, contract_annotations: *Vec<*NameInfo>, summary: *AnnComplexitySSASummary, declared_space_rank: u64, limit_rank: u64) -> u64 {
+    if (fn == 0 || summary == 0 || limit_rank == 0) { return 0; }
+    if (summary.total_space_rank != 0) { return 0; }
+    if (summary.space_conf != ANN_COMPLEXITY_CONF_HEURISTIC && summary.space_conf != ANN_COMPLEXITY_CONF_UNKNOWN) { return 0; }
+
+    var constraints_ann: *CompilerAnnotationParsed = annotation_complexity_get_single_in_vec(contract_annotations, "constraints", 11);
+    var ast_conf: u64 = ANN_COMPLEXITY_CONF_UNKNOWN;
+    var ast_rank: u64 = annotation_complexity_infer_space_rank_with_meta(fn, constraints_ann, &ast_conf);
+    var ast_compare_rank: u64 = ast_rank;
+    if (declared_space_rank != 0 &&
+        annotation_complexity_rank_order(declared_space_rank) > annotation_complexity_rank_order(ast_compare_rank)) {
+        ast_compare_rank = declared_space_rank;
+    }
+    if (ast_compare_rank == 0) { ast_compare_rank = declared_space_rank; }
     if (ast_compare_rank == 0) { return 0; }
     if (annotation_complexity_rank_exceeds(ast_compare_rank, limit_rank) == 0) { return 1; }
     return 0;
@@ -5449,10 +6141,15 @@ func annotation_validate_complexity_preservation_ssa(ctx: *SSAContext) -> u64 {
         }
 
         var declared_time_rank: u64 = 0;
+        var declared_space_rank: u64 = 0;
         if (complexity_ann != 0) {
             var declared_time_arg: *CompilerAnnotationArg = annotation_complexity_find_time_arg(complexity_ann);
             if (declared_time_arg != 0 && declared_time_arg.kind == 3) {
                 declared_time_rank = annotation_complexity_rank_from_expr(declared_time_arg.string_ptr, declared_time_arg.string_len);
+            }
+            var declared_space_arg: *CompilerAnnotationArg = annotation_complexity_find_named_arg(complexity_ann, "space", 5);
+            if (declared_space_arg != 0 && declared_space_arg.kind == 3) {
+                declared_space_rank = annotation_complexity_rank_from_expr(declared_space_arg.string_ptr, declared_space_arg.string_len);
             }
         }
         if (declared_time_rank != 0 &&
@@ -5463,12 +6160,25 @@ func annotation_validate_complexity_preservation_ssa(ctx: *SSAContext) -> u64 {
                 declared_time_rank);
             return 0;
         }
+        if (declared_space_rank != 0 &&
+            annotation_complexity_rank_exceeds(summary.total_space_rank, declared_space_rank) != 0 &&
+            annotation_complexity_preservation_allow_ast_space_fallback(fn, contract_annotations, summary, declared_space_rank, declared_space_rank) == 0) {
+            annotation_complexity_emit_space_preservation_error(fn, summary, contract_annotations,
+                "violated contract: complexity.space on final SSA/codegen surface",
+                declared_space_rank);
+            return 0;
+        }
 
         var budget_time_rank: u64 = 0;
+        var budget_space_rank: u64 = 0;
         if (budget_ann != 0) {
             var budget_time_arg: *CompilerAnnotationArg = annotation_complexity_find_time_arg(budget_ann);
             if (budget_time_arg != 0 && budget_time_arg.kind == 3) {
                 budget_time_rank = annotation_complexity_rank_from_expr(budget_time_arg.string_ptr, budget_time_arg.string_len);
+            }
+            var budget_space_arg: *CompilerAnnotationArg = annotation_complexity_find_named_arg(budget_ann, "space", 5);
+            if (budget_space_arg != 0 && budget_space_arg.kind == 3) {
+                budget_space_rank = annotation_complexity_rank_from_expr(budget_space_arg.string_ptr, budget_space_arg.string_len);
             }
         }
         var debug_ann: *CompilerAnnotationParsed = annotation_complexity_get_single_in_vec(contract_annotations, "complexity_debug", 16);
@@ -5477,15 +6187,25 @@ func annotation_validate_complexity_preservation_ssa(ctx: *SSAContext) -> u64 {
             emit_stderr_len(fn.name_ptr, fn.name_len);
             emit_stderr(" ssa_time=");
             emit_stderr(annotation_complexity_rank_name(summary.total_rank));
+            emit_stderr(" ssa_space=");
+            emit_stderr(annotation_complexity_rank_name(summary.total_space_rank));
             emit_stderr(" ssa_callee=");
             emit_stderr(annotation_complexity_rank_name(summary.callee_rank));
             emit_stderr(" ssa_conf=");
             emit_stderr(annotation_complexity_confidence_name(summary.conf));
+            emit_stderr(" ssa_space_conf=");
+            emit_stderr(annotation_complexity_confidence_name(summary.space_conf));
             emit_stderr(" contract_time=");
             if (declared_time_rank != 0) { emit_stderr(annotation_complexity_rank_name(declared_time_rank)); }
             else { emit_stderr("none"); }
+            emit_stderr(" contract_space=");
+            if (declared_space_rank != 0) { emit_stderr(annotation_complexity_rank_name(declared_space_rank)); }
+            else { emit_stderr("none"); }
             emit_stderr(" budget_time=");
             if (budget_time_rank != 0) { emit_stderr(annotation_complexity_rank_name(budget_time_rank)); }
+            else { emit_stderr("none"); }
+            emit_stderr(" budget_space=");
+            if (budget_space_rank != 0) { emit_stderr(annotation_complexity_rank_name(budget_space_rank)); }
             else { emit_stderr("none"); }
             emit_stderr("\n");
         }
@@ -5495,6 +6215,14 @@ func annotation_validate_complexity_preservation_ssa(ctx: *SSAContext) -> u64 {
             annotation_complexity_emit_preservation_error(fn, summary, contract_annotations,
                 "violated contract: complexity_budget.time on final SSA/codegen surface",
                 budget_time_rank);
+            return 0;
+        }
+        if (budget_space_rank != 0 &&
+            annotation_complexity_rank_exceeds(summary.total_space_rank, budget_space_rank) != 0 &&
+            annotation_complexity_preservation_allow_ast_space_fallback(fn, contract_annotations, summary, declared_space_rank, budget_space_rank) == 0) {
+            annotation_complexity_emit_space_preservation_error(fn, summary, contract_annotations,
+                "violated contract: complexity_budget.space on final SSA/codegen surface",
+                budget_space_rank);
             return 0;
         }
     }
