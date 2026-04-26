@@ -431,6 +431,7 @@ rm -f "$JOBS_DIR"/*.expect 2>/dev/null || true
 RUN_TAG="run_$$"
 CASE_RESULT_FILES=()
 IR_RESULT_FILES=()
+LLVM_RESULT_FILES=()
 SUITE_CASES_DIR="$ROOT_DIR/build/${VERSION}_suite_cases/$RUN_TAG"
 mkdir -p "$SUITE_CASES_DIR"
 
@@ -829,6 +830,61 @@ run_ir_case() {
     return 0
 }
 
+run_llvm_case() {
+    set +e
+    local case_num="$1"
+    local test_file="$2"
+    local test_name="$3"
+    local test_label="$4"
+    local result_file="$5"
+
+    local case_tag="[$case_num] LLVM $test_label"
+    local case_pass=0
+    local case_fail=0
+    local case_status="PASS"
+
+    local out_file="$RESULTS_DIR/${test_name}.llvm.out"
+    local err_file="$RESULTS_DIR/${test_name}.llvm.err"
+    local out_file_persist="$RESULTS_DIR_BASE/${test_name}.llvm.out"
+    local err_file_persist="$RESULTS_DIR_BASE/${test_name}.llvm.err"
+
+    rm -f "$out_file" "$err_file"
+
+    local llvm_exit=0
+    $COMPILER -llvm-build "$test_file" >"$out_file" 2>"$err_file"
+    llvm_exit="$?"
+    if [ "$llvm_exit" -ne 0 ]; then
+        persist_result_file "$out_file" "$out_file_persist"
+        persist_result_file "$err_file" "$err_file_persist"
+        case_fail=1
+        if [ "$llvm_exit" -ge 128 ]; then
+            local sig=$((llvm_exit - 128))
+            case_status="FAIL (llvm-build crash: signal $sig, exit=$llvm_exit)"
+        else
+            case_status="FAIL (llvm-build exit=$llvm_exit)"
+        fi
+    elif ! grep -q "\[RUN\] exit=0" "$out_file"; then
+        persist_result_file "$out_file" "$out_file_persist"
+        persist_result_file "$err_file" "$err_file_persist"
+        case_fail=1
+        case_status="FAIL (llvm-build missing successful run marker)"
+    else
+        case_pass=1
+    fi
+
+    if [ "$KEEP_TEST_ARTIFACTS" -eq 0 ]; then
+        rm -f "$out_file" "$err_file"
+    fi
+
+    {
+        echo "CASE_TAG=\"$case_tag\""
+        echo "CASE_STATUS=\"$case_status\""
+        echo "CASE_PASS=$case_pass"
+        echo "CASE_FAIL=$case_fail"
+    } > "$result_file"
+    return 0
+}
+
 # Find all top-level test files across success/fail dirs (exclude module files).
 SOURCE_GLOBS=()
 if [ -d "$TEST_DIR" ]; then
@@ -879,7 +935,7 @@ for TEST_FILE in "${TEST_FILES[@]}"; do
             continue
         fi
     fi
-    CONTENT_HASH=$(awk '{if ($0 !~ /^\/\/ (Covers:|Mode:|Opt:|Compiler args:|Compile only:|Expect exit code:|Expect compile fail:|Expect error contains:|Expect asm contains:|Expect stdout:|Stdin:)/) print}' "$TEST_FILE" | md5sum | awk '{print $1}')
+CONTENT_HASH=$(awk '{if ($0 !~ /^\/\/ (Covers:|Mode:|Opt:|Compiler args:|Compile only:|LLVM Build:|Expect exit code:|Expect compile fail:|Expect error contains:|Expect asm contains:|Expect stdout:|Stdin:)/) print}' "$TEST_FILE" | md5sum | awk '{print $1}')
     if [ -n "${SEEN_HASH[$CONTENT_HASH]}" ]; then
         if [ "$TEST_QUIET" -eq 0 ]; then
             echo "[SKIP] Duplicate content: $TEST_LABEL (same as ${SEEN_HASH[$CONTENT_HASH]})"
@@ -931,6 +987,11 @@ for TEST_FILE in "${TEST_FILES[@]}"; do
     COMPILE_ONLY=0
     if [ "$COMPILE_ONLY_RAW" = "1" ] || [ "$COMPILE_ONLY_RAW" = "true" ] || [ "$COMPILE_ONLY_RAW" = "yes" ]; then
         COMPILE_ONLY=1
+    fi
+    LLVM_BUILD_RAW=$(grep -m1 -E '^// LLVM Build:' "$TEST_FILE" | awk -F': ' '{print $2}' | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]' || true)
+    LLVM_BUILD=0
+    if [ "$LLVM_BUILD_RAW" = "1" ] || [ "$LLVM_BUILD_RAW" = "true" ] || [ "$LLVM_BUILD_RAW" = "yes" ]; then
+        LLVM_BUILD=1
     fi
     if [ "$EXPECT_COMPILE_FAIL" -eq 1 ] && [ "$STRICT_FAIL_DIAGNOSTICS" -eq 1 ] && [ -z "$EXPECT_ERROR_FILE" ]; then
         echo "Error: Missing '// Expect error contains:' directive for compile-fail test: $TEST_LABEL"
@@ -990,6 +1051,13 @@ for TEST_FILE in "${TEST_FILES[@]}"; do
         echo "       Test mode/opt:   $TEST_MODES_CSV / $TEST_OPTS_CSV"
         exit 1
     fi
+
+    if [ "$LLVM_BUILD" -eq 1 ]; then
+        TOTAL=$((TOTAL + 1))
+        RESULT_FILE="$JOBS_DIR/${RUN_TAG}_llvm_${TOTAL}.result"
+        LLVM_RESULT_FILES+=("$RESULT_FILE")
+        launch_job_with_limit run_llvm_case "$TOTAL" "$TEST_FILE" "$TEST_NAME" "$TEST_LABEL" "$RESULT_FILE"
+    fi
 done
 
 wait || true
@@ -1015,6 +1083,29 @@ for RESULT_FILE in "${CASE_RESULT_FILES[@]}"; do
     STRESS_FAILED=$((STRESS_FAILED + CASE_STRESS_FAIL))
     STABILITY_PASSED=$((STABILITY_PASSED + CASE_STABILITY_PASS))
     STABILITY_FAILED=$((STABILITY_FAILED + CASE_STABILITY_FAIL))
+
+    if [ "$TEST_QUIET" -eq 0 ]; then
+        if [ "$CASE_FAIL" -eq 0 ]; then
+            echo -e "${GREEN}${CASE_TAG} ${CASE_STATUS}${NC}"
+        else
+            echo -e "${RED}${CASE_TAG} ${CASE_STATUS}${NC}"
+        fi
+    fi
+done
+
+for RESULT_FILE in "${LLVM_RESULT_FILES[@]}"; do
+    if [ ! -f "$RESULT_FILE" ]; then
+        FAILED=$((FAILED + 1))
+        continue
+    fi
+    CASE_TAG=""
+    CASE_STATUS=""
+    CASE_PASS=0
+    CASE_FAIL=0
+    source "$RESULT_FILE"
+
+    PASSED=$((PASSED + CASE_PASS))
+    FAILED=$((FAILED + CASE_FAIL))
 
     if [ "$TEST_QUIET" -eq 0 ]; then
         if [ "$CASE_FAIL" -eq 0 ]; then

@@ -2,7 +2,8 @@
 source_filename = "bpp-llvm-skeleton"
 target triple = "x86_64-unknown-linux-gnu"
 
-; bpp.ssa.blocks=1 insts=2 phis=0 entry=0 term_op=32
+; bpp.ssa.blocks=1 insts=2 phis=0 entry=0 term_op=32 params=0 sig=1 body_params=1
+; bpp.ssa.ops=10,32
 define i64 @"_95_llvm_ll_skeleton_fixture_success__runtime_entry"() {
 entry:
   %r1 = add i64 0, 0
@@ -19,5 +20,5 @@ entry:
   !0,
   !1
 }
-!0 = !{ptr @"_95_llvm_ll_skeleton_fixture_success__runtime_entry", !"bpp.contract.surface", !"95_llvm_ll_skeleton_fixture_success", !"public-callable", !"public-callable", i64 8, i64 115, i64 7, i64 6, i64 0, i64 0, !"_95_llvm_ll_skeleton_fixture_success__runtime_entry"}
-!1 = !{ptr @"_95_llvm_ll_skeleton_fixture_success__runtime_entry", !"bpp.contract.entry", !"95_llvm_ll_skeleton_fixture_success", !"public-callable", !"none", i64 8, i64 115, i64 7, i64 6, i64 0, i64 0, !"_95_llvm_ll_skeleton_fixture_success__runtime_entry"}
+!0 = !{ptr @"_95_llvm_ll_skeleton_fixture_success__runtime_entry", !"bpp.contract.surface", !"95_llvm_ll_skeleton_fixture_success", !"public-callable", !"public-callable", i64 8, i64 115, i64 9, i64 6, i64 0, i64 0, !"_95_llvm_ll_skeleton_fixture_success__runtime_entry"}
+!1 = !{ptr @"_95_llvm_ll_skeleton_fixture_success__runtime_entry", !"bpp.contract.entry", !"95_llvm_ll_skeleton_fixture_success", !"public-callable", !"none", i64 8, i64 115, i64 9, i64 6, i64 0, i64 0, !"_95_llvm_ll_skeleton_fixture_success__runtime_entry"}

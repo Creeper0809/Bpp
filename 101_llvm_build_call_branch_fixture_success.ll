@@ -51,5 +51,5 @@ entry:
   !0,
   !1
 }
-!0 = !{ptr @"_101_llvm_build_call_branch_fixture_success__runtime_entry", !"bpp.contract.surface", !"101_llvm_build_call_branch_fixture_success", !"public-callable", !"public-callable", i64 8, i64 115, i64 10, i64 6, i64 0, i64 0, !"_101_llvm_build_call_branch_fixture_success__runtime_entry"}
-!1 = !{ptr @"_101_llvm_build_call_branch_fixture_success__runtime_entry", !"bpp.contract.entry", !"101_llvm_build_call_branch_fixture_success", !"public-callable", !"none", i64 8, i64 115, i64 10, i64 6, i64 0, i64 0, !"_101_llvm_build_call_branch_fixture_success__runtime_entry"}
+!0 = !{ptr @"_101_llvm_build_call_branch_fixture_success__runtime_entry", !"bpp.contract.surface", !"101_llvm_build_call_branch_fixture_success", !"public-callable", !"public-callable", i64 8, i64 115, i64 12, i64 6, i64 0, i64 0, !"_101_llvm_build_call_branch_fixture_success__runtime_entry"}
+!1 = !{ptr @"_101_llvm_build_call_branch_fixture_success__runtime_entry", !"bpp.contract.entry", !"101_llvm_build_call_branch_fixture_success", !"public-callable", !"none", i64 8, i64 115, i64 12, i64 6, i64 0, i64 0, !"_101_llvm_build_call_branch_fixture_success__runtime_entry"}

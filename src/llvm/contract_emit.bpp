@@ -208,6 +208,24 @@ func llvm_contract_sketch_has_direct_call_to_name_impl(sketch: *LLVMSSAFuncSketc
     return 0;
 }
 
+func llvm_contract_sketch_has_lea_func_to_name_impl(sketch: *LLVMSSAFuncSketch, target_ptr: u64, target_len: u64) -> u64 {
+    if (sketch == 0 || sketch.blocks == 0 || target_ptr == 0 || target_len == 0) { return 0; }
+    var nb: u64 = sketch.blocks.len();
+    for (var bi: u64 = 0; bi < nb; bi = bi + 1) {
+        var block: *LLVMSSABlockSketch = sketch.blocks.get(bi);
+        if (block == 0 || block.insts == 0) { continue; }
+        var ni: u64 = block.insts.len();
+        for (var ii: u64 = 0; ii < ni; ii = ii + 1) {
+            var inst: *LLVMSSAInstSketch = block.insts.get(ii);
+            if (inst == 0 || inst.op != SSA_OP_LEA_FUNC || inst.has_src1 == 0 || inst.src1_is_const == 0) { continue; }
+            var info: *PtrLen = (*PtrLen)inst.src1_value;
+            if (info == 0 || info.ptr == 0 || info.len != target_len) { continue; }
+            if (str_eq(info.ptr, info.len, target_ptr, target_len) != 0) { return 1; }
+        }
+    }
+    return 0;
+}
+
 func llvm_contract_func_reachable_from_impl(module: *LLVMSSAModuleSketch, root_ptr: u64, root_len: u64, target_ptr: u64, target_len: u64, depth: u64) -> u64 {
     if (module == 0 || module.funcs == 0 || root_ptr == 0 || root_len == 0 || target_ptr == 0 || target_len == 0) { return 0; }
     if (root_len == target_len && str_eq(root_ptr, root_len, target_ptr, target_len) != 0) { return 1; }
@@ -215,6 +233,7 @@ func llvm_contract_func_reachable_from_impl(module: *LLVMSSAModuleSketch, root_p
     var root_sketch: *LLVMSSAFuncSketch = llvm_ssa_find_func_sketch(module, root_ptr, root_len);
     if (root_sketch == 0 || root_sketch.blocks == 0) { return 0; }
     if (llvm_contract_sketch_has_direct_call_to_name_impl(root_sketch, target_ptr, target_len) != 0) { return 1; }
+    if (llvm_contract_sketch_has_lea_func_to_name_impl(root_sketch, target_ptr, target_len) != 0) { return 1; }
     var n: u64 = module.funcs.len();
     for (var i: u64 = 0; i < n; i = i + 1) {
         var callee: *LLVMSSAFuncSketch = module.funcs.get(i);
@@ -495,6 +514,41 @@ func llvm_contract_ll_emit_ssa_value_impl(inst: *LLVMSSAInstSketch, which: u64) 
     return 0;
 }
 
+func llvm_contract_ll_emit_int_width_type_impl(width: u64) -> u64 {
+    if (width == 1) { emit("i8"); return 1; }
+    if (width == 2) { emit("i16"); return 1; }
+    if (width == 4) { emit("i32"); return 1; }
+    if (width == 8) { emit("i64"); return 1; }
+    return 0;
+}
+
+func llvm_contract_ll_emit_float_value_impl(inst: *LLVMSSAInstSketch, which: u64) -> u64 {
+    if (inst == 0) { return 0; }
+    var raw: u64 = 0;
+    var is_const: u64 = 0;
+    if (which == 1) {
+        is_const = inst.src1_is_const;
+        raw = inst.src1_value;
+    } else if (which == 2) {
+        is_const = inst.src2_is_const;
+        raw = inst.src2_value;
+    } else {
+        return 0;
+    }
+    if (is_const != 0) {
+        var info: *NameInfo = (*NameInfo)raw;
+        if (info == 0 || info.ptr == 0 || info.len == 0) {
+            emit("0.0");
+            return 1;
+        }
+        io_write_out(info.ptr, info.len);
+        return 1;
+    }
+    emit("%r");
+    print_u64(raw);
+    return 1;
+}
+
 func llvm_contract_ll_emit_local_slot_name_impl(kind: u64, id: u64) -> u64 {
     if (kind == 1) { emit("%loc"); }
     else { emit("%var"); }
@@ -586,18 +640,51 @@ func llvm_contract_ll_emit_call_arg_ptr_casts_impl(program: *AstProgram, sketch:
         var arg_reg: u64 = info.args_vec.get(i);
         if (callee == 0 || callee.params_vec == 0 || i >= callee.params_vec.len()) { continue; }
         var param: *Param = callee.params_vec.get(i);
-        if (param == 0 || param.ptr_depth == 0) { continue; }
+        if (param == 0) { continue; }
         var enc: u64 = llvm_contract_ll_find_reg_local_slot_impl(sketch, arg_reg, block_idx, inst_idx);
-        if (enc != 0) { continue; }
-        emit("  %argptr");
-        print_u64(block_idx);
-        emit("_");
-        print_u64(inst_idx);
-        emit("_");
-        print_u64(i);
-        emit(" = inttoptr i64 %r");
-        print_u64(arg_reg);
-        emit(" to ptr\n");
+        if (param.ptr_depth != 0) {
+            if (enc != 0) { continue; }
+            emit("  %argptr");
+            print_u64(block_idx);
+            emit("_");
+            print_u64(inst_idx);
+            emit("_");
+            print_u64(i);
+            emit(" = inttoptr i64 %r");
+            print_u64(arg_reg);
+            emit(" to ptr\n");
+            continue;
+        }
+        if (param.type_kind == TYPE_BOOL) {
+            if (llvm_contract_ll_reg_is_bool_impl(sketch, arg_reg) != 0) { continue; }
+            emit("  %argcast");
+            print_u64(block_idx);
+            emit("_");
+            print_u64(inst_idx);
+            emit("_");
+            print_u64(i);
+            emit(" = trunc i64 %r");
+            print_u64(arg_reg);
+            emit(" to i1\n");
+            continue;
+        }
+        if (param.type_kind == TYPE_U8 || param.type_kind == TYPE_I8 ||
+            param.type_kind == TYPE_U16 || param.type_kind == TYPE_I16 ||
+            param.type_kind == TYPE_U32 || param.type_kind == TYPE_I32) {
+            emit("  %argcast");
+            print_u64(block_idx);
+            emit("_");
+            print_u64(inst_idx);
+            emit("_");
+            print_u64(i);
+            emit(" = trunc i64 %r");
+            print_u64(arg_reg);
+            emit(" to ");
+            if (param.type_kind == TYPE_U8 || param.type_kind == TYPE_I8) { emit("i8"); }
+            else if (param.type_kind == TYPE_U16 || param.type_kind == TYPE_I16) { emit("i16"); }
+            else { emit("i32"); }
+            emit("\n");
+        }
     }
     return 1;
 }
@@ -632,6 +719,27 @@ func llvm_contract_ll_emit_call_args_impl(program: *AstProgram, sketch: *LLVMSSA
                 emit("_");
                 print_u64(i);
             }
+        } else if (type_kind == TYPE_BOOL) {
+            if (llvm_contract_ll_reg_is_bool_impl(sketch, arg_reg) != 0) {
+                emit("%r");
+                print_u64(arg_reg);
+            } else {
+                emit("%argcast");
+                print_u64(block_idx);
+                emit("_");
+                print_u64(inst_idx);
+                emit("_");
+                print_u64(i);
+            }
+        } else if (type_kind == TYPE_U8 || type_kind == TYPE_I8 ||
+                   type_kind == TYPE_U16 || type_kind == TYPE_I16 ||
+                   type_kind == TYPE_U32 || type_kind == TYPE_I32) {
+            emit("%argcast");
+            print_u64(block_idx);
+            emit("_");
+            print_u64(inst_idx);
+            emit("_");
+            print_u64(i);
         } else {
             emit("%r");
             print_u64(arg_reg);
@@ -645,7 +753,21 @@ func llvm_contract_ll_emit_call_inst_impl(program: *AstProgram, sketch: *LLVMSSA
     var info: *SSACallInfo = (*SSACallInfo)inst.src1_value;
     if (info == 0 || info.name_ptr == 0 || info.name_len == 0) { return 0; }
     llvm_contract_ll_emit_call_arg_ptr_casts_impl(program, sketch, block_idx, inst_idx, info);
-    if (inst.dest != 0) {
+    var needs_raw_ret: u64 = 0;
+    if (inst.dest != 0 && info.ret_ptr_depth == 0 &&
+        (info.ret_type == TYPE_U8 || info.ret_type == TYPE_I8 ||
+         info.ret_type == TYPE_U16 || info.ret_type == TYPE_I16 ||
+         info.ret_type == TYPE_U32 || info.ret_type == TYPE_I32)) {
+        needs_raw_ret = 1;
+    }
+    if (inst.dest != 0 && info.ret_ptr_depth != 0) { needs_raw_ret = 1; }
+    if (needs_raw_ret != 0) {
+        emit("  %callraw");
+        print_u64(block_idx);
+        emit("_");
+        print_u64(inst_idx);
+        emit(" = ");
+    } else if (inst.dest != 0) {
         emit("  %r");
         print_u64(inst.dest);
         emit(" = ");
@@ -659,6 +781,111 @@ func llvm_contract_ll_emit_call_inst_impl(program: *AstProgram, sketch: *LLVMSSA
     emit("(");
     llvm_contract_ll_emit_call_args_impl(program, sketch, block_idx, inst_idx, info);
     emit(")\n");
+    if (needs_raw_ret != 0) {
+        if (info.ret_ptr_depth != 0) {
+            emit("  %r");
+            print_u64(inst.dest);
+            emit(" = ptrtoint ptr %callraw");
+            print_u64(block_idx);
+            emit("_");
+            print_u64(inst_idx);
+            emit(" to i64\n");
+        } else {
+            emit("  %r");
+            print_u64(inst.dest);
+            emit(" = ");
+            if (info.ret_type == TYPE_U8 || info.ret_type == TYPE_U16 || info.ret_type == TYPE_U32) { emit("zext "); }
+            else { emit("sext "); }
+            if (info.ret_type == TYPE_U8 || info.ret_type == TYPE_I8) { emit("i8 "); }
+            else if (info.ret_type == TYPE_U16 || info.ret_type == TYPE_I16) { emit("i16 "); }
+            else { emit("i32 "); }
+            emit("%callraw");
+            print_u64(block_idx);
+            emit("_");
+            print_u64(inst_idx);
+            emit(" to i64\n");
+        }
+    }
+    return 1;
+}
+
+func llvm_contract_ll_emit_call_ptr_args_impl(sketch: *LLVMSSAFuncSketch, info: *SSACallPtrInfo) -> u64 {
+    if (sketch == 0 || info == 0 || info.args_vec == 0) { return 0; }
+    var nargs: u64 = info.nargs;
+    for (var i: u64 = 0; i < nargs; i = i + 1) {
+        if (i != 0) { emit(", "); }
+        emit("i64 %r");
+        print_u64(info.args_vec.get(i));
+    }
+    return 1;
+}
+
+func llvm_contract_ll_emit_call_ptr_inst_impl(sketch: *LLVMSSAFuncSketch, block_idx: u64, inst_idx: u64, inst: *LLVMSSAInstSketch) -> u64 {
+    if (sketch == 0 || inst == 0 || inst.has_src1 == 0 || inst.src1_is_const == 0) { return 0; }
+    var info: *SSACallPtrInfo = (*SSACallPtrInfo)inst.src1_value;
+    if (info == 0 || info.callee_reg == 0) { return 0; }
+    emit("  %callptr");
+    print_u64(block_idx);
+    emit("_");
+    print_u64(inst_idx);
+    emit(" = inttoptr i64 %r");
+    print_u64(info.callee_reg);
+    emit(" to ptr\n");
+    var needs_raw_ret: u64 = 0;
+    if (inst.dest != 0 && info.ret_ptr_depth == 0 &&
+        (info.ret_type == TYPE_U8 || info.ret_type == TYPE_I8 ||
+         info.ret_type == TYPE_U16 || info.ret_type == TYPE_I16 ||
+         info.ret_type == TYPE_U32 || info.ret_type == TYPE_I32)) {
+        needs_raw_ret = 1;
+    }
+    if (inst.dest != 0 && info.ret_ptr_depth != 0) { needs_raw_ret = 1; }
+    if (needs_raw_ret != 0) {
+        emit("  %callraw");
+        print_u64(block_idx);
+        emit("_");
+        print_u64(inst_idx);
+        emit(" = ");
+    } else if (inst.dest != 0) {
+        emit("  %r");
+        print_u64(inst.dest);
+        emit(" = ");
+    } else {
+        emit("  ");
+    }
+    emit("call ");
+    if (llvm_contract_emit_type_impl(info.ret_type, info.ret_ptr_depth) == 0) { emit("i64"); }
+    emit(" %callptr");
+    print_u64(block_idx);
+    emit("_");
+    print_u64(inst_idx);
+    emit("(");
+    llvm_contract_ll_emit_call_ptr_args_impl(sketch, info);
+    emit(")\n");
+    if (needs_raw_ret != 0) {
+        if (info.ret_ptr_depth != 0) {
+            emit("  %r");
+            print_u64(inst.dest);
+            emit(" = ptrtoint ptr %callraw");
+            print_u64(block_idx);
+            emit("_");
+            print_u64(inst_idx);
+            emit(" to i64\n");
+        } else {
+            emit("  %r");
+            print_u64(inst.dest);
+            emit(" = ");
+            if (info.ret_type == TYPE_U8 || info.ret_type == TYPE_U16 || info.ret_type == TYPE_U32) { emit("zext "); }
+            else { emit("sext "); }
+            if (info.ret_type == TYPE_U8 || info.ret_type == TYPE_I8) { emit("i8 "); }
+            else if (info.ret_type == TYPE_U16 || info.ret_type == TYPE_I16) { emit("i16 "); }
+            else { emit("i32 "); }
+            emit("%callraw");
+            print_u64(block_idx);
+            emit("_");
+            print_u64(inst_idx);
+            emit(" to i64\n");
+        }
+    }
     return 1;
 }
 
@@ -690,7 +917,10 @@ func llvm_contract_ll_reg_is_bool_impl(sketch: *LLVMSSAFuncSketch, reg_id: u64) 
                 inst.op == SSA_OP_LT || inst.op == SSA_OP_GT ||
                 inst.op == SSA_OP_LE || inst.op == SSA_OP_GE ||
                 inst.op == SSA_OP_ULT || inst.op == SSA_OP_UGT ||
-                inst.op == SSA_OP_ULE || inst.op == SSA_OP_UGE) {
+                inst.op == SSA_OP_ULE || inst.op == SSA_OP_UGE ||
+                inst.op == SSA_OP_FEQ || inst.op == SSA_OP_FNE ||
+                inst.op == SSA_OP_FLT || inst.op == SSA_OP_FGT ||
+                inst.op == SSA_OP_FLE || inst.op == SSA_OP_FGE) {
                 return 1;
             }
             return 0;
@@ -722,6 +952,18 @@ func llvm_contract_ll_emit_ssa_body_impl(program: *AstProgram, fn: *AstFunc, ske
                     print_u64(inst.dest);
                     emit(" = ptrtoint ptr ");
                     llvm_contract_ll_emit_local_slot_name_impl(1, inst.src1_value);
+                    emit(" to i64\n");
+                    break;
+                case SSA_OP_LEA_FUNC:
+                    emit("  %r");
+                    print_u64(inst.dest);
+                    emit(" = ptrtoint ptr ");
+                    var fn_info: *PtrLen = (*PtrLen)inst.src1_value;
+                    if (fn_info == 0 || fn_info.ptr == 0 || fn_info.len == 0) {
+                        emit("null");
+                    } else {
+                        llvm_contract_emit_quoted_symbol_impl(fn_info.ptr, fn_info.len);
+                    }
                     emit(" to i64\n");
                     break;
                 case SSA_OP_LOAD:
@@ -769,6 +1011,64 @@ func llvm_contract_ll_emit_ssa_body_impl(program: *AstProgram, fn: *AstFunc, ske
                         emit(" = load i64, ptr null\n");
                     }
                     break;
+                case SSA_OP_LOAD8:
+                case SSA_OP_LOAD16:
+                case SSA_OP_LOAD32:
+                    var load_w: u64 = 1;
+                    if (inst.op == SSA_OP_LOAD16) { load_w = 2; }
+                    else if (inst.op == SSA_OP_LOAD32) { load_w = 4; }
+                    var enc_lw: u64 = 0;
+                    if (inst.has_src1 != 0 && inst.src1_is_const == 0) {
+                        enc_lw = llvm_contract_ll_find_reg_local_slot_impl(sketch, inst.src1_value, bi, i);
+                    }
+                    if (enc_lw != 0) {
+                        emit("  %load");
+                        print_u64(block.id);
+                        emit("_");
+                        print_u64(i);
+                        emit(" = load ");
+                        llvm_contract_ll_emit_int_width_type_impl(load_w);
+                        emit(", ptr ");
+                        llvm_contract_ll_emit_local_slot_name_impl(1, enc_lw);
+                        emit("\n");
+                    } else if (inst.has_src1 != 0 && inst.src1_is_const == 0) {
+                        emit("  %addr");
+                        print_u64(block.id);
+                        emit("_");
+                        print_u64(i);
+                        emit(" = inttoptr i64 %r");
+                        print_u64(inst.src1_value);
+                        emit(" to ptr\n");
+                        emit("  %load");
+                        print_u64(block.id);
+                        emit("_");
+                        print_u64(i);
+                        emit(" = load ");
+                        llvm_contract_ll_emit_int_width_type_impl(load_w);
+                        emit(", ptr %addr");
+                        print_u64(block.id);
+                        emit("_");
+                        print_u64(i);
+                        emit("\n");
+                    } else {
+                        emit("  %load");
+                        print_u64(block.id);
+                        emit("_");
+                        print_u64(i);
+                        emit(" = add ");
+                        llvm_contract_ll_emit_int_width_type_impl(load_w);
+                        emit(" 0, 0\n");
+                    }
+                    emit("  %r");
+                    print_u64(inst.dest);
+                    emit(" = zext ");
+                    llvm_contract_ll_emit_int_width_type_impl(load_w);
+                    emit(" %load");
+                    print_u64(block.id);
+                    emit("_");
+                    print_u64(i);
+                    emit(" to i64\n");
+                    break;
                 case SSA_OP_STORE64:
                     if (inst.has_src1 != 0 && inst.src1_is_const == 0) {
                         var enc: u64 = llvm_contract_ll_find_reg_local_slot_impl(sketch, inst.src1_value, bi, i);
@@ -800,15 +1100,112 @@ func llvm_contract_ll_emit_ssa_body_impl(program: *AstProgram, fn: *AstFunc, ske
                         emit(", ptr null\n");
                     }
                     break;
+                case SSA_OP_STORE8:
+                case SSA_OP_STORE16:
+                case SSA_OP_STORE32:
+                    var store_w: u64 = 1;
+                    if (inst.op == SSA_OP_STORE16) { store_w = 2; }
+                    else if (inst.op == SSA_OP_STORE32) { store_w = 4; }
+                    emit("  %store");
+                    print_u64(block.id);
+                    emit("_");
+                    print_u64(i);
+                    emit(" = trunc i64 ");
+                    llvm_contract_ll_emit_ssa_value_impl(inst, 2);
+                    emit(" to ");
+                    llvm_contract_ll_emit_int_width_type_impl(store_w);
+                    emit("\n");
+                    if (inst.has_src1 != 0 && inst.src1_is_const == 0) {
+                        var enc_sw: u64 = llvm_contract_ll_find_reg_local_slot_impl(sketch, inst.src1_value, bi, i);
+                        if (enc_sw != 0) {
+                            emit("  store ");
+                            llvm_contract_ll_emit_int_width_type_impl(store_w);
+                            emit(" %store");
+                            print_u64(block.id);
+                            emit("_");
+                            print_u64(i);
+                            emit(", ptr ");
+                            llvm_contract_ll_emit_local_slot_name_impl(1, enc_sw);
+                            emit("\n");
+                        } else {
+                            emit("  %addr");
+                            print_u64(block.id);
+                            emit("_");
+                            print_u64(i);
+                            emit(" = inttoptr i64 %r");
+                            print_u64(inst.src1_value);
+                            emit(" to ptr\n");
+                            emit("  store ");
+                            llvm_contract_ll_emit_int_width_type_impl(store_w);
+                            emit(" %store");
+                            print_u64(block.id);
+                            emit("_");
+                            print_u64(i);
+                            emit(", ptr %addr");
+                            print_u64(block.id);
+                            emit("_");
+                            print_u64(i);
+                            emit("\n");
+                        }
+                    } else {
+                        emit("  store ");
+                        llvm_contract_ll_emit_int_width_type_impl(store_w);
+                        emit(" %store");
+                        print_u64(block.id);
+                        emit("_");
+                        print_u64(i);
+                        emit(", ptr null\n");
+                    }
+                    break;
                 case SSA_OP_PARAM:
+                    var pidx: u64 = inst.src1_value;
+                    var param_t: *Param = 0;
+                    if (fn != 0 && fn.params_vec != 0 && pidx < fn.params_vec.len()) {
+                        param_t = fn.params_vec.get(pidx);
+                    }
                     emit("  %r");
                     print_u64(inst.dest);
-                    emit(" = add i64 0, %p");
-                    print_u64(inst.src1_value);
-                    emit("\n");
+                    if (param_t != 0 && param_t.ptr_depth != 0) {
+                        emit(" = ptrtoint ptr %p");
+                        print_u64(pidx);
+                        emit(" to i64\n");
+                    } else if (param_t != 0 && param_t.type_kind == TYPE_F64) {
+                        emit(" = fadd double 0.0, %p");
+                        print_u64(pidx);
+                        emit("\n");
+                    } else if (param_t != 0 && param_t.type_kind == TYPE_BOOL) {
+                        emit(" = zext i1 %p");
+                        print_u64(pidx);
+                        emit(" to i64\n");
+                    } else if (param_t != 0 && (param_t.type_kind == TYPE_U8 || param_t.type_kind == TYPE_U16 || param_t.type_kind == TYPE_U32)) {
+                        emit(" = zext ");
+                        if (param_t.type_kind == TYPE_U8) { emit("i8"); }
+                        else if (param_t.type_kind == TYPE_U16) { emit("i16"); }
+                        else { emit("i32"); }
+                        emit(" %p");
+                        print_u64(pidx);
+                        emit(" to i64\n");
+                    } else if (param_t != 0 && (param_t.type_kind == TYPE_I8 || param_t.type_kind == TYPE_I16 || param_t.type_kind == TYPE_I32)) {
+                        emit(" = sext ");
+                        if (param_t.type_kind == TYPE_I8) { emit("i8"); }
+                        else if (param_t.type_kind == TYPE_I16) { emit("i16"); }
+                        else { emit("i32"); }
+                        emit(" %p");
+                        print_u64(pidx);
+                        emit(" to i64\n");
+                    } else {
+                        emit(" = add i64 0, %p");
+                        print_u64(pidx);
+                        emit("\n");
+                    }
                     break;
                 case SSA_OP_CALL:
                     if (llvm_contract_ll_emit_call_inst_impl(program, sketch, bi, i, inst) == 0) {
+                        emitln("  unreachable");
+                    }
+                    break;
+                case SSA_OP_CALL_PTR:
+                    if (llvm_contract_ll_emit_call_ptr_inst_impl(sketch, bi, i, inst) == 0) {
                         emitln("  unreachable");
                     }
                     break;
@@ -817,6 +1214,13 @@ func llvm_contract_ll_emit_ssa_body_impl(program: *AstProgram, fn: *AstFunc, ske
                     print_u64(inst.dest);
                     emit(" = add i64 0, ");
                     llvm_contract_ll_emit_ssa_value_impl(inst, 1);
+                    emit("\n");
+                    break;
+                case SSA_OP_FCONST:
+                    emit("  %r");
+                    print_u64(inst.dest);
+                    emit(" = fadd double 0.0, ");
+                    llvm_contract_ll_emit_float_value_impl(inst, 1);
                     emit("\n");
                     break;
                 case SSA_OP_ADD:
@@ -854,6 +1258,160 @@ func llvm_contract_ll_emit_ssa_body_impl(program: *AstProgram, fn: *AstFunc, ske
                     emit(", ");
                     llvm_contract_ll_emit_ssa_value_impl(inst, 2);
                     emit("\n");
+                    break;
+                case SSA_OP_UDIV:
+                    emit("  %r");
+                    print_u64(inst.dest);
+                    emit(" = udiv i64 ");
+                    llvm_contract_ll_emit_ssa_value_impl(inst, 1);
+                    emit(", ");
+                    llvm_contract_ll_emit_ssa_value_impl(inst, 2);
+                    emit("\n");
+                    break;
+                case SSA_OP_MOD:
+                    emit("  %r");
+                    print_u64(inst.dest);
+                    emit(" = srem i64 ");
+                    llvm_contract_ll_emit_ssa_value_impl(inst, 1);
+                    emit(", ");
+                    llvm_contract_ll_emit_ssa_value_impl(inst, 2);
+                    emit("\n");
+                    break;
+                case SSA_OP_UMOD:
+                    emit("  %r");
+                    print_u64(inst.dest);
+                    emit(" = urem i64 ");
+                    llvm_contract_ll_emit_ssa_value_impl(inst, 1);
+                    emit(", ");
+                    llvm_contract_ll_emit_ssa_value_impl(inst, 2);
+                    emit("\n");
+                    break;
+                case SSA_OP_AND:
+                    emit("  %r");
+                    print_u64(inst.dest);
+                    emit(" = and i64 ");
+                    llvm_contract_ll_emit_ssa_value_impl(inst, 1);
+                    emit(", ");
+                    llvm_contract_ll_emit_ssa_value_impl(inst, 2);
+                    emit("\n");
+                    break;
+                case SSA_OP_OR:
+                    emit("  %r");
+                    print_u64(inst.dest);
+                    emit(" = or i64 ");
+                    llvm_contract_ll_emit_ssa_value_impl(inst, 1);
+                    emit(", ");
+                    llvm_contract_ll_emit_ssa_value_impl(inst, 2);
+                    emit("\n");
+                    break;
+                case SSA_OP_XOR:
+                    emit("  %r");
+                    print_u64(inst.dest);
+                    emit(" = xor i64 ");
+                    llvm_contract_ll_emit_ssa_value_impl(inst, 1);
+                    emit(", ");
+                    llvm_contract_ll_emit_ssa_value_impl(inst, 2);
+                    emit("\n");
+                    break;
+                case SSA_OP_SHL:
+                    emit("  %r");
+                    print_u64(inst.dest);
+                    emit(" = shl i64 ");
+                    llvm_contract_ll_emit_ssa_value_impl(inst, 1);
+                    emit(", ");
+                    llvm_contract_ll_emit_ssa_value_impl(inst, 2);
+                    emit("\n");
+                    break;
+                case SSA_OP_SHR:
+                    emit("  %r");
+                    print_u64(inst.dest);
+                    emit(" = lshr i64 ");
+                    llvm_contract_ll_emit_ssa_value_impl(inst, 1);
+                    emit(", ");
+                    llvm_contract_ll_emit_ssa_value_impl(inst, 2);
+                    emit("\n");
+                    break;
+                case SSA_OP_SAR:
+                    emit("  %r");
+                    print_u64(inst.dest);
+                    emit(" = ashr i64 ");
+                    llvm_contract_ll_emit_ssa_value_impl(inst, 1);
+                    emit(", ");
+                    llvm_contract_ll_emit_ssa_value_impl(inst, 2);
+                    emit("\n");
+                    break;
+                case SSA_OP_FNEG:
+                    emit("  %r");
+                    print_u64(inst.dest);
+                    emit(" = fneg double ");
+                    llvm_contract_ll_emit_float_value_impl(inst, 1);
+                    emit("\n");
+                    break;
+                case SSA_OP_FADD:
+                case SSA_OP_FSUB:
+                case SSA_OP_FMUL:
+                case SSA_OP_FDIV:
+                    emit("  %r");
+                    print_u64(inst.dest);
+                    emit(" = ");
+                    if (inst.op == SSA_OP_FADD) { emit("fadd"); }
+                    else if (inst.op == SSA_OP_FSUB) { emit("fsub"); }
+                    else if (inst.op == SSA_OP_FMUL) { emit("fmul"); }
+                    else { emit("fdiv"); }
+                    emit(" double ");
+                    llvm_contract_ll_emit_float_value_impl(inst, 1);
+                    emit(", ");
+                    llvm_contract_ll_emit_float_value_impl(inst, 2);
+                    emit("\n");
+                    break;
+                case SSA_OP_FEQ:
+                case SSA_OP_FNE:
+                case SSA_OP_FLT:
+                case SSA_OP_FGT:
+                case SSA_OP_FLE:
+                case SSA_OP_FGE:
+                    emit("  %r");
+                    print_u64(inst.dest);
+                    emit(" = fcmp ");
+                    if (inst.op == SSA_OP_FEQ) { emit("oeq"); }
+                    else if (inst.op == SSA_OP_FNE) { emit("one"); }
+                    else if (inst.op == SSA_OP_FLT) { emit("olt"); }
+                    else if (inst.op == SSA_OP_FGT) { emit("ogt"); }
+                    else if (inst.op == SSA_OP_FLE) { emit("ole"); }
+                    else { emit("oge"); }
+                    emit(" double ");
+                    llvm_contract_ll_emit_float_value_impl(inst, 1);
+                    emit(", ");
+                    llvm_contract_ll_emit_float_value_impl(inst, 2);
+                    emit("\n");
+                    break;
+                case SSA_OP_I2F:
+                    emit("  %r");
+                    print_u64(inst.dest);
+                    emit(" = sitofp i64 ");
+                    llvm_contract_ll_emit_ssa_value_impl(inst, 1);
+                    emit(" to double\n");
+                    break;
+                case SSA_OP_U2F:
+                    emit("  %r");
+                    print_u64(inst.dest);
+                    emit(" = uitofp i64 ");
+                    llvm_contract_ll_emit_ssa_value_impl(inst, 1);
+                    emit(" to double\n");
+                    break;
+                case SSA_OP_F2I:
+                    emit("  %r");
+                    print_u64(inst.dest);
+                    emit(" = fptosi double ");
+                    llvm_contract_ll_emit_float_value_impl(inst, 1);
+                    emit(" to i64\n");
+                    break;
+                case SSA_OP_F2U:
+                    emit("  %r");
+                    print_u64(inst.dest);
+                    emit(" = fptoui double ");
+                    llvm_contract_ll_emit_float_value_impl(inst, 1);
+                    emit(" to i64\n");
                     break;
                 case SSA_OP_EQ:
                 case SSA_OP_NE:
@@ -935,21 +1493,81 @@ func llvm_contract_ll_emit_ssa_body_impl(program: *AstProgram, fn: *AstFunc, ske
                     emit("\n");
                     break;
                 case SSA_OP_RET:
-                    emit("  ret ");
+                    if (sketch.ast_ret_type == TYPE_VOID && sketch.ast_ret_ptr_depth == 0) {
+                        emitln("  ret void");
+                        break;
+                    }
+                    if (inst.has_src1 == 0) {
+                        emit("  ret ");
+                        if (sketch.ast_ret_ptr_depth > 0) { emitln("ptr null"); }
+                        else if (sketch.ast_ret_type == TYPE_BOOL) { emitln("i1 0"); }
+                        else if (sketch.ast_ret_type == TYPE_U8 || sketch.ast_ret_type == TYPE_I8) { emitln("i8 0"); }
+                        else if (sketch.ast_ret_type == TYPE_U16 || sketch.ast_ret_type == TYPE_I16) { emitln("i16 0"); }
+                        else if (sketch.ast_ret_type == TYPE_U32 || sketch.ast_ret_type == TYPE_I32) { emitln("i32 0"); }
+                        else if (sketch.ast_ret_type == TYPE_F64) { emitln("double 0.0"); }
+                        else { emitln("i64 0"); }
+                        break;
+                    }
                     if (sketch.ast_ret_ptr_depth > 0) {
-                        emit("ptr ");
-                    } else if (sketch.ast_ret_type == TYPE_BOOL) {
-                        emit("i1 ");
-                    } else if (sketch.ast_ret_type == TYPE_F64) {
-                        emit("double ");
-                    } else if (sketch.ast_ret_type == TYPE_VOID) {
-                        emit("void");
+                        emit("  %retptr");
+                        print_u64(block.id);
+                        emit("_");
+                        print_u64(i);
+                        emit(" = inttoptr i64 %r");
+                        print_u64(inst.src1_value);
+                        emit(" to ptr\n");
+                        emit("  ret ptr %retptr");
+                        print_u64(block.id);
+                        emit("_");
+                        print_u64(i);
                         emit("\n");
                         break;
-                    } else {
-                        emit("i64 ");
                     }
-                    if (inst.has_src1 == 0) { emit("0"); }
+                    if (sketch.ast_ret_type == TYPE_U8 || sketch.ast_ret_type == TYPE_I8 ||
+                        sketch.ast_ret_type == TYPE_U16 || sketch.ast_ret_type == TYPE_I16 ||
+                        sketch.ast_ret_type == TYPE_U32 || sketch.ast_ret_type == TYPE_I32) {
+                        emit("  %retcast");
+                        print_u64(block.id);
+                        emit("_");
+                        print_u64(i);
+                        emit(" = trunc i64 %r");
+                        print_u64(inst.src1_value);
+                        emit(" to ");
+                        if (sketch.ast_ret_type == TYPE_U8 || sketch.ast_ret_type == TYPE_I8) { emit("i8"); }
+                        else if (sketch.ast_ret_type == TYPE_U16 || sketch.ast_ret_type == TYPE_I16) { emit("i16"); }
+                        else { emit("i32"); }
+                        emit("\n");
+                        emit("  ret ");
+                        if (sketch.ast_ret_type == TYPE_U8 || sketch.ast_ret_type == TYPE_I8) { emit("i8 "); }
+                        else if (sketch.ast_ret_type == TYPE_U16 || sketch.ast_ret_type == TYPE_I16) { emit("i16 "); }
+                        else { emit("i32 "); }
+                        emit("%retcast");
+                        print_u64(block.id);
+                        emit("_");
+                        print_u64(i);
+                        emit("\n");
+                        break;
+                    }
+                    if (sketch.ast_ret_type == TYPE_BOOL && llvm_contract_ll_reg_is_bool_impl(sketch, inst.src1_value) == 0) {
+                        emit("  %retbool");
+                        print_u64(block.id);
+                        emit("_");
+                        print_u64(i);
+                        emit(" = icmp ne i64 %r");
+                        print_u64(inst.src1_value);
+                        emit(", 0\n");
+                        emit("  ret i1 %retbool");
+                        print_u64(block.id);
+                        emit("_");
+                        print_u64(i);
+                        emit("\n");
+                        break;
+                    }
+                    emit("  ret ");
+                    if (sketch.ast_ret_type == TYPE_BOOL) { emit("i1 "); }
+                    else if (sketch.ast_ret_type == TYPE_F64) { emit("double "); }
+                    else { emit("i64 "); }
+                    if (sketch.ast_ret_type == TYPE_F64) { llvm_contract_ll_emit_float_value_impl(inst, 1); }
                     else { llvm_contract_ll_emit_ssa_value_impl(inst, 1); }
                     emit("\n");
                     break;
