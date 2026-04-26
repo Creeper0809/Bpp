@@ -13,6 +13,7 @@ import compiler.runtime_api;
 import compiler.pass_runner;
 import compiler.annotations;
 import compiler.ast_dump;
+import llvm.contract_adapter;
 import codegen;
 import opt;
 
@@ -35,6 +36,7 @@ struct MainCliParseResult {
     public ast_filter_no_std: u64;
 }
 struct MainOutputPaths { public asm_path: u64; public obj_path: u64; public exe_path: u64; }
+struct MainLLVMPaths { public ll_path: u64; public exe_path: u64; }
 
 impl Argv6 {
     public constructor() {
@@ -89,8 +91,15 @@ impl Argv2 {
     }
 }
 
+impl MainLLVMPaths {
+    public constructor() {
+        self.ll_path = 0;
+        self.exe_path = 0;
+    }
+}
+
 func main_print_usage() -> u64 {
-    emit("Usage: bppc [-O0|-O1] [-dump-ast|-dump-ast-graph|-dump-ast-json|-dump-ir|-dump-ssa|-asm] [--ast-func <name>] [--ast-module <module>] [--ast-no-std] [--target <linux-x86_64|windows-x86_64>] [--symbolic-report] [--strict-std-complexity-summary] <source.bpp>\n");
+    emit("Usage: bppc [-O0|-O1] [-dump-ast|-dump-ast-graph|-dump-ast-json|-dump-ir|-dump-ssa|-dump-llvm-contract|-dump-llvm-proto|-dump-llvm-ll|-llvm-build|-asm] [--ast-func <name>] [--ast-module <module>] [--ast-no-std] [--target <linux-x86_64|windows-x86_64>] [--symbolic-report] [--strict-std-complexity-summary] <source.bpp>\n");
     return 0;
 }
 
@@ -165,6 +174,22 @@ func main_parse_cli(argc: u64, argv_ptr: *u64) -> MainCliParseResult {
         }
         if (str_eq(arg, arg_len, "-dump-ast-json", 14)) {
             opt_set_output_mode(OUT_AST_JSON);
+            continue;
+        }
+        if (str_eq(arg, arg_len, "-dump-llvm-contract", 19)) {
+            opt_set_output_mode(OUT_LLVM_CONTRACT);
+            continue;
+        }
+        if (str_eq(arg, arg_len, "-dump-llvm-proto", 16)) {
+            opt_set_output_mode(OUT_LLVM_PROTO);
+            continue;
+        }
+        if (str_eq(arg, arg_len, "-dump-llvm-ll", 13)) {
+            opt_set_output_mode(OUT_LLVM_LL);
+            continue;
+        }
+        if (str_eq(arg, arg_len, "-llvm-build", 11)) {
+            opt_set_output_mode(OUT_LLVM_BUILD);
             continue;
         }
         if (str_eq(arg, arg_len, "--ast-func", 10) || str_eq(arg, arg_len, "--graph-func", 12)) {
@@ -331,6 +356,17 @@ func main_build_output_paths(base_name: u64, base_len: u64) -> MainOutputPaths {
     paths.asm_path = str_concat(base_name, base_len, ".s", 2);
     paths.obj_path = str_concat(base_name, base_len, ".o", 2);
     paths.exe_path = str_concat(base_name, base_len, ".out", 4);
+    return paths;
+}
+
+func main_build_llvm_paths(base_name: u64, base_len: u64) -> MainLLVMPaths {
+    var paths: MainLLVMPaths;
+    paths.ll_path = str_concat(base_name, base_len, ".ll", 3);
+    if (compiler_target() == COMPILER_TARGET_WINDOWS_X86_64) {
+        paths.exe_path = str_concat(base_name, base_len, ".llvm.exe", 9);
+        return paths;
+    }
+    paths.exe_path = str_concat(base_name, base_len, ".llvm.out", 9);
     return paths;
 }
 
@@ -602,6 +638,69 @@ func main_run_output(exe_path: u64) -> u64 {
     return 0;
 }
 
+func main_emit_llvm_file(ll_path: u64, merged_prog: *AstProgram) -> u64 {
+    if (annotation_dump_llvm_ll_skeleton_to_path(merged_prog, ll_path, str_len(ll_path)) == 0) {
+        emit_stderr("[ERROR] failed to write LLVM ll output: ");
+        emit_stderr(ll_path);
+        emit_stderr("\n");
+        return 1;
+    }
+    return 0;
+}
+
+func main_run_clang_ir(ll_path: u64, exe_path: u64) -> u64 {
+    if (os_host_is_windows() != 0) {
+        emit_stderr("[ERROR] -llvm-build is not wired for Windows host execution yet\n");
+        return 1;
+    }
+    var clang_argv: *Argv8 = new Argv8{};
+    clang_argv.a0 = (u64)"clang";
+    clang_argv.a1 = (u64)"-x";
+    clang_argv.a2 = (u64)"ir";
+    clang_argv.a3 = (u64)"-B";
+    clang_argv.a4 = (u64)"/usr/bin";
+    clang_argv.a5 = ll_path;
+    clang_argv.a6 = (u64)"-o";
+    clang_argv.a7 = exe_path;
+
+    var clang_status: i64 = os_execute((u64)"/usr/bin/clang", (u64)clang_argv);
+    if (main_status_exec_not_found(clang_status) != 0) {
+        clang_status = os_execute((u64)"/usr/local/bin/clang", (u64)clang_argv);
+    }
+    if (main_status_exec_not_found(clang_status) != 0) {
+        clang_status = os_execute((u64)"/bin/clang", (u64)clang_argv);
+    }
+    if (main_status_exec_not_found(clang_status) != 0) {
+        emit_stderr("[ERROR] clang not found. Install clang or add it to PATH.\n");
+        return 1;
+    }
+    if (clang_status != 0) {
+        emit_stderr("[ERROR] clang failed with status ");
+        emit_i64_stderr(clang_status);
+        emit_stderr("\n");
+        return 1;
+    }
+    return 0;
+}
+
+func main_emit_llvm_and_run(base_name: u64, base_len: u64, merged_prog: *AstProgram) -> u64 {
+    if (compiler_target() != COMPILER_TARGET_LINUX_X86_64) {
+        emit_stderr("[ERROR] -llvm-build currently supports linux-x86_64 target only\n");
+        return 1;
+    }
+    var paths: MainLLVMPaths = main_build_llvm_paths(base_name, base_len);
+    if (main_emit_llvm_file(paths.ll_path, merged_prog) != 0) { return 1; }
+    if (main_run_clang_ir(paths.ll_path, paths.exe_path) != 0) { return 1; }
+    emit("[OK] llvm ll: ");
+    emit(paths.ll_path);
+    emit("\n");
+    emit("[OK] llvm exe: ");
+    emit(paths.exe_path);
+    emit("\n");
+    if (main_run_output(paths.exe_path) != 0) { return 1; }
+    return 0;
+}
+
 func main_emit_and_run(base_name: u64, base_len: u64, merged_prog: *AstProgram) -> u64 {
     var paths: MainOutputPaths = main_build_output_paths(base_name, base_len);
     var asm_path: u64 = paths.asm_path;
@@ -662,7 +761,7 @@ func main(argc: u64, argv: u64) -> u64 {
     ast_filter.module_len = cli.ast_filter_module_len;
     ast_filter.no_std = cli.ast_filter_no_std;
 
-    if (out_mode == OUT_EXEC && main_host_allows_target(target) == 0) {
+    if ((out_mode == OUT_EXEC || out_mode == OUT_LLVM_BUILD) && main_host_allows_target(target) == 0) {
         emit_stderr("[ERROR] target ");
         emit_stderr(compiler_target_name(target));
         emit_stderr(" cannot be executed on this host.\n");
@@ -685,6 +784,57 @@ func main(argc: u64, argv: u64) -> u64 {
             program_with_sigs_ir(merged_prog, get_func_sigs());
             if (diag_has_errors() != 0) {
                 emit_stderr("[ERROR] IR generation failed (");
+                emit_u64_stderr(diag_count());
+                emit_stderr(" error(s))\n");
+                return 1;
+            }
+            break;
+        case OUT_LLVM_CONTRACT:
+            diag_reset();
+            if (annotation_dump_llvm_contract_adapter_stdout(merged_prog) == 0) {
+                emit_stderr("[ERROR] LLVM contract adapter generation failed\n");
+                return 1;
+            }
+            if (diag_has_errors() != 0) {
+                emit_stderr("[ERROR] LLVM contract adapter generation failed (");
+                emit_u64_stderr(diag_count());
+                emit_stderr(" error(s))\n");
+                return 1;
+            }
+            break;
+        case OUT_LLVM_PROTO:
+            diag_reset();
+            if (annotation_dump_llvm_contract_proto_stdout(merged_prog) == 0) {
+                emit_stderr("[ERROR] LLVM contract prototype generation failed\n");
+                return 1;
+            }
+            if (diag_has_errors() != 0) {
+                emit_stderr("[ERROR] LLVM contract prototype generation failed (");
+                emit_u64_stderr(diag_count());
+                emit_stderr(" error(s))\n");
+                return 1;
+            }
+            break;
+        case OUT_LLVM_LL:
+            diag_reset();
+            if (annotation_dump_llvm_ll_skeleton_stdout(merged_prog) == 0) {
+                emit_stderr("[ERROR] LLVM ll skeleton generation failed\n");
+                return 1;
+            }
+            if (diag_has_errors() != 0) {
+                emit_stderr("[ERROR] LLVM ll skeleton generation failed (");
+                emit_u64_stderr(diag_count());
+                emit_stderr(" error(s))\n");
+                return 1;
+            }
+            break;
+        case OUT_LLVM_BUILD:
+            diag_reset();
+            if (main_emit_llvm_and_run(base_name, base_len, merged_prog) != 0) {
+                return 1;
+            }
+            if (diag_has_errors() != 0) {
+                emit_stderr("[ERROR] LLVM build failed (");
                 emit_u64_stderr(diag_count());
                 emit_stderr(" error(s))\n");
                 return 1;
