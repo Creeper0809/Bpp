@@ -234,6 +234,23 @@ extract_numeric_version() {
     return 1
 }
 
+is_container_env() {
+    if [ -f "/.dockerenv" ] || [ -f "/run/.containerenv" ]; then
+        return 0
+    fi
+    if [ -f "/proc/1/cgroup" ] && grep -Eq '(docker|containerd|kubepods|podman)' /proc/1/cgroup 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
+shm_available_kb() {
+    if [ ! -d "/dev/shm" ] || [ ! -w "/dev/shm" ]; then
+        return 1
+    fi
+    df -Pk /dev/shm 2>/dev/null | awk 'NR==2 {print $4}'
+}
+
 VERSION="${BPP_VERSION:-}"
 if [ -z "$VERSION" ]; then
     VERSION="$(read_config_value VERSION)"
@@ -251,6 +268,10 @@ TEST_SCRIPT="$SCRIPT_DIR/test/run_tests.sh"
 BASE_COMPILER="${VERSION}_base"
 NASM_FLAGS="-felf64 -O1"
 UPDATE_BOOTSTRAP="${UPDATE_BOOTSTRAP:-0}"
+TEST_FAST_IO_EXPLICIT=0
+if [ "${TEST_FAST_IO+x}" = "x" ]; then TEST_FAST_IO_EXPLICIT=1; fi
+TEST_JOBS_EXPLICIT=0
+if [ "${TEST_JOBS+x}" = "x" ]; then TEST_JOBS_EXPLICIT=1; fi
 TEST_FAST_IO="${TEST_FAST_IO:-1}"
 TEST_QUIET="${TEST_QUIET:-1}"
 KEEP_TEST_ARTIFACTS="${KEEP_TEST_ARTIFACTS:-0}"
@@ -283,6 +304,15 @@ else
     exit 1
 fi
 
+TEST_FAST_IO_MIN_SHM_KB="${BPP_TEST_FAST_IO_MIN_SHM_KB:-262144}"
+if [ "$TEST_FAST_IO" -eq 1 ] && [ "$TEST_FAST_IO_EXPLICIT" -eq 0 ]; then
+    TEST_SHM_AVAIL_KB="$(shm_available_kb || true)"
+    if [ -z "$TEST_SHM_AVAIL_KB" ] || [ "$TEST_SHM_AVAIL_KB" -lt "$TEST_FAST_IO_MIN_SHM_KB" ]; then
+        echo "[WARN] TEST_FAST_IO auto-disabled: /dev/shm has ${TEST_SHM_AVAIL_KB:-0} KB available (< ${TEST_FAST_IO_MIN_SHM_KB} KB)."
+        TEST_FAST_IO=0
+    fi
+fi
+
 if [ "$TEST_JOBS" -eq 0 ]; then
     DETECTED_JOBS=4
     if command -v nproc >/dev/null 2>&1; then
@@ -294,6 +324,13 @@ if [ "$TEST_JOBS" -eq 0 ]; then
     TEST_JOBS=$((DETECTED_JOBS * TEST_JOBS_SCALE))
     if [ "$TEST_JOBS" -lt 12 ]; then TEST_JOBS=12; fi
     if [ "$TEST_JOBS" -gt 64 ]; then TEST_JOBS=64; fi
+fi
+if [ "$TEST_JOBS_EXPLICIT" -eq 0 ] && is_container_env; then
+    CONTAINER_TEST_JOBS="${BPP_CONTAINER_TEST_JOBS:-4}"
+    if [ "$CONTAINER_TEST_JOBS" -gt 0 ] && [ "$TEST_JOBS" -gt "$CONTAINER_TEST_JOBS" ]; then
+        echo "[WARN] TEST_JOBS capped for container build: $TEST_JOBS -> $CONTAINER_TEST_JOBS."
+        TEST_JOBS="$CONTAINER_TEST_JOBS"
+    fi
 fi
 
 # Use RAM disk for large self-host ASM I/O when available (no build step skipped).

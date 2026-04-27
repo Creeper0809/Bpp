@@ -150,16 +150,51 @@ COMPILE_FAIL_SINGLE_VARIANT=${COMPILE_FAIL_SINGLE_VARIANT:-}
 TEST_SUITE_CASE_LIMIT=${TEST_SUITE_CASE_LIMIT:-}
 STRICT_FAIL_DIAGNOSTICS=${STRICT_FAIL_DIAGNOSTICS:-1}
 TEST_TIMEOUT_SEC=${TEST_TIMEOUT_SEC:-15}
+TEST_FAST_IO_MIN_SHM_KB=${BPP_TEST_FAST_IO_MIN_SHM_KB:-262144}
 FAST_IO_ACTIVE=0
+
+shm_available_kb() {
+    if [ ! -d "/dev/shm" ] || [ ! -w "/dev/shm" ]; then
+        return 1
+    fi
+    df -Pk /dev/shm 2>/dev/null | awk 'NR==2 {print $4}'
+}
+
+compiler_clang_available() {
+    [ -x "/usr/bin/clang" ] || [ -x "/usr/local/bin/clang" ] || [ -x "/bin/clang" ]
+}
+
+selected_tests_need_llvm_build() {
+    local test_file test_name test_label llvm_build_raw
+    for test_file in "${TEST_FILES[@]}"; do
+        test_name="$(basename "$test_file" .bpp)"
+        test_label="${TEST_DISPLAY_NAME[$test_file]:-$test_name}"
+        if [ -n "$TEST_NAME_FILTER" ]; then
+            if [[ ! "$test_label" =~ $TEST_NAME_FILTER ]] && [[ ! "$test_name" =~ $TEST_NAME_FILTER ]]; then
+                continue
+            fi
+        fi
+        llvm_build_raw="$(grep -m1 -E '^// LLVM Build:' "$test_file" | awk -F': ' '{print $2}' | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]' || true)"
+        if [ "$llvm_build_raw" = "1" ] || [ "$llvm_build_raw" = "true" ] || [ "$llvm_build_raw" = "yes" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
 
 BUILD_DIR="$BUILD_DIR_BASE"
 RESULTS_DIR="$RESULTS_DIR_BASE"
-if [ "$TEST_FAST_IO" -eq 1 ] && [ -d "/dev/shm" ] && [ -w "/dev/shm" ]; then
-    WORK_DIR="$(mktemp -d "/dev/shm/bpp_${VERSION}_tests_XXXXXX")"
-    BUILD_DIR="$WORK_DIR/${VERSION}_tests"
-    RESULTS_DIR="$WORK_DIR/test_results"
-    FAST_IO_ACTIVE=1
-    trap 'rm -rf "$WORK_DIR"' EXIT
+if [ "$TEST_FAST_IO" -eq 1 ]; then
+    SHM_AVAIL_KB="$(shm_available_kb || true)"
+    if [ -n "$SHM_AVAIL_KB" ] && [ "$SHM_AVAIL_KB" -ge "$TEST_FAST_IO_MIN_SHM_KB" ]; then
+        WORK_DIR="$(mktemp -d "/dev/shm/bpp_${VERSION}_tests_XXXXXX")"
+        BUILD_DIR="$WORK_DIR/${VERSION}_tests"
+        RESULTS_DIR="$WORK_DIR/test_results"
+        FAST_IO_ACTIVE=1
+        trap 'rm -rf "$WORK_DIR"' EXIT
+    else
+        echo "[WARN] TEST_FAST_IO disabled: /dev/shm has ${SHM_AVAIL_KB:-0} KB available (< ${TEST_FAST_IO_MIN_SHM_KB} KB)."
+    fi
 fi
 
 persist_result_file() {
@@ -1051,6 +1086,11 @@ done
 
 if [ "${#TEST_FILES[@]}" -eq 0 ]; then
     echo "No test files found in $TEST_DIR or $TEST_FAIL_DIR"
+    exit 1
+fi
+if selected_tests_need_llvm_build && ! compiler_clang_available; then
+    echo "Error: LLVM build tests require clang at /usr/bin/clang, /usr/local/bin/clang, or /bin/clang."
+    echo "       Install clang or filter out tests with '// LLVM Build: true'."
     exit 1
 fi
 
