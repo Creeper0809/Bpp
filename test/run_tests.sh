@@ -128,6 +128,7 @@ if [ ! -x "$COMPILER" ]; then
     echo "Error: Compiler not found or not executable: $COMPILER"
     exit 1
 fi
+COMPILER="$(cd "$(dirname "$COMPILER")" && pwd)/$(basename "$COMPILER")"
 
 VERSION="$(derive_version_label "$COMPILER")"
 TEST_DIR="test/source"
@@ -135,6 +136,7 @@ TEST_FAIL_DIR="test/source_fail"
 IR_TEST_DIR="test/ir"
 BUILD_DIR_BASE="build/${VERSION}_tests"
 RESULTS_DIR_BASE="build/test_results"
+LLVM_ARTIFACT_DIR_BASE="build/${VERSION}_llvm"
 
 TEST_FAST_IO=${TEST_FAST_IO:-0}
 TEST_QUIET=${TEST_QUIET:-0}
@@ -167,6 +169,30 @@ persist_result_file() {
         mkdir -p "$(dirname "$dst")"
         cp "$src" "$dst"
     fi
+}
+
+cleanup_llvm_build_artifacts() {
+    local out_file="$1"
+    local artifact_dir="$2"
+    local test_name="$3"
+    local artifact_path
+
+    if [ -f "$out_file" ]; then
+        while IFS= read -r artifact_path; do
+            [ -n "$artifact_path" ] || continue
+            case "$artifact_path" in
+                /*) rm -f "$artifact_path" ;;
+                *) rm -f "$artifact_dir/$artifact_path" ;;
+            esac
+        done < <(sed -n 's/^\[OK\] llvm \(ll\|obj\|exe\): //p' "$out_file")
+    fi
+
+    rm -f \
+        "$artifact_dir/${test_name}.ll" \
+        "$artifact_dir/${test_name}.llvm.o" \
+        "$artifact_dir/${test_name}.llvm.obj" \
+        "$artifact_dir/${test_name}.llvm.out" \
+        "$artifact_dir/${test_name}.llvm.exe"
 }
 
 prepare_test_stdin_file() {
@@ -433,7 +459,9 @@ CASE_RESULT_FILES=()
 IR_RESULT_FILES=()
 LLVM_RESULT_FILES=()
 SUITE_CASES_DIR="$ROOT_DIR/build/${VERSION}_suite_cases/$RUN_TAG"
+LLVM_ARTIFACT_DIR="$ROOT_DIR/$LLVM_ARTIFACT_DIR_BASE/$RUN_TAG"
 mkdir -p "$SUITE_CASES_DIR"
+mkdir -p "$LLVM_ARTIFACT_DIR"
 
 launch_job_with_limit() {
     while [ "$(jobs -rp | wc -l)" -ge "$TEST_JOBS" ]; do
@@ -855,6 +883,13 @@ run_llvm_case() {
     local out_file_persist="$RESULTS_DIR_BASE/${test_name}.llvm.out"
     local err_file_persist="$RESULTS_DIR_BASE/${test_name}.llvm.err"
     local program_out_file_persist="$RESULTS_DIR_BASE/${test_name}.llvm.program.out"
+    local test_file_abs="$test_file"
+    case "$test_file_abs" in
+        /*) ;;
+        *) test_file_abs="$ROOT_DIR/$test_file_abs" ;;
+    esac
+    local llvm_case_dir="$LLVM_ARTIFACT_DIR"
+    mkdir -p "$llvm_case_dir"
 
     rm -f "$out_file" "$err_file" "$program_out_file"
 
@@ -864,9 +899,9 @@ run_llvm_case() {
         read -r -a compiler_extra_args < "$compiler_args_file"
     fi
     if [ -n "$stdin_file" ]; then
-        $COMPILER "${compiler_extra_args[@]}" -llvm-build "$test_file" <"$stdin_file" >"$out_file" 2>"$err_file"
+        (cd "$llvm_case_dir" && "$COMPILER" "${compiler_extra_args[@]}" -llvm-build "$test_file_abs") <"$stdin_file" >"$out_file" 2>"$err_file"
     else
-        $COMPILER "${compiler_extra_args[@]}" -llvm-build "$test_file" >"$out_file" 2>"$err_file"
+        (cd "$llvm_case_dir" && "$COMPILER" "${compiler_extra_args[@]}" -llvm-build "$test_file_abs") >"$out_file" 2>"$err_file"
     fi
     llvm_exit="$?"
     if [ "$llvm_exit" -ne 0 ]; then
@@ -882,16 +917,23 @@ run_llvm_case() {
     else
         local ll_path
         ll_path="$(sed -n 's/^\[OK\] llvm ll: //p' "$out_file" | tail -n 1)"
+        local ll_path_abs="$ll_path"
+        if [ -n "$ll_path_abs" ]; then
+            case "$ll_path_abs" in
+                /*) ;;
+                *) ll_path_abs="$llvm_case_dir/$ll_path_abs" ;;
+            esac
+        fi
         local missing_metadata_pat=""
         if [ -n "$expect_llvm_metadata_file" ] && [ -f "$expect_llvm_metadata_file" ]; then
-            if [ -z "$ll_path" ] || [ ! -f "$ll_path" ]; then
+            if [ -z "$ll_path_abs" ] || [ ! -f "$ll_path_abs" ]; then
                 missing_metadata_pat="<missing llvm ll output>"
             else
                 while IFS= read -r pat || [ -n "$pat" ]; do
                     if [ -z "$pat" ]; then
                         continue
                     fi
-                    if ! grep -Fq "$pat" "$ll_path"; then
+                    if ! grep -Fq "$pat" "$ll_path_abs"; then
                         missing_metadata_pat="$pat"
                         break
                     fi
@@ -957,6 +999,7 @@ run_llvm_case() {
     fi
 
     if [ "$KEEP_TEST_ARTIFACTS" -eq 0 ]; then
+        cleanup_llvm_build_artifacts "$out_file" "$llvm_case_dir" "$test_name"
         rm -f "$out_file" "$err_file" "$program_out_file"
     fi
 
@@ -1273,12 +1316,14 @@ echo ""
 if [ $FAILED -eq 0 ]; then
     if [ "$KEEP_TEST_ARTIFACTS" -eq 0 ]; then
         rm -rf "$SUITE_CASES_DIR"
+        rm -rf "$LLVM_ARTIFACT_DIR"
     fi
     echo -e "${GREEN}All tests passed!${NC}"
     exit 0
 else
     if [ "$KEEP_TEST_ARTIFACTS" -eq 0 ]; then
         rm -rf "$SUITE_CASES_DIR"
+        rm -rf "$LLVM_ARTIFACT_DIR"
     fi
     echo -e "${RED}Some tests failed.${NC}"
     exit 1
