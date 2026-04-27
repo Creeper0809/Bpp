@@ -1229,12 +1229,12 @@ struct 상속 → trait 정의 → impl → VTable 생성 → 다형성
   - **배경**: v3에서 레지스터 할당 복잡도로 제거, v4.5+에서 재설계
   - 참조: v4_roadmap.md 보안 섹션
 
-- [ ] **프로퍼티 훅** (v3에서 제거된 기능)
-  - [ ] @[getter], @[setter] 속성
-  - [ ] 필드 접근 시 자동 함수 호출
+- [ ] **프로퍼티 확장** (현재 `property(...)` 기반 기능의 후속 작업)
+  - [ ] 필드 접근 시 자동 함수 호출 고도화
   - [ ] lazy evaluation, validation 지원
-  - DoD: C# 스타일 프로퍼티 구현
-  - **배경**: v3에서 복잡도로 제거, v4.5+에서 재평가
+  - [ ] property 전용 진단/툴링 개선
+  - DoD: C# 스타일 프로퍼티 경험 강화
+  - **배경**: 기본 property hook은 복원되었고, 이후 확장 방향을 재평가
 
 - [ ] **고급 암호/알고리즘 Intrinsics (v4.5+)**
   - [ ] Multi-precision 연산 (mpadd_u256, mpmul_u256)

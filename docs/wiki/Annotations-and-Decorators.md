@@ -6,6 +6,9 @@
 
 - 단순 메타 태그가 아니라, 컴파일러 pass에서 의미를 해석해 동작을 바꾸기 위한 확장 지점입니다.
 - `override`/`entry`/decorator 같은 규칙성 있는 기능을 일관된 표기로 제공하기 위해 존재합니다.
+- Bpp 관점에서 annotation은 장식이 아니라 declaration-level contract surface입니다.
+  - decorator는 선언 변환 계약
+  - metadata는 분석/제약/도구 계약
 
 ## How to Use
 
@@ -94,6 +97,46 @@ func <decorator>(next: u64, <target-params...>) -> <target-ret>
 3. 대상 함수 위에 `@[decorator_name]` 부여
 4. 다중 decorator면 적용 순서(아래->위) 의도 확인
 
+## Composition Rules (v11)
+
+현재 구현에서 합성 규칙은 다음 순서로 이해하는 것이 가장 정확합니다.
+
+1. `property(...)`는 field/member access contract로 먼저 확정됩니다.
+   - property는 annotation이 아니며, field declaration에서 직접 해석됩니다.
+   - manual getter/setter로 연결된 함수가 decorator를 가지더라도, property hook은 최종 public wrapper 이름을 통해 계속 접근됩니다.
+2. built-in annotation(`@[entry]`, `@[override]`)은 decorator 후보가 아닙니다.
+   - built-in annotation은 먼저 validation되고, decorator 수집에서는 제외됩니다.
+3. multiple decorator는 아래에서 위로 적용됩니다.
+   - 함수에 더 가까운 annotation이 inner wrapper가 됩니다.
+   - 맨 위 annotation이 최종 public surface를 감싸는 outer wrapper가 됩니다.
+4. impl method에 붙은 decorator는 최종 public wrapper에 impl metadata를 유지합니다.
+   - 따라서 decorated override/magic method도 method lookup과 override contract를 잃지 않습니다.
+5. `@[entry]`와 decorator를 함께 쓰면, entry target은 최종 public wrapper surface를 가리킵니다.
+   - 즉 entry function도 decorator를 통해 감싸진 최종 실행 경로로 진입합니다.
+6. annotation expansion 뒤에는 contract preservation pass가 다시 한 번 실행됩니다.
+   - generated wrapper/original function이 module ownership을 잃지 않았는지
+   - wrapper body의 direct call이 여전히 resolvable한지
+   - final entry surface가 callable zero-arg 함수로 남아 있는지
+   - complexity surface metadata가 parseable한 상태로 final public surface에 남아 있는지
+   를 확인합니다.
+7. SSA/codegen 직전에도 generated contract function을 한 번 더 검증합니다.
+   - direct `call`
+   - direct `call_slice_store`
+   - `lea_func` function reference
+   가 여전히 유효한 symbol target을 가리키는지 확인합니다.
+8. complexity-family annotation이 붙은 final callable surface는 SSA summary로 다시 검증됩니다.
+9. 이 재검증은 현재 `time`과 `space` rank를 포함하며, wrapper surface에서 더 무거워진 계약은 preservation 오류가 납니다.
+10. 관련 diagnostics는 shared contract-surface metadata를 사용해 function/module/surface kind/contract family와 declared/budget rank를 같은 형식으로 출력합니다.
+   - declared `complexity.time`
+   - `complexity_budget.time`
+   - missing SSA summary
+   를 contract preservation 관점에서 다시 확인합니다.
+11. backend 직전에는 lowered contract boundary verifier가 한 번 더 실행됩니다.
+   - module ownership
+   - std/prelude module ownership
+   - final SSA complexity summary
+   를 확인한 뒤 backend emission으로 넘어갑니다.
+
 ### Invalid Examples
 
 ```bpp
@@ -146,3 +189,4 @@ func f(x: u64) -> u64 { return x; }
 - 어노테이션 네이밍 규칙(예: `meta_*`, `deco_*`)을 팀 규약으로 고정합니다.
 - entry 함수는 별도 파일/섹션에 분리해 가독성을 확보합니다.
 - decorator 도입 시 성공/실패 케이스 테스트를 함께 추가합니다.
+- contract가 함께 붙는 경우에는 apply order를 주석이나 테스트로 고정하는 편이 좋습니다.

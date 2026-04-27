@@ -1,0 +1,560 @@
+// llvm_lower_ssa.b - Scaffold for future SSA -> LLVM lowering
+
+import std.vec;
+import std.str;
+import ast;
+import types;
+import compiler.annotations;
+import emitter.typeinfo;
+import llvm.contract_types;
+import ssa;
+import ssa.datastruct;
+import ssa.core;
+import run as to_ssa from ssa.mem2reg;
+
+struct LLVMSSALoweringOptions {
+    public preserve_contract_metadata: u64;
+    public emit_named_metadata: u64;
+    public emit_function_skeletons: u64;
+}
+
+impl LLVMSSALoweringOptions {
+    public constructor() {
+        self.preserve_contract_metadata = 1;
+        self.emit_named_metadata = 1;
+        self.emit_function_skeletons = 1;
+    }
+}
+
+struct LLVMSSAFuncSketch {
+    public fn_id: u64;
+    public name_ptr: u64;
+    public name_len: u64;
+    public has_body: u64;
+    public param_count: u64;
+    public block_count: u64;
+    public phi_count: u64;
+    public inst_count: u64;
+    public entry_block_id: u64;
+    public terminator_op: u64;
+    public ast_ret_type: u64;
+    public ast_ret_ptr_depth: u64;
+    public zero_arg_nonvariadic: u64;
+    public supported_ret_type: u64;
+    public supported_param_types: u64;
+    public ll_body_param_types: u64;
+    public blocks: *Vec<*LLVMSSABlockSketch>;
+}
+
+impl LLVMSSAFuncSketch {
+    public constructor() {
+        self.fn_id = 0;
+        self.name_ptr = 0;
+        self.name_len = 0;
+        self.has_body = 0;
+        self.param_count = 0;
+        self.block_count = 0;
+        self.phi_count = 0;
+        self.inst_count = 0;
+        self.entry_block_id = 0;
+        self.terminator_op = 0;
+        self.ast_ret_type = 0;
+        self.ast_ret_ptr_depth = 0;
+        self.zero_arg_nonvariadic = 0;
+        self.supported_ret_type = 0;
+        self.supported_param_types = 0;
+        self.ll_body_param_types = 0;
+        self.blocks = 0;
+    }
+}
+
+struct LLVMSSAInstSketch {
+    public op: u64;
+    public dest: u64;
+    public has_src1: u64;
+    public src1_is_const: u64;
+    public src1_value: u64;
+    public has_src2: u64;
+    public src2_is_const: u64;
+    public src2_value: u64;
+    public phi_args: *Vec<*LLVMSSAPhiArgSketch>;
+}
+
+impl LLVMSSAInstSketch {
+    public constructor() {
+        self.op = 0;
+        self.dest = 0;
+        self.has_src1 = 0;
+        self.src1_is_const = 0;
+        self.src1_value = 0;
+        self.has_src2 = 0;
+        self.src2_is_const = 0;
+        self.src2_value = 0;
+        self.phi_args = 0;
+    }
+}
+
+struct LLVMSSAPhiArgSketch {
+    public val: u64;
+    public block_id: u64;
+}
+
+impl LLVMSSAPhiArgSketch {
+    public constructor() {
+        self.val = 0;
+        self.block_id = 0;
+    }
+}
+
+struct LLVMSSABlockSketch {
+    public id: u64;
+    public is_entry: u64;
+    public phi_count: u64;
+    public inst_count: u64;
+    public terminator_op: u64;
+    public insts: *Vec<*LLVMSSAInstSketch>;
+}
+
+impl LLVMSSABlockSketch {
+    public constructor() {
+        self.id = 0;
+        self.is_entry = 0;
+        self.phi_count = 0;
+        self.inst_count = 0;
+        self.terminator_op = 0;
+        self.insts = 0;
+    }
+}
+
+struct LLVMSSAModuleSketch {
+    public funcs: *Vec<*LLVMSSAFuncSketch>;
+    public contract_atoms: *Vec<*AnnLLVMContractAtom>;
+    public source_program: *AstProgram;
+    public source_ssa: *SSAContext;
+}
+
+impl LLVMSSAModuleSketch {
+    public constructor() {
+        self.funcs = 0;
+        self.contract_atoms = 0;
+        self.source_program = 0;
+        self.source_ssa = 0;
+    }
+}
+
+func llvm_ssa_find_ast_func(program: *AstProgram, name: []u8) -> *AstFunc {
+    if (program == 0 || program.funcs_vec == 0 || name.ptr == 0 || name.len == 0) { return 0; }
+    var n: u64 = program.funcs_vec.len();
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var fn: *AstFunc = program.funcs_vec.get(i);
+        if (fn == 0 || fn.name_ptr == 0 || fn.name_len != name.len) { continue; }
+        if (str_eq(slice(fn.name_ptr, fn.name_len), slice(name.ptr, name.len)) != 0) { return fn; }
+    }
+    return 0;
+}
+
+func llvm_ssa_count_block_phis(block: *SSABlock) -> u64 {
+    if (block == 0) { return 0; }
+    var count: u64 = 0;
+    var cur: *SSAInstruction = block.phi_head;
+    while (cur != 0) {
+        count = count + 1;
+        cur = cur.next;
+    }
+    return count;
+}
+
+func llvm_ssa_count_block_insts(block: *SSABlock) -> u64 {
+    if (block == 0) { return 0; }
+    var count: u64 = 0;
+    var cur: *SSAInstruction = block.inst_head;
+    while (cur != 0) {
+        count = count + 1;
+        cur = cur.next;
+    }
+    return count;
+}
+
+func llvm_ssa_block_terminator_op(block: *SSABlock) -> u64 {
+    if (block == 0 || block.inst_tail == 0) { return 0; }
+    return op_of(block.inst_tail);
+}
+
+func llvm_ssa_inst_to_sketch(inst: *SSAInstruction) -> *LLVMSSAInstSketch {
+    if (inst == 0) { return 0; }
+    var out: *LLVMSSAInstSketch = new LLVMSSAInstSketch{};
+    out.op = op_of(inst);
+    out.dest = inst.dest;
+    if (out.op == SSA_OP_PHI) {
+        var phi_args: *Vec<*LLVMSSAPhiArgSketch> = new Vec<*LLVMSSAPhiArgSketch>{heap_alloc((4) * sizeof(*LLVMSSAPhiArgSketch)), 0, (4)};
+        var phi_arg: *SSAPhiArg = (*SSAPhiArg)inst.src1;
+        while (phi_arg != 0) {
+            var arg_sketch: *LLVMSSAPhiArgSketch = new LLVMSSAPhiArgSketch{};
+            arg_sketch.val = phi_arg.val;
+            arg_sketch.block_id = phi_arg.block_id;
+            phi_args.push(arg_sketch);
+            phi_arg = phi_arg.next;
+        }
+        out.phi_args = phi_args;
+        return out;
+    }
+    if (inst.src1 != 0) {
+        out.has_src1 = 1;
+        out.src1_is_const = operand_is_const(inst.src1);
+        out.src1_value = operand_value(inst.src1);
+    }
+    if (inst.src2 != 0) {
+        out.has_src2 = 1;
+        out.src2_is_const = operand_is_const(inst.src2);
+        out.src2_value = operand_value(inst.src2);
+    }
+    return out;
+}
+
+func llvm_ssa_block_to_sketch(block: *SSABlock, is_entry: u64) -> *LLVMSSABlockSketch {
+    if (block == 0) { return 0; }
+    var out: *LLVMSSABlockSketch = new LLVMSSABlockSketch{};
+    out.id = block.id;
+    out.is_entry = is_entry;
+    out.phi_count = llvm_ssa_count_block_phis(block);
+    out.inst_count = llvm_ssa_count_block_insts(block);
+    out.terminator_op = llvm_ssa_block_terminator_op(block);
+    var insts: *Vec<*LLVMSSAInstSketch> = new Vec<*LLVMSSAInstSketch>{heap_alloc((32) * sizeof(*LLVMSSAInstSketch)), 0, (32)};
+    var phi_cur: *SSAInstruction = block.phi_head;
+    while (phi_cur != 0) {
+        var phi_sketch: *LLVMSSAInstSketch = llvm_ssa_inst_to_sketch(phi_cur);
+        if (phi_sketch != 0) { insts.push(phi_sketch); }
+        phi_cur = phi_cur.next;
+    }
+    var cur: *SSAInstruction = block.inst_head;
+    while (cur != 0) {
+        var inst_sketch: *LLVMSSAInstSketch = llvm_ssa_inst_to_sketch(cur);
+        if (inst_sketch != 0) { insts.push(inst_sketch); }
+        cur = cur.next;
+    }
+    out.insts = insts;
+    return out;
+}
+
+func llvm_ssa_ast_zero_arg_nonvariadic(fn: *AstFunc) -> u64 {
+    if (fn == 0) { return 0; }
+    if (fn.params_vec == 0 || fn.params_vec.len() == 0) { return 1; }
+    return 0;
+}
+
+func llvm_ssa_type_supported_for_sig(type_kind: u64, ptr_depth: u64) -> u64 {
+    if (ptr_depth > 0) { return 1; }
+    match (type_kind) {
+        case TYPE_VOID: return 1;
+        case TYPE_BOOL: return 1;
+        case TYPE_U8: return 1;
+        case TYPE_I8: return 1;
+        case TYPE_U16: return 1;
+        case TYPE_I16: return 1;
+        case TYPE_U32: return 1;
+        case TYPE_I32: return 1;
+        case TYPE_U64: return 1;
+        case TYPE_I64: return 1;
+        case TYPE_F64: return 1;
+    }
+    return 0;
+}
+
+func llvm_ssa_ast_param_sig_supported(param: *Param) -> u64 {
+    if (param == 0 || param.is_variadic != 0) { return 0; }
+    if (param.type_kind == TYPE_STRUCT && param.ptr_depth == 0) { return 1; }
+    if (param.type_kind == TYPE_SLICE && param.ptr_depth == 0) { return 1; }
+    if (param.type_kind == TYPE_ARRAY && param.ptr_depth == 0) { return 1; }
+    return llvm_ssa_type_supported_for_sig(param.type_kind, param.ptr_depth);
+}
+
+func llvm_ssa_ast_param_ll_body_supported(param: *Param) -> u64 {
+    if (param == 0 || param.is_variadic != 0) { return 0; }
+    if (param.type_kind == TYPE_STRUCT && param.ptr_depth == 0) { return 1; }
+    if (param.type_kind == TYPE_SLICE && param.ptr_depth == 0) { return 1; }
+    if (param.type_kind == TYPE_ARRAY && param.ptr_depth == 0) { return 1; }
+    if (param.ptr_depth != 0) { return 1; }
+    if (param.type_kind == TYPE_BOOL) { return 1; }
+    if (param.type_kind == TYPE_U8 || param.type_kind == TYPE_I8) { return 1; }
+    if (param.type_kind == TYPE_U16 || param.type_kind == TYPE_I16) { return 1; }
+    if (param.type_kind == TYPE_U32 || param.type_kind == TYPE_I32) { return 1; }
+    if (param.type_kind == TYPE_U64 || param.type_kind == TYPE_I64) { return 1; }
+    if (param.type_kind == TYPE_F64) { return 1; }
+    return 0;
+}
+
+func llvm_ssa_ast_supported_param_types(fn: *AstFunc) -> u64 {
+    if (fn == 0) { return 0; }
+    if (fn.params_vec == 0) { return 1; }
+    var n: u64 = fn.params_vec.len();
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        if (llvm_ssa_ast_param_sig_supported(fn.params_vec.get(i)) == 0) { return 0; }
+    }
+    return 1;
+}
+
+func llvm_ssa_ast_ll_body_param_types(fn: *AstFunc) -> u64 {
+    if (fn == 0) { return 0; }
+    if (fn.params_vec == 0) { return 1; }
+    var n: u64 = fn.params_vec.len();
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        if (llvm_ssa_ast_param_ll_body_supported(fn.params_vec.get(i)) == 0) { return 0; }
+    }
+    return 1;
+}
+
+func llvm_ssa_ast_ll_body_supported_ret_type(fn: *AstFunc) -> u64 {
+    if (fn == 0) { return 0; }
+    if (fn.ret_ptr_depth != 0) { return 1; }
+    if (fn.ret_type == TYPE_SLICE) { return 1; }
+    if (fn.ret_type == TYPE_STRUCT) { return 1; }
+    if (fn.ret_type == TYPE_VOID) { return 1; }
+    if (fn.ret_type == TYPE_BOOL) { return 1; }
+    if (fn.ret_type == TYPE_U8 || fn.ret_type == TYPE_I8) { return 1; }
+    if (fn.ret_type == TYPE_U16 || fn.ret_type == TYPE_I16) { return 1; }
+    if (fn.ret_type == TYPE_U32 || fn.ret_type == TYPE_I32) { return 1; }
+    if (fn.ret_type == TYPE_U64 || fn.ret_type == TYPE_I64) { return 1; }
+    if (fn.ret_type == TYPE_F64) { return 1; }
+    return 0;
+}
+
+func llvm_ssa_ast_supported_ret_type(fn: *AstFunc) -> u64 {
+    if (fn == 0) { return 0; }
+    if (fn.ret_ptr_depth > 0) { return 1; }
+    if (fn.ret_type == TYPE_SLICE) { return 1; }
+    if (fn.ret_type == TYPE_STRUCT) { return 1; }
+    match (fn.ret_type) {
+        case TYPE_VOID: return 1;
+        case TYPE_BOOL: return 1;
+        case TYPE_U8: return 1;
+        case TYPE_I8: return 1;
+        case TYPE_U16: return 1;
+        case TYPE_I16: return 1;
+        case TYPE_U32: return 1;
+        case TYPE_I32: return 1;
+        case TYPE_U64: return 1;
+        case TYPE_I64: return 1;
+        case TYPE_F64: return 1;
+    }
+    return 0;
+}
+
+func llvm_ssa_collect_module_sketch(program: *AstProgram, ssa_ctx: *SSAContext, adapter: *AnnLLVMContractAdapter, opts: *LLVMSSALoweringOptions) -> *LLVMSSAModuleSketch {
+    if (program == 0) { return 0; }
+    var out: *LLVMSSAModuleSketch = new LLVMSSAModuleSketch{};
+    out.source_program = program;
+    out.source_ssa = ssa_ctx;
+
+    var funcs: *Vec<*LLVMSSAFuncSketch> = new Vec<*LLVMSSAFuncSketch>{heap_alloc((32) * sizeof(*LLVMSSAFuncSketch)), 0, (32)};
+    if (ssa_ctx != 0) {
+        var ssa_funcs: []*SSAFunction = ssa_ctx.funcs;
+        var n_ssa: u64 = slice_len(ssa_funcs);
+        for (var i_ssa: u64 = 0; i_ssa < n_ssa; i_ssa = i_ssa + 1) {
+            var ssa_fn: *SSAFunction = ssa_funcs[i_ssa];
+            if (ssa_fn == 0 || ssa_fn.name_ptr == 0 || ssa_fn.name_len == 0) { continue; }
+            var sketch: *LLVMSSAFuncSketch = new LLVMSSAFuncSketch{};
+            sketch.fn_id = ssa_fn.id;
+            sketch.name_ptr = ssa_fn.name_ptr;
+            sketch.name_len = ssa_fn.name_len;
+            if (ssa_fn.entry != 0) { sketch.entry_block_id = ssa_fn.entry.id; }
+            var blocks: []*SSABlock = ssa_fn.blocks;
+            sketch.block_count = slice_len(blocks);
+            var block_sketches: *Vec<*LLVMSSABlockSketch> = new Vec<*LLVMSSABlockSketch>{heap_alloc((sketch.block_count + 4) * sizeof(*LLVMSSABlockSketch)), 0, (sketch.block_count + 4)};
+            for (var bi: u64 = 0; bi < sketch.block_count; bi = bi + 1) {
+                var block: *SSABlock = blocks[bi];
+                if (block == 0) { continue; }
+                sketch.phi_count = sketch.phi_count + llvm_ssa_count_block_phis(block);
+                sketch.inst_count = sketch.inst_count + llvm_ssa_count_block_insts(block);
+                if (block == ssa_fn.entry || sketch.terminator_op == 0) {
+                    var term_op: u64 = llvm_ssa_block_terminator_op(block);
+                    if (term_op != 0) { sketch.terminator_op = term_op; }
+                }
+                var block_sketch: *LLVMSSABlockSketch = llvm_ssa_block_to_sketch(block, (block == ssa_fn.entry));
+                if (block_sketch != 0) { block_sketches.push(block_sketch); }
+            }
+            sketch.blocks = block_sketches;
+            if (sketch.phi_count != 0 || sketch.inst_count != 0) { sketch.has_body = 1; }
+            var ast_fn: *AstFunc = llvm_ssa_find_ast_func(program, slice(ssa_fn.name_ptr, ssa_fn.name_len));
+            if (ast_fn != 0) {
+                sketch.ast_ret_type = ast_fn.ret_type;
+                sketch.ast_ret_ptr_depth = ast_fn.ret_ptr_depth;
+                if (ast_fn.params_vec != 0) { sketch.param_count = ast_fn.params_vec.len(); }
+                sketch.zero_arg_nonvariadic = llvm_ssa_ast_zero_arg_nonvariadic(ast_fn);
+                sketch.supported_ret_type = llvm_ssa_ast_supported_ret_type(ast_fn);
+                sketch.supported_param_types = llvm_ssa_ast_supported_param_types(ast_fn);
+                sketch.ll_body_param_types = llvm_ssa_ast_ll_body_param_types(ast_fn);
+                if (ast_fn.body != 0) { sketch.has_body = 1; }
+            }
+            funcs.push(sketch);
+        }
+    } else if (program.funcs_vec != 0) {
+        var n: u64 = program.funcs_vec.len();
+        for (var i: u64 = 0; i < n; i = i + 1) {
+            var fn: *AstFunc = program.funcs_vec.get(i);
+            if (fn == 0 || fn.name_ptr == 0 || fn.name_len == 0) { continue; }
+            var sketch_fallback: *LLVMSSAFuncSketch = new LLVMSSAFuncSketch{};
+            sketch_fallback.name_ptr = fn.name_ptr;
+            sketch_fallback.name_len = fn.name_len;
+            sketch_fallback.ast_ret_type = fn.ret_type;
+            sketch_fallback.ast_ret_ptr_depth = fn.ret_ptr_depth;
+            if (fn.params_vec != 0) { sketch_fallback.param_count = fn.params_vec.len(); }
+            sketch_fallback.zero_arg_nonvariadic = llvm_ssa_ast_zero_arg_nonvariadic(fn);
+            sketch_fallback.supported_ret_type = llvm_ssa_ast_supported_ret_type(fn);
+            sketch_fallback.supported_param_types = llvm_ssa_ast_supported_param_types(fn);
+            sketch_fallback.ll_body_param_types = llvm_ssa_ast_ll_body_param_types(fn);
+            if (fn.body != 0) { sketch_fallback.has_body = 1; }
+            sketch_fallback.blocks = new Vec<*LLVMSSABlockSketch>{heap_alloc((4) * sizeof(*LLVMSSABlockSketch)), 0, (4)};
+            funcs.push(sketch_fallback);
+        }
+    }
+    out.funcs = funcs;
+
+    if (opts != 0 && opts.preserve_contract_metadata != 0 && adapter != 0) {
+        out.contract_atoms = adapter.atoms;
+    }
+    return out;
+}
+
+func llvm_ssa_collect_module_sketch_from_program(program: *AstProgram, adapter: *AnnLLVMContractAdapter, opts: *LLVMSSALoweringOptions) -> *LLVMSSAModuleSketch {
+    if (program == 0) { return 0; }
+    typeinfo_set_structs(program.structs_vec);
+    typeinfo_set_funcs(program.funcs_vec);
+    ssa_builder_diag_suppress_set(1);
+    var ssa_ctx: *SSAContext = build_program(program);
+    to_ssa(ssa_ctx);
+    ssa_builder_diag_suppress_set(0);
+    return llvm_ssa_collect_module_sketch(program, ssa_ctx, adapter, opts);
+}
+
+func llvm_ssa_find_func_sketch(module: *LLVMSSAModuleSketch, name: []u8) -> *LLVMSSAFuncSketch {
+    if (module == 0 || module.funcs == 0 || name.ptr == 0 || name.len == 0) { return 0; }
+    var n: u64 = module.funcs.len();
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var sketch: *LLVMSSAFuncSketch = module.funcs.get(i);
+        if (sketch == 0 || sketch.name_ptr == 0 || sketch.name_len != name.len) { continue; }
+        if (str_eq(slice(sketch.name_ptr, sketch.name_len), slice(name.ptr, name.len)) != 0) { return sketch; }
+    }
+    return 0;
+}
+
+func llvm_ssa_validate_module_sketch(module: *LLVMSSAModuleSketch) -> u64 {
+    if (module == 0 || module.source_program == 0) { return 0; }
+    if (module.funcs == 0) { return 1; }
+    var n: u64 = module.funcs.len();
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var sketch: *LLVMSSAFuncSketch = module.funcs.get(i);
+        if (sketch == 0) { continue; }
+        if (sketch.name_ptr == 0 || sketch.name_len == 0) { return 0; }
+        if (module.source_ssa != 0 && sketch.block_count == 0) { return 0; }
+    }
+    return 1;
+}
+
+func llvm_ssa_contract_atom_count(module: *LLVMSSAModuleSketch) -> u64 {
+    if (module == 0 || module.contract_atoms == 0) { return 0; }
+    return module.contract_atoms.len();
+}
+
+func llvm_ssa_op_supported_for_ll(op: u64) -> u64 {
+    if (op == SSA_OP_NOP) { return 1; }
+    if (op == SSA_OP_PHI) { return 1; }
+    if (op == SSA_OP_CONST) { return 1; }
+    if (op == SSA_OP_FCONST) { return 1; }
+    if (op == SSA_OP_COPY) { return 1; }
+    if (op == SSA_OP_LOAD) { return 1; }
+    if (op == SSA_OP_STORE) { return 1; }
+    if (op == SSA_OP_PARAM) { return 1; }
+    if (op == SSA_OP_CALL) { return 1; }
+    if (op == SSA_OP_ADD) { return 1; }
+    if (op == SSA_OP_SUB) { return 1; }
+    if (op == SSA_OP_MUL) { return 1; }
+    if (op == SSA_OP_DIV) { return 1; }
+    if (op == SSA_OP_UDIV) { return 1; }
+    if (op == SSA_OP_MOD) { return 1; }
+    if (op == SSA_OP_UMOD) { return 1; }
+    if (op == SSA_OP_AND) { return 1; }
+    if (op == SSA_OP_OR) { return 1; }
+    if (op == SSA_OP_XOR) { return 1; }
+    if (op == SSA_OP_SHL) { return 1; }
+    if (op == SSA_OP_SHR) { return 1; }
+    if (op == SSA_OP_SAR) { return 1; }
+    if (op == SSA_OP_FADD) { return 1; }
+    if (op == SSA_OP_FSUB) { return 1; }
+    if (op == SSA_OP_FMUL) { return 1; }
+    if (op == SSA_OP_FDIV) { return 1; }
+    if (op == SSA_OP_FNEG) { return 1; }
+    if (op == SSA_OP_FEQ) { return 1; }
+    if (op == SSA_OP_FNE) { return 1; }
+    if (op == SSA_OP_FLT) { return 1; }
+    if (op == SSA_OP_FGT) { return 1; }
+    if (op == SSA_OP_FLE) { return 1; }
+    if (op == SSA_OP_FGE) { return 1; }
+    if (op == SSA_OP_I2F) { return 1; }
+    if (op == SSA_OP_U2F) { return 1; }
+    if (op == SSA_OP_F2I) { return 1; }
+    if (op == SSA_OP_F2U) { return 1; }
+    if (op == SSA_OP_EQ) { return 1; }
+    if (op == SSA_OP_NE) { return 1; }
+    if (op == SSA_OP_LT) { return 1; }
+    if (op == SSA_OP_GT) { return 1; }
+    if (op == SSA_OP_LE) { return 1; }
+    if (op == SSA_OP_GE) { return 1; }
+    if (op == SSA_OP_ULT) { return 1; }
+    if (op == SSA_OP_UGT) { return 1; }
+    if (op == SSA_OP_ULE) { return 1; }
+    if (op == SSA_OP_UGE) { return 1; }
+    if (op == SSA_OP_LEA_LOCAL) { return 1; }
+    if (op == SSA_OP_LEA_STR) { return 1; }
+    if (op == SSA_OP_LEA_GLOBAL) { return 1; }
+    if (op == SSA_OP_LEA_FUNC) { return 1; }
+    if (op == SSA_OP_LOAD8) { return 1; }
+    if (op == SSA_OP_LOAD16) { return 1; }
+    if (op == SSA_OP_LOAD32) { return 1; }
+    if (op == SSA_OP_LOAD64) { return 1; }
+    if (op == SSA_OP_STORE8) { return 1; }
+    if (op == SSA_OP_STORE16) { return 1; }
+    if (op == SSA_OP_STORE32) { return 1; }
+    if (op == SSA_OP_STORE64) { return 1; }
+    if (op == SSA_OP_ASM) { return 1; }
+    if (op == SSA_OP_CALL_PTR) { return 1; }
+    if (op == SSA_OP_CALL_SLICE_STORE) { return 1; }
+    if (op == SSA_OP_JMP) { return 1; }
+    if (op == SSA_OP_BR) { return 1; }
+    if (op == SSA_OP_RET) { return 1; }
+    if (op == SSA_OP_RET_SLICE_HEAP) { return 1; }
+    return 0;
+}
+
+func llvm_ssa_block_has_meaningful_ll_inst(block: *LLVMSSABlockSketch) -> u64 {
+    if (block == 0 || block.insts == 0) { return 0; }
+    var n: u64 = block.insts.len();
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var inst: *LLVMSSAInstSketch = block.insts.get(i);
+        if (inst == 0) { continue; }
+        if (inst.op != SSA_OP_NOP) { return 1; }
+    }
+    return 0;
+}
+
+func llvm_ssa_func_supports_ll_body(fn: *AstFunc, sketch: *LLVMSSAFuncSketch) -> u64 {
+    if (fn == 0 || sketch == 0) { return 0; }
+    if (sketch.supported_ret_type == 0 || sketch.supported_param_types == 0) { return 0; }
+    if (llvm_ssa_ast_ll_body_supported_ret_type(fn) == 0) { return 0; }
+    if (sketch.ll_body_param_types == 0) { return 0; }
+    if (sketch.blocks == 0 || sketch.blocks.len() == 0) { return 0; }
+    var nblocks: u64 = sketch.blocks.len();
+    var saw_nonempty: u64 = 0;
+    for (var bi: u64 = 0; bi < nblocks; bi = bi + 1) {
+        var block: *LLVMSSABlockSketch = sketch.blocks.get(bi);
+        if (block == 0) { continue; }
+        if (llvm_ssa_block_has_meaningful_ll_inst(block) == 0) { continue; }
+        saw_nonempty = 1;
+        var n: u64 = block.insts.len();
+        for (var i: u64 = 0; i < n; i = i + 1) {
+            var inst: *LLVMSSAInstSketch = block.insts.get(i);
+            if (inst == 0) { continue; }
+            if (llvm_ssa_op_supported_for_ll(inst.op) == 0) { return 0; }
+        }
+    }
+    return saw_nonempty;
+}

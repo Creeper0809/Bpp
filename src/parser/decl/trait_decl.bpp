@@ -20,11 +20,27 @@ import parser.stmt;
 import parser.decl;
 import parser.decl.generic_decl;
 
+func trait_decl_fail_tok(p: *Parser, tok: *Token, code: u64, msg: u64) -> u64 {
+    end_error_capture();
+    set_error_context(msg, str_len(msg));
+    diag_emit_error_tag("parse", code, msg);
+    diag_emit_token_site(tok);
+    return finalize_parse_error(p);
+}
+
+func trait_decl_fail_name(p: *Parser, tok: *Token, code: u64, msg: u64, name: []u8) -> u64 {
+    end_error_capture();
+    set_error_context(msg, str_len(msg));
+    diag_emit_error_tag("parse", code, msg);
+    diag_emit_token_site(tok);
+    diag_emit_labelled_name("name: ", slice(name.ptr, name.len));
+    return finalize_parse_error(p);
+}
+
 func trait_parse_assoc_decl(p: *Parser, assoc_types: *Vec<*TraitAssocType>) -> u64 {
     consume_tok(p, TOKEN_ALIAS);
     if (peek_kind(p) != TOKEN_IDENTIFIER) {
-        emit_stderr("[ERROR] trait associated type declaration expects identifier\n");
-        panic_here(p, "Syntax error");
+        trait_decl_fail_tok(p, peek_tok(p), "P1620", "trait associated type declaration expects identifier");
     }
     var name_tok: *Token = peek_tok(p);
     consume_tok(p, TOKEN_IDENTIFIER);
@@ -34,14 +50,11 @@ func trait_parse_assoc_decl(p: *Parser, assoc_types: *Vec<*TraitAssocType>) -> u
     for (var i: u64 = 0; i < n; i++) {
         var prev: *TraitAssocType = assoc_types.get(i);
         if (prev == 0) { continue; }
-        if (str_eq(prev.name_ptr, prev.name_len, name_tok.ptr, name_tok.len) != 0) {
-            emit_stderr("[ERROR] duplicate trait associated type declaration: ");
-            emit_stderr_len(name_tok.ptr, name_tok.len);
-            emit_stderr("\n");
-            panic_here(p, "Syntax error");
+        if (str_eq(slice(prev.name_ptr, prev.name_len), slice(name_tok.ptr, name_tok.len)) != 0) {
+            trait_decl_fail_name(p, name_tok, "P1621", "duplicate trait associated type declaration", slice(name_tok.ptr, name_tok.len));
         }
     }
-    var assoc: *TraitAssocType = new TraitAssocType();
+    var assoc: *TraitAssocType = new TraitAssocType{};
     assoc.name_ptr = name_tok.ptr;
     assoc.name_len = name_tok.len;
     assoc_types.push(assoc);
@@ -54,15 +67,14 @@ func trait_parse_method_signature(p: *Parser, mode: u64) -> *AstFunc {
     var name_tok: *Token = peek_tok(p);
     var name_kind: u64 = peek_kind(p);
     if (name_kind != TOKEN_IDENTIFIER) {
-        emit_stderr("[ERROR] Expected trait method name identifier\n");
-        panic_here(p, "Syntax error");
+        trait_decl_fail_tok(p, name_tok, "P1622", "Expected trait method name identifier");
     }
     advance_tok(p);
 
     set_parsing_context(name_tok.ptr, name_tok.len, name_tok.line);
 
     consume_tok(p, TOKEN_LPAREN);
-    var params: *Vec<*Param> = new Vec<*Param>(8);
+    var params: *Vec<*Param> = new Vec<*Param>{heap_alloc((8) * sizeof(*Param)), 0, (8)};
     if (peek_kind(p) != TOKEN_RPAREN) {
         params.push(generic_parse_param(p));
         while (match_tok(p, TOKEN_COMMA)) {
@@ -113,13 +125,16 @@ func trait_parse_method_signature(p: *Parser, mode: u64) -> *AstFunc {
             decl_skip_block(p);
         }
     } else {
-        emit_stderr("[ERROR] trait method must end with ';' or method body\n");
-        panic_here(p, "Syntax error");
+        trait_decl_fail_tok(p, peek_tok(p), "P1623", "trait method must end with ';' or method body");
     }
-    return ast_func_ex(name_tok.ptr, name_tok.len, params, ret_type, ret_ptr_depth, ret_is_tagged, ret_struct_name_ptr, ret_struct_name_len, ret_tag_layout_ptr, ret_tag_layout_len, body);
+    var fn: *AstFunc = ast_func_ex(slice(name_tok.ptr, name_tok.len), params, ret_type, ret_ptr_depth, ret_is_tagged, slice(ret_struct_name_ptr, ret_struct_name_len), slice(ret_tag_layout_ptr, ret_tag_layout_len), body);
+    fn.decl_line = name_tok.line;
+    fn.decl_col = name_tok.col;
+    return fn;
 }
 
 func trait_parse_def(p: *Parser, mode: u64) -> *TraitDef {
+    var annotations: *Vec<*NameInfo> = take_leading_annotations(p);
     consume_tok(p, TOKEN_TRAIT);
 
     var name_tok: *Token = peek_tok(p);
@@ -127,22 +142,50 @@ func trait_parse_def(p: *Parser, mode: u64) -> *TraitDef {
     var name_len: u64 = name_tok.len;
     consume_tok(p, TOKEN_IDENTIFIER);
 
+    var generic_params: *Vec<*GenericParam> = generic_params_any(p);
+    if (generic_params != 0) {
+        type_parser_set_generic_params(p, generic_params);
+    }
+    generic_where_clause(p, generic_params);
+
     consume_tok(p, TOKEN_LBRACE);
 
-    var methods: *Vec<*TraitMethod> = new Vec<*TraitMethod>(8);
-    var assoc_types: *Vec<*TraitAssocType> = new Vec<*TraitAssocType>(2);
+    var methods: *Vec<*TraitMethod> = new Vec<*TraitMethod>{heap_alloc((8) * sizeof(*TraitMethod)), 0, (8)};
+    var assoc_types: *Vec<*TraitAssocType> = new Vec<*TraitAssocType>{heap_alloc((2) * sizeof(*TraitAssocType)), 0, (2)};
     while (peek_kind(p) != TOKEN_RBRACE) {
         if (peek_kind(p) == TOKEN_EOF) { break; }
         if (peek_kind(p) == TOKEN_ALIAS) {
             trait_parse_assoc_decl(p, assoc_types);
             continue;
         }
+
+        var method_access: u64 = ACCESS_PUBLIC;
+        var method_annotations: *Vec<*NameInfo> = 0;
+        while (1) {
+            var mk: u64 = peek_kind(p);
+            if (mk == TOKEN_AT) {
+                var group: *Vec<*NameInfo> = consume_annotation_group(p);
+                method_annotations = annotations_append(method_annotations, group);
+                continue;
+            }
+            if (mk == TOKEN_PUBLIC) { method_access = ACCESS_PUBLIC; advance_tok(p); continue; }
+            if (mk == TOKEN_PRIVATE) { method_access = ACCESS_PRIVATE; advance_tok(p); continue; }
+            if (mk == TOKEN_PROTECTED) { method_access = ACCESS_PROTECTED; advance_tok(p); continue; }
+            break;
+        }
+
         if (peek_kind(p) != TOKEN_FUNC) {
-            emit_stderr("[ERROR] trait block can only contain methods or alias declarations\n");
-            panic_here(p, "Syntax error");
+            trait_decl_fail_tok(p, peek_tok(p), "P1624", "trait block can only contain methods or alias declarations");
         }
         var sig: *AstFunc = trait_parse_method_signature(p, mode);
-        var tm: *TraitMethod = new TraitMethod();
+        if (method_annotations != 0) {
+            if (sig.annotations_vec == 0) {
+                sig.annotations_vec = method_annotations;
+            } else {
+                sig.annotations_vec = annotations_append(sig.annotations_vec, method_annotations);
+            }
+        }
+        var tm: *TraitMethod = new TraitMethod{};
         tm.name_ptr = sig.name_ptr;
         tm.name_len = sig.name_len;
         tm.sig = sig;
@@ -152,7 +195,11 @@ func trait_parse_def(p: *Parser, mode: u64) -> *TraitDef {
 
     consume_tok(p, TOKEN_RBRACE);
 
-    var td: *TraitDef = new TraitDef();
+    if (generic_params != 0) {
+        type_parser_clear_generic_params(p);
+    }
+
+    var td: *TraitDef = new TraitDef{};
     td.name_ptr = name_ptr;
     td.name_len = name_len;
     td.methods_vec = methods;

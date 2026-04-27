@@ -334,16 +334,17 @@ if [ -n "$BASE_BIN" ] && [ ! -f "$BASE_BIN" ]; then
 fi
 if [ -z "$BASE_BIN" ]; then
     BASE_CANDIDATES=()
-    # Prefer the last successful stage0 for this version; stage1 can be the
-    # artifact currently under repair and may hang while bootstrapping.
-    add_base_candidate "./build/tmp/dev_stage0"
-    add_base_candidate "./build/${VERSION}.out"
-    add_base_candidate "./bin/${VERSION}_stage0"
-    add_base_candidate "$(pick_old_latest_stage1_file || true)"
+    # Prefer the most recent successful self-host artifacts.  The ad-hoc
+    # dev_stage0 can be much older than the current source and still pass the
+    # small smoke test while miscompiling the compiler itself.
+    add_base_candidate "./bin/${VERSION}_stage1"
     add_base_candidate "./bin/stage1"
+    add_base_candidate "./bin/${VERSION}_stage0"
+    add_base_candidate "./build/${VERSION}.out"
+    add_base_candidate "./build/tmp/dev_stage0"
+    add_base_candidate "$(pick_old_latest_stage1_file || true)"
     add_base_candidate "./bin/bootstrap"
     add_base_candidate "./bin/${BASE_COMPILER}"
-    add_base_candidate "./bin/${VERSION}_stage1"
     add_base_candidate "./bin/${VERSION}"
     add_base_candidate "$(pick_latest_stage1_file || true)"
 

@@ -27,27 +27,19 @@ import parser.decl.trait_decl;
 func decl_report_unexpected_top_level(p: *Parser) -> u64 {
     var err_tok: *Token = peek_tok(p);
     if (err_tok == 0) {
-        emit_stderr("[ERROR] Unexpected EOF at top-level declaration\n");
+        diag_emit_error_tag("parse", "top-level", "unexpected EOF at top-level declaration");
+        diag_emit_help("expected one of: func, const, enum, struct, union, trait, impl, var, import");
+        diag_note_error();
         panic_here(p, "Unexpected token");
         return 0;
     }
-    emit_stderr("[ERROR] Unexpected top-level token at line ");
-    emit_u64_stderr(err_tok.line);
-    emit_stderr(", column ");
-    emit_u64_stderr(err_tok.col);
-    emit_stderr("\n");
-    emit_stderr("  Expected one of: func, const, enum, struct, union, trait, impl, var, import\n");
-    emit_stderr("  Got: ");
+    diag_emit_error_tag("parse", "top-level", "unexpected top-level token");
+    diag_emit_token_site(err_tok);
+    emit_stderr("[NOTE] expected one of: func, const, enum, struct, union, trait, impl, var, import\n");
+    emit_stderr("[NOTE] got: ");
     emit_stderr_len(token_kind_name(err_tok.kind), token_kind_name_len(err_tok.kind));
-    emit_stderr(" (id=");
-    emit_u64_stderr(err_tok.kind);
-    emit_stderr(")");
-    if (err_tok.kind != TOKEN_EOF && err_tok.ptr != 0 && err_tok.len != 0) {
-        emit_stderr(" near `");
-        emit_stderr_len(err_tok.ptr, err_tok.len);
-        emit_stderr("`");
-    }
-    emit_stderr("\n");
+    emit_stderr_nl();
+    diag_note_error();
     panic_at_tok(p, err_tok, "Unexpected token");
     return 0;
 }
@@ -127,7 +119,12 @@ func decl_global_var_decl_full(p: *Parser, globals: *Vec<*GlobalInfo>) -> u64 {
     if (match_tok(p, TOKEN_COLON)) {
         gtype = type_parse_ex(p);
     } else {
-        gtype = new TypeInfo(TYPE_U64, 0);
+        end_error_capture();
+        set_error_context("global variable declared without explicit type", 45);
+        diag_emit_error_tag("parse", "P1677", "global variable declared without explicit type");
+        diag_emit_token_site(tok);
+        diag_emit_labelled_name("global: ", slice(tok.ptr, tok.len));
+        finalize_parse_error(p);
     }
 
     var init_kind: u64 = GLOBAL_INIT_NONE;
@@ -136,15 +133,14 @@ func decl_global_var_decl_full(p: *Parser, globals: *Vec<*GlobalInfo>) -> u64 {
     if (match_tok(p, TOKEN_EQ)) {
         init_expr = expr_parse(p);
         if (init_expr == 0) {
-            emit_stderr("[ERROR] Global init expression missing\n");
-            panic_here(p, "Syntax error");
+            parse_fail_here_code(p, "P1678", "Global init expression missing");
         }
         init_kind = GLOBAL_INIT_EXPR;
     }
 
     consume_tok(p, TOKEN_SEMICOLON);
 
-    var ginfo: *GlobalInfo = new GlobalInfo();
+    var ginfo: *GlobalInfo = new GlobalInfo{};
     ginfo.name_ptr = tok.ptr;
     ginfo.name_len = tok.len;
     ginfo.typeinfo_ptr = gtype;
@@ -264,16 +260,16 @@ func decl_program_impl(p: *Parser, mode: u64) -> *AstProgram {
         set_recovery_mode(p, 1, 40);
     }
 
-    var funcs: *Vec<*AstFunc> = new Vec<*AstFunc>(16);
-    var consts: *Vec<*AstConstDecl> = new Vec<*AstConstDecl>(1);
-    var imports: *Vec<*AstImport> = new Vec<*AstImport>(16);
+    var funcs: *Vec<*AstFunc> = new Vec<*AstFunc>{heap_alloc((16) * sizeof(*AstFunc)), 0, (16)};
+    var consts: *Vec<*AstConstDecl> = new Vec<*AstConstDecl>{heap_alloc((1) * sizeof(*AstConstDecl)), 0, (1)};
+    var imports: *Vec<*AstImport> = new Vec<*AstImport>{heap_alloc((16) * sizeof(*AstImport)), 0, (16)};
     var globals: *Vec<*GlobalInfo> = 0;
     var structs: *Vec<*AstStructDef> = 0;
 
     if (mode == PARSE_PROGRAM_MODE_FULL) {
-        consts = new Vec<*AstConstDecl>(64);
-        globals = new Vec<*GlobalInfo>(32);
-        structs = new Vec<*AstStructDef>(16);
+        consts = new Vec<*AstConstDecl>{heap_alloc((64) * sizeof(*AstConstDecl)), 0, (64)};
+        globals = new Vec<*GlobalInfo>{heap_alloc((32) * sizeof(*GlobalInfo)), 0, (32)};
+        structs = new Vec<*AstStructDef>{heap_alloc((16) * sizeof(*AstStructDef)), 0, (16)};
     }
 
     generated_funcs_begin(p);
@@ -281,7 +277,7 @@ func decl_program_impl(p: *Parser, mode: u64) -> *AstProgram {
     while (peek_kind(p) != TOKEN_EOF) {
         clear_parsing_context();
         var k: u64 = peek_kind(p);
-        switch (k) {
+        match (k) {
             case TOKEN_FUNC:
                 decl_program_handle_func(p, mode, funcs);
                 break;
@@ -315,8 +311,23 @@ func decl_program_impl(p: *Parser, mode: u64) -> *AstProgram {
                     decl_program_handle_global(p, mode, globals);
                     break;
                 }
-                emit_stderr("[ERROR] annotation target must be function or variable declaration\n");
-                panic_here(p, "Syntax error");
+                if (next_k == TOKEN_STRUCT || next_k == TOKEN_UNION || next_k == TOKEN_PACKED) {
+                    decl_program_handle_struct(p, mode, structs);
+                    break;
+                }
+                if (next_k == TOKEN_ENUM) {
+                    decl_program_handle_enum(p, mode, consts, funcs, structs);
+                    break;
+                }
+                if (next_k == TOKEN_TRAIT) {
+                    trait_parse_def(p, mode);
+                    break;
+                }
+                if (next_k == TOKEN_IMPL) {
+                    decl_program_handle_impl(p, mode, funcs);
+                    break;
+                }
+                parse_fail_here_code(p, "P1679", "annotation target must be a declaration");
                 break;
             case TOKEN_IMPORT:
                 imports.push(import_parse_decl(p));
@@ -336,9 +347,8 @@ func decl_program_impl(p: *Parser, mode: u64) -> *AstProgram {
     clear_parsing_context();
 
     if (has_errors(p) != 0) {
-        emit_stderr("[ERROR] parse failed with ");
-        emit_u64_stderr(error_count(p));
-        emit_stderr(" error(s)\n");
+        diag_emit_error_tag("parse", "P1680", "parse failed");
+        diag_emit_labelled_u64("error count: ", error_count(p));
         set_recovery_mode(p, 0, 0);
         return 0;
     }

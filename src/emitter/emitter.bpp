@@ -40,7 +40,7 @@ var g_backend_globals: *Vec<*GlobalInfo>;      // Backend-owned internal globals
 var g_globals_map: *HashMap<u64, *GlobalInfo>; // Global lookup cache: name -> global info
 var g_defer_stack: *Vec<*AstNode>;              // Stack of deferred statements
 var g_defer_markers: *Vec<u64>;                 // Block scope markers for defer
-var g_defer_loop_markers: *Vec<u64>;            // Loop/switch scope markers for defer
+var g_defer_loop_markers: *Vec<u64>;            // Loop/match scope markers for defer
 var g_closure_handle_map: *HashMap<u64, u64>;   // Local vars that hold lambda closure object pointers
 
 // Current function return type information (for struct return)
@@ -48,6 +48,8 @@ var g_current_func_ret_type: u64;
 var g_current_func_ret_ptr_depth: u64;
 var g_current_func_ret_struct_name_ptr: u64;
 var g_current_func_ret_struct_name_len: u64;
+var g_emitter_current_func_name_ptr: u64;
+var g_emitter_current_func_name_len: u64;
 
 struct EmitterCtx {
     public symtab: *Symtab;
@@ -59,11 +61,10 @@ struct EmitterCtx {
 
 impl EmitterCtx {
     public constructor() {
-        self.symtab = 0;
-        self.globals = 0;
-        self.backend_globals = 0;
-        self.consts = 0;
-        self.label_counter = 0;
+        var self_u64: *u64 = (*u64)self;
+        for (var i: u64 = 0; i < 5; i++) {
+            self_u64[i] = 0;
+        }
     }
 }
 
@@ -71,13 +72,15 @@ var g_emitter_ctx: *EmitterCtx;
 
 func emitter_ctx_current() -> *EmitterCtx {
     if (g_emitter_ctx == 0) {
-        g_emitter_ctx = new EmitterCtx();
+        g_emitter_ctx = new EmitterCtx{g_symtab, g_globals, g_backend_globals, g_consts, g_label_counter};
+        return g_emitter_ctx;
     }
-    g_emitter_ctx.symtab = g_symtab;
-    g_emitter_ctx.globals = g_globals;
-    g_emitter_ctx.backend_globals = g_backend_globals;
-    g_emitter_ctx.consts = g_consts;
-    g_emitter_ctx.label_counter = g_label_counter;
+    var ctx_u64: *u64 = (*u64)g_emitter_ctx;
+    ctx_u64[0] = (u64)g_symtab;
+    ctx_u64[1] = (u64)g_globals;
+    ctx_u64[2] = (u64)g_backend_globals;
+    ctx_u64[3] = (u64)g_consts;
+    ctx_u64[4] = g_label_counter;
     return g_emitter_ctx;
 }
 
@@ -92,7 +95,10 @@ func symtab_current_with_ctx(ctx: *EmitterCtx) -> *Symtab {
     return ctx.symtab;
 }
 func symtab_set_with_ctx(ctx: *EmitterCtx, s: *Symtab) -> u64 {
-    if (ctx != 0) { ctx.symtab = s; }
+    if (ctx != 0) {
+        var ctx_u64: *u64 = (*u64)ctx;
+        ctx_u64[0] = (u64)s;
+    }
     g_symtab = s;
     return 0;
 }
@@ -112,10 +118,11 @@ func globals_set(g: *Vec<*GlobalInfo>) -> u64 {
 }
 func globals_set_with_ctx(ctx: *EmitterCtx, g: *Vec<*GlobalInfo>) -> u64 {
     g_globals = g;
-    g_backend_globals = new Vec<*GlobalInfo>(8);
+    g_backend_globals = new Vec<*GlobalInfo>{heap_alloc((8) * sizeof(*GlobalInfo)), 0, (8)};
     if (ctx != 0) {
-        ctx.globals = g_globals;
-        ctx.backend_globals = g_backend_globals;
+        var ctx_u64: *u64 = (*u64)ctx;
+        ctx_u64[1] = (u64)g_globals;
+        ctx_u64[2] = (u64)g_backend_globals;
     }
     rebuild_globals_map();
     return 0;
@@ -124,12 +131,12 @@ func globals_set_with_ctx(ctx: *EmitterCtx, g: *Vec<*GlobalInfo>) -> u64 {
 func add_backend_global(ginfo: *GlobalInfo) -> u64 {
     if (ginfo == 0) { return 0; }
     if (g_backend_globals == 0) {
-        g_backend_globals = new Vec<*GlobalInfo>(8);
+        g_backend_globals = new Vec<*GlobalInfo>{heap_alloc((8) * sizeof(*GlobalInfo)), 0, (8)};
     }
-    if (is_global_var(ginfo.name_ptr, ginfo.name_len) != 0) { return 0; }
+    if (is_global_var(slice(ginfo.name_ptr, ginfo.name_len)) != 0) { return 0; }
     g_backend_globals.push(ginfo);
     if (g_globals_map != 0) {
-        g_globals_map.put(ginfo.name_ptr, ginfo.name_len, ginfo);
+        g_globals_map.put(slice(ginfo.name_ptr, ginfo.name_len), ginfo);
     }
     return 0;
 }
@@ -144,7 +151,10 @@ func consts_set(c: *Vec<*ConstInfo>) -> u64 {
 }
 func consts_set_with_ctx(ctx: *EmitterCtx, c: *Vec<*ConstInfo>) -> u64 {
     g_consts = c;
-    if (ctx != 0) { ctx.consts = c; }
+    if (ctx != 0) {
+        var ctx_u64: *u64 = (*u64)ctx;
+        ctx_u64[3] = (u64)c;
+    }
     rebuild_consts_map();
     return 0;
 }
@@ -156,33 +166,34 @@ func defer_markers() -> *Vec<u64> { return g_defer_markers; }
 func defer_loop_markers() -> *Vec<u64> { return g_defer_loop_markers; }
 
 func closure_handles_reset() -> u64 {
-    g_closure_handle_map = new HashMap<u64, u64>(16);
+    g_closure_handle_map = new HashMap<u64, u64>{0, 0, 0};
+    g_closure_handle_map.ensure_capacity(16);
     return 0;
 }
 
-func closure_handle_set(name_ptr: u64, name_len: u64, enabled: u64) -> u64 {
-    if (name_ptr == 0 || name_len == 0) { return 0; }
+func closure_handle_set(name: []u8, enabled: u64) -> u64 {
+    if (name.ptr == 0 || name.len == 0) { return 0; }
     if (g_closure_handle_map == 0) {
         closure_handles_reset();
     }
     if (enabled == 0) {
-        g_closure_handle_map.put(name_ptr, name_len, 0);
+        g_closure_handle_map.put(slice(name.ptr, name.len), 0);
         return 0;
     }
-    g_closure_handle_map.put(name_ptr, name_len, 1);
+    g_closure_handle_map.put(slice(name.ptr, name.len), 1);
     return 0;
 }
 
-func closure_handle_is(name_ptr: u64, name_len: u64) -> u64 {
-    if (name_ptr == 0 || name_len == 0) { return 0; }
+func closure_handle_is(name: []u8) -> u64 {
+    if (name.ptr == 0 || name.len == 0) { return 0; }
     if (g_closure_handle_map == 0) { return 0; }
-    if (g_closure_handle_map.get(name_ptr, name_len) == 1) { return 1; }
+    if (g_closure_handle_map.get(slice(name.ptr, name.len)) == 1) { return 1; }
     return 0;
 }
 
-func lambda_bind_name_is(name_ptr: u64, name_len: u64) -> u64 {
-    if (name_ptr == 0 || name_len < 14) { return 0; }
-    if (str_eq(name_ptr, 14, "__lambda_bind_", 14) == 0) { return 0; }
+func lambda_bind_name_is(name: []u8) -> u64 {
+    if (name.ptr == 0 || name.len < 14) { return 0; }
+    if (str_eq(slice(name.ptr, 14), slice("__lambda_bind_", str_len("__lambda_bind_"))) == 0) { return 0; }
     return 1;
 }
 
@@ -191,23 +202,23 @@ func emitter_closure_expr_is_lambda_handle(expr: u64) -> u64 {
     var kind: u64 = ast_kind(expr);
     if (kind == AST_CALL) {
         var call: *AstCall = (*AstCall)expr;
-        if (lambda_bind_name_is(call.name_ptr, call.name_len) != 0) { return 1; }
+        if (lambda_bind_name_is(slice(call.name_ptr, call.name_len)) != 0) { return 1; }
         return 0;
     }
     if (kind == AST_IDENT) {
         var idn: *AstIdent = (*AstIdent)expr;
-        return closure_handle_is(idn.name_ptr, idn.name_len);
+        return closure_handle_is(slice(idn.name_ptr, idn.name_len));
     }
     return 0;
 }
 
-func emitter_closure_track_from_expr(target_name_ptr: u64, target_name_len: u64, value_expr: u64) -> u64 {
-    if (target_name_ptr == 0 || target_name_len == 0) { return 0; }
+func emitter_closure_track_from_expr(target_name: []u8, value_expr: u64) -> u64 {
+    if (target_name.ptr == 0 || target_name.len == 0) { return 0; }
     if (emitter_closure_expr_is_lambda_handle(value_expr) != 0) {
-        closure_handle_set(target_name_ptr, target_name_len, 1);
+        closure_handle_set(slice(target_name.ptr, target_name.len), 1);
         return 0;
     }
-    closure_handle_set(target_name_ptr, target_name_len, 0);
+    closure_handle_set(slice(target_name.ptr, target_name.len), 0);
     return 0;
 }
 
@@ -222,6 +233,12 @@ func ret_type_current() -> u64 { return g_current_func_ret_type; }
 func ret_ptr_depth_current() -> u64 { return g_current_func_ret_ptr_depth; }
 func ret_struct_name_ptr_current() -> u64 { return g_current_func_ret_struct_name_ptr; }
 func ret_struct_name_len_current() -> u64 { return g_current_func_ret_struct_name_len; }
+func current_func_name_set(ptr: u64, len: u64) -> u64 {
+    g_emitter_current_func_name_ptr = ptr;
+    g_emitter_current_func_name_len = len;
+}
+func current_func_name_ptr_current() -> u64 { return g_emitter_current_func_name_ptr; }
+func current_func_name_len_current() -> u64 { return g_emitter_current_func_name_len; }
 
 // ============================================
 // Initialization
@@ -232,22 +249,27 @@ func init_state() -> u64 {
     // symtab = [names_vec, offsets_vec, types_vec, count, stack_offset]
     g_symtab = symtab_new();
     var symtab: *Symtab = g_symtab;
-    symtab.stack_offset = -8;
+    var symtab_u64: *u64 = (*u64)symtab;
+    symtab_u64[4] = 0 - 8;
     
     g_label_counter = 0;
-    g_strings = new Vec<*StringEntry>(32);
-    g_strings_map = new HashMap<u64, *StringEntry>(64);
-    g_floats = new Vec<*FloatEntry>(32);
-    g_loop_labels = new Vec<u64>(16);
-    g_loop_continue_labels = new Vec<u64>(16);
-    g_consts = new Vec<*ConstInfo>(64);
-    g_consts_map = new HashMap<u64, *ConstInfo>(128);
-    g_globals_map = new HashMap<u64, *GlobalInfo>(128);
-    g_backend_globals = new Vec<*GlobalInfo>(8);
-    g_defer_stack = new Vec<*AstNode>(32);
-    g_defer_markers = new Vec<u64>(32);
-    g_defer_loop_markers = new Vec<u64>(16);
-    g_closure_handle_map = new HashMap<u64, u64>(16);
+    g_strings = new Vec<*StringEntry>{heap_alloc((32) * sizeof(*StringEntry)), 0, (32)};
+    g_strings_map = new HashMap<u64, *StringEntry>{0, 0, 0};
+    g_strings_map.ensure_capacity(64);
+    g_floats = new Vec<*FloatEntry>{heap_alloc((32) * sizeof(*FloatEntry)), 0, (32)};
+    g_loop_labels = new Vec<u64>{heap_alloc((16) * sizeof(u64)), 0, (16)};
+    g_loop_continue_labels = new Vec<u64>{heap_alloc((16) * sizeof(u64)), 0, (16)};
+    g_consts = new Vec<*ConstInfo>{heap_alloc((64) * sizeof(*ConstInfo)), 0, (64)};
+    g_consts_map = new HashMap<u64, *ConstInfo>{0, 0, 0};
+    g_consts_map.ensure_capacity(128);
+    g_globals_map = new HashMap<u64, *GlobalInfo>{0, 0, 0};
+    g_globals_map.ensure_capacity(128);
+    g_backend_globals = new Vec<*GlobalInfo>{heap_alloc((8) * sizeof(*GlobalInfo)), 0, (8)};
+    g_defer_stack = new Vec<*AstNode>{heap_alloc((32) * sizeof(*AstNode)), 0, (32)};
+    g_defer_markers = new Vec<u64>{heap_alloc((32) * sizeof(u64)), 0, (32)};
+    g_defer_loop_markers = new Vec<u64>{heap_alloc((16) * sizeof(u64)), 0, (16)};
+    g_closure_handle_map = new HashMap<u64, u64>{0, 0, 0};
+    g_closure_handle_map.ensure_capacity(16);
 }
 
 func rebuild_globals_map() -> u64 {
@@ -261,19 +283,20 @@ func rebuild_globals_map() -> u64 {
         cap = total * 2;
         if (cap < 16) { cap = 16; }
     }
-    g_globals_map = new HashMap<u64, *GlobalInfo>(cap);
+    g_globals_map = new HashMap<u64, *GlobalInfo>{0, 0, 0};
+    g_globals_map.ensure_capacity(cap);
     if (g_globals != 0) {
         for (var i: u64 = 0; i < user_count; i++) {
             var ginfo: *GlobalInfo = g_globals.get(i);
             if (ginfo == 0) { continue; }
-            g_globals_map.put(ginfo.name_ptr, ginfo.name_len, ginfo);
+            g_globals_map.put(slice(ginfo.name_ptr, ginfo.name_len), ginfo);
         }
     }
     if (g_backend_globals != 0) {
         for (var j: u64 = 0; j < backend_count; j++) {
             var bg: *GlobalInfo = g_backend_globals.get(j);
             if (bg == 0) { continue; }
-            g_globals_map.put(bg.name_ptr, bg.name_len, bg);
+            g_globals_map.put(slice(bg.name_ptr, bg.name_len), bg);
         }
     }
     return 0;
@@ -285,32 +308,34 @@ func rebuild_consts_map() -> u64 {
         cap = g_consts.len() * 2;
         if (cap < 16) { cap = 16; }
     }
-    g_consts_map = new HashMap<u64, *ConstInfo>(cap);
+    g_consts_map = new HashMap<u64, *ConstInfo>{0, 0, 0};
+    g_consts_map.ensure_capacity(cap);
     if (g_consts == 0) { return 0; }
 
     var len: u64 = g_consts.len();
     for (var i: u64 = 0; i < len; i++) {
         var cinfo: *ConstInfo = g_consts.get(i);
         if (cinfo == 0) { continue; }
-        g_consts_map.put(cinfo.name_ptr, cinfo.name_len, cinfo);
+        g_consts_map.put(slice(cinfo.name_ptr, cinfo.name_len), cinfo);
     }
     return 0;
 }
 
 func globals_set_from_prog(globals: *Vec<*GlobalInfo>) -> u64 {
     if (globals == 0) {
-        g_globals = new Vec<*GlobalInfo>(32);
+        g_globals = new Vec<*GlobalInfo>{heap_alloc((32) * sizeof(*GlobalInfo)), 0, (32)};
     } else {
         g_globals = globals;
     }
-    g_backend_globals = new Vec<*GlobalInfo>(8);
+    g_backend_globals = new Vec<*GlobalInfo>{heap_alloc((8) * sizeof(*GlobalInfo)), 0, (8)};
     rebuild_globals_map();
     return 0;
 }
 
 func load_consts(consts: *Vec<*AstConstDecl>) -> u64 {
-    g_consts = new Vec<*ConstInfo>(64);
-    g_consts_map = new HashMap<u64, *ConstInfo>(128);
+    g_consts = new Vec<*ConstInfo>{heap_alloc((64) * sizeof(*ConstInfo)), 0, (64)};
+    g_consts_map = new HashMap<u64, *ConstInfo>{0, 0, 0};
+    g_consts_map.ensure_capacity(128);
     if (consts == 0) { return 0; }
 
     var clen: u64 = consts.len();
@@ -318,7 +343,7 @@ func load_consts(consts: *Vec<*AstConstDecl>) -> u64 {
         var const_decl: *AstConstDecl = consts.get(ci);
         var cinfo_struct: *ConstInfo = new ConstInfo{const_decl.name_ptr, const_decl.name_len, const_decl.value};
         g_consts.push(cinfo_struct);
-        g_consts_map.put(const_decl.name_ptr, const_decl.name_len, cinfo_struct);
+        g_consts_map.put(slice(const_decl.name_ptr, const_decl.name_len), cinfo_struct);
     }
     return 0;
 }
@@ -327,9 +352,9 @@ func load_consts(consts: *Vec<*AstConstDecl>) -> u64 {
 // Global Variable Check
 // ============================================
 
-func is_global_var(name_ptr: u64, name_len: u64) -> u64 {
+func is_global_var(name: []u8) -> u64 {
     if (g_globals_map != 0) {
-        var gm: *GlobalInfo = g_globals_map.get(name_ptr, name_len);
+        var gm: *GlobalInfo = g_globals_map.get(slice(name.ptr, name.len));
         if (gm != 0) { return true; }
         return false;
     }
@@ -337,7 +362,7 @@ func is_global_var(name_ptr: u64, name_len: u64) -> u64 {
     var len: u64 = g_globals.len();
     for (var i: u64 = 0; i < len; i++) {
         var ginfo: *GlobalInfo = g_globals.get(i);
-        if (str_eq(ginfo.name_ptr, ginfo.name_len, name_ptr, name_len)) {
+        if (str_eq(slice(ginfo.name_ptr, ginfo.name_len), slice(name.ptr, name.len))) {
             return true;
         }
     }
@@ -349,7 +374,8 @@ func is_global_var(name_ptr: u64, name_len: u64) -> u64 {
 // ============================================
 
 func emit_asm_text_with_alias(text_vec: *Vec<u64>) -> u64 {
-    var asm_len: u64 = text_vec.?len();
+    var asm_len: u64 = 0;
+    if (text_vec != 0) { asm_len = text_vec.len(); }
     var i: u64 = 0;
     var at_line_start: u64 = 1;
 
@@ -361,11 +387,16 @@ func emit_asm_text_with_alias(text_vec: *Vec<u64>) -> u64 {
             i = i + 1;
             continue;
         }
-        if (ch == 32) {
-            if (at_line_start == 1) {
-                emit("    ");
-                at_line_start = 0;
-            }
+        if (at_line_start == 1) {
+            emit("    ");
+            at_line_start = 0;
+        }
+
+        var ident_start: u64 = 0;
+        if ((ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122) || ch == 95) {
+            ident_start = 1;
+        }
+        if (ident_start == 0) {
             emit_char(ch);
             i = i + 1;
             continue;
@@ -374,16 +405,13 @@ func emit_asm_text_with_alias(text_vec: *Vec<u64>) -> u64 {
         var tok_start: u64 = i;
         while (i < asm_len) {
             var ch2: u64 = text_vec.get(i);
-            if (ch2 == 10 || ch2 == 32) { break; }
+            if (!((ch2 >= 65 && ch2 <= 90) || (ch2 >= 97 && ch2 <= 122) || (ch2 >= 48 && ch2 <= 57) || ch2 == 95)) {
+                break;
+            }
             i = i + 1;
         }
         var tok_len: u64 = i - tok_start;
         if (tok_len == 0) { continue; }
-
-        if (at_line_start == 1) {
-            emit("    ");
-            at_line_start = 0;
-        }
 
         var tok_ptr: u64 = heap_alloc((tok_len + 1) * sizeof(u8));
         var tok_u8: []u8 = slice(tok_ptr, tok_len + 1);
@@ -392,7 +420,7 @@ func emit_asm_text_with_alias(text_vec: *Vec<u64>) -> u64 {
         }
         tok_u8[tok_len] = 0;
 
-        var alias_info_ptr: *NameInfo = sym_reg_alias_get(tok_ptr, tok_len);
+        var alias_info_ptr: *NameInfo = sym_reg_alias_get(slice(tok_ptr, tok_len));
         if (alias_info_ptr != 0) {
             emit_len(alias_info_ptr.ptr, alias_info_ptr.len);
         } else {
@@ -408,9 +436,9 @@ func emit_asm_text_with_alias(text_vec: *Vec<u64>) -> u64 {
 // Constants Lookup
 // ============================================
 
-func const_find(name_ptr: u64, name_len: u64) -> ConstResult {
+func const_find(name: []u8) -> ConstResult {
     if (g_consts_map != 0) {
-        var cached: *ConstInfo = g_consts_map.get(name_ptr, name_len);
+        var cached: *ConstInfo = g_consts_map.get(slice(name.ptr, name.len));
         if (cached != 0) {
             return ConstResult{1, cached.value};
         }
@@ -420,7 +448,7 @@ func const_find(name_ptr: u64, name_len: u64) -> ConstResult {
     var len: u64 = g_consts.len();
     for (var i: u64 = 0; i < len; i++) {
         var cinfo: *ConstInfo = g_consts.get(i);
-        if (str_eq(cinfo.name_ptr, cinfo.name_len, name_ptr, name_len)) {
+        if (str_eq(slice(cinfo.name_ptr, cinfo.name_len), slice(name.ptr, name.len))) {
             return ConstResult{1, cinfo.value};
         }
     }
@@ -569,15 +597,15 @@ func emit_store_rax_to_addr(type_kind: u64, ptr_depth: u64) -> u64 {
     return 1;
 }
 
-func emit_copy_bytes_with_regs(src_reg_ptr: u64, src_reg_len: u64, dst_reg_ptr: u64, dst_reg_len: u64, size: u64) -> u64 {
+func emit_copy_bytes_with_regs(src_reg: []u8, dst_reg: []u8, size: u64) -> u64 {
     var off: u64 = 0;
     while (off + 8 <= size) {
         emit("    mov rcx, [");
-        emit_len(src_reg_ptr, src_reg_len);
+        emit_len(src_reg.ptr, src_reg.len);
         if (off != 0) { emit("+"); emit_u64(off); }
         emit("]\n");
         emit("    mov [");
-        emit_len(dst_reg_ptr, dst_reg_len);
+        emit_len(dst_reg.ptr, dst_reg.len);
         if (off != 0) { emit("+"); emit_u64(off); }
         emit("], rcx\n");
         off = off + 8;
@@ -585,11 +613,11 @@ func emit_copy_bytes_with_regs(src_reg_ptr: u64, src_reg_len: u64, dst_reg_ptr: 
     var rem: u64 = size - off;
     if (rem >= 4) {
         emit("    mov ecx, [");
-        emit_len(src_reg_ptr, src_reg_len);
+        emit_len(src_reg.ptr, src_reg.len);
         if (off != 0) { emit("+"); emit_u64(off); }
         emit("]\n");
         emit("    mov [");
-        emit_len(dst_reg_ptr, dst_reg_len);
+        emit_len(dst_reg.ptr, dst_reg.len);
         if (off != 0) { emit("+"); emit_u64(off); }
         emit("], ecx\n");
         off = off + 4;
@@ -597,11 +625,11 @@ func emit_copy_bytes_with_regs(src_reg_ptr: u64, src_reg_len: u64, dst_reg_ptr: 
     }
     if (rem >= 2) {
         emit("    mov cx, [");
-        emit_len(src_reg_ptr, src_reg_len);
+        emit_len(src_reg.ptr, src_reg.len);
         if (off != 0) { emit("+"); emit_u64(off); }
         emit("]\n");
         emit("    mov [");
-        emit_len(dst_reg_ptr, dst_reg_len);
+        emit_len(dst_reg.ptr, dst_reg.len);
         if (off != 0) { emit("+"); emit_u64(off); }
         emit("], cx\n");
         off = off + 2;
@@ -609,11 +637,11 @@ func emit_copy_bytes_with_regs(src_reg_ptr: u64, src_reg_len: u64, dst_reg_ptr: 
     }
     if (rem >= 1) {
         emit("    mov cl, [");
-        emit_len(src_reg_ptr, src_reg_len);
+        emit_len(src_reg.ptr, src_reg.len);
         if (off != 0) { emit("+"); emit_u64(off); }
         emit("]\n");
         emit("    mov [");
-        emit_len(dst_reg_ptr, dst_reg_len);
+        emit_len(dst_reg.ptr, dst_reg.len);
         if (off != 0) { emit("+"); emit_u64(off); }
         emit("], cl\n");
     }
@@ -625,16 +653,18 @@ func emit_copy_bytes_with_regs(src_reg_ptr: u64, src_reg_len: u64, dst_reg_ptr: 
 // ============================================
 
 func string_table_init() -> u64 {
-    g_strings = new Vec<*StringEntry>(32);
-    g_strings_map = new HashMap<u64, *StringEntry>(64);
+    g_strings = new Vec<*StringEntry>{heap_alloc((32) * sizeof(*StringEntry)), 0, (32)};
+    g_strings_map = new HashMap<u64, *StringEntry>{0, 0, 0};
+    g_strings_map.ensure_capacity(64);
     return 0;
 }
 
-func string_get_label(str_ptr: u64, str_len: u64) -> u64 {
+func string_get_label(str: []u8) -> u64 {
     if (g_strings_map == 0) {
-        g_strings_map = new HashMap<u64, *StringEntry>(64);
+        g_strings_map = new HashMap<u64, *StringEntry>{0, 0, 0};
+        g_strings_map.ensure_capacity(64);
     }
-    var cached: *StringEntry = g_strings_map.get(str_ptr, str_len);
+    var cached: *StringEntry = g_strings_map.get(slice(str.ptr, str.len));
     if (cached != 0) {
         return cached.label_id;
     }
@@ -642,9 +672,9 @@ func string_get_label(str_ptr: u64, str_len: u64) -> u64 {
     var label_id: u64 = g_label_counter;
     g_label_counter = g_label_counter + 1;
     
-    var str_entry: *StringEntry = new StringEntry{str_ptr, str_len, label_id};
+    var str_entry: *StringEntry = new StringEntry{str.ptr, str.len, label_id};
     g_strings.push(str_entry);
-    g_strings_map.put(str_ptr, str_len, str_entry);
+    g_strings_map.put(slice(str.ptr, str.len), str_entry);
     
     return label_id;
 }
@@ -697,11 +727,11 @@ func string_emit_data() -> u64 {
 // Float Literals Table
 // ============================================
 
-func float_get_label(str_ptr: u64, str_len: u64) -> u64 {
+func float_get_label(str: []u8) -> u64 {
     var count: u64 = g_floats.len();
     for (var i: u64 = 0; i < count; i++) {
         var entry: *FloatEntry = g_floats.get(i);
-        if (str_eq(entry.str_ptr, entry.str_len, str_ptr, str_len)) {
+        if (str_eq(slice(entry.str_ptr, entry.str_len), slice(str.ptr, str.len))) {
             return entry.label_id;
         }
     }
@@ -709,7 +739,7 @@ func float_get_label(str_ptr: u64, str_len: u64) -> u64 {
     var label_id: u64 = g_label_counter;
     g_label_counter = g_label_counter + 1;
 
-    var fe: *FloatEntry = new FloatEntry{str_ptr, str_len, label_id};
+    var fe: *FloatEntry = new FloatEntry{str.ptr, str.len, label_id};
     g_floats.push(fe);
     return label_id;
 }
@@ -733,25 +763,25 @@ func float_emit_data() -> u64 {
 // Global Variables Data/BSS Emission
 // ============================================
 
-func _global_eval_const_value(name_ptr: u64, name_len: u64, out_value: *u64) -> u64 {
-    var resolved_ptr: u64 = name_ptr;
-    var resolved_len: u64 = name_len;
-    if (resolved_len > 6 && str_eq(resolved_ptr, 6, "_gvar_", 6)) {
+func _global_eval_const_value(name: []u8, out_value: *u64) -> u64 {
+    var resolved_ptr: u64 = name.ptr;
+    var resolved_len: u64 = name.len;
+    if (resolved_len > 6 && str_eq(slice(resolved_ptr, 6), slice("_gvar_", str_len("_gvar_")))) {
         resolved_ptr = resolved_ptr + 6;
         resolved_len = resolved_len - 6;
     }
-    var resolved: *NameInfo = resolve_name(resolved_ptr, resolved_len);
+    var resolved: *NameInfo = resolve_name(slice(resolved_ptr, resolved_len));
     if (resolved != 0) {
         resolved_ptr = resolved.ptr;
         resolved_len = resolved.len;
     }
-    var res: ConstResult = const_find(resolved_ptr, resolved_len);
+    var res: ConstResult = const_find(slice(resolved_ptr, resolved_len));
     if (res.found != 0) {
         *out_value = res.value;
         return true;
     }
 
-    var res2: ConstResult = const_find(name_ptr, name_len);
+    var res2: ConstResult = const_find(slice(name.ptr, name.len));
     if (res2.found != 0) {
         *out_value = res2.value;
         return true;
@@ -767,11 +797,11 @@ func _global_eval_const_value(name_ptr: u64, name_len: u64, out_value: *u64) -> 
         var n: u64 = g_consts.len();
         for (var i: u64 = 0; i < n; i++) {
             var cinfo: *ConstInfo = g_consts.get(i);
-            if (cinfo.name_len <= name_len + 2) { continue; }
-            var suffix_pos: u64 = cinfo.name_len - name_len;
+            if (cinfo.name_len <= name.len + 2) { continue; }
+            var suffix_pos: u64 = cinfo.name_len - name.len;
             var name_u8: []u8 = slice(cinfo.name_ptr, cinfo.name_len);
             if (name_u8[suffix_pos - 2] != 95 || name_u8[suffix_pos - 1] != 95) { continue; }
-            if (str_eq(cinfo.name_ptr + suffix_pos, name_len, name_ptr, name_len)) {
+            if (str_eq(slice(cinfo.name_ptr + suffix_pos, name.len), slice(name.ptr, name.len))) {
                 if (matched == 0) {
                     matched = 1;
                     matched_value = cinfo.value;
@@ -780,7 +810,7 @@ func _global_eval_const_value(name_ptr: u64, name_len: u64, out_value: *u64) -> 
                     continue;
                 }
                 emit_stderr("[ERROR] Ambiguous global const init fallback for name: ");
-                emit_stderr_len(name_ptr, name_len);
+                emit_stderr_len(name.ptr, name.len);
                 emit_stderr("\n");
                 emit_stderr("  candidate1: ");
                 emit_stderr_len(matched_name_ptr, matched_name_len);
@@ -809,7 +839,7 @@ func _global_eval_scalar_expr(expr: *AstNode, out_value: *u64) -> u64 {
     }
     if (kind == AST_IDENT) {
         var id: *AstIdent = (*AstIdent)expr;
-        return _global_eval_const_value(id.name_ptr, id.name_len, out_value);
+        return _global_eval_const_value(slice(id.name_ptr, id.name_len), out_value);
     }
     if (kind == AST_MEMBER_ACCESS) {
         var ma: *AstMemberAccess = (*AstMemberAccess)expr;
@@ -824,7 +854,7 @@ func _global_eval_scalar_expr(expr: *AstNode, out_value: *u64) -> u64 {
             scope_ptr = scope_id.name_ptr;
             scope_len = scope_id.name_len;
         }
-        var scoped: *ConstResult = (*ConstResult)sym_find_scoped_const(scope_ptr, scope_len, ma.member_ptr, ma.member_len);
+        var scoped: *ConstResult = (*ConstResult)sym_find_scoped_const(slice(scope_ptr, scope_len), slice(ma.member_ptr, ma.member_len));
         if (scoped != 0 && scoped.found != 0) {
             *out_value = scoped.value;
             return true;
@@ -836,7 +866,17 @@ func _global_eval_scalar_expr(expr: *AstNode, out_value: *u64) -> u64 {
         if (un.op == TOKEN_MINUS) {
             var inner_value: u64 = 0;
             if (_global_eval_scalar_expr(un.operand, &inner_value) == 0) { return false; }
-            *out_value = 0 - inner_value;
+            if (inner_value == 0) {
+                *out_value = 0;
+                return true;
+            }
+            var sign_bit: u64 = 1;
+            sign_bit = sign_bit << 63;
+            if (inner_value == sign_bit) {
+                *out_value = sign_bit;
+                return true;
+            }
+            *out_value = sign_bit | (sign_bit - inner_value);
             return true;
         }
     }
@@ -908,9 +948,9 @@ func _global_emit_struct_literal_vptr_or_panic(struct_def: *AstStructDef, f: *Fi
     var impl_count: u64 = impls.len();
     for (var ti: u64 = 0; ti < impl_count; ti++) {
         var impl_info: *TraitImpl = impls.get(ti);
-        if (!str_eq(impl_info.struct_ptr, impl_info.struct_len, struct_def.name_ptr, struct_def.name_len)) { continue; }
-        var vptr_name: *NameInfo = trait_build_vptr_field_name(impl_info.trait_ptr, impl_info.trait_len);
-        if (!str_eq(vptr_name.ptr, vptr_name.len, f.name_ptr, f.name_len)) { continue; }
+        if (!str_eq(slice(impl_info.struct_ptr, impl_info.struct_len), slice(struct_def.name_ptr, struct_def.name_len))) { continue; }
+        var vptr_name: *NameInfo = trait_build_vptr_field_name(slice(impl_info.trait_ptr, impl_info.trait_len));
+        if (!str_eq(slice(vptr_name.ptr, vptr_name.len), slice(f.name_ptr, f.name_len))) { continue; }
         emit("    dq _gvar_");
         emit_len(impl_info.vtable_global_ptr, impl_info.vtable_global_len);
         emit_nl();
@@ -924,24 +964,24 @@ func _global_emit_struct_literal_vptr_or_panic(struct_def: *AstStructDef, f: *Fi
     return 0;
 }
 
-func _global_find_global_info_by_name(name_ptr: u64, name_len: u64) -> *GlobalInfo {
+func _global_find_global_info_by_name(name: []u8) -> *GlobalInfo {
     if (g_globals == 0) { return 0; }
     var n: u64 = g_globals.len();
     for (var i: u64 = 0; i < n; i++) {
         var ginfo: *GlobalInfo = g_globals.get(i);
-        if (str_eq(ginfo.name_ptr, ginfo.name_len, name_ptr, name_len)) {
+        if (str_eq(slice(ginfo.name_ptr, ginfo.name_len), slice(name.ptr, name.len))) {
             return ginfo;
         }
     }
     return 0;
 }
 
-func _global_emit_qword_symbol(symbol_ptr: u64, symbol_len: u64, is_global_var: u64) -> u64 {
+func _global_emit_qword_symbol(symbol: []u8, is_global_var: u64) -> u64 {
     emit("    dq ");
     if (is_global_var != 0) {
         emit("_gvar_");
     }
-    emit_len(symbol_ptr, symbol_len);
+    emit_len(symbol.ptr, symbol.len);
     emit_nl();
     return 0;
 }
@@ -949,26 +989,26 @@ func _global_emit_qword_symbol(symbol_ptr: u64, symbol_len: u64, is_global_var: 
 func _global_emit_ident_pointer_value_or_panic(id: *AstIdent) -> u64 {
     var resolved_ptr: u64 = id.name_ptr;
     var resolved_len: u64 = id.name_len;
-    var resolved: *NameInfo = resolve_name(id.name_ptr, id.name_len);
+    var resolved: *NameInfo = resolve_name(slice(id.name_ptr, id.name_len));
     if (resolved != 0) {
         resolved_ptr = resolved.ptr;
         resolved_len = resolved.len;
     }
 
-    if (sym_func_exists(resolved_ptr, resolved_len) != 0 || sym_func_exists(id.name_ptr, id.name_len) != 0) {
-        _global_emit_qword_symbol(resolved_ptr, resolved_len, 0);
+    if (sym_func_exists(slice(resolved_ptr, resolved_len)) != 0 || sym_func_exists(slice(id.name_ptr, id.name_len)) != 0) {
+        _global_emit_qword_symbol(slice(resolved_ptr, resolved_len), 0);
         return 0;
     }
 
-    var ginfo_resolved: *GlobalInfo = _global_find_global_info_by_name(resolved_ptr, resolved_len);
+    var ginfo_resolved: *GlobalInfo = _global_find_global_info_by_name(slice(resolved_ptr, resolved_len));
     if (ginfo_resolved != 0) {
-        _global_emit_qword_symbol(ginfo_resolved.name_ptr, ginfo_resolved.name_len, 1);
+        _global_emit_qword_symbol(slice(ginfo_resolved.name_ptr, ginfo_resolved.name_len), 1);
         return 0;
     }
 
-    var ginfo_raw: *GlobalInfo = _global_find_global_info_by_name(id.name_ptr, id.name_len);
+    var ginfo_raw: *GlobalInfo = _global_find_global_info_by_name(slice(id.name_ptr, id.name_len));
     if (ginfo_raw != 0) {
-        _global_emit_qword_symbol(ginfo_raw.name_ptr, ginfo_raw.name_len, 1);
+        _global_emit_qword_symbol(slice(ginfo_raw.name_ptr, ginfo_raw.name_len), 1);
         return 0;
     }
 
@@ -992,7 +1032,7 @@ func _global_emit_pointer_value_or_panic(expr: *AstNode) -> u64 {
     var kind: u64 = ast_kind(expr);
     if (kind == AST_STRING) {
         var str: *AstString = (*AstString)expr;
-        var label_id: u64 = string_get_label(str.str_ptr, str.str_len);
+        var label_id: u64 = string_get_label(slice(str.str_ptr, str.str_len));
         emit("    dq _str");
         emit_u64(label_id);
         emit_nl();
@@ -1119,7 +1159,7 @@ func _global_emit_struct_literal_body_or_panic(struct_def: *AstStructDef, values
         var f: *FieldDesc = fields.get(i);
         var field_size: u64 = _global_emit_struct_literal_field_size_or_panic(f);
 
-        if (trait_is_vptr_field_name(f.name_ptr, f.name_len) != 0) {
+        if (trait_is_vptr_field_name(slice(f.name_ptr, f.name_len)) != 0) {
             _global_emit_struct_literal_vptr_or_panic(struct_def, f);
             cursor = cursor + field_size;
             continue;
@@ -1140,7 +1180,7 @@ func _global_emit_struct_literal_body_or_panic(struct_def: *AstStructDef, values
             var nested_lit: *AstStructLiteral = (*AstStructLiteral)val_expr;
             var nested_def: *AstStructDef = nested_lit.struct_def;
             if (nested_def == 0) {
-                nested_def = get_struct_def(f.struct_name_ptr, f.struct_name_len);
+                nested_def = get_struct_def(slice(f.struct_name_ptr, f.struct_name_len));
             }
             if (nested_def == 0) {
                 emit_stderr("[ERROR] Nested struct definition not found for global initializer\n");
@@ -1161,7 +1201,7 @@ func _global_emit_struct_literal_body_or_panic(struct_def: *AstStructDef, values
         value_index = value_index + 1;
     }
 
-    var struct_size: u64 = layout_type_sizeof(TYPE_STRUCT, 0, struct_def.name_ptr, struct_def.name_len);
+    var struct_size: u64 = layout_type_sizeof(TYPE_STRUCT, 0, slice(struct_def.name_ptr, struct_def.name_len));
     if (cursor < struct_size) {
         _global_emit_padding(struct_size - cursor);
         cursor = struct_size;
@@ -1175,12 +1215,12 @@ func _global_emit_struct_literal_value_or_panic(field_size: u64, val_expr: *AstN
         var id: *AstIdent = (*AstIdent)val_expr;
         var resolved_ptr: u64 = id.name_ptr;
         var resolved_len: u64 = id.name_len;
-        var resolved: *NameInfo = resolve_name(id.name_ptr, id.name_len);
+        var resolved: *NameInfo = resolve_name(slice(id.name_ptr, id.name_len));
         if (resolved != 0) {
             resolved_ptr = resolved.ptr;
             resolved_len = resolved.len;
         }
-        if (sym_func_exists(resolved_ptr, resolved_len) != 0 || sym_func_exists(id.name_ptr, id.name_len) != 0) {
+        if (sym_func_exists(slice(resolved_ptr, resolved_len)) != 0 || sym_func_exists(slice(id.name_ptr, id.name_len)) != 0) {
             emit("    dq ");
             emit_len(resolved_ptr, resolved_len);
             emit_nl();
@@ -1199,7 +1239,7 @@ func _global_emit_struct_literal_value_or_panic(field_size: u64, val_expr: *AstN
 func _global_emit_struct_literal(ginfo: *GlobalInfo, lit: *AstStructLiteral) -> u64 {
     var struct_def: *AstStructDef = lit.struct_def;
     if (struct_def == 0 && ginfo.typeinfo_ptr != 0) {
-        struct_def = get_struct_def(ginfo.typeinfo_ptr.struct_name_ptr, ginfo.typeinfo_ptr.struct_name_len);
+        struct_def = get_struct_def(slice(ginfo.typeinfo_ptr.struct_name_ptr, ginfo.typeinfo_ptr.struct_name_len));
     }
     if (struct_def == 0) {
         emit_stderr("[ERROR] Missing struct def for global init\n");
@@ -1227,7 +1267,7 @@ func globals_emit_data() -> u64 {
         if (ginfo == 0) { continue; }
         if (ginfo.init_kind == GLOBAL_INIT_NONE || ginfo.init_kind == GLOBAL_INIT_RUNTIME) { continue; }
 
-        set_current_module_for_global(ginfo.name_ptr, ginfo.name_len);
+        set_current_module_for_global(slice(ginfo.name_ptr, ginfo.name_len));
 
         if (emitted == 0) {
             emitln("\nsection .data");
@@ -1246,7 +1286,8 @@ func globals_emit_data() -> u64 {
                 continue;
             }
             // Non-static initializer: lower to runtime global init and place storage in .bss.
-            ginfo.init_kind = GLOBAL_INIT_RUNTIME;
+            var ginfo_u64: *u64 = (*u64)ginfo;
+            ginfo_u64[3] = GLOBAL_INIT_RUNTIME;
             continue;
         }
 
@@ -1258,7 +1299,7 @@ func globals_emit_data() -> u64 {
 
         var value: u64 = ginfo.init_value;
         if (ginfo.init_kind == GLOBAL_INIT_CONST) {
-            var ok: u64 = _global_eval_const_value(ginfo.init_name_ptr, ginfo.init_name_len, &value);
+            var ok: u64 = _global_eval_const_value(slice(ginfo.init_name_ptr, ginfo.init_name_len), &value);
             if (ok == 0) {
                 emit_stderr("[ERROR] Global init const not found: ");
                 emit_stderr_len(ginfo.init_name_ptr, ginfo.init_name_len);

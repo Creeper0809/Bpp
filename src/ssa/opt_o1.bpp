@@ -44,7 +44,7 @@ func kv_set(map: *Vec<*SSAOptKV>, key: u64, val: u64) -> u64 {
         entry.active = 1;
         return 0;
     }
-    var new_entry: *SSAOptKV = new SSAOptKV();
+    var new_entry: *SSAOptKV = new SSAOptKV{};
     new_entry.key = key;
     new_entry.val = val;
     new_entry.active = 1;
@@ -94,7 +94,7 @@ func use_inc(map: *Vec<*SSAOptKV>, key: u64) -> u64 {
         entry.val = entry.val + 1;
         return 0;
     }
-    var new_entry: *SSAOptKV = new SSAOptKV();
+    var new_entry: *SSAOptKV = new SSAOptKV{};
     new_entry.key = key;
     new_entry.val = 1;
     new_entry.active = 1;
@@ -142,7 +142,7 @@ func is_dce_pure(op: u64) -> u64 {
 }
 
 func collect_uses(fn: *SSAFunction) -> *Vec<*SSAOptKV> {
-    var uses: *Vec<*SSAOptKV> = new Vec<*SSAOptKV>(64);
+    var uses: *Vec<*SSAOptKV> = new Vec<*SSAOptKV>{heap_alloc((64) * sizeof(*SSAOptKV)), 0, (64)};
     var blocks: []*SSABlock = fn.blocks;
     var bcount: u64 = slice_len(blocks);
 
@@ -225,6 +225,28 @@ func collect_uses(fn: *SSAFunction) -> *Vec<*SSAOptKV> {
     return uses;
 }
 
+func remove_dead_phis(block: *SSABlock, uses: *Vec<*SSAOptKV>) -> u64 {
+    if (block == 0) { return 0; }
+    var removed: u64 = 0;
+    var prev: *SSAInstruction = 0;
+    var cur: *SSAInstruction = block.phi_head;
+    while (cur != 0) {
+        var next: *SSAInstruction = cur.next;
+        if (cur.dest != 0 && use_get(uses, cur.dest) == 0) {
+            if (prev == 0) {
+                block.phi_head = next;
+            } else {
+                prev.next = next;
+            }
+            removed = 1;
+        } else {
+            prev = cur;
+        }
+        cur = next;
+    }
+    return removed;
+}
+
 func dce_run(fn: *SSAFunction) -> u64 {
     var changed: u64 = 1;
     while (changed != 0) {
@@ -236,6 +258,10 @@ func dce_run(fn: *SSAFunction) -> u64 {
         var bi: u64 = 0;
         for (bi = 0; bi < bcount; bi = bi + 1) {
             var b: *SSABlock = blocks[bi];
+
+            if (remove_dead_phis(b, uses) != 0) {
+                changed = 1;
+            }
 
             var cur: *SSAInstruction = b.inst_head;
             while (cur != 0) {
@@ -304,6 +330,14 @@ func fold_inst(inst: *SSAInstruction) -> u64 {
     var a: u64 = operand_value(inst.src1);
     var b: u64 = operand_value(inst.src2);
     var res: u64 = 0;
+
+    // Keep explicit unary-minus lowering (`0 - literal`) in instruction form.
+    // The x86 backend already handles runtime SUB correctly, while eager folding
+    // here can re-materialize the old large unsigned immediate form and break
+    // inline-asm comparisons in O1.
+    if (op == SSA_OP_SUB && a == 0 && b != 0) {
+        return false;
+    }
 
     var i64_min_bits: u64 = 1;
     i64_min_bits = i64_min_bits << 63;
@@ -402,7 +436,7 @@ func operand_const_value(reg_consts: *Vec<*SSAOptKV>, opr: u64) -> SSAOptConstVa
         result.has = 1;
         return result;
     }
-    var entry: *SSAOptKV = const_find(reg_consts, operand_value(opr));
+    var entry: *SSAOptKV = const_find(slice(reg_consts, operand_value(opr)));
     if (entry != 0) {
         result.val = entry.val;
         result.has = 1;
@@ -442,7 +476,7 @@ func handle_load(cur: *SSAInstruction, reg_consts: *Vec<*SSAOptKV>, var_consts: 
     if (op_of(cur) != SSA_OP_LOAD) { return 0; }
     if (operand_is_const(cur.src1)) {
         var var_id2: u64 = operand_value(cur.src1);
-        var entry_load: *SSAOptKV = const_find(var_consts, var_id2);
+        var entry_load: *SSAOptKV = const_find(slice(var_consts, var_id2));
         if (entry_load != 0) {
             var v3: u64 = entry_load.val;
             set_op(cur, SSA_OP_CONST);
@@ -461,14 +495,14 @@ func handle_foldable(cur: *SSAInstruction, reg_consts: *Vec<*SSAOptKV>) -> u64 {
     if (is_foldable(op) == 0) { return 0; }
 
     if (!operand_is_const(cur.src1)) {
-        var entry1: *SSAOptKV = const_find(reg_consts, operand_value(cur.src1));
+        var entry1: *SSAOptKV = const_find(slice(reg_consts, operand_value(cur.src1)));
         if (entry1 != 0) {
             var c1: u64 = entry1.val;
             cur.src1 = operand_const(c1);
         }
     }
     if (!operand_is_const(cur.src2)) {
-        var entry2: *SSAOptKV = const_find(reg_consts, operand_value(cur.src2));
+        var entry2: *SSAOptKV = const_find(slice(reg_consts, operand_value(cur.src2)));
         if (entry2 != 0) {
             var c2: u64 = entry2.val;
             cur.src2 = operand_const(c2);
@@ -484,8 +518,8 @@ func handle_foldable(cur: *SSAInstruction, reg_consts: *Vec<*SSAOptKV>) -> u64 {
 }
 
 func run_block(b: *SSABlock) -> u64 {
-    var reg_consts: *Vec<*SSAOptKV> = new Vec<*SSAOptKV>(32);
-    var var_consts: *Vec<*SSAOptKV> = new Vec<*SSAOptKV>(32);
+    var reg_consts: *Vec<*SSAOptKV> = new Vec<*SSAOptKV>{heap_alloc((32) * sizeof(*SSAOptKV)), 0, (32)};
+    var var_consts: *Vec<*SSAOptKV> = new Vec<*SSAOptKV>{heap_alloc((32) * sizeof(*SSAOptKV)), 0, (32)};
 
     var cur: *SSAInstruction = b.inst_head;
     while (cur != 0) {

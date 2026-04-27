@@ -47,10 +47,10 @@ for (var i: u64 = 0; i < 10; i = i + 1) {
 - cond: 순수 조건식
 - update: 단순 증감/대입
 
-### switch / match
+### match
 
 ```bpp
-switch (v) {
+match (v) {
     case 1: ...
     default: ...
 }
@@ -60,6 +60,8 @@ match (v) {
     case _: ...
 }
 ```
+
+`switch`는 더 이상 surface syntax가 아니며, 기존 코드는 `match`로 옮겨야 합니다.
 
 `match` 사용 시 주의:
 

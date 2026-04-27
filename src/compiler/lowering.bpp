@@ -5,6 +5,7 @@ import compiler.core_utils;
 import compiler.generic.engine;
 import compiler.symbol_runtime;
 import compiler.ast_lowering;
+import std.str;
 import std.vec;
 import ast;
 import types;
@@ -68,12 +69,12 @@ func set_global_init_value(ginfo: *GlobalInfo, value: u64) -> u64 {
     return 0;
 }
 
-func set_global_init_const_name(ginfo: *GlobalInfo, name_ptr: u64, name_len: u64) -> u64 {
+func set_global_init_const_name(ginfo: *GlobalInfo, name: []u8) -> u64 {
     if (ginfo == 0) { return 0; }
     ginfo.init_kind = GLOBAL_INIT_CONST;
     ginfo.init_value = 0;
-    ginfo.init_name_ptr = name_ptr;
-    ginfo.init_name_len = name_len;
+    ginfo.init_name_ptr = name.ptr;
+    ginfo.init_name_len = name.len;
     return 0;
 }
 
@@ -119,7 +120,7 @@ func finalize_single_global_init_kind(ginfo: *GlobalInfo) -> u64 {
 
     if (kind == AST_IDENT) {
         var id: *AstIdent = (*AstIdent)expr;
-        var const_res: *ConstResult = (*ConstResult)sym_find_const(id.name_ptr, id.name_len);
+        var const_res: *ConstResult = (*ConstResult)sym_find_const(slice(id.name_ptr, id.name_len));
         if (const_res != 0 && const_res.found != 0) {
             set_global_init_value(ginfo, const_res.value);
         } else {
@@ -156,42 +157,48 @@ func lower_finalize_global_init_kinds() -> u64 {
     return 0;
 }
 
-func insert_default_constructor(struct_name_ptr: u64, struct_name_len: u64) -> u64 {
+func insert_default_constructor_single(struct_name: []u8) -> u64 {
     if (g_compiler_ctx.all_funcs == 0 || g_compiler_ctx.all_func_sigs == 0) { return 0; }
-    var ctor_name: *NameInfo = _compiler_build_constructor_name(struct_name_ptr, struct_name_len);
-    if (sym_func_exists(ctor_name.ptr, ctor_name.len) != 0) { return 0; }
+    var ctor_name: *NameInfo = _compiler_build_constructor_name(slice(struct_name.ptr, struct_name.len));
+    if (sym_func_exists(slice(ctor_name.ptr, ctor_name.len)) != 0) { return 0; }
 
-    var params: *Vec<*Param> = new Vec<*Param>(1);
-    params.push(_compiler_make_self_param(struct_name_ptr, struct_name_len));
-    var stmts: *Vec<*AstNode> = new Vec<*AstNode>(0);
+    var params: *Vec<*Param> = new Vec<*Param>{heap_alloc((1) * sizeof(*Param)), 0, (1)};
+    params.push(_compiler_make_self_param(slice(struct_name.ptr, struct_name.len)));
+    var stmts: *Vec<*AstNode> = new Vec<*AstNode>{heap_alloc((0) * sizeof(*AstNode)), 0, (0)};
     var body: *AstNode = (*AstNode)ast_block(stmts);
-    var fn: *AstFunc = ast_func_ex(ctor_name.ptr, ctor_name.len, params, TYPE_VOID, 0, 0, 0, 0, 0, 0, body);
+    var fn: *AstFunc = ast_func_ex(slice(ctor_name.ptr, ctor_name.len), params, TYPE_VOID, 0, 0, slice(0, 0), slice(0, 0), body);
     g_compiler_ctx.all_funcs.push(fn);
     g_compiler_ctx.all_func_sigs.push(fn);
     sym_invalidate_func_lookup();
     return 0;
 }
 
-func lower_insert_default_constructors() -> u64 {
-    var n: u64 = g_compiler_ctx.all_structs_vec.?len();
-    if (n == 0) { return 0; }
-    for (var i: u64 = 0; i < n; i++) {
-        var def: *AstStructDef = g_compiler_ctx.all_structs_vec.get(i);
-        if (def == 0) { continue; }
-        if (sym_is_generic_struct_def(def) != 0) { continue; }
-        insert_default_constructor(def.name_ptr, def.name_len);
+func insert_default_constructor(struct_name: []u8) -> u64 {
+    insert_default_constructor_single(slice(struct_name.ptr, struct_name.len));
+    var resolved_struct: *NameInfo = resolve_name(slice(struct_name.ptr, struct_name.len));
+    if (resolved_struct != 0) {
+        if (str_eq(slice(resolved_struct.ptr, resolved_struct.len), slice(struct_name.ptr, struct_name.len)) == 0) {
+            insert_default_constructor_single(slice(resolved_struct.ptr, resolved_struct.len));
+        }
     }
     return 0;
 }
 
+func lower_insert_default_constructors() -> u64 {
+    // Constructors are explicit. Zero-initialization remains available through
+    // brace initialization and plain local declarations, but `Type()` / `new Type()`
+    // should only succeed when a matching constructor is declared.
+    return 0;
+}
+
 func has_super_constructor_call_expr(expr: *AstNode) -> u64 {
-    var walker: CompilerAstWalker = ast_walker_new(COMPILER_AST_WALK_FIND_SUPER_CTOR, 0, 0);
+    var walker: CompilerAstWalker = ast_walker_new(COMPILER_AST_WALK_FIND_SUPER_CTOR, slice(0, 0));
     ast_walker_walk_expr(&walker, expr);
     return walker.found;
 }
 
 func has_super_constructor_call_stmt(stmt: *AstNode) -> u64 {
-    var walker: CompilerAstWalker = ast_walker_new(COMPILER_AST_WALK_FIND_SUPER_CTOR, 0, 0);
+    var walker: CompilerAstWalker = ast_walker_new(COMPILER_AST_WALK_FIND_SUPER_CTOR, slice(0, 0));
     ast_walker_walk_stmt(&walker, stmt);
     return walker.found;
 }
@@ -206,62 +213,35 @@ func insert_auto_super_constructor_chain_for_fn(fn: *AstFunc) -> u64 {
         method_ptr = fn.name_ptr;
         method_len = fn.name_len;
     }
-    if (sym_is_constructor_name(method_ptr, method_len) == 0) { return 0; }
+    if (sym_is_constructor_name(slice(method_ptr, method_len)) == 0) { return 0; }
 
-    var owner_def: *AstStructDef = get_struct_def(fn.impl_owner_ptr, fn.impl_owner_len);
+    var owner_def: *AstStructDef = get_struct_def(slice(fn.impl_owner_ptr, fn.impl_owner_len));
     if (owner_def == 0 || owner_def.parents_vec == 0 || owner_def.parents_vec.len() == 0) { return 0; }
     if (has_super_constructor_call_stmt(fn.body) != 0) { return 0; }
 
-    if (owner_def.parents_vec.len() != 1) {
-        emit_stderr("[ERROR] automatic super constructor chaining is ambiguous with multiple parents: ");
-        emit_stderr_len(owner_def.name_ptr, owner_def.name_len);
-        emit_stderr("\n");
-        diag_error("Compiler error");
-        return 0;
+    var parent_ctor_count: u64 = 0;
+    var pn: u64 = owner_def.parents_vec.len();
+    for (var pi: u64 = 0; pi < pn; pi++) {
+        var parent_desc: *ParentDesc = owner_def.parents_vec.get(pi);
+        var parent_def: *AstStructDef = resolve_parent_def(parent_desc, "Compiler error");
+        if (parent_def == 0) { continue; }
+        var parent_ctor: CompilerMethodResolveResult = sym_resolve_method_overload(slice(parent_def.name_ptr, parent_def.name_len), slice("constructor", 11), 0, 0);
+        if (parent_ctor.found != 0) {
+            parent_ctor_count = parent_ctor_count + 1;
+        }
     }
+    if (parent_ctor_count == 0) { return 0; }
 
-    var parent_desc: *ParentDesc = owner_def.parents_vec.get(0);
-    var parent_def: *AstStructDef = resolve_parent_def(parent_desc, "Compiler error");
-    var parent_ctor: CompilerMethodResolveResult = sym_resolve_method_overload(parent_def.name_ptr, parent_def.name_len, "constructor", 11, 0, 0);
-    if (parent_ctor.found == 0) {
-        emit_stderr("[ERROR] parent constructor() is required for automatic super chaining: ");
-        emit_stderr_len(parent_def.name_ptr, parent_def.name_len);
-        emit_stderr("\n");
-        diag_error("Compiler error");
-        return 0;
+    diag_emit_error_tag("lowering", "constructor", "derived constructor must call super.constructor() explicitly");
+    emit_stderr("[NOTE] method: ");
+    emit_stderr_len(owner_def.name_ptr, owner_def.name_len);
+    emit_stderr(".constructor");
+    emit_stderr_nl();
+    if (parent_ctor_count > 1) {
+        diag_emit_note("multiple parent constructors are visible, so implicit super chaining would be ambiguous");
     }
-
-    var injected_args: *Vec<*AstNode> = new Vec<*AstNode>(0);
-    var injected_call: *AstMethodCall = ast_method_call((*AstNode)ast_super(), "constructor", 11, injected_args);
-    var injected_stmt: *AstNode = (*AstNode)ast_expr_stmt((*AstNode)injected_call);
-
-    if (fn.body == 0) {
-        var only_stmts: *Vec<*AstNode> = new Vec<*AstNode>(1);
-        only_stmts.push(injected_stmt);
-        fn.body = (*AstNode)ast_block(only_stmts);
-        return 0;
-    }
-
-    if (ast_kind(fn.body) != AST_BLOCK) {
-        var wrapped_stmts: *Vec<*AstNode> = new Vec<*AstNode>(2);
-        wrapped_stmts.push(injected_stmt);
-        wrapped_stmts.push(fn.body);
-        fn.body = (*AstNode)ast_block(wrapped_stmts);
-        return 0;
-    }
-
-    var body_block: *AstBlock = (*AstBlock)fn.body;
-    var old_stmts: *Vec<*AstNode> = body_block.stmts_vec;
-    if (old_stmts == 0) {
-        old_stmts = new Vec<*AstNode>(1);
-    }
-    var old_len: u64 = old_stmts.len();
-    var new_stmts: *Vec<*AstNode> = new Vec<*AstNode>(old_len + 1);
-    new_stmts.push(injected_stmt);
-    for (var i2: u64 = 0; i2 < old_len; i2++) {
-        new_stmts.push(old_stmts.get(i2));
-    }
-    body_block.stmts_vec = new_stmts;
+    diag_emit_help("add `super.constructor();` as the first statement of the derived constructor");
+    diag_note_error();
     return 0;
 }
 
@@ -276,9 +256,9 @@ func lower_insert_auto_super_constructor_chains() -> u64 {
 
 func lower_insert_global_init_func() -> u64 {
     if (has_runtime_global_init() == 0) { return 0; }
-    if (sym_func_exists("__global_init", 13)) { return 0; }
+    if (sym_func_exists(slice("__global_init", 13))) { return 0; }
 
-    var stmts: *Vec<*AstNode> = new Vec<*AstNode>(8);
+    var stmts: *Vec<*AstNode> = new Vec<*AstNode>{heap_alloc((8) * sizeof(*AstNode)), 0, (8)};
     var n: u64 = g_compiler_ctx.all_globals.len();
     for (var i: u64 = 0; i < n; i++) {
         var ginfo: *GlobalInfo = g_compiler_ctx.all_globals.get(i);
@@ -289,7 +269,7 @@ func lower_insert_global_init_func() -> u64 {
             diag_error("Compilation failed");
             continue;
         }
-        var target: *AstNode = (*AstNode)ast_ident(ginfo.name_ptr, ginfo.name_len);
+        var target: *AstNode = (*AstNode)ast_ident(slice(ginfo.name_ptr, ginfo.name_len));
         var assign: *AstAssign = ast_assign(target, init_expr);
         stmts.push((*AstNode)assign);
     }
@@ -297,8 +277,8 @@ func lower_insert_global_init_func() -> u64 {
     if (stmts.len() == 0) { return 0; }
 
     var block: *AstNode = (*AstNode)ast_block(stmts);
-    var params: *Vec<*Param> = new Vec<*Param>(0);
-    var fn: *AstFunc = ast_func("__global_init", 13, params, TYPE_VOID, block);
+    var params: *Vec<*Param> = new Vec<*Param>{heap_alloc((0) * sizeof(*Param)), 0, (0)};
+    var fn: *AstFunc = ast_func(slice("__global_init", 13), params, TYPE_VOID, block);
     g_compiler_ctx.all_funcs.push(fn);
     g_compiler_ctx.all_func_sigs.push(fn);
     sym_invalidate_func_lookup();
@@ -307,7 +287,8 @@ func lower_insert_global_init_func() -> u64 {
 
 func lower_exceptions_with_ctx(ctx: *CompilerCtx) -> u64 {
     if (compiler_ctx_is_active(ctx) == 0) {
-        emit_stderr("[ERROR] lower_exceptions_with_ctx requires active compiler context\n");
+        diag_emit_error_tag("lowering", "internal", "lower_exceptions_with_ctx requires active compiler context");
+        diag_note_error();
         return 1;
     }
     return lower_exceptions();
@@ -315,7 +296,8 @@ func lower_exceptions_with_ctx(ctx: *CompilerCtx) -> u64 {
 
 func lower_parse_sugar_with_ctx(ctx: *CompilerCtx) -> u64 {
     if (compiler_ctx_is_active(ctx) == 0) {
-        emit_stderr("[ERROR] lower_parse_sugar_with_ctx requires active compiler context\n");
+        diag_emit_error_tag("lowering", "internal", "lower_parse_sugar_with_ctx requires active compiler context");
+        diag_note_error();
         return 1;
     }
     return lower_parse_sugar();
@@ -323,7 +305,8 @@ func lower_parse_sugar_with_ctx(ctx: *CompilerCtx) -> u64 {
 
 func lower_finalize_global_init_kinds_with_ctx(ctx: *CompilerCtx) -> u64 {
     if (compiler_ctx_is_active(ctx) == 0) {
-        emit_stderr("[ERROR] lower_finalize_global_init_kinds_with_ctx requires active compiler context\n");
+        diag_emit_error_tag("lowering", "internal", "lower_finalize_global_init_kinds_with_ctx requires active compiler context");
+        diag_note_error();
         return 1;
     }
     return lower_finalize_global_init_kinds();
@@ -331,7 +314,8 @@ func lower_finalize_global_init_kinds_with_ctx(ctx: *CompilerCtx) -> u64 {
 
 func lower_insert_default_constructors_with_ctx(ctx: *CompilerCtx) -> u64 {
     if (compiler_ctx_is_active(ctx) == 0) {
-        emit_stderr("[ERROR] lower_insert_default_constructors_with_ctx requires active compiler context\n");
+        diag_emit_error_tag("lowering", "internal", "lower_insert_default_constructors_with_ctx requires active compiler context");
+        diag_note_error();
         return 1;
     }
     return lower_insert_default_constructors();
@@ -339,7 +323,8 @@ func lower_insert_default_constructors_with_ctx(ctx: *CompilerCtx) -> u64 {
 
 func lower_insert_auto_super_constructor_chains_with_ctx(ctx: *CompilerCtx) -> u64 {
     if (compiler_ctx_is_active(ctx) == 0) {
-        emit_stderr("[ERROR] lower_insert_auto_super_constructor_chains_with_ctx requires active compiler context\n");
+        diag_emit_error_tag("lowering", "internal", "lower_insert_auto_super_constructor_chains_with_ctx requires active compiler context");
+        diag_note_error();
         return 1;
     }
     return lower_insert_auto_super_constructor_chains();
@@ -347,7 +332,8 @@ func lower_insert_auto_super_constructor_chains_with_ctx(ctx: *CompilerCtx) -> u
 
 func lower_insert_global_init_func_with_ctx(ctx: *CompilerCtx) -> u64 {
     if (compiler_ctx_is_active(ctx) == 0) {
-        emit_stderr("[ERROR] lower_insert_global_init_func_with_ctx requires active compiler context\n");
+        diag_emit_error_tag("lowering", "internal", "lower_insert_global_init_func_with_ctx requires active compiler context");
+        diag_note_error();
         return 1;
     }
     return lower_insert_global_init_func();

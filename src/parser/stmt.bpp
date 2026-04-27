@@ -3,7 +3,7 @@
 // Parses all statement types:
 // - Variable declarations
 // - Assignments and expression statements
-// - Control flow (if, while, for, switch)
+// - Control flow (if, while, for, match)
 // - break, continue, return
 // - Inline assembly blocks
 
@@ -23,25 +23,25 @@ import compiler.symbol_runtime;
 import parser.util;
 import parser.type;
 import parser.expr;
-import parser.stmt.switching;
+import parser.stmt.matching;
 import parser.stmt.misc;
 
-func stmt_internal_name(prefix_ptr: u64, prefix_len: u64, id: u64) -> *NameInfo {
+func stmt_internal_name(prefix: []u8, id: u64) -> *NameInfo {
     var id_buf: u64 = heap_alloc(32 * sizeof(u8));
     var id_len: u64 = io_u64_to_ascii(id_buf, id);
-    var total_len: u64 = prefix_len + id_len;
+    var total_len: u64 = prefix.len + id_len;
     var out_ptr: u64 = heap_alloc((total_len + 1) * sizeof(u8));
     var out_u8: []u8 = slice(out_ptr, total_len + 1);
-    str_copy(out_ptr, prefix_ptr, prefix_len);
-    str_copy(out_ptr + prefix_len, id_buf, id_len);
+    str_copy(out_ptr, prefix.ptr, prefix.len);
+    str_copy(out_ptr + prefix.len, id_buf, id_len);
     out_u8[total_len] = 0;
     return new NameInfo{out_ptr, total_len};
 }
 
 func stmt_annotation_is_line_complexity_ignore(info: *NameInfo) -> u64 {
     if (info == 0) { return 0; }
-    if (annotation_name_matches(info, "complexity_ignore", 17) != 0) { return 1; }
-    if (annotation_name_matches(info, "symbolic_ignore", 15) != 0) { return 1; }
+    if (annotation_name_matches(info, slice("complexity_ignore", 17)) != 0) { return 1; }
+    if (annotation_name_matches(info, slice("symbolic_ignore", 15)) != 0) { return 1; }
     return 0;
 }
 
@@ -62,13 +62,11 @@ func stmt_validate_line_annotations(p: *Parser, annotations: *Vec<*NameInfo>, st
             continue;
         }
         if (allow_generic_on_stmt != 0) { continue; }
-        emit_stderr("[ERROR] statement annotations only support @[complexity_ignore(...)] or @[symbolic_ignore(...)]\n");
-        panic_here(p, "Syntax error");
+        parse_fail_here_code_help(p, "P1400", "statement annotations only support @[complexity_ignore(...)] or @[symbolic_ignore(...)]", "generic statement annotations are only allowed on variable declarations");
         return 0;
     }
     if (ignore_count > 1) {
-        emit_stderr("[ERROR] duplicate skip annotation on statement (@[complexity_ignore]/@[symbolic_ignore])\n");
-        panic_here(p, "Syntax error");
+        parse_fail_here_code(p, "P1401", "duplicate skip annotation on statement (@[complexity_ignore]/@[symbolic_ignore])");
         return 0;
     }
     return 1;
@@ -77,7 +75,7 @@ func stmt_validate_line_annotations(p: *Parser, annotations: *Vec<*NameInfo>, st
 func stmt_attach_line_annotations(p: *Parser, stmt: *AstNode, annotations: *Vec<*NameInfo>) -> *AstNode {
     if (annotations == 0 || annotations.len() == 0 || stmt == 0) { return stmt; }
     var kind: u64 = ast_kind(stmt);
-    switch (kind) {
+    match (kind) {
         case AST_VAR_DECL:
             var vd: *AstVarDecl = (*AstVarDecl)stmt;
             vd.annotations_vec = annotations_append(vd.annotations_vec, annotations);
@@ -152,25 +150,24 @@ func stmt_attach_line_annotations(p: *Parser, stmt: *AstNode, annotations: *Vec<
             bk.annotations_vec = annotations_append(bk.annotations_vec, annotations);
             return stmt;
     }
-    emit_stderr("[ERROR] statement kind does not support annotations\n");
-    panic_here(p, "Syntax error");
+    parse_fail_here_code(p, "P1402", "statement kind does not support annotations");
     return stmt;
 }
 
-func stmt_name_matches_aliases(name_ptr: u64, name_len: u64, local_ptr: u64, local_len: u64, fq_ptr: u64, fq_len: u64) -> u64 {
-    if (name_ptr == 0 || name_len == 0) { return 0; }
-    if (str_eq(name_ptr, name_len, local_ptr, local_len) != 0) { return 1; }
-    if (str_eq(name_ptr, name_len, fq_ptr, fq_len) != 0) { return 1; }
+func stmt_name_matches_aliases(name: []u8, local: []u8, fq: []u8) -> u64 {
+    if (name.ptr == 0 || name.len == 0) { return 0; }
+    if (str_eq(slice(name.ptr, name.len), slice(local.ptr, local.len)) != 0) { return 1; }
+    if (str_eq(slice(name.ptr, name.len), slice(fq.ptr, fq.len)) != 0) { return 1; }
     return 0;
 }
 
-func stmt_name_is_number_type(name_ptr: u64, name_len: u64) -> u64 {
-    return stmt_name_matches_aliases(name_ptr, name_len, "Number", 6, "std_number__Number", 18);
+func stmt_name_is_number_type(name: []u8) -> u64 {
+    return stmt_name_matches_aliases(slice(name.ptr, name.len), slice("Number", 6), slice("std_number__Number", 18));
 }
 
-func stmt_is_number_type(type_kind: u64, ptr_depth: u64, struct_name_ptr: u64, struct_name_len: u64) -> u64 {
+func stmt_is_number_type(type_kind: u64, ptr_depth: u64, struct_name: []u8) -> u64 {
     if (type_kind != TYPE_STRUCT || ptr_depth != 0) { return 0; }
-    return stmt_name_is_number_type(struct_name_ptr, struct_name_len);
+    return stmt_name_is_number_type(slice(struct_name.ptr, struct_name.len));
 }
 
 func stmt_is_integer_literal_expr(expr: *AstNode) -> u64 {
@@ -188,31 +185,31 @@ func stmt_is_integer_literal_expr(expr: *AstNode) -> u64 {
 
 func stmt_wrap_integer_literal_number_ctor(expr: *AstNode) -> *AstNode {
     if (stmt_is_integer_literal_expr(expr) == 0) { return expr; }
-    var args: *Vec<*AstNode> = new Vec<*AstNode>(1);
+    var args: *Vec<*AstNode> = new Vec<*AstNode>{heap_alloc((1) * sizeof(*AstNode)), 0, (1)};
     args.push(expr);
-    return (*AstNode)ast_call((u64)"number_from_i64", 15, args);
+    return (*AstNode)ast_call(slice((u64)"number_from_i64", 15), args);
 }
 
-func stmt_struct_base_matches_name(struct_name_ptr: u64, struct_name_len: u64, target_ptr: u64, target_len: u64) -> u64 {
-    if (struct_name_ptr == 0 || struct_name_len == 0 || target_ptr == 0 || target_len == 0) { return 0; }
-    var base_len: u64 = sym_find_generic_suffix_index(struct_name_ptr, struct_name_len);
-    if (str_eq(struct_name_ptr, base_len, target_ptr, target_len) != 0) { return 1; }
-    if (base_len < target_len) { return 0; }
-    if (str_eq(struct_name_ptr + (base_len - target_len), target_len, target_ptr, target_len) != 0) { return 1; }
+func stmt_struct_base_matches_name(struct_name: []u8, target: []u8) -> u64 {
+    if (struct_name.ptr == 0 || struct_name.len == 0 || target.ptr == 0 || target.len == 0) { return 0; }
+    var base_len: u64 = sym_find_generic_suffix_index(slice(struct_name.ptr, struct_name.len));
+    if (str_eq(slice(struct_name.ptr, base_len), slice(target.ptr, target.len)) != 0) { return 1; }
+    if (base_len < target.len) { return 0; }
+    if (str_eq(slice(struct_name.ptr + (base_len - target.len), target.len), slice(target.ptr, target.len)) != 0) { return 1; }
     return 0;
 }
 
-func stmt_is_modnumber_type(type_kind: u64, ptr_depth: u64, struct_name_ptr: u64, struct_name_len: u64) -> u64 {
+func stmt_is_modnumber_type(type_kind: u64, ptr_depth: u64, struct_name: []u8) -> u64 {
     if (type_kind != TYPE_STRUCT || ptr_depth != 0) { return 0; }
-    if (struct_name_ptr == 0 || struct_name_len == 0) { return 0; }
-    if (stmt_struct_base_matches_name(struct_name_ptr, struct_name_len, (u64)"modnumber", 9) != 0) { return 1; }
+    if (struct_name.ptr == 0 || struct_name.len == 0) { return 0; }
+    if (stmt_struct_base_matches_name(slice(struct_name.ptr, struct_name.len), slice((u64)"modnumber", 9)) != 0) { return 1; }
     return 0;
 }
 
-func stmt_modnumber_extract_modulus(struct_name_ptr: u64, struct_name_len: u64, out_mod: *u64) -> u64 {
+func stmt_modnumber_extract_modulus(struct_name: []u8, out_mod: *u64) -> u64 {
     if (out_mod == 0) { return 0; }
     out_mod[0] = 0;
-    var bindings: *Vec<*GenericBinding> = sym_get_generic_struct_bindings(struct_name_ptr, struct_name_len);
+    var bindings: *Vec<*GenericBinding> = sym_get_generic_struct_bindings(slice(struct_name.ptr, struct_name.len));
     if (bindings != 0) {
         var n: u64 = bindings.len();
         for (var i: u64 = 0; i < n; i++) {
@@ -224,12 +221,12 @@ func stmt_modnumber_extract_modulus(struct_name_ptr: u64, struct_name_len: u64, 
         }
     }
 
-    var base_len: u64 = sym_find_generic_suffix_index(struct_name_ptr, struct_name_len);
-    if (base_len >= struct_name_len) { return 0; }
-    var suffix_ptr: u64 = struct_name_ptr + base_len;
-    var suffix_len: u64 = struct_name_len - base_len;
+    var base_len: u64 = sym_find_generic_suffix_index(slice(struct_name.ptr, struct_name.len));
+    if (base_len >= struct_name.len) { return 0; }
+    var suffix_ptr: u64 = struct_name.ptr + base_len;
+    var suffix_len: u64 = struct_name.len - base_len;
     if (suffix_len < 8) { return 0; }
-    if (str_eq(suffix_ptr, 7, "__G__V_", 7) == 0) { return 0; }
+    if (str_eq(slice(suffix_ptr, 7), slice("__G__V_", str_len("__G__V_"))) == 0) { return 0; }
     var suffix_u8: []u8 = slice(suffix_ptr, suffix_len);
     var idx: u64 = 7;
     var acc: u64 = 0;
@@ -246,48 +243,48 @@ func stmt_modnumber_extract_modulus(struct_name_ptr: u64, struct_name_len: u64, 
     return 1;
 }
 
-func stmt_is_modnumber_literal_type(type_kind: u64, ptr_depth: u64, struct_name_ptr: u64, struct_name_len: u64, out_mod: *u64) -> u64 {
-    if (stmt_is_modnumber_type(type_kind, ptr_depth, struct_name_ptr, struct_name_len) == 0) { return 0; }
-    return stmt_modnumber_extract_modulus(struct_name_ptr, struct_name_len, out_mod);
+func stmt_is_modnumber_literal_type(type_kind: u64, ptr_depth: u64, struct_name: []u8, out_mod: *u64) -> u64 {
+    if (stmt_is_modnumber_type(type_kind, ptr_depth, slice(struct_name.ptr, struct_name.len)) == 0) { return 0; }
+    return stmt_modnumber_extract_modulus(slice(struct_name.ptr, struct_name.len), out_mod);
 }
 
-func stmt_is_number_literal_type(type_kind: u64, ptr_depth: u64, struct_name_ptr: u64, struct_name_len: u64, declared_number_kw: u64) -> u64 {
+func stmt_is_number_literal_type(type_kind: u64, ptr_depth: u64, struct_name: []u8, declared_number_kw: u64) -> u64 {
     if (declared_number_kw != 0) { return 1; }
-    return stmt_is_number_type(type_kind, ptr_depth, struct_name_ptr, struct_name_len);
+    return stmt_is_number_type(type_kind, ptr_depth, slice(struct_name.ptr, struct_name.len));
 }
 
 func stmt_number_from_u64_expr(v: u64) -> *AstNode {
-    var args: *Vec<*AstNode> = new Vec<*AstNode>(1);
+    var args: *Vec<*AstNode> = new Vec<*AstNode>{heap_alloc((1) * sizeof(*AstNode)), 0, (1)};
     args.push((*AstNode)ast_literal(v));
-    return (*AstNode)ast_call((u64)"number_from_u64", 15, args);
+    return (*AstNode)ast_call(slice((u64)"number_from_u64", 15), args);
 }
 
-func stmt_resolve_struct_def(name_ptr: u64, name_len: u64) -> *AstStructDef {
-    var sd: *AstStructDef = get_struct_def(name_ptr, name_len);
+func stmt_resolve_struct_def(name: []u8) -> *AstStructDef {
+    var sd: *AstStructDef = get_struct_def(slice(name.ptr, name.len));
     if (sd != 0) { return sd; }
-    var resolved: *NameInfo = resolve_name(name_ptr, name_len);
+    var resolved: *NameInfo = resolve_name(slice(name.ptr, name.len));
     if (resolved != 0) {
-        sd = get_struct_def(resolved.ptr, resolved.len);
+        sd = get_struct_def(slice(resolved.ptr, resolved.len));
         if (sd != 0) { return sd; }
     }
     return 0;
 }
 
-func stmt_wrap_integer_literal_modnumber_ctor(expr: *AstNode, struct_name_ptr: u64, struct_name_len: u64, modulus_value: u64) -> *AstNode {
+func stmt_wrap_integer_literal_modnumber_ctor(expr: *AstNode, struct_name: []u8, modulus_value: u64) -> *AstNode {
     if (stmt_is_integer_literal_expr(expr) == 0) { return expr; }
-    var struct_def: *AstStructDef = stmt_resolve_struct_def(struct_name_ptr, struct_name_len);
+    var struct_def: *AstStructDef = stmt_resolve_struct_def(slice(struct_name.ptr, struct_name.len));
     if (struct_def == 0) { return expr; }
 
     var literal_value_number: *AstNode = stmt_wrap_integer_literal_number_ctor(expr);
     var modulus_number_for_value: *AstNode = stmt_number_from_u64_expr(modulus_value);
     var modulus_number_for_field: *AstNode = stmt_number_from_u64_expr(modulus_value);
 
-    var reduce_args: *Vec<*AstNode> = new Vec<*AstNode>(2);
+    var reduce_args: *Vec<*AstNode> = new Vec<*AstNode>{heap_alloc((2) * sizeof(*AstNode)), 0, (2)};
     reduce_args.push(literal_value_number);
     reduce_args.push(modulus_number_for_value);
-    var reduced_value: *AstNode = (*AstNode)ast_call((u64)"mod_number_reduce", 17, reduce_args);
+    var reduced_value: *AstNode = (*AstNode)ast_call(slice((u64)"mod_number_reduce", 17), reduce_args);
 
-    var fields: *Vec<*AstNode> = new Vec<*AstNode>(2);
+    var fields: *Vec<*AstNode> = new Vec<*AstNode>{heap_alloc((2) * sizeof(*AstNode)), 0, (2)};
     fields.push(reduced_value);
     fields.push(modulus_number_for_field);
     return (*AstNode)ast_struct_literal(struct_def, fields);
@@ -300,45 +297,55 @@ func stmt_assignment_target_modnumber_modulus(p: *Parser, target: *AstNode, out_
     out_struct_len[0] = 0;
     if (p == 0 || target == 0 || ast_kind(target) != AST_IDENT) { return 0; }
     var idn: *AstIdent = (*AstIdent)target;
-    var symbol: *Param = current_function_find_symbol(p, idn.name_ptr, idn.name_len);
+    var symbol: *Param = current_function_find_symbol(p, slice(idn.name_ptr, idn.name_len));
     if (symbol == 0) { return 0; }
-    if (stmt_is_modnumber_type(symbol.type_kind, symbol.ptr_depth, symbol.struct_name_ptr, symbol.struct_name_len) == 0) { return 0; }
+    if (stmt_is_modnumber_type(symbol.type_kind, symbol.ptr_depth, slice(symbol.struct_name_ptr, symbol.struct_name_len)) == 0) { return 0; }
     out_struct_ptr[0] = symbol.struct_name_ptr;
     out_struct_len[0] = symbol.struct_name_len;
-    return stmt_modnumber_extract_modulus(symbol.struct_name_ptr, symbol.struct_name_len, out_modulus);
+    return stmt_modnumber_extract_modulus(slice(symbol.struct_name_ptr, symbol.struct_name_len), out_modulus);
 }
 
 func stmt_is_number_ident_expr(p: *Parser, expr: *AstNode) -> u64 {
     if (p == 0 || expr == 0 || ast_kind(expr) != AST_IDENT) { return 0; }
     var idn: *AstIdent = (*AstIdent)expr;
-    var symbol: *Param = current_function_find_symbol(p, idn.name_ptr, idn.name_len);
+    var symbol: *Param = current_function_find_symbol(p, slice(idn.name_ptr, idn.name_len));
     if (symbol == 0) { return 0; }
-    return stmt_is_number_type(symbol.type_kind, symbol.ptr_depth, symbol.struct_name_ptr, symbol.struct_name_len);
+    return stmt_is_number_type(symbol.type_kind, symbol.ptr_depth, slice(symbol.struct_name_ptr, symbol.struct_name_len));
+}
+
+func stmt_peek_is_number_type_name(p: *Parser) -> u64 {
+    var tok: *Token = peek_tok(p);
+    if (tok == 0) { return 0; }
+    if (tok.kind == TOKEN_NUMBER_TYPE) { return 1; }
+    if (tok.kind == TOKEN_IDENTIFIER && str_eq(slice(tok.ptr, tok.len), slice("number", str_len("number"))) != 0) { return 1; }
+    if (tok.kind == TOKEN_IDENTIFIER && str_eq(slice(tok.ptr, tok.len), slice("Number", str_len("Number"))) != 0) { return 1; }
+    if (tok.kind == TOKEN_IDENTIFIER && str_eq(slice(tok.ptr, tok.len), slice("std_number__Number", str_len("std_number__Number"))) != 0) { return 1; }
+    return 0;
 }
 
 func stmt_call_is_number_ctor(call: *AstCall) -> u64 {
     if (call == 0) { return 0; }
     var name_ptr: u64 = call.name_ptr;
     var name_len: u64 = call.name_len;
-    var resolved: *NameInfo = resolve_name(name_ptr, name_len);
+    var resolved: *NameInfo = resolve_name(slice(name_ptr, name_len));
     if (resolved != 0) {
         name_ptr = resolved.ptr;
         name_len = resolved.len;
     }
-    if (stmt_name_is_number_builtin(name_ptr, name_len, "number_from_i64", 15) != 0) { return 1; }
-    if (stmt_name_is_number_builtin(name_ptr, name_len, "number_from_u64", 15) != 0) { return 1; }
-    if (stmt_name_is_number_builtin(name_ptr, name_len, "number_from_str", 15) != 0) { return 1; }
+    if (stmt_name_is_number_builtin(slice(name_ptr, name_len), slice("number_from_i64", 15)) != 0) { return 1; }
+    if (stmt_name_is_number_builtin(slice(name_ptr, name_len), slice("number_from_u64", 15)) != 0) { return 1; }
+    if (stmt_name_is_number_builtin(slice(name_ptr, name_len), slice("number_from_str", 15)) != 0) { return 1; }
     return 0;
 }
 
-func stmt_name_is_number_builtin(name_ptr: u64, name_len: u64, base_ptr: u64, base_len: u64) -> u64 {
-    if (name_ptr == 0 || name_len == 0 || base_ptr == 0 || base_len == 0) { return 0; }
-    if (str_eq(name_ptr, name_len, base_ptr, base_len) != 0) { return 1; }
+func stmt_name_is_number_builtin(name: []u8, base: []u8) -> u64 {
+    if (name.ptr == 0 || name.len == 0 || base.ptr == 0 || base.len == 0) { return 0; }
+    if (str_eq(slice(name.ptr, name.len), slice(base.ptr, base.len)) != 0) { return 1; }
     var prefix_ptr: u64 = (u64)"std_number__";
     var prefix_len: u64 = 12;
-    if (name_len == prefix_len + base_len &&
-        str_eq(name_ptr, prefix_len, prefix_ptr, prefix_len) != 0 &&
-        str_eq(name_ptr + prefix_len, base_len, base_ptr, base_len) != 0) {
+    if (name.len == prefix_len + base.len &&
+        str_eq(slice(name.ptr, prefix_len), slice(prefix_ptr, prefix_len)) != 0 &&
+        str_eq(slice(name.ptr + prefix_len, base.len), slice(base.ptr, base.len)) != 0) {
         return 1;
     }
     return 0;
@@ -400,7 +407,7 @@ func stmt_expr_contains_number(p: *Parser, expr: *AstNode) -> u64 {
 
 func stmt_is_primitive_integer_type(type_kind: u64, ptr_depth: u64) -> u64 {
     if (ptr_depth != 0) { return 0; }
-    switch (type_kind) {
+    match (type_kind) {
         case TYPE_U8:
         case TYPE_U16:
         case TYPE_U32:
@@ -416,7 +423,7 @@ func stmt_is_primitive_integer_type(type_kind: u64, ptr_depth: u64) -> u64 {
 
 func stmt_is_unsigned_integer_type(type_kind: u64, ptr_depth: u64) -> u64 {
     if (ptr_depth != 0) { return 0; }
-    switch (type_kind) {
+    match (type_kind) {
         case TYPE_U8:
         case TYPE_U16:
         case TYPE_U32:
@@ -427,7 +434,7 @@ func stmt_is_unsigned_integer_type(type_kind: u64, ptr_depth: u64) -> u64 {
 }
 
 func stmt_is_number_box_binary_op(op: u64) -> u64 {
-    switch (op) {
+    match (op) {
         case TOKEN_PLUS:
         case TOKEN_MINUS:
         case TOKEN_STAR:
@@ -460,7 +467,7 @@ func stmt_rewrite_expr_to_number_boxed(p: *Parser, expr: *AstNode) -> *AstNode {
     }
     if (k == AST_IDENT) {
         var idn: *AstIdent = (*AstIdent)expr;
-        var symbol: *Param = current_function_find_symbol(p, idn.name_ptr, idn.name_len);
+        var symbol: *Param = current_function_find_symbol(p, slice(idn.name_ptr, idn.name_len));
         if (symbol != 0 && stmt_is_primitive_integer_type(symbol.type_kind, symbol.ptr_depth) != 0) {
             var ctor_ptr: u64 = (u64)"number_from_i64";
             var ctor_len: u64 = 15;
@@ -472,11 +479,11 @@ func stmt_rewrite_expr_to_number_boxed(p: *Parser, expr: *AstNode) -> *AstNode {
             }
             var arg_expr: *AstNode = expr;
             if (symbol.type_kind != cast_target) {
-                arg_expr = (*AstNode)ast_cast_ex(expr, cast_target, 0, 0, 0, 0, 0, 0);
+                arg_expr = (*AstNode)ast_cast_ex(expr, cast_target, 0, 0, slice(0, 0), slice(0, 0));
             }
-            var args_id: *Vec<*AstNode> = new Vec<*AstNode>(1);
+            var args_id: *Vec<*AstNode> = new Vec<*AstNode>{heap_alloc((1) * sizeof(*AstNode)), 0, (1)};
             args_id.push(arg_expr);
-            return (*AstNode)ast_call(ctor_ptr, ctor_len, args_id);
+            return (*AstNode)ast_call(slice(ctor_ptr, ctor_len), args_id);
         }
     }
     if (k == AST_UNARY) {
@@ -506,9 +513,9 @@ func stmt_rewrite_expr_to_number_boxed(p: *Parser, expr: *AstNode) -> *AstNode {
 func stmt_assignment_target_is_number_ident(p: *Parser, target: *AstNode) -> u64 {
     if (p == 0 || target == 0 || ast_kind(target) != AST_IDENT) { return 0; }
     var idn: *AstIdent = (*AstIdent)target;
-    var symbol: *Param = current_function_find_symbol(p, idn.name_ptr, idn.name_len);
+    var symbol: *Param = current_function_find_symbol(p, slice(idn.name_ptr, idn.name_len));
     if (symbol == 0) { return 0; }
-    return stmt_is_number_type(symbol.type_kind, symbol.ptr_depth, symbol.struct_name_ptr, symbol.struct_name_len);
+    return stmt_is_number_type(symbol.type_kind, symbol.ptr_depth, slice(symbol.struct_name_ptr, symbol.struct_name_len));
 }
 
 // ============================================
@@ -537,9 +544,10 @@ func stmt_parse_var_decl(p: *Parser) -> *AstNode {
     var array_len_param_len: u64 = 0;
     var elem_typeinfo: *TypeInfo = 0;
     var declared_number_kw: u64 = 0;
+    var infer_from_init: u64 = 0;
     
     if (match_tok(p, TOKEN_COLON)) {
-        if (peek_kind(p) == TOKEN_NUMBER_TYPE) {
+        if (stmt_peek_is_number_type_name(p) != 0) {
             declared_number_kw = 1;
         }
         var ty_info: *TypeInfo = type_parse_ex(p);
@@ -577,29 +585,43 @@ func stmt_parse_var_decl(p: *Parser) -> *AstNode {
             struct_name_ptr = type_number_struct_name_ptr();
             struct_name_len = type_number_struct_name_len();
         }
+    } else {
+        type_kind = TYPE_VOID;
+        ptr_depth = 0;
+        infer_from_init = 1;
     }
     
     var init: *AstNode = 0;
     
     if (match_tok(p, TOKEN_EQ)) {
         init = expr_parse(p);
-        var modnumber_modulus: u64 = 0;
-        if (stmt_is_modnumber_type(type_kind, ptr_depth, struct_name_ptr, struct_name_len) != 0 &&
-            stmt_modnumber_extract_modulus(struct_name_ptr, struct_name_len, &modnumber_modulus) != 0) {
-            init = stmt_wrap_integer_literal_modnumber_ctor(init, struct_name_ptr, struct_name_len, modnumber_modulus);
-        }
-        if (declared_number_kw != 0 || stmt_is_number_type(type_kind, ptr_depth, struct_name_ptr, struct_name_len) != 0) {
-            if (stmt_is_integer_literal_expr(init) != 0) {
-                init = stmt_wrap_integer_literal_number_ctor(init);
-            } else {
-                init = stmt_rewrite_expr_to_number_boxed(p, init);
+        if (infer_from_init == 0) {
+            var modnumber_modulus: u64 = 0;
+            if (stmt_is_modnumber_type(type_kind, ptr_depth, slice(struct_name_ptr, struct_name_len)) != 0 &&
+                stmt_modnumber_extract_modulus(slice(struct_name_ptr, struct_name_len), &modnumber_modulus) != 0) {
+                init = stmt_wrap_integer_literal_modnumber_ctor(init, slice(struct_name_ptr, struct_name_len), modnumber_modulus);
+            }
+            if (declared_number_kw != 0 || stmt_is_number_type(type_kind, ptr_depth, slice(struct_name_ptr, struct_name_len)) != 0) {
+                if (stmt_is_integer_literal_expr(init) != 0) {
+                    init = stmt_wrap_integer_literal_number_ctor(init);
+                } else {
+                    init = stmt_rewrite_expr_to_number_boxed(p, init);
+                }
             }
         }
+    } else if (infer_from_init != 0) {
+        end_error_capture();
+        set_error_context("variable declared without explicit type", 38);
+        diag_emit_error_tag("parse", "P1403", "variable declared without explicit type");
+        diag_emit_token_site(name_tok);
+        diag_emit_labelled_name("variable: ", slice(name_tok.ptr, name_tok.len));
+        diag_emit_help("add an explicit type annotation or provide an initializer, for example `var x: u64 = 0;` or `var x = 0;`");
+        finalize_parse_error(p);
     }
     
     consume_tok(p, TOKEN_SEMICOLON);
     
-    var decl: *AstVarDecl = ast_var_decl(name_tok.ptr, name_tok.len, type_kind, ptr_depth, init);
+    var decl: *AstVarDecl = ast_var_decl(slice(name_tok.ptr, name_tok.len), type_kind, ptr_depth, init);
     decl.is_tagged = is_tagged;
     decl.struct_name_ptr = struct_name_ptr;
     decl.struct_name_len = struct_name_len;
@@ -623,7 +645,7 @@ func stmt_parse_var_decl(p: *Parser) -> *AstNode {
 
 func is_assignable_expr(expr: *AstNode) -> u64 {
     var k: u64 = ast_kind(expr);
-    switch (k) {
+    match (k) {
         case AST_IDENT: return true;
         case AST_DEREF: return true;
         case AST_DEREF8: return true;
@@ -642,7 +664,7 @@ func stmt_is_enum_member_const_target(target: *AstNode) -> u64 {
     if (ma.object == 0 || ast_kind(ma.object) != AST_IDENT) { return 0; }
 
     var sid: *AstIdent = (*AstIdent)ma.object;
-    var scoped_const: *ConstResult = (*ConstResult)sym_find_scoped_const(sid.name_ptr, sid.name_len, ma.member_ptr, ma.member_len);
+    var scoped_const: *ConstResult = (*ConstResult)sym_find_scoped_const(slice(sid.name_ptr, sid.name_len), slice(ma.member_ptr, ma.member_len));
     if (scoped_const == 0 || scoped_const.found == 0) { return 0; }
     return 1;
 }
@@ -651,18 +673,18 @@ func stmt_validate_assignment_target_not_enum_const(p: *Parser, target: *AstNode
     if (stmt_is_enum_member_const_target(target) == 0) { return 0; }
     var ma: *AstMemberAccess = (*AstMemberAccess)target;
     var sid: *AstIdent = (*AstIdent)ma.object;
-    emit_stderr("[ERROR] Cannot assign to enum member constant: ");
-    emit_stderr_len(sid.name_ptr, sid.name_len);
-    emit_stderr(".");
-    emit_stderr_len(ma.member_ptr, ma.member_len);
-    emit_stderr("\n");
-    panic_here(p, "Syntax error");
+    end_error_capture();
+    set_error_context("Cannot assign to enum member constant", 36);
+    diag_emit_error_tag("parse", "P1404", "Cannot assign to enum member constant");
+    diag_emit_token_site(peek_tok(p));
+    diag_emit_labelled_member("target: ", slice(sid.name_ptr, sid.name_len), slice(ma.member_ptr, ma.member_len));
+    finalize_parse_error(p);
     return 0;
 }
 
 func make_incdec_rhs(incdec_kind: u64, target: *AstNode) -> *AstNode {
     var one: *AstNode = ast_literal(1);
-    switch (incdec_kind) {
+    match (incdec_kind) {
         case TOKEN_PLUSPLUS:
             return ast_binary(TOKEN_PLUS, target, one);
         case TOKEN_MINUSMINUS:
@@ -680,7 +702,7 @@ func stmt_parse_assign_or_postfix_expr(p: *Parser, lhs: *AstNode) -> *AstNode {
         var modnumber_struct_ptr: u64 = 0;
         var modnumber_struct_len: u64 = 0;
         if (stmt_assignment_target_modnumber_modulus(p, lhs, &modnumber_modulus, &modnumber_struct_ptr, &modnumber_struct_len) != 0) {
-            rhs = stmt_wrap_integer_literal_modnumber_ctor(rhs, modnumber_struct_ptr, modnumber_struct_len, modnumber_modulus);
+            rhs = stmt_wrap_integer_literal_modnumber_ctor(rhs, slice(modnumber_struct_ptr, modnumber_struct_len), modnumber_modulus);
         }
         if (stmt_assignment_target_is_number_ident(p, lhs) != 0) {
             rhs = stmt_rewrite_expr_to_number_boxed(p, rhs);
@@ -695,17 +717,22 @@ func stmt_parse_prefix_incdec_assign(p: *Parser) -> *AstNode {
     consume_tok(p, k);
     var target: *AstNode = expr_parse_unary(p);
     if (!is_assignable_expr(target)) {
-        emit_stderr("[ERROR] ++/-- requires assignable expression\n");
-        panic_here(p, "Syntax error");
+        parse_fail_here_code(p, "P1405", "++/-- requires assignable expression");
     }
     stmt_validate_assignment_target_not_enum_const(p, target);
     var rhs: *AstNode = make_incdec_rhs(k, target);
     return ast_assign(target, rhs);
 }
 
+func stmt_parse_prefix_incdec_stmt(p: *Parser) -> *AstNode {
+    var stmt: *AstNode = stmt_parse_prefix_incdec_assign(p);
+    consume_tok(p, TOKEN_SEMICOLON);
+    return stmt;
+}
+
 func stmt_parse_postfix_incdec_after_expr(p: *Parser, expr: *AstNode) -> *AstNode {
     var k: u64 = peek_kind(p);
-    switch (k) {
+    match (k) {
         case TOKEN_PLUSPLUS:
         case TOKEN_MINUSMINUS:
             break;
@@ -714,8 +741,7 @@ func stmt_parse_postfix_incdec_after_expr(p: *Parser, expr: *AstNode) -> *AstNod
     }
     consume_tok(p, k);
     if (!is_assignable_expr(expr)) {
-        emit_stderr("[ERROR] ++/-- requires assignable expression\n");
-        panic_here(p, "Syntax error");
+        parse_fail_here_code(p, "P1405", "++/-- requires assignable expression");
     }
     stmt_validate_assignment_target_not_enum_const(p, expr);
     var rhs: *AstNode = make_incdec_rhs(k, expr);
@@ -723,7 +749,7 @@ func stmt_parse_postfix_incdec_after_expr(p: *Parser, expr: *AstNode) -> *AstNod
 }
 
 func stmt_wrap_in_block(stmt: *AstNode) -> *AstNode {
-    var stmts: *Vec<*AstNode> = new Vec<*AstNode>(1);
+    var stmts: *Vec<*AstNode> = new Vec<*AstNode>{heap_alloc((1) * sizeof(*AstNode)), 0, (1)};
     stmts.push(stmt);
     return ast_block(stmts);
 }
@@ -745,7 +771,7 @@ func stmt_parse_assign_or_expr(p: *Parser) -> *AstNode {
         var modnumber_struct_ptr: u64 = 0;
         var modnumber_struct_len: u64 = 0;
         if (stmt_assignment_target_modnumber_modulus(p, expr, &modnumber_modulus, &modnumber_struct_ptr, &modnumber_struct_len) != 0) {
-            val = stmt_wrap_integer_literal_modnumber_ctor(val, modnumber_struct_ptr, modnumber_struct_len, modnumber_modulus);
+            val = stmt_wrap_integer_literal_modnumber_ctor(val, slice(modnumber_struct_ptr, modnumber_struct_len), modnumber_modulus);
         }
         if (stmt_assignment_target_is_number_ident(p, expr) != 0) {
             val = stmt_rewrite_expr_to_number_boxed(p, val);
@@ -757,19 +783,23 @@ func stmt_parse_assign_or_expr(p: *Parser) -> *AstNode {
     // Compound assignment: x += 5  =>  x = x + 5
     var k: u64 = peek_kind(p);
     var bin_op: u64 = 0;
-    switch (k) {
+    match (k) {
         case TOKEN_PLUS_EQ: bin_op = TOKEN_PLUS; break;
         case TOKEN_MINUS_EQ: bin_op = TOKEN_MINUS; break;
         case TOKEN_STAR_EQ: bin_op = TOKEN_STAR; break;
         case TOKEN_SLASH_EQ: bin_op = TOKEN_SLASH; break;
         case TOKEN_PERCENT_EQ: bin_op = TOKEN_PERCENT; break;
+        case TOKEN_AMP_EQ: bin_op = TOKEN_AMPERSAND; break;
+        case TOKEN_PIPE_EQ: bin_op = TOKEN_PIPE; break;
+        case TOKEN_CARET_EQ: bin_op = TOKEN_CARET; break;
+        case TOKEN_LSHIFT_EQ: bin_op = TOKEN_LSHIFT; break;
+        case TOKEN_RSHIFT_EQ: bin_op = TOKEN_RSHIFT; break;
         default: bin_op = 0; break;
     }
     if (bin_op != 0) {
         consume_tok(p, k);
         if (!is_assignable_expr(expr)) {
-            emit_stderr("[ERROR] Compound assignment requires assignable expression\n");
-            panic_here(p, "Syntax error");
+            parse_fail_here_code(p, "P1406", "Compound assignment requires assignable expression");
         }
         stmt_validate_assignment_target_not_enum_const(p, expr);
         var rhs: *AstNode = expr_parse(p);
@@ -781,13 +811,12 @@ func stmt_parse_assign_or_expr(p: *Parser) -> *AstNode {
 
     // Postfix ++/-- statement sugar: x++; x--;  =>  x = x +/- 1;
     var post_k: u64 = peek_kind(p);
-    switch (post_k) {
+    match (post_k) {
         case TOKEN_PLUSPLUS:
         case TOKEN_MINUSMINUS:
             consume_tok(p, post_k);
             if (!is_assignable_expr(expr)) {
-                emit_stderr("[ERROR] ++/-- requires assignable expression\n");
-                panic_here(p, "Syntax error");
+                parse_fail_here_code(p, "P1405", "++/-- requires assignable expression");
             }
             stmt_validate_assignment_target_not_enum_const(p, expr);
             var rhs: *AstNode = make_incdec_rhs(post_k, expr);
@@ -851,14 +880,14 @@ func stmt_parse_do_while(p: *Parser) -> *AstNode {
     consume_tok(p, TOKEN_RPAREN);
     consume_tok(p, TOKEN_SEMICOLON);
 
-    var first_name: *NameInfo = stmt_internal_name("__do_first_", 11, next_generated_id(p));
-    var first_decl: *AstVarDecl = ast_var_decl(first_name.ptr, first_name.len, TYPE_U64, 0, (*AstNode)ast_literal(1));
-    var first_ident_a: *AstNode = (*AstNode)ast_ident(first_name.ptr, first_name.len);
-    var first_ident_b: *AstNode = (*AstNode)ast_ident(first_name.ptr, first_name.len);
+    var first_name: *NameInfo = stmt_internal_name(slice("__do_first_", 11), next_generated_id(p));
+    var first_decl: *AstVarDecl = ast_var_decl(slice(first_name.ptr, first_name.len), TYPE_U64, 0, (*AstNode)ast_literal(1));
+    var first_ident_a: *AstNode = (*AstNode)ast_ident(slice(first_name.ptr, first_name.len));
+    var first_ident_b: *AstNode = (*AstNode)ast_ident(slice(first_name.ptr, first_name.len));
     var loop_cond: *AstNode = (*AstNode)ast_binary(TOKEN_OROR, first_ident_a, cond);
     var clear_first: *AstNode = (*AstNode)ast_assign(first_ident_b, (*AstNode)ast_literal(0));
 
-    var loop_body_stmts: *Vec<*AstNode> = new Vec<*AstNode>(8);
+    var loop_body_stmts: *Vec<*AstNode> = new Vec<*AstNode>{heap_alloc((8) * sizeof(*AstNode)), 0, (8)};
     loop_body_stmts.push(clear_first);
     if (body != 0 && ast_kind(body) == AST_BLOCK) {
         stmt_try_append_block_stmts(loop_body_stmts, body);
@@ -868,7 +897,7 @@ func stmt_parse_do_while(p: *Parser) -> *AstNode {
     var loop_body: *AstNode = (*AstNode)ast_block(loop_body_stmts);
     var lowered_while: *AstNode = (*AstNode)ast_while(loop_cond, loop_body);
 
-    var out_stmts: *Vec<*AstNode> = new Vec<*AstNode>(2);
+    var out_stmts: *Vec<*AstNode> = new Vec<*AstNode>{heap_alloc((2) * sizeof(*AstNode)), 0, (2)};
     out_stmts.push((*AstNode)first_decl);
     out_stmts.push(lowered_while);
     return (*AstNode)ast_block(out_stmts);
@@ -882,7 +911,7 @@ func stmt_parse_for(p: *Parser) -> *AstNode {
     var k: u64 = peek_kind(p);
 
     // Parse init clause
-    switch (k) {
+    match (k) {
         case TOKEN_SEMICOLON:
             consume_tok(p, TOKEN_SEMICOLON);
             break;
@@ -891,8 +920,7 @@ func stmt_parse_for(p: *Parser) -> *AstNode {
             break;
         case TOKEN_PLUSPLUS:
         case TOKEN_MINUSMINUS:
-            init = stmt_parse_prefix_incdec_assign(p);
-            consume_tok(p, TOKEN_SEMICOLON);
+            init = stmt_parse_prefix_incdec_stmt(p);
             break;
         default:
             var lhs: *AstNode = expr_parse(p);
@@ -911,7 +939,7 @@ func stmt_parse_for(p: *Parser) -> *AstNode {
     k = peek_kind(p);
 
     // Parse update clause
-    switch (k) {
+    match (k) {
         case TOKEN_RPAREN:
             // No update clause
             break;
@@ -934,7 +962,7 @@ func stmt_parse_for(p: *Parser) -> *AstNode {
 }
 
 func stmt_switch_parse_case_body(p: *Parser) -> *AstNode {
-    var stmts: *Vec<*AstNode> = new Vec<*AstNode>(8);
+    var stmts: *Vec<*AstNode> = new Vec<*AstNode>{heap_alloc((8) * sizeof(*AstNode)), 0, (8)};
     while (peek_kind(p) != TOKEN_CASE) {
         if (peek_kind(p) == TOKEN_DEFAULT) { break; }
         if (peek_kind(p) == TOKEN_RBRACE) { break; }
@@ -944,43 +972,35 @@ func stmt_switch_parse_case_body(p: *Parser) -> *AstNode {
     return (*AstNode)ast_block(stmts);
 }
 
-func stmt_parse_switch(p: *Parser) -> *AstNode {
-    var is_match_stmt: u64 = 0;
-    if (peek_kind(p) == TOKEN_MATCH) {
-        consume_tok(p, TOKEN_MATCH);
-        is_match_stmt = 1;
-    } else {
-        consume_tok(p, TOKEN_SWITCH);
-    }
+func stmt_parse_match_after_keyword(p: *Parser) -> *AstNode {
     consume_tok(p, TOKEN_LPAREN);
     var expr: *AstNode = expr_parse(p);
     consume_tok(p, TOKEN_RPAREN);
     consume_tok(p, TOKEN_LBRACE);
 
-    var cases: *Vec<*AstNode> = new Vec<*AstNode>(16);
-    var arms: *Vec<*ParseSwitchArm> = new Vec<*ParseSwitchArm>(16);
+    var cases: *Vec<*AstNode> = new Vec<*AstNode>{heap_alloc((16) * sizeof(*AstNode)), 0, (16)};
+    var arms: *Vec<*ParseMatchArm> = new Vec<*ParseMatchArm>{heap_alloc((16) * sizeof(*ParseMatchArm)), 0, (16)};
     var has_pattern_arm: u64 = 0;
     p.breakable_depth = p.breakable_depth + 1;
 
     while (peek_kind(p) != TOKEN_RBRACE) {
         if (peek_kind(p) == TOKEN_EOF) { break; }
-        var arm: *ParseSwitchArm = switch_parse_case_head(p, is_match_stmt);
+        var arm: *ParseMatchArm = match_parse_case_head(p, 1);
         if (arm == 0) { break; }
         consume_tok(p, TOKEN_COLON);
         arm.body = stmt_switch_parse_case_body(p);
-        if (arm.kind == PARSE_SWITCH_ARM_VARIANT) {
+        if (arm.kind == PARSE_MATCH_ARM_VARIANT) {
             has_pattern_arm = 1;
         }
         arms.push(arm);
 
-        if (arm.kind == PARSE_SWITCH_ARM_DEFAULT) {
+        if (arm.kind == PARSE_MATCH_ARM_DEFAULT) {
             cases.push(ast_case(0, arm.body, 1));
             continue;
         }
-        if (arm.kind == PARSE_SWITCH_ARM_SIMPLE) {
+        if (arm.kind == PARSE_MATCH_ARM_SIMPLE) {
             if (arm.values_vec == 0 || arm.values_vec.len() == 0) {
-                emit_stderr("[ERROR] case value is required\n");
-                panic_here(p, "Syntax error");
+                parse_fail_here_code(p, "P1407", "case value is required");
             }
             var cvn: u64 = arm.values_vec.len();
             for (var ci: u64 = 0; ci < cvn; ci++) {
@@ -992,12 +1012,27 @@ func stmt_parse_switch(p: *Parser) -> *AstNode {
     p.breakable_depth = p.breakable_depth - 1;
     consume_tok(p, TOKEN_RBRACE);
     if (has_pattern_arm != 0) {
-        return switch_lower_pattern_match(p, expr, arms, is_match_stmt);
+        return match_lower_pattern_match(p, expr, arms, 1);
     }
-    if (is_match_stmt != 0) {
-        return ast_match(expr, cases);
-    }
-    return ast_switch(expr, cases);
+    return ast_match(expr, cases);
+}
+
+func stmt_parse_match(p: *Parser) -> *AstNode {
+    consume_tok(p, TOKEN_MATCH);
+    return stmt_parse_match_after_keyword(p);
+}
+
+func stmt_parse_removed_switch(p: *Parser) -> *AstNode {
+    var tok: *Token = peek_tok(p);
+    end_error_capture();
+    set_error_context("Removed syntax", 14);
+    diag_emit_error_tag("parse", "P1101", "'switch' has been removed from the surface language");
+    diag_emit_token_site(tok);
+    diag_emit_help("rewrite it as 'match (expr) { case ...: ... }'");
+    record_error(p);
+    diag_error("Syntax error");
+    consume_tok(p, TOKEN_SWITCH);
+    return stmt_parse_match_after_keyword(p);
 }
 
 // ============================================
@@ -1007,8 +1042,7 @@ func stmt_parse_switch(p: *Parser) -> *AstNode {
 func stmt_parse_break(p: *Parser) -> *AstNode {
     consume_tok(p, TOKEN_BREAK);
     if (p.breakable_depth == 0) {
-        emit_stderr("[ERROR] break can only be used inside loop/switch\n");
-        panic_here(p, "Syntax error");
+        parse_fail_here_code(p, "P1408", "break can only be used inside loop/match");
     }
     consume_tok(p, TOKEN_SEMICOLON);
     return ast_break();
@@ -1017,8 +1051,7 @@ func stmt_parse_break(p: *Parser) -> *AstNode {
 func stmt_parse_continue(p: *Parser) -> *AstNode {
     consume_tok(p, TOKEN_CONTINUE);
     if (p.breakable_depth == 0) {
-        emit_stderr("[ERROR] continue can only be used inside loop\n");
-        panic_here(p, "Syntax error");
+        parse_fail_here_code(p, "P1409", "continue can only be used inside loop");
     }
     consume_tok(p, TOKEN_SEMICOLON);
     return ast_continue();
@@ -1068,8 +1101,7 @@ func stmt_parse_try(p: *Parser) -> *AstNode {
             catch_name_ptr = catch_tok.ptr;
             catch_name_len = catch_tok.len;
             if (match_tok(p, TOKEN_COLON) == 0) {
-                emit_stderr("[ERROR] catch binding requires explicit payload type\n");
-                panic_here(p, "Syntax error");
+                parse_fail_here_code_help(p, "P1410", "catch binding requires explicit payload type", "use catch (err: ErrorType) { ... }");
             }
             catch_value_type = type_parse_ex(p);
             consume_tok(p, TOKEN_RPAREN);
@@ -1082,10 +1114,9 @@ func stmt_parse_try(p: *Parser) -> *AstNode {
     }
 
     if (catch_block == 0 && finally_block == 0) {
-        emit_stderr("[ERROR] try statement requires catch and/or finally block\n");
-        panic_here(p, "Syntax error");
+        parse_fail_here_code_help(p, "P1411", "try statement requires catch and/or finally block", "add catch { ... }, finally { ... }, or both");
     }
-    return (*AstNode)ast_try_stmt(try_block, catch_block, finally_block, catch_name_ptr, catch_name_len, catch_value_type);
+    return (*AstNode)ast_try_stmt(try_block, catch_block, finally_block, slice(catch_name_ptr, catch_name_len), catch_value_type);
 }
 
 // ============================================
@@ -1110,14 +1141,14 @@ func stmt_is_lambda_closure_decl(stmt: *AstNode) -> u64 {
     if (ast_kind(decl.init_expr) != AST_CALL) { return 0; }
     var call: *AstCall = (*AstCall)decl.init_expr;
     if (call.name_ptr == 0 || call.name_len < 14) { return 0; }
-    if (str_eq(call.name_ptr, 14, "__lambda_bind_", 14) == 0) { return 0; }
+    if (str_eq(slice(call.name_ptr, 14), slice("__lambda_bind_", str_len("__lambda_bind_"))) == 0) { return 0; }
     return 1;
 }
 
 func stmt_block_try_append_owned_cleanup(stmts: *Vec<*AstNode>, stmt: *AstNode) -> u64 {
     if (stmts == 0 || stmt_is_lambda_closure_decl(stmt) == 0) { return 0; }
     var decl: *AstVarDecl = (*AstVarDecl)stmt;
-    var delete_expr: *AstNode = (*AstNode)ast_ident(decl.name_ptr, decl.name_len);
+    var delete_expr: *AstNode = (*AstNode)ast_ident(slice(decl.name_ptr, decl.name_len));
     var delete_stmt: *AstNode = (*AstNode)ast_delete(delete_expr);
     stmts.push((*AstNode)ast_defer(delete_stmt));
     return 0;
@@ -1130,7 +1161,7 @@ func stmt_parse_block(p: *Parser) -> *AstNode {
     consume_tok(p, TOKEN_LBRACE);
     var local_scope_mark: u64 = mark_local_scope(p);
     
-    var stmts: *Vec<*AstNode> = new Vec<*AstNode>(16);
+    var stmts: *Vec<*AstNode> = new Vec<*AstNode>{heap_alloc((16) * sizeof(*AstNode)), 0, (16)};
     
     while (peek_kind(p) != TOKEN_RBRACE) {
         if (peek_kind(p) == TOKEN_EOF) { break; }
@@ -1149,12 +1180,10 @@ func stmt_parse(p: *Parser) -> *AstNode {
     push_trace("stmt_parse", "parser/stmt.b", __LINE__);
     defer pop_trace();
     var k: u64 = peek_kind(p);
-    switch (k) {
+    match (k) {
         case TOKEN_PLUSPLUS:
         case TOKEN_MINUSMINUS:
-            var stmt: *AstNode = stmt_parse_prefix_incdec_assign(p);
-            consume_tok(p, TOKEN_SEMICOLON);
-            return stmt;
+            return stmt_parse_prefix_incdec_stmt(p);
         case TOKEN_VAR:
             return stmt_parse_var_decl(p);
         case TOKEN_AT:
@@ -1172,9 +1201,10 @@ func stmt_parse(p: *Parser) -> *AstNode {
             return stmt_parse_do_while(p);
         case TOKEN_FOR:
             return stmt_parse_for(p);
-        case TOKEN_SWITCH:
         case TOKEN_MATCH:
-            return stmt_parse_switch(p);
+            return stmt_parse_match(p);
+        case TOKEN_SWITCH:
+            return stmt_parse_removed_switch(p);
         case TOKEN_BREAK:
             return stmt_parse_break(p);
         case TOKEN_CONTINUE:
@@ -1183,6 +1213,8 @@ func stmt_parse(p: *Parser) -> *AstNode {
             return misc_parse_asm(p);
         case TOKEN_ALIAS:
             return misc_parse_alias(p);
+        case TOKEN_LBRACE:
+            return stmt_parse_block(p);
         case TOKEN_DEFER:
             return stmt_parse_defer(p);
         case TOKEN_DELETE:

@@ -23,6 +23,8 @@
 1. line/column
 2. expected vs got token
 3. 구체 메시지 (예: named args 제한, throw 제약, decorator 시그니처 오류)
+4. phase tag (`parse`, `compiler`, `typecheck`, `ssa`, `codegen`)
+5. help/note 라인
 
 ### Compile-fail Test
 
@@ -48,3 +50,4 @@
   - 대표 실패 케이스 1개 이상
   - 핵심 진단 substring 검증
 - 동일한 종류의 실패는 suite 단위로 묶어 관리합니다.
+- 내부 포인터 값, 토큰 kind id 같은 구현 세부 정보는 기본 진단보다 debug 진단에 두는 편이 좋습니다.
