@@ -836,7 +836,13 @@ run_llvm_case() {
     local test_file="$2"
     local test_name="$3"
     local test_label="$4"
-    local result_file="$5"
+    local expected="$5"
+    local result_file="$6"
+    local stdin_file="${7:-}"
+    local expect_stdout_file="${8:-}"
+    local compiler_args_file="${9:-}"
+    local compile_only="${10:-0}"
+    local expect_llvm_metadata_file="${11:-}"
 
     local case_tag="[$case_num] LLVM $test_label"
     local case_pass=0
@@ -845,13 +851,23 @@ run_llvm_case() {
 
     local out_file="$RESULTS_DIR/${test_name}.llvm.out"
     local err_file="$RESULTS_DIR/${test_name}.llvm.err"
+    local program_out_file="$RESULTS_DIR/${test_name}.llvm.program.out"
     local out_file_persist="$RESULTS_DIR_BASE/${test_name}.llvm.out"
     local err_file_persist="$RESULTS_DIR_BASE/${test_name}.llvm.err"
+    local program_out_file_persist="$RESULTS_DIR_BASE/${test_name}.llvm.program.out"
 
-    rm -f "$out_file" "$err_file"
+    rm -f "$out_file" "$err_file" "$program_out_file"
 
     local llvm_exit=0
-    $COMPILER -llvm-build "$test_file" >"$out_file" 2>"$err_file"
+    local -a compiler_extra_args=()
+    if [ -n "$compiler_args_file" ] && [ -f "$compiler_args_file" ]; then
+        read -r -a compiler_extra_args < "$compiler_args_file"
+    fi
+    if [ -n "$stdin_file" ]; then
+        $COMPILER "${compiler_extra_args[@]}" -llvm-build "$test_file" <"$stdin_file" >"$out_file" 2>"$err_file"
+    else
+        $COMPILER "${compiler_extra_args[@]}" -llvm-build "$test_file" >"$out_file" 2>"$err_file"
+    fi
     llvm_exit="$?"
     if [ "$llvm_exit" -ne 0 ]; then
         persist_result_file "$out_file" "$out_file_persist"
@@ -863,17 +879,85 @@ run_llvm_case() {
         else
             case_status="FAIL (llvm-build exit=$llvm_exit)"
         fi
-    elif ! grep -q "\[RUN\] exit=0" "$out_file"; then
+    else
+        local ll_path
+        ll_path="$(sed -n 's/^\[OK\] llvm ll: //p' "$out_file" | tail -n 1)"
+        local missing_metadata_pat=""
+        if [ -n "$expect_llvm_metadata_file" ] && [ -f "$expect_llvm_metadata_file" ]; then
+            if [ -z "$ll_path" ] || [ ! -f "$ll_path" ]; then
+                missing_metadata_pat="<missing llvm ll output>"
+            else
+                while IFS= read -r pat || [ -n "$pat" ]; do
+                    if [ -z "$pat" ]; then
+                        continue
+                    fi
+                    if ! grep -Fq "$pat" "$ll_path"; then
+                        missing_metadata_pat="$pat"
+                        break
+                    fi
+                done < "$expect_llvm_metadata_file"
+            fi
+        fi
+        if [ -n "$missing_metadata_pat" ]; then
+            persist_result_file "$out_file" "$out_file_persist"
+            persist_result_file "$err_file" "$err_file_persist"
+            case_fail=1
+            case_status="FAIL (llvm metadata mismatch: $missing_metadata_pat)"
+        elif [ "$compile_only" = "1" ]; then
+            if [ -z "$ll_path" ]; then
+                persist_result_file "$out_file" "$out_file_persist"
+                persist_result_file "$err_file" "$err_file_persist"
+                case_fail=1
+                case_status="FAIL (llvm-build missing ll marker)"
+            else
+                case_pass=1
+                case_status="PASS (compile only)"
+            fi
+        else
+            local run_exit
+            run_exit="$(sed -n 's/^\[RUN\] exit=//p' "$out_file" | tail -n 1)"
+            local expected_raw="$expected"
+            if [ "$expected_raw" -ne 0 ]; then
+                expected_raw=$((expected_raw * 256))
+            fi
+            if [ -z "$run_exit" ]; then
+                persist_result_file "$out_file" "$out_file_persist"
+                persist_result_file "$err_file" "$err_file_persist"
+                case_fail=1
+                case_status="FAIL (llvm-build missing run marker)"
+            elif [ "$run_exit" -ne "$expected_raw" ]; then
+                persist_result_file "$out_file" "$out_file_persist"
+                persist_result_file "$err_file" "$err_file_persist"
+                case_fail=1
+                case_status="FAIL (llvm-build run exit=$run_exit expected=$expected_raw)"
+            else
+                if [ -n "$expect_stdout_file" ] && [ -f "$expect_stdout_file" ]; then
+                    perl -0ne 'if (/\[OK\] llvm exe: [^\n]*\n(.*?)(?:\[RUN\] exit=|\z)/s) { print $1; }' "$out_file" > "$program_out_file"
+                    if ! cmp -s "$program_out_file" "$expect_stdout_file"; then
+                        persist_result_file "$out_file" "$out_file_persist"
+                        persist_result_file "$err_file" "$err_file_persist"
+                        persist_result_file "$program_out_file" "$program_out_file_persist"
+                        case_fail=1
+                        case_status="FAIL (llvm stdout mismatch)"
+                    else
+                        case_pass=1
+                    fi
+                else
+                    case_pass=1
+                fi
+            fi
+        fi
+    fi
+
+    if [ "$case_fail" -eq 0 ] && [ "$case_pass" -eq 0 ]; then
         persist_result_file "$out_file" "$out_file_persist"
         persist_result_file "$err_file" "$err_file_persist"
         case_fail=1
         case_status="FAIL (llvm-build missing successful run marker)"
-    else
-        case_pass=1
     fi
 
     if [ "$KEEP_TEST_ARTIFACTS" -eq 0 ]; then
-        rm -f "$out_file" "$err_file"
+        rm -f "$out_file" "$err_file" "$program_out_file"
     fi
 
     {
@@ -935,7 +1019,7 @@ for TEST_FILE in "${TEST_FILES[@]}"; do
             continue
         fi
     fi
-CONTENT_HASH=$(awk '{if ($0 !~ /^\/\/ (Covers:|Mode:|Opt:|Compiler args:|Compile only:|LLVM Build:|Expect exit code:|Expect compile fail:|Expect error contains:|Expect asm contains:|Expect stdout:|Stdin:)/) print}' "$TEST_FILE" | md5sum | awk '{print $1}')
+CONTENT_HASH=$(awk '{if ($0 !~ /^\/\/ (Covers:|Mode:|Opt:|Compiler args:|Compile only:|LLVM Build:|LLVM Only:|Expect exit code:|Expect compile fail:|Expect error contains:|Expect asm contains:|Expect llvm metadata contains:|Expect stdout:|Stdin:)/) print}' "$TEST_FILE" | md5sum | awk '{print $1}')
     if [ -n "${SEEN_HASH[$CONTENT_HASH]}" ]; then
         if [ "$TEST_QUIET" -eq 0 ]; then
             echo "[SKIP] Duplicate content: $TEST_LABEL (same as ${SEEN_HASH[$CONTENT_HASH]})"
@@ -983,6 +1067,13 @@ CONTENT_HASH=$(awk '{if ($0 !~ /^\/\/ (Covers:|Mode:|Opt:|Compiler args:|Compile
         rm -f "$EXPECT_ASM_FILE"
         EXPECT_ASM_FILE=""
     fi
+    EXPECT_LLVM_METADATA_FILE="$JOBS_DIR/${RUN_TAG}_${TEST_NAME}.llvm_metadata_expect"
+    rm -f "$EXPECT_LLVM_METADATA_FILE"
+    grep -E '^// Expect llvm metadata contains:' "$TEST_FILE" | sed -E 's|^// Expect llvm metadata contains:[[:space:]]*||' > "$EXPECT_LLVM_METADATA_FILE" || true
+    if [ ! -s "$EXPECT_LLVM_METADATA_FILE" ]; then
+        rm -f "$EXPECT_LLVM_METADATA_FILE"
+        EXPECT_LLVM_METADATA_FILE=""
+    fi
     COMPILE_ONLY_RAW=$(grep -m1 -E '^// Compile only:' "$TEST_FILE" | awk -F': ' '{print $2}' | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]' || true)
     COMPILE_ONLY=0
     if [ "$COMPILE_ONLY_RAW" = "1" ] || [ "$COMPILE_ONLY_RAW" = "true" ] || [ "$COMPILE_ONLY_RAW" = "yes" ]; then
@@ -992,6 +1083,15 @@ CONTENT_HASH=$(awk '{if ($0 !~ /^\/\/ (Covers:|Mode:|Opt:|Compiler args:|Compile
     LLVM_BUILD=0
     if [ "$LLVM_BUILD_RAW" = "1" ] || [ "$LLVM_BUILD_RAW" = "true" ] || [ "$LLVM_BUILD_RAW" = "yes" ]; then
         LLVM_BUILD=1
+    fi
+    LLVM_ONLY_RAW=$(grep -m1 -E '^// LLVM Only:' "$TEST_FILE" | awk -F': ' '{print $2}' | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]' || true)
+    LLVM_ONLY=0
+    if [ "$LLVM_ONLY_RAW" = "1" ] || [ "$LLVM_ONLY_RAW" = "true" ] || [ "$LLVM_ONLY_RAW" = "yes" ]; then
+        LLVM_ONLY=1
+    fi
+    if [ "$LLVM_ONLY" -eq 1 ] && [ "$LLVM_BUILD" -eq 0 ]; then
+        echo "Error: '// LLVM Only: true' requires '// LLVM Build: true' for $TEST_LABEL"
+        exit 1
     fi
     if [ "$EXPECT_COMPILE_FAIL" -eq 1 ] && [ "$STRICT_FAIL_DIAGNOSTICS" -eq 1 ] && [ -z "$EXPECT_ERROR_FILE" ]; then
         echo "Error: Missing '// Expect error contains:' directive for compile-fail test: $TEST_LABEL"
@@ -1010,30 +1110,13 @@ CONTENT_HASH=$(awk '{if ($0 !~ /^\/\/ (Covers:|Mode:|Opt:|Compiler args:|Compile
     fi
 
     VARIANT_COUNT=0
-    for MODE in nossa ssa; do
-        if ! csv_has "$GLOBAL_MODES_CSV" "$MODE" || ! csv_has "$TEST_MODES_CSV" "$MODE"; then
-            continue
-        fi
-        for OPT in O0 O1; do
-            if ! csv_has "$GLOBAL_OPTS_CSV" "$OPT" || ! csv_has "$TEST_OPTS_CSV" "$OPT"; then
-                continue
-            fi
-            VARIANT_COUNT=$((VARIANT_COUNT + 1))
-            TOTAL=$((TOTAL + 1))
-            RESULT_FILE="$JOBS_DIR/${RUN_TAG}_case_${TOTAL}.result"
-            CASE_RESULT_FILES+=("$RESULT_FILE")
-            launch_job_with_limit run_matrix_case "$TOTAL" "$TEST_FILE" "$TEST_NAME" "$TEST_LABEL" "$MODE" "$OPT" "$EXPECTED" "$EXPECT_COMPILE_FAIL" "$EXPECT_ERROR_FILE" "$EXPECT_STDOUT_FILE" "$STDIN_FILE" "$RESULT_FILE" "$COMPILER_ARGS_FILE" "$EXPECT_ASM_FILE" "$COMPILE_ONLY"
-        done
-    done
-
-    # If global quick filters eliminate all variants, honor per-test directives.
-    if [ "$VARIANT_COUNT" -eq 0 ]; then
+    if [ "$LLVM_ONLY" -eq 0 ]; then
         for MODE in nossa ssa; do
-            if ! csv_has "$TEST_MODES_CSV" "$MODE"; then
+            if ! csv_has "$GLOBAL_MODES_CSV" "$MODE" || ! csv_has "$TEST_MODES_CSV" "$MODE"; then
                 continue
             fi
             for OPT in O0 O1; do
-                if ! csv_has "$TEST_OPTS_CSV" "$OPT"; then
+                if ! csv_has "$GLOBAL_OPTS_CSV" "$OPT" || ! csv_has "$TEST_OPTS_CSV" "$OPT"; then
                     continue
                 fi
                 VARIANT_COUNT=$((VARIANT_COUNT + 1))
@@ -1043,20 +1126,39 @@ CONTENT_HASH=$(awk '{if ($0 !~ /^\/\/ (Covers:|Mode:|Opt:|Compiler args:|Compile
                 launch_job_with_limit run_matrix_case "$TOTAL" "$TEST_FILE" "$TEST_NAME" "$TEST_LABEL" "$MODE" "$OPT" "$EXPECTED" "$EXPECT_COMPILE_FAIL" "$EXPECT_ERROR_FILE" "$EXPECT_STDOUT_FILE" "$STDIN_FILE" "$RESULT_FILE" "$COMPILER_ARGS_FILE" "$EXPECT_ASM_FILE" "$COMPILE_ONLY"
             done
         done
-    fi
 
-    if [ "$VARIANT_COUNT" -eq 0 ]; then
-        echo "Error: No test variants selected for $TEST_LABEL"
-        echo "       Global mode/opt: $GLOBAL_MODES_CSV / $GLOBAL_OPTS_CSV"
-        echo "       Test mode/opt:   $TEST_MODES_CSV / $TEST_OPTS_CSV"
-        exit 1
+        # If global quick filters eliminate all variants, honor per-test directives.
+        if [ "$VARIANT_COUNT" -eq 0 ]; then
+            for MODE in nossa ssa; do
+                if ! csv_has "$TEST_MODES_CSV" "$MODE"; then
+                    continue
+                fi
+                for OPT in O0 O1; do
+                    if ! csv_has "$TEST_OPTS_CSV" "$OPT"; then
+                        continue
+                    fi
+                    VARIANT_COUNT=$((VARIANT_COUNT + 1))
+                    TOTAL=$((TOTAL + 1))
+                    RESULT_FILE="$JOBS_DIR/${RUN_TAG}_case_${TOTAL}.result"
+                    CASE_RESULT_FILES+=("$RESULT_FILE")
+                    launch_job_with_limit run_matrix_case "$TOTAL" "$TEST_FILE" "$TEST_NAME" "$TEST_LABEL" "$MODE" "$OPT" "$EXPECTED" "$EXPECT_COMPILE_FAIL" "$EXPECT_ERROR_FILE" "$EXPECT_STDOUT_FILE" "$STDIN_FILE" "$RESULT_FILE" "$COMPILER_ARGS_FILE" "$EXPECT_ASM_FILE" "$COMPILE_ONLY"
+                done
+            done
+        fi
+
+        if [ "$VARIANT_COUNT" -eq 0 ]; then
+            echo "Error: No test variants selected for $TEST_LABEL"
+            echo "       Global mode/opt: $GLOBAL_MODES_CSV / $GLOBAL_OPTS_CSV"
+            echo "       Test mode/opt:   $TEST_MODES_CSV / $TEST_OPTS_CSV"
+            exit 1
+        fi
     fi
 
     if [ "$LLVM_BUILD" -eq 1 ]; then
         TOTAL=$((TOTAL + 1))
         RESULT_FILE="$JOBS_DIR/${RUN_TAG}_llvm_${TOTAL}.result"
         LLVM_RESULT_FILES+=("$RESULT_FILE")
-        launch_job_with_limit run_llvm_case "$TOTAL" "$TEST_FILE" "$TEST_NAME" "$TEST_LABEL" "$RESULT_FILE"
+        launch_job_with_limit run_llvm_case "$TOTAL" "$TEST_FILE" "$TEST_NAME" "$TEST_LABEL" "$EXPECTED" "$RESULT_FILE" "$STDIN_FILE" "$EXPECT_STDOUT_FILE" "$COMPILER_ARGS_FILE" "$COMPILE_ONLY" "$EXPECT_LLVM_METADATA_FILE"
     fi
 done
 

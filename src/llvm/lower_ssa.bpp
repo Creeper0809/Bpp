@@ -5,10 +5,12 @@ import std.str;
 import ast;
 import types;
 import compiler.annotations;
+import emitter.typeinfo;
 import llvm.contract_types;
 import ssa;
 import ssa.datastruct;
 import ssa.core;
+import run as to_ssa from ssa.mem2reg;
 
 struct LLVMSSALoweringOptions {
     public preserve_contract_metadata: u64;
@@ -75,6 +77,7 @@ struct LLVMSSAInstSketch {
     public has_src2: u64;
     public src2_is_const: u64;
     public src2_value: u64;
+    public phi_args: *Vec<*LLVMSSAPhiArgSketch>;
 }
 
 impl LLVMSSAInstSketch {
@@ -87,6 +90,19 @@ impl LLVMSSAInstSketch {
         self.has_src2 = 0;
         self.src2_is_const = 0;
         self.src2_value = 0;
+        self.phi_args = 0;
+    }
+}
+
+struct LLVMSSAPhiArgSketch {
+    public val: u64;
+    public block_id: u64;
+}
+
+impl LLVMSSAPhiArgSketch {
+    public constructor() {
+        self.val = 0;
+        self.block_id = 0;
     }
 }
 
@@ -169,6 +185,19 @@ func llvm_ssa_inst_to_sketch(inst: *SSAInstruction) -> *LLVMSSAInstSketch {
     var out: *LLVMSSAInstSketch = new LLVMSSAInstSketch{};
     out.op = op_of(inst);
     out.dest = inst.dest;
+    if (out.op == SSA_OP_PHI) {
+        var phi_args: *Vec<*LLVMSSAPhiArgSketch> = new Vec<*LLVMSSAPhiArgSketch>{heap_alloc((4) * sizeof(*LLVMSSAPhiArgSketch)), 0, (4)};
+        var phi_arg: *SSAPhiArg = (*SSAPhiArg)inst.src1;
+        while (phi_arg != 0) {
+            var arg_sketch: *LLVMSSAPhiArgSketch = new LLVMSSAPhiArgSketch{};
+            arg_sketch.val = phi_arg.val;
+            arg_sketch.block_id = phi_arg.block_id;
+            phi_args.push(arg_sketch);
+            phi_arg = phi_arg.next;
+        }
+        out.phi_args = phi_args;
+        return out;
+    }
     if (inst.src1 != 0) {
         out.has_src1 = 1;
         out.src1_is_const = operand_is_const(inst.src1);
@@ -191,6 +220,12 @@ func llvm_ssa_block_to_sketch(block: *SSABlock, is_entry: u64) -> *LLVMSSABlockS
     out.inst_count = llvm_ssa_count_block_insts(block);
     out.terminator_op = llvm_ssa_block_terminator_op(block);
     var insts: *Vec<*LLVMSSAInstSketch> = new Vec<*LLVMSSAInstSketch>{heap_alloc((32) * sizeof(*LLVMSSAInstSketch)), 0, (32)};
+    var phi_cur: *SSAInstruction = block.phi_head;
+    while (phi_cur != 0) {
+        var phi_sketch: *LLVMSSAInstSketch = llvm_ssa_inst_to_sketch(phi_cur);
+        if (phi_sketch != 0) { insts.push(phi_sketch); }
+        phi_cur = phi_cur.next;
+    }
     var cur: *SSAInstruction = block.inst_head;
     while (cur != 0) {
         var inst_sketch: *LLVMSSAInstSketch = llvm_ssa_inst_to_sketch(cur);
@@ -227,11 +262,17 @@ func llvm_ssa_type_supported_for_sig(type_kind: u64, ptr_depth: u64) -> u64 {
 
 func llvm_ssa_ast_param_sig_supported(param: *Param) -> u64 {
     if (param == 0 || param.is_variadic != 0) { return 0; }
+    if (param.type_kind == TYPE_STRUCT && param.ptr_depth == 0) { return 1; }
+    if (param.type_kind == TYPE_SLICE && param.ptr_depth == 0) { return 1; }
+    if (param.type_kind == TYPE_ARRAY && param.ptr_depth == 0) { return 1; }
     return llvm_ssa_type_supported_for_sig(param.type_kind, param.ptr_depth);
 }
 
 func llvm_ssa_ast_param_ll_body_supported(param: *Param) -> u64 {
     if (param == 0 || param.is_variadic != 0) { return 0; }
+    if (param.type_kind == TYPE_STRUCT && param.ptr_depth == 0) { return 1; }
+    if (param.type_kind == TYPE_SLICE && param.ptr_depth == 0) { return 1; }
+    if (param.type_kind == TYPE_ARRAY && param.ptr_depth == 0) { return 1; }
     if (param.ptr_depth != 0) { return 1; }
     if (param.type_kind == TYPE_BOOL) { return 1; }
     if (param.type_kind == TYPE_U8 || param.type_kind == TYPE_I8) { return 1; }
@@ -265,6 +306,8 @@ func llvm_ssa_ast_ll_body_param_types(fn: *AstFunc) -> u64 {
 func llvm_ssa_ast_ll_body_supported_ret_type(fn: *AstFunc) -> u64 {
     if (fn == 0) { return 0; }
     if (fn.ret_ptr_depth != 0) { return 1; }
+    if (fn.ret_type == TYPE_SLICE) { return 1; }
+    if (fn.ret_type == TYPE_STRUCT) { return 1; }
     if (fn.ret_type == TYPE_VOID) { return 1; }
     if (fn.ret_type == TYPE_BOOL) { return 1; }
     if (fn.ret_type == TYPE_U8 || fn.ret_type == TYPE_I8) { return 1; }
@@ -278,6 +321,8 @@ func llvm_ssa_ast_ll_body_supported_ret_type(fn: *AstFunc) -> u64 {
 func llvm_ssa_ast_supported_ret_type(fn: *AstFunc) -> u64 {
     if (fn == 0) { return 0; }
     if (fn.ret_ptr_depth > 0) { return 1; }
+    if (fn.ret_type == TYPE_SLICE) { return 1; }
+    if (fn.ret_type == TYPE_STRUCT) { return 1; }
     match (fn.ret_type) {
         case TYPE_VOID: return 1;
         case TYPE_BOOL: return 1;
@@ -372,8 +417,11 @@ func llvm_ssa_collect_module_sketch(program: *AstProgram, ssa_ctx: *SSAContext, 
 
 func llvm_ssa_collect_module_sketch_from_program(program: *AstProgram, adapter: *AnnLLVMContractAdapter, opts: *LLVMSSALoweringOptions) -> *LLVMSSAModuleSketch {
     if (program == 0) { return 0; }
+    typeinfo_set_structs(program.structs_vec);
+    typeinfo_set_funcs(program.funcs_vec);
     ssa_builder_diag_suppress_set(1);
     var ssa_ctx: *SSAContext = build_program(program);
+    to_ssa(ssa_ctx);
     ssa_builder_diag_suppress_set(0);
     return llvm_ssa_collect_module_sketch(program, ssa_ctx, adapter, opts);
 }
@@ -408,8 +456,11 @@ func llvm_ssa_contract_atom_count(module: *LLVMSSAModuleSketch) -> u64 {
 }
 
 func llvm_ssa_op_supported_for_ll(op: u64) -> u64 {
+    if (op == SSA_OP_NOP) { return 1; }
+    if (op == SSA_OP_PHI) { return 1; }
     if (op == SSA_OP_CONST) { return 1; }
     if (op == SSA_OP_FCONST) { return 1; }
+    if (op == SSA_OP_COPY) { return 1; }
     if (op == SSA_OP_LOAD) { return 1; }
     if (op == SSA_OP_STORE) { return 1; }
     if (op == SSA_OP_PARAM) { return 1; }
@@ -453,6 +504,8 @@ func llvm_ssa_op_supported_for_ll(op: u64) -> u64 {
     if (op == SSA_OP_ULE) { return 1; }
     if (op == SSA_OP_UGE) { return 1; }
     if (op == SSA_OP_LEA_LOCAL) { return 1; }
+    if (op == SSA_OP_LEA_STR) { return 1; }
+    if (op == SSA_OP_LEA_GLOBAL) { return 1; }
     if (op == SSA_OP_LEA_FUNC) { return 1; }
     if (op == SSA_OP_LOAD8) { return 1; }
     if (op == SSA_OP_LOAD16) { return 1; }
@@ -462,10 +515,24 @@ func llvm_ssa_op_supported_for_ll(op: u64) -> u64 {
     if (op == SSA_OP_STORE16) { return 1; }
     if (op == SSA_OP_STORE32) { return 1; }
     if (op == SSA_OP_STORE64) { return 1; }
+    if (op == SSA_OP_ASM) { return 1; }
     if (op == SSA_OP_CALL_PTR) { return 1; }
+    if (op == SSA_OP_CALL_SLICE_STORE) { return 1; }
     if (op == SSA_OP_JMP) { return 1; }
     if (op == SSA_OP_BR) { return 1; }
     if (op == SSA_OP_RET) { return 1; }
+    if (op == SSA_OP_RET_SLICE_HEAP) { return 1; }
+    return 0;
+}
+
+func llvm_ssa_block_has_meaningful_ll_inst(block: *LLVMSSABlockSketch) -> u64 {
+    if (block == 0 || block.insts == 0) { return 0; }
+    var n: u64 = block.insts.len();
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var inst: *LLVMSSAInstSketch = block.insts.get(i);
+        if (inst == 0) { continue; }
+        if (inst.op != SSA_OP_NOP) { return 1; }
+    }
     return 0;
 }
 
@@ -476,10 +543,12 @@ func llvm_ssa_func_supports_ll_body(fn: *AstFunc, sketch: *LLVMSSAFuncSketch) ->
     if (sketch.ll_body_param_types == 0) { return 0; }
     if (sketch.blocks == 0 || sketch.blocks.len() == 0) { return 0; }
     var nblocks: u64 = sketch.blocks.len();
+    var saw_nonempty: u64 = 0;
     for (var bi: u64 = 0; bi < nblocks; bi = bi + 1) {
         var block: *LLVMSSABlockSketch = sketch.blocks.get(bi);
-        if (block == 0) { return 0; }
-        if (block.phi_count != 0 || block.insts == 0 || block.insts.len() == 0) { return 0; }
+        if (block == 0) { continue; }
+        if (llvm_ssa_block_has_meaningful_ll_inst(block) == 0) { continue; }
+        saw_nonempty = 1;
         var n: u64 = block.insts.len();
         for (var i: u64 = 0; i < n; i = i + 1) {
             var inst: *LLVMSSAInstSketch = block.insts.get(i);
@@ -487,5 +556,5 @@ func llvm_ssa_func_supports_ll_body(fn: *AstFunc, sketch: *LLVMSSAFuncSketch) ->
             if (llvm_ssa_op_supported_for_ll(inst.op) == 0) { return 0; }
         }
     }
-    return 1;
+    return saw_nonempty;
 }
