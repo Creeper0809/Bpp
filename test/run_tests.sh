@@ -139,6 +139,7 @@ RESULTS_DIR_BASE="build/test_results"
 LLVM_ARTIFACT_DIR_BASE="build/${VERSION}_llvm"
 
 TEST_FAST_IO=${TEST_FAST_IO:-0}
+TEST_SKIP_LLVM_BUILD=${TEST_SKIP_LLVM_BUILD:-0}
 TEST_QUIET=${TEST_QUIET:-0}
 KEEP_TEST_ARTIFACTS=${KEEP_TEST_ARTIFACTS:-1}
 TEST_JOBS=${TEST_JOBS:-0}
@@ -152,6 +153,12 @@ STRICT_FAIL_DIAGNOSTICS=${STRICT_FAIL_DIAGNOSTICS:-1}
 TEST_TIMEOUT_SEC=${TEST_TIMEOUT_SEC:-15}
 TEST_FAST_IO_MIN_SHM_KB=${BPP_TEST_FAST_IO_MIN_SHM_KB:-262144}
 FAST_IO_ACTIVE=0
+
+TEST_SKIP_LLVM_BUILD="$(echo "$TEST_SKIP_LLVM_BUILD" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+case "$TEST_SKIP_LLVM_BUILD" in
+    1|true|yes) TEST_SKIP_LLVM_BUILD=1 ;;
+    *) TEST_SKIP_LLVM_BUILD=0 ;;
+esac
 
 shm_available_kb() {
     if [ ! -d "/dev/shm" ] || [ ! -w "/dev/shm" ]; then
@@ -402,6 +409,7 @@ mkdir -p "$RESULTS_DIR_BASE"
 TOTAL=0
 PASSED=0
 FAILED=0
+LLVM_SKIPPED=0
 
 # Resolve profile defaults first, then normalize filters.
 if [ -z "$TEST_MODE_FILTER" ]; then
@@ -476,6 +484,7 @@ if [ "$TEST_QUIET" -eq 0 ]; then
     echo "[INFO] Mode filter: $GLOBAL_MODES_CSV"
     echo "[INFO] Opt filter: $GLOBAL_OPTS_CSV"
     echo "[INFO] Name filter: ${TEST_NAME_FILTER:-<none>}"
+    echo "[INFO] Skip LLVM build tests: $TEST_SKIP_LLVM_BUILD"
     echo "[INFO] Compile-fail single variant: $COMPILE_FAIL_SINGLE_VARIANT"
     echo "[INFO] Strict fail diagnostics: $STRICT_FAIL_DIAGNOSTICS"
     echo "[INFO] Suite case limit: $TEST_SUITE_CASE_LIMIT (0=all)"
@@ -1088,7 +1097,7 @@ if [ "${#TEST_FILES[@]}" -eq 0 ]; then
     echo "No test files found in $TEST_DIR or $TEST_FAIL_DIR"
     exit 1
 fi
-if selected_tests_need_llvm_build && ! compiler_clang_available; then
+if [ "$TEST_SKIP_LLVM_BUILD" -eq 0 ] && selected_tests_need_llvm_build && ! compiler_clang_available; then
     echo "Error: LLVM build tests require clang at /usr/bin/clang, /usr/local/bin/clang, or /bin/clang."
     echo "       Install clang or filter out tests with '// LLVM Build: true'."
     exit 1
@@ -1171,6 +1180,16 @@ CONTENT_HASH=$(awk '{if ($0 !~ /^\/\/ (Covers:|Mode:|Opt:|Compiler args:|Compile
     LLVM_ONLY=0
     if [ "$LLVM_ONLY_RAW" = "1" ] || [ "$LLVM_ONLY_RAW" = "true" ] || [ "$LLVM_ONLY_RAW" = "yes" ]; then
         LLVM_ONLY=1
+    fi
+    if [ "$LLVM_BUILD" -eq 1 ] && [ "$TEST_SKIP_LLVM_BUILD" -eq 1 ]; then
+        LLVM_SKIPPED=$((LLVM_SKIPPED + 1))
+        LLVM_BUILD=0
+        if [ "$LLVM_ONLY" -eq 1 ]; then
+            if [ "$TEST_QUIET" -eq 0 ]; then
+                echo -e "${YELLOW}[SKIP] LLVM $TEST_LABEL (TEST_SKIP_LLVM_BUILD=1)${NC}"
+            fi
+            continue
+        fi
     fi
     if [ "$LLVM_ONLY" -eq 1 ] && [ "$LLVM_BUILD" -eq 0 ]; then
         echo "Error: '// LLVM Only: true' requires '// LLVM Build: true' for $TEST_LABEL"
@@ -1349,6 +1368,7 @@ echo "========================================"
 echo "Total:  $TOTAL"
 echo -e "Passed: ${GREEN}$PASSED${NC}"
 echo -e "Failed: ${RED}$FAILED${NC}"
+echo -e "LLVM skipped: ${YELLOW}$LLVM_SKIPPED${NC}"
 echo -e "Stress: ${GREEN}$STRESS_PASSED${NC} passed, ${RED}$STRESS_FAILED${NC} failed"
 echo -e "Stability: ${GREEN}$STABILITY_PASSED${NC} passed, ${RED}$STABILITY_FAILED${NC} failed"
 echo ""
