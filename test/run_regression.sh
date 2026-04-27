@@ -146,8 +146,7 @@ if "$COMPILER" -asm "$BAD_SRC" > /dev/null 2> "$BAD_ERR"; then
     exit 1
 fi
 grep -Fq "Unexpected token" "$BAD_ERR"
-grep -Fq "line" "$BAD_ERR"
-grep -Fq "column" "$BAD_ERR"
+grep -Fq '  --> 3:5 near `return`' "$BAD_ERR"
 if grep -Fq "Parse error" "$BAD_ERR"; then
     echo "[ERROR] Legacy 'Parse error' message leaked"
     exit 1
