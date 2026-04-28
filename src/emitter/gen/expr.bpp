@@ -89,6 +89,18 @@ func emit_member_is_bits_field(member: []u8) -> u64 {
     return 0;
 }
 
+func emit_member_slice_offset(member: []u8, out_offset: *u64) -> u64 {
+    if (out_offset != 0) { *out_offset = 0; }
+    if (str_eq(slice(member.ptr, member.len), slice("ptr", str_len("ptr"))) != 0) {
+        return 1;
+    }
+    if (str_eq(slice(member.ptr, member.len), slice("len", str_len("len"))) != 0) {
+        if (out_offset != 0) { *out_offset = 8; }
+        return 1;
+    }
+    return 0;
+}
+
 func emit_try_match_struct_def_by_tail(name: []u8) -> *AstStructDef {
     if (name.ptr == 0 || name.len == 0) { return 0; }
     var all_structs: *Vec<*AstStructDef> = typeinfo_get_structs();
@@ -135,31 +147,28 @@ func emit_try_match_struct_def_by_tail(name: []u8) -> *AstStructDef {
 func emit_hydrate_struct_def_from_type(ti: *TypeInfo) -> *AstStructDef {
     if (ti == 0) { return 0; }
     if (ti.struct_def != 0) {
-        if (ti.struct_name_ptr == 0 || ti.struct_name_len == 0) {
-            ti.struct_name_ptr = ti.struct_def.name_ptr;
-            ti.struct_name_len = ti.struct_def.name_len;
+        if (u8_slice_ptr(ti.struct_name) == 0 || u8_slice_len(ti.struct_name) == 0) {
+            ti.struct_name = slice(ti.struct_def.name_ptr, ti.struct_def.name_len);
         }
         return ti.struct_def;
     }
-    if (ti.struct_name_ptr == 0 || ti.struct_name_len == 0) { return 0; }
+    if (u8_slice_ptr(ti.struct_name) == 0 || u8_slice_len(ti.struct_name) == 0) { return 0; }
 
-    var struct_def: *AstStructDef = get_struct_def(slice(ti.struct_name_ptr, ti.struct_name_len));
+    var struct_def: *AstStructDef = get_struct_def(ti.struct_name);
     if (struct_def == 0) {
-        var resolved: *NameInfo = resolve_name(slice(ti.struct_name_ptr, ti.struct_name_len));
+        var resolved: *NameInfo = resolve_name(ti.struct_name);
         if (resolved != 0) {
             struct_def = get_struct_def(slice(resolved.ptr, resolved.len));
             if (struct_def != 0) {
-                ti.struct_name_ptr = resolved.ptr;
-                ti.struct_name_len = resolved.len;
+                ti.struct_name = slice(resolved.ptr, resolved.len);
             }
         }
     }
     if (struct_def == 0) {
-        struct_def = emit_try_match_struct_def_by_tail(slice(ti.struct_name_ptr, ti.struct_name_len));
+        struct_def = emit_try_match_struct_def_by_tail(ti.struct_name);
     }
     if (struct_def != 0) {
-        ti.struct_name_ptr = struct_def.name_ptr;
-        ti.struct_name_len = struct_def.name_len;
+        ti.struct_name = slice(struct_def.name_ptr, struct_def.name_len);
     }
     ti.struct_def = struct_def;
     return struct_def;
@@ -334,11 +343,11 @@ func emit_stack_ctor_call_at_r12(sc: *AstStackCtor, symtab: *Symtab) -> u64 {
         return 0;
     }
 
-    var size: u64 = layout_type_sizeof(sc.type_kind, sc.ptr_depth, slice(sc.struct_name_ptr, sc.struct_name_len));
+    var size: u64 = layout_type_sizeof(sc.type_kind, sc.ptr_depth, sc.struct_name);
     emit_stack_ctor_emit_memzero(size);
 
-    emit_emit_trait_vptr_init_at_r12(slice(sc.struct_name_ptr, sc.struct_name_len));
-    var resolved_ctor: CompilerMethodResolveResult = emit_resolve_constructor_call(slice(sc.struct_name_ptr, sc.struct_name_len), sc.ctor_args_vec, symtab, slice("stack ctor", 10));
+    emit_emit_trait_vptr_init_at_r12(sc.struct_name);
+    var resolved_ctor: CompilerMethodResolveResult = emit_resolve_constructor_call(sc.struct_name, sc.ctor_args_vec, symtab, slice("stack ctor", 10));
     if (resolved_ctor.found == 0 || resolved_ctor.fn == 0) {
         return 0;
     }
@@ -450,8 +459,8 @@ func emit_method_call_ret_struct_size(mc: *AstMethodCall, symtab: *Symtab) -> u6
     var recv_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)receiver, symtab);
     if (recv_ti == 0) { return 0; }
     if (recv_ti.type_kind != TYPE_STRUCT) { return 0; }
-    var struct_ptr: u64 = recv_ti.struct_name_ptr;
-    var struct_len: u64 = recv_ti.struct_name_len;
+    var struct_ptr: u64 = u8_slice_ptr(recv_ti.struct_name);
+    var struct_len: u64 = u8_slice_len(recv_ti.struct_name);
     if (struct_ptr == 0 || struct_len == 0) { return 0; }
 
     var args: *Vec<*AstNode> = mc.args_vec;
@@ -478,8 +487,8 @@ func emit_method_call_sret_to_offset(mc: *AstMethodCall, dest_offset: u64, symta
     var struct_name_ptr: u64 = 0;
     var struct_name_len: u64 = 0;
     if (type_info != 0) {
-        struct_name_ptr = type_info.struct_name_ptr;
-        struct_name_len = type_info.struct_name_len;
+        struct_name_ptr = u8_slice_ptr(type_info.struct_name);
+        struct_name_len = u8_slice_len(type_info.struct_name);
     }
     var args: *Vec<*AstNode> = mc.args_vec;
     var nargs: u64 = 0;
@@ -888,7 +897,7 @@ func _cg_sysv_push_call_arg(arg: *AstNode, symtab: *Symtab) -> u64 {
             return emit_sysv_push_slice_arg(arg, arg_kind);
         }
         if (at.type_kind == TYPE_STRUCT && at.ptr_depth == 0) {
-            var struct_size: u64 = layout_type_sizeof(TYPE_STRUCT, 0, slice(at.struct_name_ptr, at.struct_name_len));
+            var struct_size: u64 = layout_type_sizeof(TYPE_STRUCT, 0, at.struct_name);
             return emit_sysv_push_struct_arg(arg, arg_kind, struct_size, symtab);
         }
     }
@@ -915,16 +924,16 @@ func emit_call_push_arg_with_param(arg: *AstNode, expected: *Param, symtab: *Sym
         return _cg_sysv_push_call_arg(arg, symtab);
     }
 
-    var src_name_ptr: u64 = at.struct_name_ptr;
-    var src_name_len: u64 = at.struct_name_len;
+    var src_name_ptr: u64 = u8_slice_ptr(at.struct_name);
+    var src_name_len: u64 = u8_slice_len(at.struct_name);
     var src_resolved: *NameInfo = resolve_name(slice(src_name_ptr, src_name_len));
     if (src_resolved != 0) {
         src_name_ptr = src_resolved.ptr;
         src_name_len = src_resolved.len;
     }
 
-    var expected_name_ptr: u64 = expected.struct_name_ptr;
-    var expected_name_len: u64 = expected.struct_name_len;
+    var expected_name_ptr: u64 = u8_slice_ptr(expected.struct_name);
+    var expected_name_len: u64 = u8_slice_len(expected.struct_name);
     var expected_resolved: *NameInfo = resolve_name(slice(expected_name_ptr, expected_name_len));
     if (expected_resolved != 0) {
         expected_name_ptr = expected_resolved.ptr;
@@ -942,15 +951,15 @@ func emit_call_push_arg_with_param(arg: *AstNode, expected: *Param, symtab: *Sym
         }
 
         var src_def: *AstStructDef = get_struct_def(slice(src_name_ptr, src_name_len));
-        if (src_def == 0 && (src_name_ptr != at.struct_name_ptr || src_name_len != at.struct_name_len)) {
-            src_def = get_struct_def(slice(at.struct_name_ptr, at.struct_name_len));
+        if (src_def == 0 && (src_name_ptr != u8_slice_ptr(at.struct_name) || src_name_len != u8_slice_len(at.struct_name))) {
+            src_def = get_struct_def(at.struct_name);
         }
         if (src_def != 0) {
             var up_offset: u64 = 0;
             var up_def: *AstStructDef = 0;
             var found_upcast: u64 = typeinfo_find_parent_offset(src_def, slice(expected_name_ptr, expected_name_len), &up_offset, &up_def);
-            if (found_upcast == 0 && (expected_name_ptr != expected.struct_name_ptr || expected_name_len != expected.struct_name_len)) {
-                found_upcast = typeinfo_find_parent_offset(src_def, slice(expected.struct_name_ptr, expected.struct_name_len), &up_offset, &up_def);
+            if (found_upcast == 0 && (expected_name_ptr != u8_slice_ptr(expected.struct_name) || expected_name_len != u8_slice_len(expected.struct_name))) {
+                found_upcast = typeinfo_find_parent_offset(src_def, expected.struct_name, &up_offset, &up_def);
             }
             if (found_upcast != 0) {
                 emit_expr(arg);
@@ -964,13 +973,13 @@ func emit_call_push_arg_with_param(arg: *AstNode, expected: *Param, symtab: *Sym
     }
 
     if (at.ptr_depth != 0) { return _cg_sysv_push_call_arg(arg, symtab); }
-    var expected_def: *AstStructDef = get_struct_def(slice(expected.struct_name_ptr, expected.struct_name_len));
-    var expected_ti: *TypeInfo = typeinfo_make_struct(0, slice(expected.struct_name_ptr, expected.struct_name_len), expected_def);
+    var expected_def: *AstStructDef = get_struct_def(expected.struct_name);
+    var expected_ti: *TypeInfo = typeinfo_make_struct(0, expected.struct_name, expected_def);
     if (typeinfo_is_assignable(at, expected_ti) == 0) {
         return _cg_sysv_push_call_arg(arg, symtab);
     }
 
-    var struct_size: u64 = layout_type_sizeof(TYPE_STRUCT, 0, slice(expected.struct_name_ptr, expected.struct_name_len));
+    var struct_size: u64 = layout_type_sizeof(TYPE_STRUCT, 0, expected.struct_name);
     return emit_sysv_push_struct_arg(arg, ast_kind(arg), struct_size, symtab);
 }
 
@@ -1171,7 +1180,7 @@ func emit_try_expr(node: u64, symtab: *Symtab) -> u64 {
             diag_emit_error_tag("codegen", "try", "try operator requires try-compatible struct value");
         } else {
             diag_emit_error_tag("codegen", "try", "try operator requires try-compatible check/value fields");
-            diag_emit_labelled_name("try struct: ", slice(opt_ti.struct_name_ptr, opt_ti.struct_name_len));
+            diag_emit_labelled_name("try struct: ", opt_ti.struct_name);
         }
         diag_emit_help("use a struct with compatible check/value fields");
         diag_force_stop_pass();
@@ -1197,7 +1206,7 @@ func emit_try_expr(node: u64, symtab: *Symtab) -> u64 {
     var struct_def: *AstStructDef = try_resolve_struct_def(opt_ti);
     if (struct_def == 0) {
         diag_emit_error_tag("codegen", "try", "try operand struct definition not found");
-        diag_emit_labelled_name("try struct: ", slice(opt_ti.struct_name_ptr, opt_ti.struct_name_len));
+        diag_emit_labelled_name("try struct: ", opt_ti.struct_name);
         diag_force_stop_pass();
         return 0;
     }
@@ -1225,7 +1234,7 @@ func emit_try_expr(node: u64, symtab: *Symtab) -> u64 {
     var check_off: u64 = get_field_offset(struct_def, slice(check_ptr, check_len));
     var value_off: u64 = get_field_offset(struct_def, slice(value_ptr, value_len));
 
-    var struct_size: u64 = layout_type_sizeof(TYPE_STRUCT, 0, slice(opt_ti.struct_name_ptr, opt_ti.struct_name_len));
+    var struct_size: u64 = layout_type_sizeof(TYPE_STRUCT, 0, opt_ti.struct_name);
     var tmp_offset: u64 = emit_alloc_tmp_struct(symtab, struct_size);
     var op_kind: u64 = ast_kind(operand);
 
@@ -1448,7 +1457,7 @@ func emit_expr_call_ptr(node: u64, symtab: *Symtab) -> u64 {
         if (callee_ti != 0) {
             closure_struct_def = callee_ti.struct_def;
             if (closure_struct_def == 0) {
-                closure_struct_def = get_struct_def(slice(callee_ti.struct_name_ptr, callee_ti.struct_name_len));
+                closure_struct_def = get_struct_def(callee_ti.struct_name);
             }
         }
         if (closure_struct_def == 0) {
@@ -1580,7 +1589,7 @@ func emit_expr_stack_ctor(node: u64, symtab: *Symtab) -> u64 {
         diag_force_stop_pass();
         return 0;
     }
-    var sc_size: u64 = layout_type_sizeof(TYPE_STRUCT, 0, slice(sc_ti.struct_name_ptr, sc_ti.struct_name_len));
+    var sc_size: u64 = layout_type_sizeof(TYPE_STRUCT, 0, sc_ti.struct_name);
     var tmp_offset_expr: u64 = emit_alloc_tmp_struct(symtab, sc_size);
     emit_stack_ctor_init_to_offset(sc, tmp_offset_expr, symtab);
     if (sc_size <= 8) {
@@ -2008,7 +2017,7 @@ func emit_expr_safe_index(node: u64, symtab: *Symtab) -> u64 {
 
     var elem_size: u64 = get_pointee_size(bt.type_kind, bt.ptr_depth);
     if (bt.ptr_depth == 1 && bt.type_kind == TYPE_STRUCT) {
-        elem_size = layout_type_sizeof(bt.type_kind, 0, slice(bt.struct_name_ptr, bt.struct_name_len));
+        elem_size = layout_type_sizeof(bt.type_kind, 0, bt.struct_name);
     }
 
     var label_null: u64 = new_label();
@@ -2125,7 +2134,7 @@ func emit_try_adjust_struct_ptr_cast(src_ti: *TypeInfo, target_struct: []u8) -> 
     if (src_ti.type_kind != TYPE_STRUCT || src_ti.ptr_depth == 0) { return 0; }
     if (target_struct.ptr == 0 || target_struct.len == 0) { return 0; }
 
-    var src_def: *AstStructDef = get_struct_def(slice(src_ti.struct_name_ptr, src_ti.struct_name_len));
+    var src_def: *AstStructDef = get_struct_def(src_ti.struct_name);
     if (src_def != 0) {
         var up_offset: u64 = 0;
         var up_def: *AstStructDef = 0;
@@ -2139,7 +2148,7 @@ func emit_try_adjust_struct_ptr_cast(src_ti: *TypeInfo, target_struct: []u8) -> 
     if (target_def != 0) {
         var down_offset: u64 = 0;
         var down_def: *AstStructDef = 0;
-        if (typeinfo_find_parent_offset(target_def, slice(src_ti.struct_name_ptr, src_ti.struct_name_len), &down_offset, &down_def) != 0) {
+        if (typeinfo_find_parent_offset(target_def, src_ti.struct_name, &down_offset, &down_def) != 0) {
             emit_emit_adjust_rax_sub(down_offset);
             return 1;
         }
@@ -2260,16 +2269,16 @@ func emit_expr_cast(node: u64, symtab: *Symtab) -> u64 {
             diag_force_stop_pass();
         return 0;
         }
-        var impl_info2: *TraitImpl = trait_find_trait_impl(slice(cast.struct_name_ptr, cast.struct_name_len), slice(src_ti.struct_name_ptr, src_ti.struct_name_len));
+        var impl_info2: *TraitImpl = trait_find_trait_impl(cast.struct_name, src_ti.struct_name);
         if (impl_info2 == 0) {
             emit_stderr("[ERROR] Struct does not implement trait for cast: ");
-            emit_stderr_len(cast.struct_name_ptr, cast.struct_name_len);
+            emit_stderr_len(u8_slice_ptr(cast.struct_name), u8_slice_len(cast.struct_name));
             emit_stderr("\n");
             diag_force_stop_pass();
         return 0;
         }
-        var struct_def: *AstStructDef = get_struct_def(slice(src_ti.struct_name_ptr, src_ti.struct_name_len));
-        var vptr_name: *NameInfo = trait_build_vptr_field_name(slice(cast.struct_name_ptr, cast.struct_name_len));
+        var struct_def: *AstStructDef = get_struct_def(src_ti.struct_name);
+        var vptr_name: *NameInfo = trait_build_vptr_field_name(cast.struct_name);
         var field_offset: u64 = 0;
         var field_desc: *FieldDesc = 0;
         var found: u64 = struct_find_field_desc_scoped(struct_def, slice(0, 0), slice(vptr_name.ptr, vptr_name.len), &field_offset, &field_desc);
@@ -2286,16 +2295,16 @@ func emit_expr_cast(node: u64, symtab: *Symtab) -> u64 {
     if (cast.target_type == TYPE_STRUCT) {
         var src_ti2: *TypeInfo = get_expr_type_with_symtab((*AstNode)expr, symtab);
         if (src_ti2 != 0 && src_ti2.type_kind == TYPE_TRAIT && src_ti2.ptr_depth > 0) {
-            var impl2: *TraitImpl = trait_find_trait_impl(slice(src_ti2.struct_name_ptr, src_ti2.struct_name_len), slice(cast.struct_name_ptr, cast.struct_name_len));
+            var impl2: *TraitImpl = trait_find_trait_impl(src_ti2.struct_name, cast.struct_name);
             if (impl2 == 0) {
                 emit_stderr("[ERROR] Trait cast target struct does not implement trait: ");
-                emit_stderr_len(cast.struct_name_ptr, cast.struct_name_len);
+                emit_stderr_len(u8_slice_ptr(cast.struct_name), u8_slice_len(cast.struct_name));
                 emit_stderr("\n");
                 diag_force_stop_pass();
         return 0;
             }
-            var struct_def2: *AstStructDef = get_struct_def(slice(cast.struct_name_ptr, cast.struct_name_len));
-            var vptr_name2: *NameInfo = trait_build_vptr_field_name(slice(src_ti2.struct_name_ptr, src_ti2.struct_name_len));
+            var struct_def2: *AstStructDef = get_struct_def(cast.struct_name);
+            var vptr_name2: *NameInfo = trait_build_vptr_field_name(src_ti2.struct_name);
             var field_offset2: u64 = 0;
             var field_desc2: *FieldDesc = 0;
             var found2: u64 = struct_find_field_desc_scoped(struct_def2, slice(0, 0), slice(vptr_name2.ptr, vptr_name2.len), &field_offset2, &field_desc2);
@@ -2314,12 +2323,12 @@ func emit_expr_cast(node: u64, symtab: *Symtab) -> u64 {
         if (cast.target_ptr_depth > 0 && src_ti2 != 0 && src_ti2.type_kind == TYPE_STRUCT && src_ti2.ptr_depth > 0) {
             emit_expr(expr);
             if (src_ti2.is_tagged == 1) { emit_tagged_mask(); }
-            if (str_eq(slice(src_ti2.struct_name_ptr, src_ti2.struct_name_len), slice(cast.struct_name_ptr, cast.struct_name_len)) == 0 &&
-                struct_is_same_or_descendant(slice(cast.struct_name_ptr, cast.struct_name_len), slice(src_ti2.struct_name_ptr, src_ti2.struct_name_len)) != 0) {
-                var check_info: CompilerDowncastCheckInfo = trait_require_checked_struct_downcast_info(slice(src_ti2.struct_name_ptr, src_ti2.struct_name_len), slice(cast.struct_name_ptr, cast.struct_name_len));
+            if (str_eq(src_ti2.struct_name, cast.struct_name) == 0 &&
+                struct_is_same_or_descendant(cast.struct_name, src_ti2.struct_name) != 0) {
+                var check_info: CompilerDowncastCheckInfo = trait_require_checked_struct_downcast_info(src_ti2.struct_name, cast.struct_name);
                 emit_emit_checked_struct_downcast_guard(check_info);
             }
-            emit_try_adjust_struct_ptr_cast(src_ti2, slice(cast.struct_name_ptr, cast.struct_name_len));
+            emit_try_adjust_struct_ptr_cast(src_ti2, cast.struct_name);
             return;
         }
     }
@@ -2355,8 +2364,8 @@ func emit_expr_sizeof(node: u64) -> u64 {
     var sizeof_node: *AstSizeof = (*AstSizeof)node;
     var type_kind: u64 = sizeof_node.type_kind;
     var ptr_depth: u64 = sizeof_node.ptr_depth;
-    var struct_name_ptr: u64 = sizeof_node.struct_name_ptr;
-    var struct_name_len: u64 = sizeof_node.struct_name_len;
+    var struct_name_ptr: u64 = u8_slice_ptr(sizeof_node.struct_name);
+    var struct_name_len: u64 = u8_slice_len(sizeof_node.struct_name);
     var size: u64 = 0;
     if (type_kind == TYPE_ARRAY || type_kind == TYPE_SLICE) {
         if (sizeof_node.array_len_is_param != 0) {
@@ -2434,14 +2443,14 @@ func emit_new_invoke_constructor(nw: *AstNew, symtab: *Symtab) -> u64 {
         diag_force_stop_pass();
         return 0;
     }
-    if (nw.struct_name_ptr == 0 || nw.struct_name_len == 0) {
+    if (u8_slice_ptr(nw.struct_name) == 0 || u8_slice_len(nw.struct_name) == 0) {
         emit_stderr("[ERROR] new constructor target struct missing metadata in emitter\n");
         diag_force_stop_pass();
         return 0;
     }
 
     var args: *Vec<*AstNode> = nw.ctor_args_vec;
-    var resolved_ctor: CompilerMethodResolveResult = emit_resolve_constructor_call(slice(nw.struct_name_ptr, nw.struct_name_len), args, symtab, slice("new", 3));
+    var resolved_ctor: CompilerMethodResolveResult = emit_resolve_constructor_call(nw.struct_name, args, symtab, slice("new", 3));
     if (resolved_ctor.found == 0 || resolved_ctor.fn == 0) {
         return 0;
     }
@@ -2494,19 +2503,19 @@ func emit_expr_new(node: u64, symtab: *Symtab) -> u64 {
         if (nw.elem_typeinfo != 0) {
             elem_size = sizeof_type_ex(nw.elem_typeinfo);
         } else {
-            elem_size = layout_type_sizeof(nw.elem_type_kind, nw.elem_ptr_depth, slice(nw.struct_name_ptr, nw.struct_name_len));
+            elem_size = layout_type_sizeof(nw.elem_type_kind, nw.elem_ptr_depth, nw.struct_name);
         }
         size = elem_size * nw.array_len;
     } else if (nw.type_kind == TYPE_SLICE) {
         size = 16;
     } else {
-        size = layout_type_sizeof(nw.type_kind, nw.ptr_depth, slice(nw.struct_name_ptr, nw.struct_name_len));
+        size = layout_type_sizeof(nw.type_kind, nw.ptr_depth, nw.struct_name);
     }
 
     emit_new_alloc_zero(size);
 
     if (nw.type_kind == TYPE_STRUCT) {
-        emit_emit_trait_vptr_init_at_r12(slice(nw.struct_name_ptr, nw.struct_name_len));
+        emit_emit_trait_vptr_init_at_r12(nw.struct_name);
     }
 
     if (nw.literal_expr != 0) {
@@ -2665,7 +2674,37 @@ func emit_struct_literal_init_ptr(init: u64) -> u64 {
             continue;
         }
 
-        emit_expr(values.get(value_index));
+        var value_expr: u64 = values.get(value_index);
+        if (field.type_kind == TYPE_SLICE && field.ptr_depth == 0) {
+            if (ast_kind(value_expr) == AST_SLICE) {
+                var sl: *AstSlice = (*AstSlice)value_expr;
+                emit_expr(sl.ptr_expr);
+                emit("    mov [r12");
+                if (field_offset != 0) { emit("+"); emit_u64(field_offset); }
+                emit("], rax\n");
+                emit_expr(sl.len_expr);
+                emit("    mov [r12");
+                var len_field_offset: u64 = field_offset + 8;
+                if (len_field_offset != 0) { emit("+"); emit_u64(len_field_offset); }
+                emit("], rax\n");
+            } else {
+                emit_lvalue(value_expr);
+                emit("    mov rbx, [rax]\n");
+                emit("    mov rcx, [rax+8]\n");
+                emit("    mov [r12");
+                if (field_offset != 0) { emit("+"); emit_u64(field_offset); }
+                emit("], rbx\n");
+                emit("    mov [r12");
+                var len_field_offset2: u64 = field_offset + 8;
+                if (len_field_offset2 != 0) { emit("+"); emit_u64(len_field_offset2); }
+                emit("], rcx\n");
+            }
+            field_offset = field_offset + field_size;
+            value_index = value_index + 1;
+            continue;
+        }
+
+        emit_expr(value_expr);
 
         emit("    mov [r12");
         if (field_offset != 0) { emit("+"); emit_u64(field_offset); }
@@ -2691,8 +2730,8 @@ func emit_property_hook_find_field(member_access: *AstMemberAccess, symtab: *Sym
 
     if (obj_ti.type_kind != TYPE_STRUCT) { return 0; }
     var struct_def: *AstStructDef = emit_hydrate_struct_def_from_type(obj_ti);
-    if (struct_def == 0 && obj_ti.struct_name_ptr != 0) {
-        struct_def = get_struct_def(slice(obj_ti.struct_name_ptr, obj_ti.struct_name_len));
+    if (struct_def == 0 && u8_slice_ptr(obj_ti.struct_name) != 0) {
+        struct_def = get_struct_def(obj_ti.struct_name);
     }
     if (struct_def == 0) { return 0; }
 
@@ -2774,8 +2813,8 @@ func emit_safe_member_access_expr(node: u64, symtab: *Symtab) -> u64 {
     emit_label(label_null);
     emit_nl();
 
-    if (ot.is_tagged == 1 && ot.tag_layout_ptr != 0) {
-        var layout_info: *AstStructDef = emit_require_tagged_layout_struct(slice(ot.tag_layout_ptr, ot.tag_layout_len));
+    if (ot.is_tagged == 1 && u8_slice_ptr(ot.tag_layout) != 0) {
+        var layout_info: *AstStructDef = emit_require_tagged_layout_struct(ot.tag_layout);
         emit_emit_tagged_layout_extract_from_rax(layout_info, slice(member_ptr, member_len));
         emit_emit_safe_null_epilogue(label_null, label_end);
         return 0;
@@ -2931,7 +2970,7 @@ func emit_member_emit_struct_field_at_rax(struct_def: *AstStructDef, parent: []u
 }
 
 func emit_member_expr_tagged_layout(object: u64, ot: *TypeInfo, member: []u8) -> u64 {
-    var layout_info: *AstStructDef = emit_require_tagged_layout_struct(slice(ot.tag_layout_ptr, ot.tag_layout_len));
+    var layout_info: *AstStructDef = emit_require_tagged_layout_struct(ot.tag_layout);
     emit_expr(object);
     emit_emit_tagged_layout_extract_from_rax(layout_info, slice(member.ptr, member.len));
     return 0;
@@ -3270,7 +3309,20 @@ func emit_member_access_expr(node: u64, symtab: *Symtab) -> u64 {
 
     var ot: *TypeInfo = get_expr_type_with_symtab((*AstNode)object, symtab);
     if (ot != 0) {
-        if (ot.ptr_depth > 0 && ot.is_tagged == 1 && ot.tag_layout_ptr != 0) {
+        if (ot.ptr_depth == 0 && ot.type_kind == TYPE_SLICE) {
+            var slice_member_offset: u64 = 0;
+            if (emit_member_slice_offset(slice(member_ptr, member_len), &slice_member_offset) == 0) {
+                diag_emit_error_tag("codegen", "slice-member", "unknown slice member");
+                diag_emit_labelled_name("member: ", slice(member_ptr, member_len));
+                diag_force_stop_pass();
+                return;
+            }
+            emit_lvalue(object);
+            emit_member_add_offset_to_rax(slice_member_offset);
+            emit("    mov rax, [rax]\n");
+            return;
+        }
+        if (ot.ptr_depth > 0 && ot.is_tagged == 1 && u8_slice_ptr(ot.tag_layout) != 0) {
             emit_member_expr_tagged_layout(object, ot, slice(member_ptr, member_len));
             return;
         }
@@ -3459,15 +3511,14 @@ func emit_binary_emit_int_op(op: u64, use_signed: u64) -> u64 {
 
 func emit_binary_is_number_type(ti: *TypeInfo) -> u64 {
     if (ti == 0 || ti.ptr_depth != 0 || ti.type_kind != TYPE_STRUCT) { return 0; }
-    if (ti.struct_name_ptr == 0 || ti.struct_name_len == 0) {
+    if (u8_slice_ptr(ti.struct_name) == 0 || u8_slice_len(ti.struct_name) == 0) {
         if (ti.struct_def != 0) {
-            ti.struct_name_ptr = ti.struct_def.name_ptr;
-            ti.struct_name_len = ti.struct_def.name_len;
+            ti.struct_name = slice(ti.struct_def.name_ptr, ti.struct_def.name_len);
         }
     }
-    if (ti.struct_name_ptr == 0 || ti.struct_name_len == 0) { return 0; }
-    if (str_eq(slice(ti.struct_name_ptr, ti.struct_name_len), slice("Number", str_len("Number"))) != 0) { return 1; }
-    if (str_eq(slice(ti.struct_name_ptr, ti.struct_name_len), slice("std_number__Number", str_len("std_number__Number"))) != 0) { return 1; }
+    if (u8_slice_ptr(ti.struct_name) == 0 || u8_slice_len(ti.struct_name) == 0) { return 0; }
+    if (str_eq(ti.struct_name, slice("Number", str_len("Number"))) != 0) { return 1; }
+    if (str_eq(ti.struct_name, slice("std_number__Number", str_len("std_number__Number"))) != 0) { return 1; }
     return 0;
 }
 
@@ -4235,10 +4286,9 @@ func emit_member_lvalue_ident(object: u64, symtab: *Symtab, parent: []u8, member
                 if (var_type.struct_def == 0 && inferred_type.struct_def != 0) {
                     var_type.struct_def = inferred_type.struct_def;
                 }
-                if ((var_type.struct_name_ptr == 0 || var_type.struct_name_len == 0) &&
-                    inferred_type.struct_name_ptr != 0 && inferred_type.struct_name_len != 0) {
-                    var_type.struct_name_ptr = inferred_type.struct_name_ptr;
-                    var_type.struct_name_len = inferred_type.struct_name_len;
+                if ((u8_slice_ptr(var_type.struct_name) == 0 || u8_slice_len(var_type.struct_name) == 0) &&
+                    u8_slice_ptr(inferred_type.struct_name) != 0 && u8_slice_len(inferred_type.struct_name) != 0) {
+                    var_type.struct_name = inferred_type.struct_name;
                 }
             }
         }
@@ -4327,6 +4377,18 @@ func emit_member_access_lvalue(node: u64, symtab: *Symtab) -> u64 {
     }
 
     var obj_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)object, symtab);
+    if (obj_ti != 0 && obj_ti.ptr_depth == 0 && obj_ti.type_kind == TYPE_SLICE) {
+        var slice_member_offset: u64 = 0;
+        if (emit_member_slice_offset(slice(member_ptr, member_len), &slice_member_offset) == 0) {
+            diag_emit_error_tag("codegen", "slice-member", "unknown slice member");
+            diag_emit_labelled_name("member: ", slice(member_ptr, member_len));
+            diag_force_stop_pass();
+            return;
+        }
+        emit_lvalue(object);
+        emit_member_add_offset_to_rax(slice_member_offset);
+        return;
+    }
     if (obj_ti != 0 && obj_ti.ptr_depth > 0 && obj_ti.type_kind == TYPE_STRUCT) {
         emit_member_lvalue_ptr_struct(object, obj_ti, slice(parent_ptr, parent_len), slice(member_ptr, member_len));
         return;
@@ -4412,7 +4474,7 @@ func emit_method_push_receiver(receiver: u64, recv_ti: *TypeInfo, recv_is_ptr: u
 
     var struct_size: u64 = 8;
     if (recv_ti != 0 && recv_ti.type_kind == TYPE_STRUCT && recv_ti.ptr_depth == 0) {
-        struct_size = layout_type_sizeof(TYPE_STRUCT, 0, slice(recv_ti.struct_name_ptr, recv_ti.struct_name_len));
+        struct_size = layout_type_sizeof(TYPE_STRUCT, 0, recv_ti.struct_name);
     }
     if (struct_size == 0) { struct_size = 8; }
     var tmp_offset: u64 = emit_alloc_tmp_struct(symtab, struct_size);
@@ -4470,11 +4532,11 @@ func emit_method_try_normalize_named_args(method_call: *AstMethodCall, recv_ti: 
     if (args != 0) { nargs = args.len(); }
 
     var fn_sig: *AstFunc = 0;
-    if (recv_ti != 0 && (recv_ti.type_kind == TYPE_TRAIT || sym_is_trait_name(slice(recv_ti.struct_name_ptr, recv_ti.struct_name_len)) != 0)) {
-        fn_sig = emit_find_trait_method_sig(slice(recv_ti.struct_name_ptr, recv_ti.struct_name_len), slice(method_call.method_ptr, method_call.method_len));
+    if (recv_ti != 0 && (recv_ti.type_kind == TYPE_TRAIT || sym_is_trait_name(recv_ti.struct_name) != 0)) {
+        fn_sig = emit_find_trait_method_sig(recv_ti.struct_name, slice(method_call.method_ptr, method_call.method_len));
     } else if (recv_ti != 0 && recv_ti.type_kind == TYPE_STRUCT) {
-        var owner_ptr: u64 = recv_ti.struct_name_ptr;
-        var owner_len: u64 = recv_ti.struct_name_len;
+        var owner_ptr: u64 = u8_slice_ptr(recv_ti.struct_name);
+        var owner_len: u64 = u8_slice_len(recv_ti.struct_name);
         if ((owner_ptr == 0 || owner_len == 0) && recv_ti.struct_def != 0) {
             owner_ptr = recv_ti.struct_def.name_ptr;
             owner_len = recv_ti.struct_def.name_len;
@@ -4491,8 +4553,8 @@ func emit_method_try_normalize_named_args(method_call: *AstMethodCall, recv_ti: 
 
     if (fn_sig == 0) {
         emit_stderr("[ERROR] named arguments require a known method signature: ");
-        if (recv_ti != 0 && recv_ti.struct_name_ptr != 0 && recv_ti.struct_name_len != 0) {
-            emit_stderr_len(recv_ti.struct_name_ptr, recv_ti.struct_name_len);
+        if (recv_ti != 0 && u8_slice_ptr(recv_ti.struct_name) != 0 && u8_slice_len(recv_ti.struct_name) != 0) {
+            emit_stderr_len(u8_slice_ptr(recv_ti.struct_name), u8_slice_len(recv_ti.struct_name));
             emit_stderr(".");
         }
         emit_stderr_len(method_call.method_ptr, method_call.method_len);
@@ -4511,7 +4573,7 @@ func emit_method_find_virtual_vptr_offset(recv_ti: *TypeInfo, trait_slice: []u8)
     if (recv_ti == 0) { return COMPILER_NOT_FOUND_U64; }
     var struct_def: *AstStructDef = recv_ti.struct_def;
     if (struct_def == 0) {
-        struct_def = get_struct_def(slice(recv_ti.struct_name_ptr, recv_ti.struct_name_len));
+        struct_def = get_struct_def(recv_ti.struct_name);
     }
     if (struct_def == 0) { return COMPILER_NOT_FOUND_U64; }
     var vptr_name: *NameInfo = trait_build_vptr_field_name(slice(trait_slice.ptr, trait_slice.len));
@@ -4526,7 +4588,7 @@ func emit_method_push_virtual_receiver(receiver: u64, recv_ti: *TypeInfo, trait_
     var off: u64 = emit_method_find_virtual_vptr_offset(recv_ti, slice(trait_slice.ptr, trait_slice.len));
     if (is_not_found_u64(off) != 0) {
         emit_stderr("[ERROR] virtual dispatch vptr not found: ");
-        emit_stderr_len(recv_ti.struct_name_ptr, recv_ti.struct_name_len);
+        emit_stderr_len(u8_slice_ptr(recv_ti.struct_name), u8_slice_len(recv_ti.struct_name));
         emit_stderr("\n");
         diag_force_stop_pass();
         return 0;
@@ -4548,7 +4610,7 @@ func emit_method_push_virtual_receiver_from_tmp(tmp_offset: u64, recv_ti: *TypeI
     var off: u64 = emit_method_find_virtual_vptr_offset(recv_ti, slice(trait_slice.ptr, trait_slice.len));
     if (is_not_found_u64(off) != 0) {
         emit_stderr("[ERROR] virtual dispatch vptr not found: ");
-        emit_stderr_len(recv_ti.struct_name_ptr, recv_ti.struct_name_len);
+        emit_stderr_len(u8_slice_ptr(recv_ti.struct_name), u8_slice_len(recv_ti.struct_name));
         emit_stderr("\n");
         diag_force_stop_pass();
         return 0;
@@ -4620,7 +4682,7 @@ func emit_safe_method_call_trait_ptr(method_call: *AstMethodCall, recv_ti: *Type
     var receiver: u64 = method_call.receiver;
     var method_ptr: u64 = method_call.method_ptr;
     var method_len: u64 = method_call.method_len;
-    var method_index: u64 = trait_find_trait_method_index(slice(recv_ti.struct_name_ptr, recv_ti.struct_name_len), slice(method_ptr, method_len));
+    var method_index: u64 = trait_find_trait_method_index(recv_ti.struct_name, slice(method_ptr, method_len));
     if (is_not_found_u64(method_index) != 0) {
         emit_stderr("[ERROR] Trait method not found: ");
         emit_stderr_len(method_ptr, method_len);
@@ -4663,9 +4725,9 @@ func emit_safe_method_call_struct_ptr(method_call: *AstMethodCall, recv_ti: *Typ
         return 0;
     }
 
-    if (check_method_access_overload(slice(recv_ti.struct_name_ptr, recv_ti.struct_name_len), slice(method_ptr, method_len), arg_types, nargs) == 0) {
+    if (check_method_access_overload(recv_ti.struct_name, slice(method_ptr, method_len), arg_types, nargs) == 0) {
         emit_stderr("[ERROR] private method access denied: ");
-        emit_stderr_len(recv_ti.struct_name_ptr, recv_ti.struct_name_len);
+        emit_stderr_len(u8_slice_ptr(recv_ti.struct_name), u8_slice_len(recv_ti.struct_name));
         emit_stderr(".");
         emit_stderr_len(method_ptr, method_len);
         emit_stderr("\n");
@@ -4674,7 +4736,7 @@ func emit_safe_method_call_struct_ptr(method_call: *AstMethodCall, recv_ti: *Typ
 
     var virt_trait: *NameInfo = 0;
     if (recv_ti.ptr_depth > 0) {
-        virt_trait = vdispatch_find_trait(slice(recv_ti.struct_name_ptr, recv_ti.struct_name_len), slice(method_ptr, method_len));
+        virt_trait = vdispatch_find_trait(recv_ti.struct_name, slice(method_ptr, method_len));
     }
     if (virt_trait != 0) {
         var method_index_v: u64 = trait_find_trait_method_index(slice(virt_trait.ptr, virt_trait.len), slice(method_ptr, method_len));
@@ -4707,7 +4769,7 @@ func emit_safe_method_call_struct_ptr(method_call: *AstMethodCall, recv_ti: *Typ
 
     var resolved_ptr: u64 = 0;
     var resolved_len: u64 = 0;
-    var resolved_method: CompilerMethodResolveResult = sym_resolve_method_overload(slice(recv_ti.struct_name_ptr, recv_ti.struct_name_len), slice(method_ptr, method_len), arg_types, nargs);
+    var resolved_method: CompilerMethodResolveResult = sym_resolve_method_overload(recv_ti.struct_name, slice(method_ptr, method_len), arg_types, nargs);
     var fn: *AstFunc = 0;
     if (resolved_method.found != 0 && resolved_method.fn != 0) {
         fn = resolved_method.fn;
@@ -4722,7 +4784,7 @@ func emit_safe_method_call_struct_ptr(method_call: *AstMethodCall, recv_ti: *Typ
         }
     }
     if (fn == 0) {
-        var name_info: *NameInfo = build_method_name(slice(recv_ti.struct_name_ptr, recv_ti.struct_name_len), slice(method_ptr, method_len));
+        var name_info: *NameInfo = build_method_name(recv_ti.struct_name, slice(method_ptr, method_len));
         resolved_ptr = name_info.ptr;
         resolved_len = name_info.len;
         var resolved: *NameInfo = resolve_name(slice(name_info.ptr, name_info.len));
@@ -4816,8 +4878,8 @@ func emit_method_call(node: u64, symtab: *Symtab) -> u64 {
         recv_is_ptr = 1;
     }
 
-    if (recv_ti != 0 && (recv_ti.type_kind == TYPE_TRAIT || sym_is_trait_name(slice(recv_ti.struct_name_ptr, recv_ti.struct_name_len)) != 0)) {
-        var method_index: u64 = trait_find_trait_method_index(slice(recv_ti.struct_name_ptr, recv_ti.struct_name_len), slice(method_ptr, method_len));
+    if (recv_ti != 0 && (recv_ti.type_kind == TYPE_TRAIT || sym_is_trait_name(recv_ti.struct_name) != 0)) {
+        var method_index: u64 = trait_find_trait_method_index(recv_ti.struct_name, slice(method_ptr, method_len));
         if (is_not_found_u64(method_index) != 0) {
             emit_stderr("[ERROR] Trait method not found: ");
             emit_stderr_len(method_ptr, method_len);
@@ -4834,9 +4896,9 @@ func emit_method_call(node: u64, symtab: *Symtab) -> u64 {
     }
 
     if (recv_ti != 0 && recv_ti.type_kind == TYPE_STRUCT) {
-        if (check_method_access_overload(slice(recv_ti.struct_name_ptr, recv_ti.struct_name_len), slice(method_ptr, method_len), arg_types, nargs) == 0) {
+        if (check_method_access_overload(recv_ti.struct_name, slice(method_ptr, method_len), arg_types, nargs) == 0) {
             emit_stderr("[ERROR] private method access denied: ");
-            emit_stderr_len(recv_ti.struct_name_ptr, recv_ti.struct_name_len);
+            emit_stderr_len(u8_slice_ptr(recv_ti.struct_name), u8_slice_len(recv_ti.struct_name));
             emit_stderr(".");
             emit_stderr_len(method_ptr, method_len);
             emit_stderr("\n");
@@ -4845,7 +4907,7 @@ func emit_method_call(node: u64, symtab: *Symtab) -> u64 {
         }
 
         if (recv_ti.ptr_depth > 0) {
-            var virt_trait: *NameInfo = vdispatch_find_trait(slice(recv_ti.struct_name_ptr, recv_ti.struct_name_len), slice(method_ptr, method_len));
+            var virt_trait: *NameInfo = vdispatch_find_trait(recv_ti.struct_name, slice(method_ptr, method_len));
             if (virt_trait != 0) {
                 var method_index_v: u64 = trait_find_trait_method_index(slice(virt_trait.ptr, virt_trait.len), slice(method_ptr, method_len));
                 if (is_not_found_u64(method_index_v) != 0) {
@@ -4866,7 +4928,7 @@ func emit_method_call(node: u64, symtab: *Symtab) -> u64 {
 
     // Get receiver type to determine struct name
     var type_info: *TypeInfo = recv_ti;
-    if (type_info == 0 || type_info.struct_name_ptr == 0 || type_info.struct_name_len == 0) {
+    if (type_info == 0 || u8_slice_ptr(type_info.struct_name) == 0 || u8_slice_len(type_info.struct_name) == 0) {
         if (ast_kind(receiver) == AST_IDENT) {
             var rid: *AstIdent = (*AstIdent)receiver;
             var ti_alt: *TypeInfo = symtab_get_type(symtab, slice(rid.name_ptr, rid.name_len));
@@ -4876,26 +4938,24 @@ func emit_method_call(node: u64, symtab: *Symtab) -> u64 {
     if (type_info != 0 && type_info.type_kind == TYPE_STRUCT) {
         var hydrated: *AstStructDef = emit_hydrate_struct_def_from_type(type_info);
         if (hydrated != 0) {
-            type_info.struct_name_ptr = hydrated.name_ptr;
-            type_info.struct_name_len = hydrated.name_len;
+            type_info.struct_name = slice(hydrated.name_ptr, hydrated.name_len);
             type_info.struct_def = hydrated;
         }
     }
-    if ((type_info == 0 || type_info.type_kind != TYPE_STRUCT || (type_info.struct_name_ptr == 0 || type_info.struct_name_len == 0)) &&
+    if ((type_info == 0 || type_info.type_kind != TYPE_STRUCT || (u8_slice_ptr(type_info.struct_name) == 0 || u8_slice_len(type_info.struct_name) == 0)) &&
         emit_binary_expr_is_number((*AstNode)receiver, recv_ti, symtab) != 0) {
-        if (type_info == 0) { type_info = new TypeInfo{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}; }
+        if (type_info == 0) { type_info = typeinfo_new(0, 0); }
         type_info.type_kind = TYPE_STRUCT;
         type_info.ptr_depth = 0;
-        type_info.struct_name_ptr = (u64)"std_number__Number";
-        type_info.struct_name_len = 18;
+        type_info.struct_name = slice((u64)"std_number__Number", 18);
         if (type_info.struct_def == 0) {
-            type_info.struct_def = get_struct_def(slice(type_info.struct_name_ptr, type_info.struct_name_len));
+            type_info.struct_def = get_struct_def(type_info.struct_name);
             if (type_info.struct_def == 0) {
                 type_info.struct_def = get_struct_def(slice((u64)"Number", 6));
             }
         }
     }
-    if (type_info == 0 || (type_info.type_kind == TYPE_STRUCT && (type_info.struct_name_ptr == 0 || type_info.struct_name_len == 0))) {
+    if (type_info == 0 || (type_info.type_kind == TYPE_STRUCT && (u8_slice_ptr(type_info.struct_name) == 0 || u8_slice_len(type_info.struct_name) == 0))) {
         var nmi: *NameInfo = build_method_name(slice((u64)"std_number__Number", 18), slice(method_ptr, method_len));
         var np: u64 = nmi.ptr;
         var nl: u64 = nmi.len;
@@ -4905,11 +4965,10 @@ func emit_method_call(node: u64, symtab: *Symtab) -> u64 {
             nl = nresolved.len;
         }
         if (typeinfo_find_func(slice(np, nl)) != 0 || typeinfo_find_func(slice(nmi.ptr, nmi.len)) != 0) {
-            if (type_info == 0) { type_info = new TypeInfo{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}; }
+            if (type_info == 0) { type_info = typeinfo_new(0, 0); }
             type_info.type_kind = TYPE_STRUCT;
             type_info.ptr_depth = 0;
-            type_info.struct_name_ptr = (u64)"std_number__Number";
-            type_info.struct_name_len = 18;
+            type_info.struct_name = slice((u64)"std_number__Number", 18);
             if (type_info.struct_def == 0) {
                 type_info.struct_def = get_struct_def(slice((u64)"std_number__Number", 18));
                 if (type_info.struct_def == 0) {
@@ -4918,11 +4977,10 @@ func emit_method_call(node: u64, symtab: *Symtab) -> u64 {
             }
         }
     }
-    if (type_info != 0 && (type_info.struct_name_ptr == 0 || type_info.struct_name_len == 0) && type_info.struct_def != 0) {
-        type_info.struct_name_ptr = type_info.struct_def.name_ptr;
-        type_info.struct_name_len = type_info.struct_def.name_len;
+    if (type_info != 0 && (u8_slice_ptr(type_info.struct_name) == 0 || u8_slice_len(type_info.struct_name) == 0) && type_info.struct_def != 0) {
+        type_info.struct_name = slice(type_info.struct_def.name_ptr, type_info.struct_def.name_len);
     }
-    if ((type_info == 0 || type_info.struct_name_ptr == 0 || type_info.struct_name_len == 0) && args != 0 && args.len() == 1) {
+    if ((type_info == 0 || u8_slice_ptr(type_info.struct_name) == 0 || u8_slice_len(type_info.struct_name) == 0) && args != 0 && args.len() == 1) {
         if (str_eq(slice(method_ptr, method_len), slice("__op_eq", str_len("__op_eq"))) != 0 || str_eq(slice(method_ptr, method_len), slice("__op_ne", str_len("__op_ne"))) != 0) {
             emit_expr(receiver);
             emit("    push rax\n");
@@ -4939,7 +4997,7 @@ func emit_method_call(node: u64, symtab: *Symtab) -> u64 {
             return 0;
         }
     }
-    if (type_info == 0 || type_info.struct_name_ptr == 0 || type_info.struct_name_len == 0) {
+    if (type_info == 0 || u8_slice_ptr(type_info.struct_name) == 0 || u8_slice_len(type_info.struct_name) == 0) {
         emit_stderr("[ERROR] Method call receiver type missing struct name\n");
         emit_stderr("[ERROR] method: ");
         emit_stderr_len(method_ptr, method_len);
@@ -4956,8 +5014,8 @@ func emit_method_call(node: u64, symtab: *Symtab) -> u64 {
         diag_force_stop_pass();
         return 0;
     }
-    var struct_name_ptr: u64 = type_info.struct_name_ptr;
-    var struct_name_len: u64 = type_info.struct_name_len;
+    var struct_name_ptr: u64 = u8_slice_ptr(type_info.struct_name);
+    var struct_name_len: u64 = u8_slice_len(type_info.struct_name);
     if (type_info.struct_def == 0) {
         type_info.struct_def = get_struct_def(slice(struct_name_ptr, struct_name_len));
     }
