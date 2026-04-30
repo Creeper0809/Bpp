@@ -124,7 +124,7 @@ func generic_infer_try_type(tr: *AstTry, symtab: *HashMap<u64, *TypeInfo>) -> *T
     if (opt_ti.type_kind != TYPE_STRUCT || opt_ti.ptr_depth != 0) { return generic_type_u64(); }
     var try_fields: CompilerTryFieldNames = try_field_names_from_typeinfo(opt_ti);
     if (try_fields.found != 0) {
-        var vt: *TypeInfo = generic_find_struct_field_type(opt_ti.struct_name, slice(0, 0), slice(try_fields.value_ptr, try_fields.value_len));
+        var vt: *TypeInfo = generic_find_struct_field_type(opt_ti.struct_name, slice(0, 0), try_fields.value);
         if (vt != 0) { return vt; }
     }
     return generic_type_u64();
@@ -766,19 +766,27 @@ func generic_get_or_create_instance(tpl_ptr: *GenericFuncTemplate, bindings: *Ve
     return name_info;
 }
 
-func generic_bound_extract_struct_name(arg_ti: *TypeInfo, out_ptr: *u64, out_len: *u64) -> u64 {
-    if (arg_ti == 0) { return 0; }
+struct GenericBoundStructName {
+    public kind: u64;
+    public name: []u8;
+}
+
+func generic_bound_extract_struct_name(arg_ti: *TypeInfo) -> GenericBoundStructName {
+    var result: GenericBoundStructName;
+    result.kind = 0;
+    result.name = slice(0, 0);
+    if (arg_ti == 0) { return result; }
     if (arg_ti.type_kind == TYPE_STRUCT) {
-        *out_ptr = u8_slice_ptr(arg_ti.struct_name);
-        *out_len = u8_slice_len(arg_ti.struct_name);
-        return 1;
+        result.kind = 1;
+        result.name = arg_ti.struct_name;
+        return result;
     }
     if (arg_ti.type_kind == TYPE_TRAIT) {
-        *out_ptr = u8_slice_ptr(arg_ti.struct_name);
-        *out_len = u8_slice_len(arg_ti.struct_name);
-        return 2;
+        result.kind = 2;
+        result.name = arg_ti.struct_name;
+        return result;
     }
-    return 0;
+    return result;
 }
 
 func typeinfo_equal_assoc(lhs: *TypeInfo, rhs: *TypeInfo) -> u64 {
@@ -899,10 +907,9 @@ func generic_validate_type_bound(gp: *GenericParam, arg_ti: *TypeInfo) -> u64 {
     if (gp == 0 || arg_ti == 0) { return 1; }
     if (u8_slice_ptr(gp.bound_trait) == 0 || u8_slice_len(gp.bound_trait) == 0) { return 1; }
 
-    var candidate_ptr: u64 = 0;
-    var candidate_len: u64 = 0;
-    var kind: u64 = generic_bound_extract_struct_name(arg_ti, &candidate_ptr, &candidate_len);
-    if (kind == 0 || candidate_ptr == 0 || candidate_len == 0) {
+    var candidate: GenericBoundStructName = generic_bound_extract_struct_name(arg_ti);
+    var kind: u64 = candidate.kind;
+    if (kind == 0 || u8_slice_ptr(candidate.name) == 0 || u8_slice_len(candidate.name) == 0) {
         diag_emit_error_tag("generic", "G1007", "generic bound requires struct/trait type argument");
         diag_emit_labelled_name("parameter: ", gp.name);
         diag_emit_labelled_name("trait: ", gp.bound_trait);
@@ -910,26 +917,26 @@ func generic_validate_type_bound(gp: *GenericParam, arg_ti: *TypeInfo) -> u64 {
     }
 
     if (kind == 2) {
-        if (str_eq(slice(candidate_ptr, candidate_len), gp.bound_trait) != 0) {
-            if (generic_validate_assoc_bounds(gp, kind, slice(candidate_ptr, candidate_len), 0) == 0) {
+        if (str_eq(candidate.name, gp.bound_trait) != 0) {
+            if (generic_validate_assoc_bounds(gp, kind, candidate.name, 0) == 0) {
                 return 0;
             }
             return 1;
         }
         diag_emit_error_tag("generic", "G1008", "generic trait argument does not satisfy bound");
         diag_emit_labelled_name("expected trait: ", gp.bound_trait);
-        diag_emit_labelled_name("got trait: ", slice(candidate_ptr, candidate_len));
+        diag_emit_labelled_name("got trait: ", candidate.name);
         return 0;
     }
 
-    var impl_info: *TraitImpl = trait_find_trait_impl(gp.bound_trait, slice(candidate_ptr, candidate_len));
+    var impl_info: *TraitImpl = trait_find_trait_impl(gp.bound_trait, candidate.name);
     if (impl_info == 0) {
         diag_emit_error_tag("generic", "G1009", "generic bound not satisfied");
-        diag_emit_labelled_name("type: ", slice(candidate_ptr, candidate_len));
+        diag_emit_labelled_name("type: ", candidate.name);
         diag_emit_labelled_name("trait: ", gp.bound_trait);
         return 0;
     }
-    if (generic_validate_assoc_bounds(gp, kind, slice(candidate_ptr, candidate_len), impl_info) == 0) {
+    if (generic_validate_assoc_bounds(gp, kind, candidate.name, impl_info) == 0) {
         return 0;
     }
     return 1;
@@ -1030,15 +1037,12 @@ func generic_clone_struct(template_def: *AstStructDef, bindings: *Vec<*GenericBi
             nf.elem_typeinfo = f.elem_typeinfo;
         }
         nf.access = f.access;
-        nf.owner_struct_ptr = new_name.ptr;
-        nf.owner_struct_len = new_name.len;
+        nf.owner_struct = new_name;
         nf.annotations_vec = f.annotations_vec;
         nf.setter_hook_mode = f.setter_hook_mode;
         nf.getter_hook_mode = f.getter_hook_mode;
-        nf.setter_hook_ptr = f.setter_hook_ptr;
-        nf.setter_hook_len = f.setter_hook_len;
-        nf.getter_hook_ptr = f.getter_hook_ptr;
-        nf.getter_hook_len = f.getter_hook_len;
+        nf.setter_hook = u8_slice_copy(f.setter_hook);
+        nf.getter_hook = u8_slice_copy(f.getter_hook);
         fields_out.push(nf);
     }
     var parents_out: *Vec<*ParentDesc> = 0;
@@ -1257,8 +1261,7 @@ const COMPILER_AST_WALK_FIND_SUPER_CTOR = 4;
 
 struct CompilerAstWalker {
     public mode: u64;
-    public owner_ptr: u64;
-    public owner_len: u64;
+    public owner: []u8;
     public super_allowed: u64;
     public found: u64;
 }

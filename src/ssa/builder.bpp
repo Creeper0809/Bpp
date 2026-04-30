@@ -82,10 +82,8 @@ struct BuilderPackedFieldMeta {
 struct BuilderTryMeta {
     public opt_ti: *TypeInfo;
     public struct_def: *AstStructDef;
-    public check_ptr: u64;
-    public check_len: u64;
-    public value_ptr: u64;
-    public value_len: u64;
+    public check: []u8;
+    public value: []u8;
     public value_desc: *FieldDesc;
 }
 
@@ -97,8 +95,7 @@ struct BuilderReturnStructTarget {
 
 struct BuilderPreparedMethodCall {
     public ok: u64;
-    public resolved_ptr: u64;
-    public resolved_len: u64;
+    public resolved: []u8;
     public recv_addr: u64;
     public resolved_fn: *AstFunc;
     public use_call_ptr: u64;
@@ -309,8 +306,8 @@ func emit_trait_vptr_init_at_addr(ctx: *BuilderCtx, base_addr: u64, struct_name:
     var n: u64 = impls.len();
     for (var i: u64 = 0; i < n; i++) {
         var impl_info: *TraitImpl = impls.get(i);
-        if (!str_eq(slice(impl_info.struct_ptr, impl_info.struct_len), slice(struct_name.ptr, struct_name.len))) { continue; }
-        var vptr_name: *NameInfo = trait_build_vptr_field_name(slice(impl_info.trait_ptr, impl_info.trait_len));
+        if (!str_eq(impl_info.impl_struct_name, slice(struct_name.ptr, struct_name.len))) { continue; }
+        var vptr_name: *NameInfo = trait_build_vptr_field_name(impl_info.trait_name);
         var field_offset: u64 = 0;
         var field_desc: *FieldDesc = 0;
         var found: u64 = struct_find_field_desc_scoped(struct_def, slice(0, 0), slice(vptr_name.ptr, vptr_name.len), &field_offset, &field_desc);
@@ -318,7 +315,7 @@ func emit_trait_vptr_init_at_addr(ctx: *BuilderCtx, base_addr: u64, struct_name:
             emit_stderr("[ERROR] vptr field not found for trait init\n");
             diag_error("SSA build error");
         }
-        var vtable_reg: u64 = new_lea_global(ctx, slice(impl_info.vtable_global_ptr, impl_info.vtable_global_len));
+        var vtable_reg: u64 = new_lea_global(ctx, impl_info.vtable_global);
         var addr_reg: u64 = base_addr;
         if (field_offset != 0) {
             var off_reg: u64 = build_const(ctx, field_offset);
@@ -397,11 +394,9 @@ func resolve_constructor_call(struct_slice: []u8, args: *Vec<*AstNode>, symtab: 
             resolved.fn = fn_ctor;
             var owner_map: *NameInfo = sym_get_impl_method_owner(slice(name_info.ptr, name_info.len));
             if (owner_map != 0) {
-                resolved.owner_ptr = owner_map.ptr;
-                resolved.owner_len = owner_map.len;
+                resolved.owner = owner_map;
             } else {
-                resolved.owner_ptr = u8_slice_ptr(fn_ctor.impl_owner);
-                resolved.owner_len = u8_slice_len(fn_ctor.impl_owner);
+                resolved.owner = fn_ctor.impl_owner;
             }
             resolved.access = sym_get_impl_method_access(slice(name_info.ptr, name_info.len));
         }
@@ -426,15 +421,14 @@ func resolve_constructor_call(struct_slice: []u8, args: *Vec<*AstNode>, symtab: 
         diag_error("SSA build error");
         return resolved;
     }
-    if (resolved.owner_ptr == 0 || resolved.owner_len == 0) {
-        resolved.owner_ptr = struct_slice.ptr;
-        resolved.owner_len = struct_slice.len;
+    if (u8_slice_ptr(resolved.owner) == 0 || u8_slice_len(resolved.owner) == 0) {
+        resolved.owner = struct_slice;
     }
     if (resolved.access == 0) { resolved.access = ACCESS_PUBLIC; }
-    if (sym_can_access_member(slice(resolved.owner_ptr, resolved.owner_len), resolved.access) == 0) {
+    if (sym_can_access_member(resolved.owner, resolved.access) == 0) {
         diag_emit_error_tag("ssa", "S2202", "constructor access denied");
         emit_stderr("  type: ");
-        emit_stderr_len(resolved.owner_ptr, resolved.owner_len);
+        emit_stderr_len(u8_slice_ptr(resolved.owner), u8_slice_len(resolved.owner));
         emit_stderr(".constructor\n");
         diag_error("SSA build error");
     }
@@ -2710,8 +2704,7 @@ func builder_try_emit_number_binary(ctx: *BuilderCtx, bin: *AstBinary, left_ti: 
 func method_prepare_call(ctx: *BuilderCtx, mc: *AstMethodCall) -> BuilderPreparedMethodCall {
     var prepared: BuilderPreparedMethodCall;
     prepared.ok = 0;
-    prepared.resolved_ptr = 0;
-    prepared.resolved_len = 0;
+    prepared.resolved = slice(0, 0);
     prepared.recv_addr = 0;
     prepared.resolved_fn = 0;
     prepared.use_call_ptr = 0;
@@ -2854,8 +2847,8 @@ func method_prepare_call(ctx: *BuilderCtx, mc: *AstMethodCall) -> BuilderPrepare
         }
     }
     if (resolved_method.found != 0 && resolved_method.fn != 0) {
-        if (sym_can_access_member(slice(resolved_method.owner_ptr, resolved_method.owner_len), resolved_method.access) == 0) {
-            member_diag_access_denied(slice(resolved_method.owner_ptr, resolved_method.owner_len), mc.method, resolved_method.access, 1);
+        if (sym_can_access_member(resolved_method.owner, resolved_method.access) == 0) {
+            member_diag_access_denied(resolved_method.owner, mc.method, resolved_method.access, 1);
             return prepared;
         }
         resolved_name = resolve_symbol_name(resolved_method.fn.name);
@@ -2863,8 +2856,8 @@ func method_prepare_call(ctx: *BuilderCtx, mc: *AstMethodCall) -> BuilderPrepare
     } else if (recv_def != 0) {
         fallback_fn = find_method_func_in_hierarchy_with_arg_count(recv_def, mc.method, nargs);
         if (fallback_fn != 0) {
-            if (access_lookup.found != 0 && sym_can_access_member(slice(access_lookup.owner_ptr, access_lookup.owner_len), access_lookup.access) == 0) {
-                member_diag_access_denied(slice(access_lookup.owner_ptr, access_lookup.owner_len), mc.method, access_lookup.access, 1);
+            if (access_lookup.found != 0 && sym_can_access_member(access_lookup.owner, access_lookup.access) == 0) {
+                member_diag_access_denied(access_lookup.owner, mc.method, access_lookup.access, 1);
                 return prepared;
             }
             resolved_name = resolve_symbol_name(fallback_fn.name);
@@ -2910,8 +2903,7 @@ func method_prepare_call(ctx: *BuilderCtx, mc: *AstMethodCall) -> BuilderPrepare
         }
     }
     prepared.ok = 1;
-    prepared.resolved_ptr = resolved_name.ptr;
-    prepared.resolved_len = resolved_name.len;
+    prepared.resolved = resolved_name;
     return prepared;
 }
 
@@ -2973,7 +2965,7 @@ func emit_method_call_value(ctx: *BuilderCtx, mc: *AstMethodCall, dst: u64, extr
     append_call_args_nodes_with_params(ctx, arg_regs, args, params, 1);
 
     var ret_meta: BuilderCallRetMeta = call_ret_meta(ctx, (u64)mc, TYPE_I64, 0);
-    var info: *SSACallInfo = make_call_info(slice(prepared.resolved_ptr, prepared.resolved_len), arg_regs, ret_meta.ret_type, ret_meta.ret_ptr_depth, ret_meta.ret_struct_size);
+    var info: *SSACallInfo = make_call_info(prepared.resolved, arg_regs, ret_meta.ret_type, ret_meta.ret_ptr_depth, ret_meta.ret_struct_size);
 
     var extra_opr2: u64 = 0;
     if (extra_dst != 0) { extra_opr2 = operand_reg(extra_dst); }
@@ -3012,7 +3004,7 @@ func emit_method_call_sret(ctx: *BuilderCtx, mc: *AstMethodCall, addr_reg: u64) 
     append_call_args_nodes_with_params(ctx, arg_regs, args, params, 1);
 
     var ret_meta: BuilderCallRetMeta = call_ret_meta(ctx, (u64)mc, TYPE_STRUCT, 0);
-    var info: *SSACallInfo = make_call_info(slice(prepared.resolved_ptr, prepared.resolved_len), arg_regs, ret_meta.ret_type, ret_meta.ret_ptr_depth, ret_meta.ret_struct_size);
+    var info: *SSACallInfo = make_call_info(prepared.resolved, arg_regs, ret_meta.ret_type, ret_meta.ret_ptr_depth, ret_meta.ret_struct_size);
     var call_ptr2: *SSAInstruction = create_inst(ctx.ssa_ctx, SSA_OP_CALL, 0, operand_const((u64)info), 0);
     append_inst(ctx.cur_block, call_ptr2);
     return 0;
@@ -3048,7 +3040,7 @@ func emit_method_call_slice_store(ctx: *BuilderCtx, mc: *AstMethodCall, addr_reg
     append_call_args_nodes_with_params(ctx, arg_regs, args, params, 1);
 
     var ret_meta: BuilderCallRetMeta = call_ret_meta(ctx, (u64)mc, TYPE_I64, 0);
-    var info: *SSACallSliceStoreInfo = make_call_slice_store_info(0, slice(prepared.resolved_ptr, prepared.resolved_len), 0, arg_regs, ret_meta.ret_type, ret_meta.ret_ptr_depth);
+    var info: *SSACallSliceStoreInfo = make_call_slice_store_info(0, prepared.resolved, 0, arg_regs, ret_meta.ret_type, ret_meta.ret_ptr_depth);
     var call_ptr2: *SSAInstruction = create_inst(ctx.ssa_ctx, SSA_OP_CALL_SLICE_STORE, 0, operand_const((u64)info), operand_reg(addr_reg));
     append_inst(ctx.cur_block, call_ptr2);
     return 0;
@@ -3781,15 +3773,13 @@ func try_resolve_meta_or_panic(ctx: *BuilderCtx, operand: u64, ret_type: u64, re
         return 0;
     }
 
-    var check_ptr: u64 = try_fields.check_ptr;
-    var check_len: u64 = try_fields.check_len;
-    var value_ptr: u64 = try_fields.value_ptr;
-    var value_len: u64 = try_fields.value_len;
+    var check: []u8 = try_fields.check;
+    var value: []u8 = try_fields.value;
 
-    var value_desc: *FieldDesc = get_field_desc(struct_def, slice(value_ptr, value_len));
+    var value_desc: *FieldDesc = get_field_desc(struct_def, value);
     if (value_desc == 0) {
         diag_emit_error_tag("ssa", "try", "try value field not found");
-        diag_emit_labelled_member("expected field: ", struct_def.name, slice(value_ptr, value_len));
+        diag_emit_labelled_member("expected field: ", struct_def.name, value);
         diag_error("SSA build error");
         return 0;
     }
@@ -3797,10 +3787,8 @@ func try_resolve_meta_or_panic(ctx: *BuilderCtx, operand: u64, ret_type: u64, re
     var meta: *BuilderTryMeta = new BuilderTryMeta{};
     meta.opt_ti = opt_ti;
     meta.struct_def = struct_def;
-    meta.check_ptr = check_ptr;
-    meta.check_len = check_len;
-    meta.value_ptr = value_ptr;
-    meta.value_len = value_len;
+    meta.check = check;
+    meta.value = value;
     meta.value_desc = value_desc;
     return meta;
 }
@@ -3902,8 +3890,8 @@ func build_try_expr(ctx: *BuilderCtx, node: u64) -> u64 {
     var opt_ti: *TypeInfo = try_meta.opt_ti;
     var struct_def: *AstStructDef = try_meta.struct_def;
     var value_desc: *FieldDesc = try_meta.value_desc;
-    var check_off: u64 = get_field_offset(struct_def, slice(try_meta.check_ptr, try_meta.check_len));
-    var value_off: u64 = get_field_offset(struct_def, slice(try_meta.value_ptr, try_meta.value_len));
+    var check_off: u64 = get_field_offset(struct_def, try_meta.check);
+    var value_off: u64 = get_field_offset(struct_def, try_meta.value);
 
     var struct_size: u64 = layout_type_sizeof(TYPE_STRUCT, 0, opt_ti.struct_name);
     var tmp_offset: u64 = symtab_add(ctx.symtab, slice(0, 0), TYPE_STRUCT, 0, struct_size);
@@ -3911,7 +3899,7 @@ func build_try_expr(ctx: *BuilderCtx, node: u64) -> u64 {
     if (try_materialize_operand(ctx, operand, struct_size, tmp_addr) == 0) { return 0; }
 
     var check_addr: u64 = try_addr_with_offset(ctx, tmp_addr, check_off);
-    var check_desc: *FieldDesc = get_field_desc(struct_def, slice(try_meta.check_ptr, try_meta.check_len));
+    var check_desc: *FieldDesc = get_field_desc(struct_def, try_meta.check);
     var check_size: u64 = 8;
     if (check_desc != 0) { check_size = layout_field_sizeof(check_desc); }
     var check_reg: u64 = load_by_size(ctx, check_addr, check_size);
@@ -4931,11 +4919,11 @@ func ssa_property_hook_build_getter_call(ctx: *BuilderCtx, member_access: *AstMe
     var obj_ti: *TypeInfo = 0;
     var field_desc: *FieldDesc = ssa_property_hook_find_field(ctx, member_access, &obj_ti);
     if (field_desc == 0 || field_desc.getter_hook_mode == FIELD_HOOK_NONE) { return 0; }
-    if (field_desc.getter_hook_ptr == 0 || field_desc.getter_hook_len == 0) { return 0; }
+    if (u8_slice_ptr(field_desc.getter_hook) == 0 || u8_slice_len(field_desc.getter_hook) == 0) { return 0; }
 
     var args: *Vec<*AstNode> = new Vec<*AstNode>{heap_alloc((1) * sizeof(*AstNode)), 0, (1)};
     args.push(ssa_property_hook_build_self_arg(member_access, obj_ti));
-    return ast_call_with_origin(slice(field_desc.getter_hook_ptr, field_desc.getter_hook_len), args, AST_CALL_ORIGIN_DIRECT);
+    return ast_call_with_origin(field_desc.getter_hook, args, AST_CALL_ORIGIN_DIRECT);
 }
 
 func ssa_property_hook_build_setter_call(ctx: *BuilderCtx, member_access: *AstMemberAccess, value: *AstNode) -> *AstCall {
@@ -4944,12 +4932,12 @@ func ssa_property_hook_build_setter_call(ctx: *BuilderCtx, member_access: *AstMe
     var obj_ti: *TypeInfo = 0;
     var field_desc: *FieldDesc = ssa_property_hook_find_field(ctx, member_access, &obj_ti);
     if (field_desc == 0 || field_desc.setter_hook_mode == FIELD_HOOK_NONE) { return 0; }
-    if (field_desc.setter_hook_ptr == 0 || field_desc.setter_hook_len == 0) { return 0; }
+    if (u8_slice_ptr(field_desc.setter_hook) == 0 || u8_slice_len(field_desc.setter_hook) == 0) { return 0; }
 
     var args: *Vec<*AstNode> = new Vec<*AstNode>{heap_alloc((2) * sizeof(*AstNode)), 0, (2)};
     args.push(ssa_property_hook_build_self_arg(member_access, obj_ti));
     args.push(value);
-    return ast_call_with_origin(slice(field_desc.setter_hook_ptr, field_desc.setter_hook_len), args, AST_CALL_ORIGIN_DIRECT);
+    return ast_call_with_origin(field_desc.setter_hook, args, AST_CALL_ORIGIN_DIRECT);
 }
 
 func expr_member_access(ctx: *BuilderCtx, node: u64) -> u64 {
@@ -5310,11 +5298,11 @@ func method_find_virtual_trait_name(recv_ti: *TypeInfo, recv_owner: []u8, method
     if (recv_def == 0) { return 0; }
 
     var abst_lookup: CompilerDeclLookup = vdispatch_find_abst_decl_in_hierarchy(recv_def, slice(method.ptr, method.len));
-    if (abst_lookup.found == 0 || abst_lookup.owner_ptr == 0 || abst_lookup.owner_len == 0) {
+    if (abst_lookup.found == 0 || u8_slice_ptr(abst_lookup.owner) == 0 || u8_slice_len(abst_lookup.owner) == 0) {
         return 0;
     }
 
-    var trait_name: *NameInfo = vdispatch_build_virtual_trait_name(slice(abst_lookup.owner_ptr, abst_lookup.owner_len));
+    var trait_name: *NameInfo = vdispatch_build_virtual_trait_name(abst_lookup.owner);
     if (trait_name == 0) { return 0; }
     if (sym_get_trait_def(slice(trait_name.ptr, trait_name.len)) == 0) { return 0; }
     return trait_name;
@@ -5424,7 +5412,7 @@ func expr_cast(ctx: *BuilderCtx, node: u64) -> u64 {
                 src_reg = mask_tagged_ptr(ctx, src_reg);
             }
             var loaded_vtable_reg: u64 = load_vtable_ptr(ctx, src_reg, 0);
-            emit_checked_vtable_guard(ctx, loaded_vtable_reg, slice(impl2.vtable_global_ptr, impl2.vtable_global_len));
+            emit_checked_vtable_guard(ctx, loaded_vtable_reg, impl2.vtable_global);
             return cast_adjust_sub(ctx, src_reg, field_offset2);
         }
 
@@ -5436,7 +5424,7 @@ func expr_cast(ctx: *BuilderCtx, node: u64) -> u64 {
                 var check_info: CompilerDowncastCheckInfo = trait_require_checked_struct_downcast_info(src_ti.struct_name, cast.struct_name);
                 if (check_info.found != 0) {
                     var loaded_vtable_reg2: u64 = load_vtable_ptr(ctx, src_reg, check_info.src_vptr_offset);
-                    emit_checked_vtable_guard(ctx, loaded_vtable_reg2, slice(check_info.expected_vtable_ptr, check_info.expected_vtable_len));
+                    emit_checked_vtable_guard(ctx, loaded_vtable_reg2, check_info.expected_vtable);
                 }
             }
             return cast_try_adjust_struct_ptr(ctx, src_ti, cast.struct_name, src_reg);
