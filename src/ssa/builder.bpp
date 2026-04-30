@@ -2511,11 +2511,15 @@ func builder_infer_overloaded_receiver_type(receiver: *AstNode, symtab: *Symtab)
         var bin: *AstBinary = (*AstBinary)receiver;
         var left_ti: *TypeInfo = builder_infer_overloaded_receiver_type(bin.left, symtab);
         if (left_ti == 0) { left_ti = get_expr_type_with_symtab(bin.left, symtab); }
-        if (bin.op == TOKEN_PLUS || bin.op == TOKEN_MINUS || bin.op == TOKEN_STAR || bin.op == TOKEN_SLASH ||
-            bin.op == TOKEN_PERCENT || bin.op == TOKEN_LSHIFT || bin.op == TOKEN_RSHIFT ||
-            bin.op == TOKEN_AMPERSAND || bin.op == TOKEN_PIPE || bin.op == TOKEN_CARET) {
+        if (builder_binary_is_number_value_op(bin.op) != 0) {
             if (left_ti != 0 && left_ti.ptr_depth == 0 && left_ti.type_kind == TYPE_STRUCT) {
                 return typeinfo_clone(left_ti);
+            }
+            var right_ti: *TypeInfo = builder_infer_overloaded_receiver_type(bin.right, symtab);
+            if (right_ti == 0) { right_ti = get_expr_type_with_symtab(bin.right, symtab); }
+            if (builder_binary_expr_is_number(bin.right, right_ti, symtab) != 0 &&
+                builder_binary_expr_is_integer(left_ti) != 0) {
+                return typeinfo_clone(right_ti);
             }
         }
         return 0;
@@ -2533,6 +2537,29 @@ func builder_infer_overloaded_receiver_type(receiver: *AstNode, symtab: *Symtab)
         return 0;
     }
 
+    return 0;
+}
+
+func builder_binary_is_number_value_op(op: u64) -> u64 {
+    if (op == TOKEN_PLUS) { return 1; }
+    if (op == TOKEN_MINUS) { return 1; }
+    if (op == TOKEN_STAR) { return 1; }
+    if (op == TOKEN_SLASH) { return 1; }
+    if (op == TOKEN_PERCENT) { return 1; }
+    if (op == TOKEN_LSHIFT) { return 1; }
+    if (op == TOKEN_RSHIFT) { return 1; }
+    if (op == TOKEN_AMPERSAND) { return 1; }
+    if (op == TOKEN_PIPE) { return 1; }
+    if (op == TOKEN_CARET) { return 1; }
+    return 0;
+}
+
+func builder_type_kind_is_unsigned_integer(kind: u64) -> u64 {
+    if (kind == TYPE_BOOL) { return 1; }
+    if (kind == TYPE_U8) { return 1; }
+    if (kind == TYPE_U16) { return 1; }
+    if (kind == TYPE_U32) { return 1; }
+    if (kind == TYPE_U64) { return 1; }
     return 0;
 }
 
@@ -2568,13 +2595,15 @@ func builder_make_overloaded_receiver_expr(receiver: *AstNode, symtab: *Symtab) 
         var bin: *AstBinary = (*AstBinary)receiver;
         var left_ti: *TypeInfo = builder_infer_overloaded_receiver_type(bin.left, symtab);
         if (left_ti == 0) { left_ti = get_expr_type_with_symtab(bin.left, symtab); }
-        if (left_ti == 0 || left_ti.ptr_depth != 0 || left_ti.type_kind != TYPE_STRUCT) { return receiver; }
         var method_name: *NameInfo = compiler_operator_binary_name(bin.op);
         if (method_name == 0) { return receiver; }
         var args: *Vec<*AstNode> = new Vec<*AstNode>{heap_alloc((1) * sizeof(*AstNode)), 0, (1)};
         args.push(bin.right);
-        var lhs_expr: *AstNode = builder_make_overloaded_receiver_expr(bin.left, symtab);
-        return (*AstNode)ast_method_call(lhs_expr, slice(method_name.ptr, method_name.len), args);
+        if (left_ti != 0 && left_ti.ptr_depth == 0 && left_ti.type_kind == TYPE_STRUCT) {
+            var lhs_expr: *AstNode = builder_make_overloaded_receiver_expr(bin.left, symtab);
+            return (*AstNode)ast_method_call(lhs_expr, slice(method_name.ptr, method_name.len), args);
+        }
+        return receiver;
     }
 
     if (recv_kind == AST_UNARY) {
@@ -2638,14 +2667,92 @@ func builder_number_expr_addr(ctx: *BuilderCtx, node: *AstNode, ti: *TypeInfo) -
     return temp_addr;
 }
 
-func builder_box_i64_to_number_addr(ctx: *BuilderCtx, value_reg: u64) -> u64 {
-    var call_args: *Vec<u64> = make_args1(value_reg);
+func builder_box_integer_to_number_addr(ctx: *BuilderCtx, value_reg: u64, ti: *TypeInfo) -> u64 {
+    var normalized: u64 = value_reg;
+    if (ti != 0 && ti.ptr_depth == 0 && ti.type_kind != TYPE_I64 && ti.type_kind != TYPE_U64) {
+        normalized = cast_int_truncate(ctx, value_reg, ti.type_kind);
+    }
+    var call_args: *Vec<u64> = make_args1(normalized);
     var boxed_reg: u64 = new_reg(ctx);
-    emit_call_name_raw(ctx, slice("std_number__Number_from_i64", str_len("std_number__Number_from_i64")), call_args, boxed_reg, 0, TYPE_STRUCT, 0, 0);
+    var call_name: []u8 = slice("std_number__Number_from_i64", str_len("std_number__Number_from_i64"));
+    if (ti != 0 && ti.ptr_depth == 0 && builder_type_kind_is_unsigned_integer(ti.type_kind) != 0) {
+        call_name = slice("std_number__Number_from_u64", str_len("std_number__Number_from_u64"));
+    }
+    emit_call_name_raw(ctx, call_name, call_args, boxed_reg, 0, TYPE_STRUCT, 0, 8);
     var temp_offset: u64 = symtab_add(ctx.symtab, slice(0, 0), TYPE_STRUCT, 0, 8);
     var temp_addr: u64 = new_lea_local(ctx, temp_offset);
     store_by_size(ctx, temp_addr, boxed_reg, 8);
     return temp_addr;
+}
+
+func builder_number_operand_addr(ctx: *BuilderCtx, node: *AstNode, ti: *TypeInfo) -> u64 {
+    if (builder_binary_expr_is_number(node, ti, ctx.symtab) != 0) {
+        return builder_number_expr_addr(ctx, node, ti);
+    }
+    if (builder_binary_expr_is_integer(ti) != 0) {
+        var value_reg: u64 = build_expr(ctx, node);
+        return builder_box_integer_to_number_addr(ctx, value_reg, ti);
+    }
+    return 0;
+}
+
+func builder_number_binary_call_name(op: u64) -> *NameInfo {
+    if (op == TOKEN_PLUS) {
+        return new NameInfo{(u64)"std_number__Number_add_values", str_len("std_number__Number_add_values")};
+    }
+    if (op == TOKEN_MINUS) {
+        return new NameInfo{(u64)"std_number__Number_sub_values", str_len("std_number__Number_sub_values")};
+    }
+    if (op == TOKEN_STAR) {
+        return new NameInfo{(u64)"std_number__Number_mul_values", str_len("std_number__Number_mul_values")};
+    }
+    if (op == TOKEN_SLASH) {
+        return new NameInfo{(u64)"std_number__Number_div_values", str_len("std_number__Number_div_values")};
+    }
+    if (op == TOKEN_PERCENT) {
+        return new NameInfo{(u64)"std_number__Number_mod_values", str_len("std_number__Number_mod_values")};
+    }
+    return 0;
+}
+
+func builder_number_bitwise_mode(op: u64) -> u64 {
+    if (op == TOKEN_AMPERSAND) { return 0; }
+    if (op == TOKEN_PIPE) { return 1; }
+    return 2;
+}
+
+func builder_emit_number_value_binary(
+    ctx: *BuilderCtx,
+    op: u64,
+    left_addr: u64,
+    right_addr: u64
+) -> u64 {
+    if (left_addr == 0 || right_addr == 0) { return 0; }
+    var dst: u64 = new_reg(ctx);
+    var direct_name: *NameInfo = builder_number_binary_call_name(op);
+    if (direct_name != 0) {
+        var args: *Vec<u64> = make_args2(left_addr, right_addr);
+        return emit_call_name_raw(ctx, slice(direct_name.ptr, direct_name.len), args, dst, 0, TYPE_STRUCT, 0, 8);
+    }
+
+    if (op == TOKEN_AMPERSAND || op == TOKEN_PIPE || op == TOKEN_CARET) {
+        var mode_reg: u64 = build_const(ctx, builder_number_bitwise_mode(op));
+        var bit_args: *Vec<u64> = make_args3(left_addr, right_addr, mode_reg);
+        return emit_call_name_raw(ctx, slice("std_number__Number_bitwise_values", str_len("std_number__Number_bitwise_values")), bit_args, dst, 0, TYPE_STRUCT, 0, 8);
+    }
+
+    if (op == TOKEN_LSHIFT || op == TOKEN_RSHIFT) {
+        var shift_args: *Vec<u64> = make_args1(right_addr);
+        var shift_reg: u64 = new_reg(ctx);
+        emit_call_name_raw(ctx, slice("std_number__Number_shift_amount", str_len("std_number__Number_shift_amount")), shift_args, shift_reg, 0, TYPE_U64, 0, 0);
+        var value_args: *Vec<u64> = make_args2(left_addr, shift_reg);
+        if (op == TOKEN_LSHIFT) {
+            return emit_call_name_raw(ctx, slice("std_number__Number_shl_values", str_len("std_number__Number_shl_values")), value_args, dst, 0, TYPE_STRUCT, 0, 8);
+        }
+        return emit_call_name_raw(ctx, slice("std_number__Number_shr_values", str_len("std_number__Number_shr_values")), value_args, dst, 0, TYPE_STRUCT, 0, 8);
+    }
+
+    return 0;
 }
 
 func builder_emit_number_cmp_bool(ctx: *BuilderCtx, op: u64, left_addr: u64, right_addr: u64) -> u64 {
@@ -2666,35 +2773,20 @@ func builder_try_emit_number_binary(ctx: *BuilderCtx, bin: *AstBinary, left_ti: 
     var left_is_number: u64 = builder_binary_expr_is_number(bin.left, left_ti, ctx.symtab);
     var right_is_number: u64 = builder_binary_expr_is_number(bin.right, right_ti, ctx.symtab);
     if (left_is_number == 0 && right_is_number == 0) { return 0; }
-    if (bin.op != TOKEN_EQEQ && bin.op != TOKEN_BANGEQ &&
-        bin.op != TOKEN_LT && bin.op != TOKEN_GT &&
-        bin.op != TOKEN_LTEQ && bin.op != TOKEN_GTEQ) {
-        return 0;
+
+    if (builder_binary_is_number_value_op(bin.op) != 0) {
+        var left_addr_value: u64 = builder_number_operand_addr(ctx, bin.left, left_ti);
+        var right_addr_value: u64 = builder_number_operand_addr(ctx, bin.right, right_ti);
+        return builder_emit_number_value_binary(ctx, bin.op, left_addr_value, right_addr_value);
     }
 
-    if (left_is_number != 0 && right_is_number != 0) {
-        var left_addr: u64 = builder_number_expr_addr(ctx, bin.left, left_ti);
-        var right_addr: u64 = builder_number_expr_addr(ctx, bin.right, right_ti);
+    if (bin.op == TOKEN_EQEQ || bin.op == TOKEN_BANGEQ ||
+        bin.op == TOKEN_LT || bin.op == TOKEN_GT ||
+        bin.op == TOKEN_LTEQ || bin.op == TOKEN_GTEQ) {
+        var left_addr: u64 = builder_number_operand_addr(ctx, bin.left, left_ti);
+        var right_addr: u64 = builder_number_operand_addr(ctx, bin.right, right_ti);
         if (left_addr != 0 && right_addr != 0) {
             return builder_emit_number_cmp_bool(ctx, bin.op, left_addr, right_addr);
-        }
-    }
-
-    if (left_is_number != 0 && builder_binary_expr_is_integer(right_ti) != 0) {
-        var left_addr2: u64 = builder_number_expr_addr(ctx, bin.left, left_ti);
-        if (left_addr2 != 0) {
-            var right_reg: u64 = build_expr(ctx, bin.right);
-            var right_addr2: u64 = builder_box_i64_to_number_addr(ctx, right_reg);
-            return builder_emit_number_cmp_bool(ctx, bin.op, left_addr2, right_addr2);
-        }
-    }
-
-    if (right_is_number != 0 && builder_binary_expr_is_integer(left_ti) != 0) {
-        var right_addr3: u64 = builder_number_expr_addr(ctx, bin.right, right_ti);
-        if (right_addr3 != 0) {
-            var left_reg: u64 = build_expr(ctx, bin.left);
-            var left_addr3: u64 = builder_box_i64_to_number_addr(ctx, left_reg);
-            return builder_emit_number_cmp_bool(ctx, bin.op, left_addr3, right_addr3);
         }
     }
 
@@ -3842,6 +3934,15 @@ func try_materialize_operand(ctx: *BuilderCtx, operand: u64, struct_size: u64, t
             store_by_size(ctx, addr2, hi_reg, tail_size);
         }
         return 1;
+    }
+
+    if (struct_size <= 8 && (op_kind == AST_BINARY || op_kind == AST_UNARY)) {
+        var inferred_ti: *TypeInfo = builder_infer_overloaded_receiver_type((*AstNode)operand, ctx.symtab);
+        if (inferred_ti != 0 && inferred_ti.type_kind == TYPE_STRUCT && inferred_ti.ptr_depth == 0) {
+            var value_reg: u64 = build_expr(ctx, operand);
+            store_by_size(ctx, tmp_addr, value_reg, struct_size);
+            return 1;
+        }
     }
 
     var src_addr2: u64 = lvalue_addr(ctx, operand);
