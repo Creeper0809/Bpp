@@ -507,11 +507,22 @@ LLVM_ARTIFACT_DIR="$ROOT_DIR/$LLVM_ARTIFACT_DIR_BASE/$RUN_TAG"
 mkdir -p "$SUITE_CASES_DIR"
 mkdir -p "$LLVM_ARTIFACT_DIR"
 
+ACTIVE_JOBS=0
+
 launch_job_with_limit() {
-    while [ "$(jobs -rp | wc -l)" -ge "$TEST_JOBS" ]; do
+    while [ "$ACTIVE_JOBS" -ge "$TEST_JOBS" ]; do
         wait -n || true
+        ACTIVE_JOBS=$((ACTIVE_JOBS - 1))
     done
     "$@" &
+    ACTIVE_JOBS=$((ACTIVE_JOBS + 1))
+}
+
+wait_for_launched_jobs() {
+    while [ "$ACTIVE_JOBS" -gt 0 ]; do
+        wait -n || true
+        ACTIVE_JOBS=$((ACTIVE_JOBS - 1))
+    done
 }
 
 run_matrix_case() {
@@ -1264,7 +1275,7 @@ CONTENT_HASH=$(awk '{if ($0 !~ /^\/\/ (Covers:|Mode:|Opt:|Compiler args:|Compile
     fi
 done
 
-wait || true
+wait_for_launched_jobs
 
 for RESULT_FILE in "${CASE_RESULT_FILES[@]}"; do
     if [ ! -f "$RESULT_FILE" ]; then
@@ -1337,7 +1348,7 @@ for TEST_FILE in $IR_TEST_FILES; do
     launch_job_with_limit run_ir_case "$TOTAL" "$TEST_FILE" "$TEST_NAME" "$RESULT_FILE"
 done
 
-wait || true
+wait_for_launched_jobs
 
 for RESULT_FILE in "${IR_RESULT_FILES[@]}"; do
     if [ ! -f "$RESULT_FILE" ]; then

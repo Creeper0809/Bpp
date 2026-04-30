@@ -280,6 +280,8 @@ TEST_JOBS="${TEST_JOBS:-0}"
 TEST_PROFILE="${TEST_PROFILE:-}"
 BUILD_AND_TEST_PROFILE="${BUILD_AND_TEST_PROFILE:-full}"
 SELFHOST_VERIFY="${SELFHOST_VERIFY:-}"
+SELFHOST_VERIFY_ASYNC="${SELFHOST_VERIFY_ASYNC:-0}"
+COMPILE_FAIL_SINGLE_VARIANT="${COMPILE_FAIL_SINGLE_VARIANT:-}"
 STRESS_RUNS="${STRESS_RUNS:-}"
 STABILITY_RUNS="${STABILITY_RUNS:-}"
 TEST_SUITE_CASE_LIMIT="${TEST_SUITE_CASE_LIMIT:-0}"
@@ -291,11 +293,15 @@ LINKER_BIN="${BPP_LINKER_EXECUTABLE:-ld}"
 if [ "$BUILD_AND_TEST_PROFILE" = "fast" ]; then
     if [ -z "$TEST_PROFILE" ]; then TEST_PROFILE="quick"; fi
     if [ -z "$SELFHOST_VERIFY" ]; then SELFHOST_VERIFY=0; fi
+    if [ -z "$COMPILE_FAIL_SINGLE_VARIANT" ]; then COMPILE_FAIL_SINGLE_VARIANT=1; fi
     if [ -z "${STRESS_RUNS:-}" ]; then STRESS_RUNS=0; fi
     if [ -z "${STABILITY_RUNS:-}" ]; then STABILITY_RUNS=0; fi
 elif [ "$BUILD_AND_TEST_PROFILE" = "full" ]; then
     if [ -z "$TEST_PROFILE" ]; then TEST_PROFILE="full"; fi
     if [ -z "$SELFHOST_VERIFY" ]; then SELFHOST_VERIFY=1; fi
+    # Compile-fail tests stop before backend codegen, so one variant preserves
+    # diagnostic coverage while avoiding redundant mode/opt matrix work.
+    if [ -z "$COMPILE_FAIL_SINGLE_VARIANT" ]; then COMPILE_FAIL_SINGLE_VARIANT=1; fi
     # Full profile keeps full test matrix, but default avoids costly repeat runs.
     # Re-enable with STRESS_RUNS/STABILITY_RUNS env when needed.
     if [ -z "${STRESS_RUNS:-}" ]; then STRESS_RUNS=0; fi
@@ -304,6 +310,11 @@ else
     echo "Error: BUILD_AND_TEST_PROFILE must be 'fast' or 'full' (got: $BUILD_AND_TEST_PROFILE)"
     exit 1
 fi
+
+case "$(echo "$SELFHOST_VERIFY_ASYNC" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')" in
+    1|true|yes) SELFHOST_VERIFY_ASYNC=1 ;;
+    *) SELFHOST_VERIFY_ASYNC=0 ;;
+esac
 
 TEST_FAST_IO_MIN_SHM_KB="${BPP_TEST_FAST_IO_MIN_SHM_KB:-262144}"
 if [ "$TEST_FAST_IO" -eq 1 ] && [ "$TEST_FAST_IO_EXPLICIT" -eq 0 ]; then
@@ -347,11 +358,21 @@ if [ -d "/dev/shm" ] && [ -w "/dev/shm" ]; then
         echo "[WARN] /dev/shm free space is low (${SHM_AVAIL_KB:-unknown} KB). Falling back to build/."
     fi
 fi
-trap 'if [ "$ASM_WORK_DIR" != "$BUILD_DIR" ]; then rm -rf "$ASM_WORK_DIR"; fi' EXIT
+cleanup_build_and_test() {
+    if [ -n "${STAGE2_PID:-}" ]; then
+        kill "$STAGE2_PID" >/dev/null 2>&1 || true
+        wait "$STAGE2_PID" >/dev/null 2>&1 || true
+    fi
+    if [ "$ASM_WORK_DIR" != "$BUILD_DIR" ]; then
+        rm -rf "$ASM_WORK_DIR"
+    fi
+}
+trap cleanup_build_and_test EXIT
 
 STAGE0_ASM="$ASM_WORK_DIR/${VERSION}_stage0.asm"
 STAGE1_ASM="$ASM_WORK_DIR/${VERSION}_stage1.asm"
 STAGE2_ASM="$ASM_WORK_DIR/${VERSION}_stage2.asm"
+STAGE2_LOG="$ASM_WORK_DIR/${VERSION}_stage2.log"
 BRIDGE_STAGE0_ASM="$ASM_WORK_DIR/${VERSION}_bridge_stage0.asm"
 
 echo "========================================="
@@ -474,16 +495,15 @@ fi
 echo "Stage 1 Build Completed"
 echo ""
 
-# Step 3: 셀프 호스팅 (2단계)
-if [ "$SELFHOST_VERIFY" = "1" ] && [ "$STAGE1_USABLE" = "1" ]; then
-    echo "[3/6] Self-Hosting Stage 2..."
+STAGE2_PID=""
+STAGE2_DONE=0
+
+run_stage2_verify() {
     ./bin/${VERSION}_stage1 -asm "${SRC_FILE}" > "${STAGE2_ASM}"
     echo "Stage 2 Build Completed"
     echo ""
 
-    # Step 4: ASM 비교 (1단계 vs 2단계)
     echo "[4/6] Self-Hosting Verification..."
-    # We only need equality check; cmp is faster than textual diff for this.
     if cmp -s "${STAGE1_ASM}" "${STAGE2_ASM}"; then
         echo "Self-Hosting Success! (Stage 1 == Stage 2)"
         echo "   ASM: $(wc -l < "${STAGE1_ASM}") lines"
@@ -491,10 +511,41 @@ if [ "$SELFHOST_VERIFY" = "1" ] && [ "$STAGE1_USABLE" = "1" ]; then
         echo "Self-Hosting Failed! ASM is different."
         echo "   Stage 1: $(wc -l < "${STAGE1_ASM}") lines"
         echo "   Stage 2: $(wc -l < "${STAGE2_ASM}") lines"
-        exit 1
+        return 1
     fi
     echo ""
-    FINAL_ASM="$STAGE2_ASM"
+    return 0
+}
+
+wait_stage2_verify() {
+    if [ -z "$STAGE2_PID" ]; then
+        return 0
+    fi
+    local status=0
+    wait "$STAGE2_PID" || status=$?
+    STAGE2_PID=""
+    STAGE2_DONE=1
+    if [ -f "$STAGE2_LOG" ]; then
+        cat "$STAGE2_LOG"
+    fi
+    return "$status"
+}
+
+# Step 3: 셀프 호스팅 (2단계)
+if [ "$SELFHOST_VERIFY" = "1" ] && [ "$STAGE1_USABLE" = "1" ]; then
+    echo "[3/6] Self-Hosting Stage 2..."
+    if [ "$SELFHOST_VERIFY_ASYNC" = "1" ]; then
+        echo "   (running in background; tests will run in parallel)"
+        ( run_stage2_verify ) > "$STAGE2_LOG" 2>&1 &
+        STAGE2_PID=$!
+        echo ""
+        echo "[4/6] Self-Hosting Verification... pending"
+        echo ""
+    else
+        run_stage2_verify
+        STAGE2_DONE=1
+        FINAL_ASM="$STAGE2_ASM"
+    fi
 else
     if [ "$SELFHOST_VERIFY" = "1" ]; then
         echo "[3/6] Self-Hosting Stage 2... skipped (stage1 smoke check failed)"
@@ -513,15 +564,31 @@ fi
 # Persist ASM artifacts under build/ as before.
 cp "${STAGE0_ASM}" "build/${VERSION}_stage0.asm"
 cp "${STAGE1_ASM}" "build/${VERSION}_stage1.asm"
-if [ "$SELFHOST_VERIFY" = "1" ] && [ -f "${STAGE2_ASM}" ]; then
+if [ "$SELFHOST_VERIFY" = "1" ] && [ "$STAGE2_DONE" = "1" ] && [ -f "${STAGE2_ASM}" ]; then
     cp "${STAGE2_ASM}" "build/${VERSION}_stage2.asm"
 fi
 
 # Step 5: 테스트 실행
 echo "[5/6] Running Tests..."
+TEST_STATUS=0
 TEST_FAST_IO="$TEST_FAST_IO" TEST_QUIET="$TEST_QUIET" KEEP_TEST_ARTIFACTS="$KEEP_TEST_ARTIFACTS" \
-TEST_SKIP_LLVM_BUILD="$TEST_SKIP_LLVM_BUILD" TEST_JOBS="$TEST_JOBS" TEST_PROFILE="$TEST_PROFILE" TEST_SUITE_CASE_LIMIT="$TEST_SUITE_CASE_LIMIT" TEST_NAME_FILTER="$TEST_NAME_FILTER" STRESS_RUNS="$STRESS_RUNS" STABILITY_RUNS="$STABILITY_RUNS" \
-  bash ${TEST_SCRIPT} "${TEST_COMPILER_BIN}" 2>&1 | tail -15
+TEST_SKIP_LLVM_BUILD="$TEST_SKIP_LLVM_BUILD" TEST_JOBS="$TEST_JOBS" TEST_PROFILE="$TEST_PROFILE" TEST_SUITE_CASE_LIMIT="$TEST_SUITE_CASE_LIMIT" TEST_NAME_FILTER="$TEST_NAME_FILTER" COMPILE_FAIL_SINGLE_VARIANT="$COMPILE_FAIL_SINGLE_VARIANT" STRESS_RUNS="$STRESS_RUNS" STABILITY_RUNS="$STABILITY_RUNS" \
+  bash ${TEST_SCRIPT} "${TEST_COMPILER_BIN}" 2>&1 | tail -15 || TEST_STATUS=$?
+
+if [ -n "$STAGE2_PID" ]; then
+    echo ""
+    echo "[3/6] Self-Hosting Stage 2 / [4/6] Verification result..."
+    if wait_stage2_verify; then
+        FINAL_ASM="$STAGE2_ASM"
+        cp "${STAGE2_ASM}" "build/${VERSION}_stage2.asm"
+    else
+        exit 1
+    fi
+fi
+
+if [ "$TEST_STATUS" -ne 0 ]; then
+    exit "$TEST_STATUS"
+fi
 
 # Step 6: 바이너리(.out) 생성 (기본 실행 경로)
 echo ""
