@@ -1165,6 +1165,176 @@ func emit_saved_scratch_large_const_op(op: u64, dest: u64, const_opr: u64, scrat
     return 0;
 }
 
+func cg_is_pow2_u64(v: u64) -> u64 {
+    if (v == 0) { return 0; }
+    return (v & (v - 1)) == 0;
+}
+
+func cg_log2_pow2_u64(v: u64) -> u64 {
+    var shift: u64 = 0;
+    var cur: u64 = v;
+    while (cur > 1) {
+        cur = cur >> 1;
+        shift = shift + 1;
+    }
+    return shift;
+}
+
+func cg_signed_pow2_divisor(value: u64, shift_out: *u64, negative_out: *u64) -> u64 {
+    if (shift_out != 0) { shift_out[0] = 0; }
+    if (negative_out != 0) { negative_out[0] = 0; }
+    if (value == 0) { return 0; }
+
+    var sign_bit: u64 = 1;
+    sign_bit = sign_bit << 63;
+    if ((value & sign_bit) == 0) {
+        if (cg_is_pow2_u64(value) == 0) { return 0; }
+        if (shift_out != 0) { shift_out[0] = cg_log2_pow2_u64(value); }
+        return 1;
+    }
+
+    var mag: u64 = 0 - value;
+    // Keep idiv for / -1 and % -1 so INT64_MIN preserves the hardware trap.
+    if (mag == 1 || mag >= sign_bit) { return 0; }
+    if (cg_is_pow2_u64(mag) == 0) { return 0; }
+    if (shift_out != 0) { shift_out[0] = cg_log2_pow2_u64(mag); }
+    if (negative_out != 0) { negative_out[0] = 1; }
+    return 1;
+}
+
+func emit_zero_reg(dest: u64) -> u64 {
+    emit("    xor ");
+    emit_reg_name(dest);
+    emit(", ");
+    emit_reg_name(dest);
+    emit_nl();
+    return 0;
+}
+
+func emit_and_reg_const(dest: u64, mask: u64) -> u64 {
+    if (mask == 0) { return emit_zero_reg(dest); }
+    if (imm_fits_signed32(mask) != 0) {
+        emit("    and ");
+        emit_reg_name(dest);
+        emit(", ");
+        emit_u64(mask);
+        emit_nl();
+        return 0;
+    }
+
+    var scratch: u64 = pick_alu_scratch_reg(dest);
+    var saved: u64 = maybe_save_live_scratch(scratch);
+    emit_mov_reg_opr(scratch, operand_const(mask));
+    emit("    and ");
+    emit_reg_name(dest);
+    emit(", ");
+    emit_reg_name(scratch);
+    emit_nl();
+    maybe_restore_live_scratch(saved, scratch);
+    return 0;
+}
+
+func emit_udiv_pow2(dest: u64, src1: u64, shift: u64) -> u64 {
+    emit_mov_reg_opr(dest, src1);
+    if (shift == 0) { return 1; }
+    emit("    shr ");
+    emit_reg_name(dest);
+    emit(", ");
+    emit_u64(shift);
+    emit_nl();
+    return 1;
+}
+
+func emit_umod_pow2(dest: u64, src1: u64, divisor: u64) -> u64 {
+    emit_mov_reg_opr(dest, src1);
+    emit_and_reg_const(dest, divisor - 1);
+    return 1;
+}
+
+func emit_div_pow2(dest: u64, src1: u64, shift: u64, negative: u64) -> u64 {
+    if (shift == 0 && negative == 0) {
+        emit_mov_reg_opr(dest, src1);
+        return 1;
+    }
+
+    var save_rax: u64 = 0;
+    var save_rdx: u64 = 0;
+    if (dest != SSA_PHYS_RAX) {
+        emit("    push rax\n");
+        save_rax = 1;
+    }
+    if (dest != SSA_PHYS_RDX) {
+        emit("    push rdx\n");
+        save_rdx = 1;
+    }
+
+    emit_mov_reg_opr(SSA_PHYS_RAX, src1);
+    emit("    cqo\n");
+    emit("    shr rdx, ");
+    emit_u64(64 - shift);
+    emit_nl();
+    emit("    add rax, rdx\n");
+    emit("    sar rax, ");
+    emit_u64(shift);
+    emit_nl();
+    if (negative != 0) {
+        emit("    neg rax\n");
+    }
+
+    if (dest != SSA_PHYS_RAX) {
+        emit("    mov ");
+        emit_reg_name(dest);
+        emit(", rax\n");
+    }
+
+    if (save_rdx != 0) { emit("    pop rdx\n"); }
+    if (save_rax != 0) { emit("    pop rax\n"); }
+    return 1;
+}
+
+func emit_mod_pow2(dest: u64, src1: u64, shift: u64) -> u64 {
+    if (shift == 0) {
+        return emit_zero_reg(dest);
+    }
+
+    var save_rax: u64 = 0;
+    var save_rdx: u64 = 0;
+    if (dest != SSA_PHYS_RAX) {
+        emit("    push rax\n");
+        save_rax = 1;
+    }
+    if (dest != SSA_PHYS_RDX) {
+        emit("    push rdx\n");
+        save_rdx = 1;
+    }
+
+    emit_mov_reg_opr(SSA_PHYS_RAX, src1);
+    emit("    push rax\n");
+    emit("    cqo\n");
+    emit("    shr rdx, ");
+    emit_u64(64 - shift);
+    emit_nl();
+    emit("    add rax, rdx\n");
+    emit("    sar rax, ");
+    emit_u64(shift);
+    emit_nl();
+    emit("    shl rax, ");
+    emit_u64(shift);
+    emit_nl();
+    emit("    pop rdx\n");
+    emit("    sub rdx, rax\n");
+
+    if (dest != SSA_PHYS_RDX) {
+        emit("    mov ");
+        emit_reg_name(dest);
+        emit(", rdx\n");
+    }
+
+    if (save_rdx != 0) { emit("    pop rdx\n"); }
+    if (save_rax != 0) { emit("    pop rax\n"); }
+    return 1;
+}
+
 func emit_push_reg(phys: u64) -> u64 {
     emit("    push ");
     emit_reg_name(phys);
@@ -1713,6 +1883,14 @@ func emit_shift(op: u64, dest: u64, src1: u64, src2: u64) -> u64 {
 }
 
 func emit_mod(dest: u64, src1: u64, src2: u64) -> u64 {
+    if (operand_is_const(src2) != 0) {
+        var mod_shift: u64 = 0;
+        var mod_negative: u64 = 0;
+        if (cg_signed_pow2_divisor(operand_value(src2), &mod_shift, &mod_negative) != 0) {
+            return emit_mod_pow2(dest, src1, mod_shift);
+        }
+    }
+
     var save_rax: u64 = 0;
     var save_rdx: u64 = 0;
     var save_rcx: u64 = 0;
@@ -1788,6 +1966,13 @@ func emit_mod(dest: u64, src1: u64, src2: u64) -> u64 {
 }
 
 func emit_umod(dest: u64, src1: u64, src2: u64) -> u64 {
+    if (operand_is_const(src2) != 0) {
+        var udivisor_mod: u64 = operand_value(src2);
+        if (cg_is_pow2_u64(udivisor_mod) != 0) {
+            return emit_umod_pow2(dest, src1, udivisor_mod);
+        }
+    }
+
     var save_rax: u64 = 0;
     var save_rdx: u64 = 0;
     var save_rcx: u64 = 0;
@@ -1926,6 +2111,14 @@ func emit_cmp_setcc(cc: []u8, dest: u64, src1: u64, src2: u64) -> u64 {
 }
 
 func emit_div(dest: u64, src1: u64, src2: u64) -> u64 {
+    if (operand_is_const(src2) != 0) {
+        var div_shift: u64 = 0;
+        var div_negative: u64 = 0;
+        if (cg_signed_pow2_divisor(operand_value(src2), &div_shift, &div_negative) != 0) {
+            return emit_div_pow2(dest, src1, div_shift, div_negative);
+        }
+    }
+
     var save_rax: u64 = 0;
     var save_rdx: u64 = 0;
     var save_rcx: u64 = 0;
@@ -1999,6 +2192,13 @@ func emit_div(dest: u64, src1: u64, src2: u64) -> u64 {
 }
 
 func emit_udiv(dest: u64, src1: u64, src2: u64) -> u64 {
+    if (operand_is_const(src2) != 0) {
+        var udivisor: u64 = operand_value(src2);
+        if (cg_is_pow2_u64(udivisor) != 0) {
+            return emit_udiv_pow2(dest, src1, cg_log2_pow2_u64(udivisor));
+        }
+    }
+
     var save_rax: u64 = 0;
     var save_rdx: u64 = 0;
     var save_rcx: u64 = 0;

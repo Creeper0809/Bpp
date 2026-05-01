@@ -5,7 +5,11 @@
 import std.io;
 import std.vec;
 
-const NUMBER_BASE = 1000000000;
+// Limbs are base 2^31. 31 bits keeps a single limb multiply plus carry
+// inside u64 while still making shifts and bitwise operations limb-native.
+const NUMBER_BASE_BITS = 31;
+const NUMBER_BASE = 2147483648;
+const NUMBER_BASE_MASK = 2147483647;
 const NUMBER_MAX_U64 = 18446744073709551615;
 const NUMBER_MAX_I64_U64 = 9223372036854775807;
 const NUMBER_MIN_I64_MAG = 9223372036854775808;
@@ -21,10 +25,19 @@ const NUMBER_SMALL_MAX_I64 = 4611686018427387903;
 const NUMBER_BITWISE_AND = 0;
 const NUMBER_BITWISE_OR = 1;
 const NUMBER_BITWISE_XOR = 2;
-const NUMBER_POW2_CHUNK_BITS = 29;
-const NUMBER_POW2_CHUNK_VALUE = 536870912;
 const NUMBER_KARATSUBA_THRESHOLD = 24;
 const NUMBER_KARATSUBA_UNBALANCED_FACTOR = 2;
+const NUMBER_TOOM3_THRESHOLD = 72;
+const NUMBER_TOOM3_UNBALANCED_FACTOR = 3;
+const NUMBER_NTT_THRESHOLD = 80;
+const NUMBER_DIV_DC_THRESHOLD = 64;
+const NUMBER_NTT_CHUNK_BITS = 15;
+const NUMBER_NTT_CHUNK_BASE = 32768;
+const NUMBER_NTT_CHUNK_MASK = 32767;
+const NUMBER_NTT_MOD1 = 998244353;
+const NUMBER_NTT_MOD2 = 1004535809;
+const NUMBER_NTT_ROOT = 3;
+const NUMBER_NTT_MAX_LEN = 2097152;
 
 struct Number {
     public bits: u64;
@@ -65,6 +78,76 @@ impl NumberBig {
         return NumberBig.alloc(0, 1);
     }
 
+    public static func alloc_zeroed(sign: i64, len: u64) -> *NumberBig {
+        var out: *NumberBig = NumberBig.alloc(sign, len + 1);
+        for (var i: u64 = 0; i < len; i = i + 1) {
+            out.digits.push(0);
+        }
+        return out;
+    }
+
+    public static func limb_low(v: u64) -> u32 {
+        return (u32)(v & NUMBER_BASE_MASK);
+    }
+
+    public static func limb_carry(v: u64) -> u64 {
+        return v >> NUMBER_BASE_BITS;
+    }
+
+    public static func digit_or_zero(big: *NumberBig, len: u64, i: u64) -> u64 {
+        if (big == 0 || big.digits == 0 || i >= len) { return 0; }
+        return (u64)big.digits.get(i);
+    }
+
+    public static func limb_and_value(a: u64, b: u64) -> u64 {
+        return a & b;
+    }
+
+    public static func limb_or_value(a: u64, b: u64) -> u64 {
+        var both: u64 = a & b;
+        return a + b - both;
+    }
+
+    public static func limb_xor_value(a: u64, b: u64) -> u64 {
+        var both: u64 = a & b;
+        return a + b - both - both;
+    }
+
+    public static func mod_pow(base: u64, exp: u64, mod: u64) -> u64 {
+        var result: u64 = 1;
+        var b: u64 = base % mod;
+        var e: u64 = exp;
+        while (e != 0) {
+            if ((e & 1) != 0) {
+                result = (result * b) % mod;
+            }
+            b = (b * b) % mod;
+            e = e >> 1;
+        }
+        return result;
+    }
+
+    public static func mod_inv(v: u64, mod: u64) -> u64 {
+        return NumberBig.mod_pow(v, mod - 2, mod);
+    }
+
+    public static func next_pow2(v: u64) -> u64 {
+        var n: u64 = 1;
+        while (n < v) {
+            n = n << 1;
+        }
+        return n;
+    }
+
+    public static func vec_u64_zeroed(len: u64) -> *Vec<u64> {
+        var buf: u64 = heap_alloc(len * sizeof(u64));
+        var out: *Vec<u64> = new Vec<u64>{buf, 0, len};
+        for (var i: u64 = 0; i < len; i = i + 1) {
+            out.push(0);
+        }
+        return out;
+    }
+
     public static func from_u64_raw(v: u64) -> *NumberBig {
         if (v == 0) {
             return NumberBig.zero();
@@ -72,9 +155,20 @@ impl NumberBig {
         var out: *NumberBig = NumberBig.alloc(1, 4);
         var mag: u64 = v;
         while (mag != 0) {
-            out.digits.push((u32)(mag % NUMBER_BASE));
-            mag = mag / NUMBER_BASE;
+            out.digits.push(NumberBig.limb_low(mag));
+            mag = mag >> NUMBER_BASE_BITS;
         }
+        out.trim_inplace();
+        return out;
+    }
+
+    public static func pow2_abs(bits: u64) -> *NumberBig {
+        var limb_shift: u64 = bits / NUMBER_BASE_BITS;
+        var bit_shift: u64 = bits % NUMBER_BASE_BITS;
+        var out: *NumberBig = NumberBig.alloc_zeroed(1, limb_shift + 1);
+        var digit: u64 = 1;
+        digit = digit << bit_shift;
+        out.digits.set(limb_shift, (u32)digit);
         out.trim_inplace();
         return out;
     }
@@ -199,8 +293,8 @@ impl NumberBig {
             if (i < an) { av = (u64)self.digits.get(i); }
             if (i < bn) { bv = (u64)rhs.digits.get(i); }
             var cur: u64 = av + bv + carry;
-            out.digits.push((u32)(cur % NUMBER_BASE));
-            carry = cur / NUMBER_BASE;
+            out.digits.push(NumberBig.limb_low(cur));
+            carry = NumberBig.limb_carry(cur);
         }
         if (carry != 0) {
             out.digits.push((u32)carry);
@@ -252,14 +346,14 @@ impl NumberBig {
                 (u64)out.digits.get(idx) +
                 (u64)self.digits.get(i) * digit +
                 carry;
-            out.digits.set(idx, (u32)(cur % NUMBER_BASE));
-            carry = cur / NUMBER_BASE;
+            out.digits.set(idx, NumberBig.limb_low(cur));
+            carry = NumberBig.limb_carry(cur);
         }
         var k: u64 = n + shift;
         while (carry != 0) {
             var cur2: u64 = (u64)out.digits.get(k) + carry;
-            out.digits.set(k, (u32)(cur2 % NUMBER_BASE));
-            carry = cur2 / NUMBER_BASE;
+            out.digits.set(k, NumberBig.limb_low(cur2));
+            carry = NumberBig.limb_carry(cur2);
             k = k + 1;
         }
         return 0;
@@ -279,14 +373,14 @@ impl NumberBig {
                 (u64)out.digits.get(idx) +
                 (u64)src.digits.get(i) +
                 carry;
-            out.digits.set(idx, (u32)(cur % NUMBER_BASE));
-            carry = cur / NUMBER_BASE;
+            out.digits.set(idx, NumberBig.limb_low(cur));
+            carry = NumberBig.limb_carry(cur);
         }
         var k: u64 = n + shift;
         while (carry != 0) {
             var cur2: u64 = (u64)out.digits.get(k) + carry;
-            out.digits.set(k, (u32)(cur2 % NUMBER_BASE));
-            carry = cur2 / NUMBER_BASE;
+            out.digits.set(k, NumberBig.limb_low(cur2));
+            carry = NumberBig.limb_carry(cur2);
             k = k + 1;
         }
         return 0;
@@ -312,6 +406,90 @@ impl NumberBig {
         return out;
     }
 
+    public func to_ntt_chunks_abs(self: *NumberBig) -> *Vec<u64> {
+        var n: u64 = 0;
+        if (self != 0 && self.sign != 0 && self.digits != 0) {
+            n = self.digits.len();
+        }
+        var buf: u64 = heap_alloc((n * 3 + 1) * sizeof(u64));
+        var out: *Vec<u64> = new Vec<u64>{buf, 0, n * 3 + 1};
+        var pending: u64 = 0;
+        var pending_bits: u64 = 0;
+        for (var i: u64 = 0; i < n; i = i + 1) {
+            var d: u64 = (u64)self.digits.get(i);
+            pending = pending + (d << pending_bits);
+            pending_bits = pending_bits + NUMBER_BASE_BITS;
+            while (pending_bits >= NUMBER_NTT_CHUNK_BITS) {
+                out.push(pending & NUMBER_NTT_CHUNK_MASK);
+                pending = pending >> NUMBER_NTT_CHUNK_BITS;
+                pending_bits = pending_bits - NUMBER_NTT_CHUNK_BITS;
+            }
+        }
+        if (pending_bits != 0 || pending != 0) {
+            out.push(pending & NUMBER_NTT_CHUNK_MASK);
+        }
+        var len: u64 = out.len();
+        while (len > 0) {
+            if (out.get(len - 1) != 0) { break; }
+            out.pop();
+            len = len - 1;
+        }
+        return out;
+    }
+
+    public static func ntt_transform(a: *Vec<u64>, n: u64, invert: u64, mod: u64) -> u64 {
+        var j: u64 = 0;
+        for (var i: u64 = 1; i < n; i = i + 1) {
+            var bit: u64 = n >> 1;
+            while ((j & bit) != 0) {
+                j = j ^ bit;
+                bit = bit >> 1;
+            }
+            j = j ^ bit;
+            if (i < j) {
+                var ai: u64 = a.get(i);
+                var aj: u64 = a.get(j);
+                a.set(i, aj);
+                a.set(j, ai);
+            }
+        }
+
+        var len: u64 = 2;
+        while (len <= n) {
+            var wlen: u64 = NumberBig.mod_pow(NUMBER_NTT_ROOT, (mod - 1) / len, mod);
+            if (invert != 0) {
+                wlen = NumberBig.mod_inv(wlen, mod);
+            }
+            var i0: u64 = 0;
+            while (i0 < n) {
+                var w: u64 = 1;
+                var half: u64 = len / 2;
+                for (var k: u64 = 0; k < half; k = k + 1) {
+                    var u: u64 = a.get(i0 + k);
+                    var v: u64 = (a.get(i0 + k + half) * w) % mod;
+                    var x: u64 = u + v;
+                    if (x >= mod) { x = x - mod; }
+                    var y: u64 = 0;
+                    if (u >= v) { y = u - v; }
+                    else { y = u + mod - v; }
+                    a.set(i0 + k, x);
+                    a.set(i0 + k + half, y);
+                    w = (w * wlen) % mod;
+                }
+                i0 = i0 + len;
+            }
+            len = len << 1;
+        }
+
+        if (invert != 0) {
+            var n_inv: u64 = NumberBig.mod_inv(n % mod, mod);
+            for (var ii: u64 = 0; ii < n; ii = ii + 1) {
+                a.set(ii, (a.get(ii) * n_inv) % mod);
+            }
+        }
+        return 0;
+    }
+
     public func mul_schoolbook_abs(
         self: *NumberBig,
         rhs: *NumberBig
@@ -335,15 +513,15 @@ impl NumberBig {
                 var cur: u64 = (u64)out.digits.get(idx);
                 var bv: u64 = (u64)rhs.digits.get(j);
                 var prod: u64 = cur + av * bv + carry;
-                out.digits.set(idx, (u32)(prod % NUMBER_BASE));
-                carry = prod / NUMBER_BASE;
+                out.digits.set(idx, NumberBig.limb_low(prod));
+                carry = NumberBig.limb_carry(prod);
             }
             var k: u64 = i + bn;
             while (carry != 0) {
                 var cur2: u64 = (u64)out.digits.get(k);
                 var sum2: u64 = cur2 + carry;
-                out.digits.set(k, (u32)(sum2 % NUMBER_BASE));
-                carry = sum2 / NUMBER_BASE;
+                out.digits.set(k, NumberBig.limb_low(sum2));
+                carry = NumberBig.limb_carry(sum2);
                 k = k + 1;
             }
         }
@@ -361,7 +539,7 @@ impl NumberBig {
         var mn: u64 = 0;
         while (tmp != 0) {
             mn = mn + 1;
-            tmp = tmp / NUMBER_BASE;
+            tmp = tmp >> NUMBER_BASE_BITS;
         }
 
         var out: *NumberBig = NumberBig.alloc(1, an + mn + 1);
@@ -372,9 +550,9 @@ impl NumberBig {
         var rem: u64 = m;
         var shift: u64 = 0;
         while (rem != 0) {
-            var digit: u64 = rem % NUMBER_BASE;
+            var digit: u64 = rem & NUMBER_BASE_MASK;
             self.add_mul_digit_shift_abs(out, digit, shift);
-            rem = rem / NUMBER_BASE;
+            rem = rem >> NUMBER_BASE_BITS;
             shift = shift + 1;
         }
 
@@ -417,6 +595,203 @@ impl NumberBig {
         return out;
     }
 
+    public func mul_toom3_abs(
+        self: *NumberBig,
+        rhs: *NumberBig
+    ) -> *NumberBig {
+        var an: u64 = self.digits.len();
+        var bn: u64 = rhs.digits.len();
+        var n: u64 = an;
+        if (bn > n) { n = bn; }
+        var m: u64 = (n + 2) / 3;
+        if (m == 0) { return self.mul_schoolbook_abs(rhs); }
+
+        var a1_count: u64 = 0;
+        if (an > m) {
+            a1_count = an - m;
+            if (a1_count > m) { a1_count = m; }
+        }
+        var a2_count: u64 = 0;
+        if (an > m * 2) { a2_count = an - m * 2; }
+        var b1_count: u64 = 0;
+        if (bn > m) {
+            b1_count = bn - m;
+            if (b1_count > m) { b1_count = m; }
+        }
+        var b2_count: u64 = 0;
+        if (bn > m * 2) { b2_count = bn - m * 2; }
+
+        var a0b: *NumberBig = self.slice_abs(0, m);
+        var a1b: *NumberBig = self.slice_abs(m, a1_count);
+        var a2b: *NumberBig = self.slice_abs(m * 2, a2_count);
+        var b0b: *NumberBig = rhs.slice_abs(0, m);
+        var b1b: *NumberBig = rhs.slice_abs(m, b1_count);
+        var b2b: *NumberBig = rhs.slice_abs(m * 2, b2_count);
+
+        var a0: Number = Number.from_big_normalized(a0b);
+        var a1: Number = Number.from_big_normalized(a1b);
+        var a2: Number = Number.from_big_normalized(a2b);
+        var b0: Number = Number.from_big_normalized(b0b);
+        var b1: Number = Number.from_big_normalized(b1b);
+        var b2: Number = Number.from_big_normalized(b2b);
+
+        var v0b: *NumberBig = a0b.mul_abs(b0b);
+        var v4b: *NumberBig = a2b.mul_abs(b2b);
+        var v0: Number = Number.from_big_normalized(v0b);
+        var v4: Number = Number.from_big_normalized(v4b);
+
+        var a01: Number = a0.add_values(&a1);
+        var eval1a: Number = a01.add_values(&a2);
+        var b01: Number = b0.add_values(&b1);
+        var eval1b: Number = b01.add_values(&b2);
+        var v1: Number = eval1a.mul_values(&eval1b);
+
+        var am1a0: Number = a0.sub_values(&a1);
+        var evalm1a: Number = am1a0.add_values(&a2);
+        var bm1a0: Number = b0.sub_values(&b1);
+        var evalm1b: Number = bm1a0.add_values(&b2);
+        var vm1: Number = evalm1a.mul_values(&evalm1b);
+
+        var a1x2: Number = a1.mul_small(2);
+        var a2x4: Number = a2.mul_small(4);
+        var eval2a0: Number = a0.add_values(&a1x2);
+        var eval2a: Number = eval2a0.add_values(&a2x4);
+        var b1x2: Number = b1.mul_small(2);
+        var b2x4: Number = b2.mul_small(4);
+        var eval2b0: Number = b0.add_values(&b1x2);
+        var eval2b: Number = eval2b0.add_values(&b2x4);
+        var v2: Number = eval2a.mul_values(&eval2b);
+
+        var two: Number = Number { NUMBER_TAG_SMALL };
+        two.set_i64(2);
+        var three: Number = Number { NUMBER_TAG_SMALL };
+        three.set_i64(3);
+
+        var s1_tmp: Number = v1.sub_values(&v0);
+        var s1: Number = s1_tmp.sub_values(&v4);
+        var sm1_tmp: Number = vm1.sub_values(&v0);
+        var sm1: Number = sm1_tmp.sub_values(&v4);
+        var v4x16: Number = v4.mul_small(16);
+        var s2_tmp: Number = v2.sub_values(&v0);
+        var s2: Number = s2_tmp.sub_values(&v4x16);
+
+        var c2_num: Number = s1.add_values(&sm1);
+        var r2: Number = c2_num.div_values(&two);
+        var s_num: Number = s1.sub_values(&sm1);
+        var s: Number = s_num.div_values(&two);
+        var r2x4: Number = r2.mul_small(4);
+        var t_num: Number = s2.sub_values(&r2x4);
+        var t: Number = t_num.div_values(&two);
+        var r3_num: Number = t.sub_values(&s);
+        var r3: Number = r3_num.div_values(&three);
+        var r1: Number = s.sub_values(&r3);
+
+        var outn: Number = v0.clone();
+        var shift1: u64 = m * NUMBER_BASE_BITS;
+        var part1: Number = r1.shl_values(shift1);
+        outn = outn.add_values(&part1);
+        var part2: Number = r2.shl_values(shift1 * 2);
+        outn = outn.add_values(&part2);
+        var part3: Number = r3.shl_values(shift1 * 3);
+        outn = outn.add_values(&part3);
+        var part4: Number = v4.shl_values(shift1 * 4);
+        outn = outn.add_values(&part4);
+
+        var out: *NumberBig = outn.to_abs_big();
+        out.trim_inplace();
+        return out;
+    }
+
+    public func mul_ntt_abs(
+        self: *NumberBig,
+        rhs: *NumberBig
+    ) -> *NumberBig {
+        var ach: *Vec<u64> = self.to_ntt_chunks_abs();
+        var bch: *Vec<u64> = rhs.to_ntt_chunks_abs();
+        var alen: u64 = ach.len();
+        var blen: u64 = bch.len();
+        if (alen == 0 || blen == 0) { return NumberBig.zero(); }
+
+        var need: u64 = alen + blen - 1;
+        var ntt_len: u64 = NumberBig.next_pow2(need);
+        if (ntt_len > NUMBER_NTT_MAX_LEN) {
+            return self.mul_toom3_abs(rhs);
+        }
+
+        var a1: *Vec<u64> = NumberBig.vec_u64_zeroed(ntt_len);
+        var b1: *Vec<u64> = NumberBig.vec_u64_zeroed(ntt_len);
+        var a2: *Vec<u64> = NumberBig.vec_u64_zeroed(ntt_len);
+        var b2: *Vec<u64> = NumberBig.vec_u64_zeroed(ntt_len);
+
+        for (var i: u64 = 0; i < alen; i = i + 1) {
+            var v: u64 = ach.get(i);
+            a1.set(i, v % NUMBER_NTT_MOD1);
+            a2.set(i, v % NUMBER_NTT_MOD2);
+        }
+        for (var j: u64 = 0; j < blen; j = j + 1) {
+            var v2: u64 = bch.get(j);
+            b1.set(j, v2 % NUMBER_NTT_MOD1);
+            b2.set(j, v2 % NUMBER_NTT_MOD2);
+        }
+
+        NumberBig.ntt_transform(a1, ntt_len, 0, NUMBER_NTT_MOD1);
+        NumberBig.ntt_transform(b1, ntt_len, 0, NUMBER_NTT_MOD1);
+        NumberBig.ntt_transform(a2, ntt_len, 0, NUMBER_NTT_MOD2);
+        NumberBig.ntt_transform(b2, ntt_len, 0, NUMBER_NTT_MOD2);
+
+        for (var k: u64 = 0; k < ntt_len; k = k + 1) {
+            a1.set(k, (a1.get(k) * b1.get(k)) % NUMBER_NTT_MOD1);
+            a2.set(k, (a2.get(k) * b2.get(k)) % NUMBER_NTT_MOD2);
+        }
+
+        NumberBig.ntt_transform(a1, ntt_len, 1, NUMBER_NTT_MOD1);
+        NumberBig.ntt_transform(a2, ntt_len, 1, NUMBER_NTT_MOD2);
+
+        var out: *NumberBig = NumberBig.alloc(1, (need * NUMBER_NTT_CHUNK_BITS) / NUMBER_BASE_BITS + 4);
+        var pending: u64 = 0;
+        var pending_bits: u64 = 0;
+        var carry: u64 = 0;
+        var inv_mod1_mod2: u64 = NumberBig.mod_inv(NUMBER_NTT_MOD1 % NUMBER_NTT_MOD2, NUMBER_NTT_MOD2);
+
+        for (var ci: u64 = 0; ci < need; ci = ci + 1) {
+            var r1: u64 = a1.get(ci);
+            var r2: u64 = a2.get(ci);
+            var diff: u64 = 0;
+            if (r2 >= r1) { diff = r2 - r1; }
+            else { diff = r2 + NUMBER_NTT_MOD2 - r1; }
+            var t: u64 = (diff * inv_mod1_mod2) % NUMBER_NTT_MOD2;
+            var coeff: u64 = r1 + NUMBER_NTT_MOD1 * t;
+            var cur: u64 = coeff + carry;
+            var chunk: u64 = cur & NUMBER_NTT_CHUNK_MASK;
+            carry = cur >> NUMBER_NTT_CHUNK_BITS;
+
+            pending = pending + (chunk << pending_bits);
+            pending_bits = pending_bits + NUMBER_NTT_CHUNK_BITS;
+            while (pending_bits >= NUMBER_BASE_BITS) {
+                out.digits.push((u32)(pending & NUMBER_BASE_MASK));
+                pending = pending >> NUMBER_BASE_BITS;
+                pending_bits = pending_bits - NUMBER_BASE_BITS;
+            }
+        }
+
+        while (carry != 0) {
+            var chunk2: u64 = carry & NUMBER_NTT_CHUNK_MASK;
+            carry = carry >> NUMBER_NTT_CHUNK_BITS;
+            pending = pending + (chunk2 << pending_bits);
+            pending_bits = pending_bits + NUMBER_NTT_CHUNK_BITS;
+            while (pending_bits >= NUMBER_BASE_BITS) {
+                out.digits.push((u32)(pending & NUMBER_BASE_MASK));
+                pending = pending >> NUMBER_BASE_BITS;
+                pending_bits = pending_bits - NUMBER_BASE_BITS;
+            }
+        }
+        if (pending_bits != 0 || pending != 0) {
+            out.digits.push((u32)(pending & NUMBER_BASE_MASK));
+        }
+        out.trim_inplace();
+        return out;
+    }
+
     public func mul_abs(self: *NumberBig, rhs: *NumberBig) -> *NumberBig {
         if (self == 0 || rhs == 0 || self.sign == 0 || rhs.sign == 0) {
             return NumberBig.zero();
@@ -429,6 +804,12 @@ impl NumberBig {
         }
         if (an > bn * NUMBER_KARATSUBA_UNBALANCED_FACTOR) {
             return self.mul_schoolbook_abs(rhs);
+        }
+        if (bn >= NUMBER_NTT_THRESHOLD) {
+            return self.mul_ntt_abs(rhs);
+        }
+        if (bn >= NUMBER_TOOM3_THRESHOLD && an <= bn * NUMBER_TOOM3_UNBALANCED_FACTOR) {
+            return self.mul_toom3_abs(rhs);
         }
         return self.mul_karatsuba_abs(rhs);
     }
@@ -443,12 +824,12 @@ impl NumberBig {
         for (var i: u64 = 0; i < an; i = i + 1) {
             var av: u64 = (u64)self.digits.get(i);
             var cur: u64 = av * m + carry;
-            out.digits.push((u32)(cur % NUMBER_BASE));
-            carry = cur / NUMBER_BASE;
+            out.digits.push(NumberBig.limb_low(cur));
+            carry = NumberBig.limb_carry(cur);
         }
         while (carry != 0) {
-            out.digits.push((u32)(carry % NUMBER_BASE));
-            carry = carry / NUMBER_BASE;
+            out.digits.push(NumberBig.limb_low(carry));
+            carry = NumberBig.limb_carry(carry);
         }
         out.trim_inplace();
         return out;
@@ -472,7 +853,7 @@ impl NumberBig {
         var i: u64 = an;
         while (i > 0) {
             i = i - 1;
-            var cur: u64 = rem * NUMBER_BASE + (u64)self.digits.get(i);
+            var cur: u64 = (rem << NUMBER_BASE_BITS) + (u64)self.digits.get(i);
             var qd: u64 = cur / m;
             rem = cur % m;
             q.digits.set(i, (u32)qd);
@@ -492,7 +873,7 @@ impl NumberBig {
         var i: u64 = an;
         while (i > 0) {
             i = i - 1;
-            var cur: u64 = rem * NUMBER_BASE + (u64)self.digits.get(i);
+            var cur: u64 = (rem << NUMBER_BASE_BITS) + (u64)self.digits.get(i);
             rem = cur % m;
         }
         return rem;
@@ -511,6 +892,280 @@ impl NumberBig {
             out.digits.push(self.digits.get(j));
         }
         out.trim_inplace();
+        return out;
+    }
+
+    public func shl_bits_abs(self: *NumberBig, bits: u64) -> *NumberBig {
+        if (self == 0 || self.sign == 0 || self.digits == 0) {
+            return NumberBig.zero();
+        }
+        if (bits == 0) { return self.abs_copy(); }
+        var n: u64 = self.digits.len();
+        var limb_shift: u64 = bits / NUMBER_BASE_BITS;
+        var bit_shift: u64 = bits % NUMBER_BASE_BITS;
+        var out: *NumberBig = NumberBig.alloc(1, n + limb_shift + 2);
+        for (var z: u64 = 0; z < limb_shift; z = z + 1) {
+            out.digits.push(0);
+        }
+        var carry: u64 = 0;
+        for (var i: u64 = 0; i < n; i = i + 1) {
+            var cur: u64 = ((u64)self.digits.get(i) << bit_shift) + carry;
+            out.digits.push(NumberBig.limb_low(cur));
+            carry = NumberBig.limb_carry(cur);
+        }
+        if (carry != 0) { out.digits.push((u32)carry); }
+        out.trim_inplace();
+        return out;
+    }
+
+    public func shr_bits_abs(self: *NumberBig, bits: u64) -> *NumberBig {
+        if (self == 0 || self.sign == 0 || self.digits == 0) {
+            return NumberBig.zero();
+        }
+        if (bits == 0) { return self.abs_copy(); }
+        var n: u64 = self.digits.len();
+        var limb_shift: u64 = bits / NUMBER_BASE_BITS;
+        if (limb_shift >= n) { return NumberBig.zero(); }
+        var bit_shift: u64 = bits % NUMBER_BASE_BITS;
+        var out_len: u64 = n - limb_shift;
+        var out: *NumberBig = NumberBig.alloc_zeroed(1, out_len);
+
+        if (bit_shift == 0) {
+            for (var i0: u64 = 0; i0 < out_len; i0 = i0 + 1) {
+                out.digits.set(i0, self.digits.get(i0 + limb_shift));
+            }
+            out.trim_inplace();
+            return out;
+        }
+
+        var low_mask: u64 = (1 << bit_shift) - 1;
+        var carry: u64 = 0;
+        var i: u64 = n;
+        while (i > limb_shift) {
+            i = i - 1;
+            var digit: u64 = (u64)self.digits.get(i);
+            var val: u64 = (digit >> bit_shift) | (carry << (NUMBER_BASE_BITS - bit_shift));
+            out.digits.set(i - limb_shift, (u32)(val & NUMBER_BASE_MASK));
+            carry = digit & low_mask;
+        }
+        out.trim_inplace();
+        return out;
+    }
+
+    public func bit_length_abs(self: *NumberBig) -> u64 {
+        if (self == 0 || self.sign == 0 || self.digits == 0) { return 0; }
+        var n: u64 = self.digits.len();
+        if (n == 0) { return 0; }
+        var top: u64 = (u64)self.digits.get(n - 1);
+        var top_bits: u64 = 0;
+        while (top != 0) {
+            top = top >> 1;
+            top_bits = top_bits + 1;
+        }
+        return (n - 1) * NUMBER_BASE_BITS + top_bits;
+    }
+
+    public func abs_divmod_knuth(self: *NumberBig, rhs: *NumberBig) -> NumberBigDivMod {
+        var out: NumberBigDivMod = NumberBigDivMod { 0, 0 };
+
+        if (self == 0 || rhs == 0 || rhs.sign == 0 || self.sign == 0) {
+            out.q = NumberBig.zero();
+            out.r = NumberBig.zero();
+            return out;
+        }
+
+        var cmp0: i64 = self.abs_cmp(rhs);
+        if (cmp0 < 0) {
+            out.q = NumberBig.zero();
+            out.r = self.abs_copy();
+            return out;
+        }
+        if (cmp0 == 0) {
+            out.q = NumberBig.from_u64_raw(1);
+            out.r = NumberBig.zero();
+            return out;
+        }
+
+        var rhs_len0: u64 = rhs.digits.len();
+        if (rhs_len0 == 1) {
+            var d0: u64 = (u64)rhs.digits.get(0);
+            out.q = self.div_small_abs(d0);
+            var r0: u64 = self.mod_small_abs(d0);
+            out.r = NumberBig.from_u64_raw(r0);
+            return out;
+        }
+
+        var top0: u64 = (u64)rhs.digits.get(rhs_len0 - 1);
+        var norm: u64 = NUMBER_BASE / (top0 + 1);
+        if (norm < 1) { norm = 1; }
+
+        var u: *NumberBig = 0;
+        var v: *NumberBig = 0;
+        if (norm == 1) {
+            u = self.abs_copy();
+            v = rhs.abs_copy();
+        } else {
+            u = self.mul_small_abs(norm);
+            v = rhs.mul_small_abs(norm);
+        }
+
+        var n: u64 = v.digits.len();
+        var u_len: u64 = u.digits.len();
+        if (u_len < n) {
+            out.q = NumberBig.zero();
+            if (norm == 1) { out.r = u; }
+            else { out.r = u.div_small_abs(norm); }
+            return out;
+        }
+
+        var m: u64 = u_len - n;
+        u.digits.push(0);
+
+        var q: *NumberBig = NumberBig.alloc_zeroed(1, m + 1);
+        var vtop: u64 = (u64)v.digits.get(n - 1);
+        var vnext: u64 = 0;
+        if (n > 1) { vnext = (u64)v.digits.get(n - 2); }
+
+        var jj: u64 = m + 1;
+        while (jj > 0) {
+            jj = jj - 1;
+
+            var u_hi: u64 = (u64)u.digits.get(jj + n);
+            var u_mid: u64 = (u64)u.digits.get(jj + n - 1);
+            var numerator: u64 = (u_hi << NUMBER_BASE_BITS) + u_mid;
+            var qhat: u64 = numerator / vtop;
+            var rhat: u64 = numerator % vtop;
+            if (qhat >= NUMBER_BASE) {
+                qhat = NUMBER_BASE - 1;
+                rhat = rhat + vtop;
+            }
+
+            if (n > 1) {
+                var adjusting: u64 = 1;
+                while (adjusting != 0) {
+                    adjusting = 0;
+                    var u_low: u64 = (u64)u.digits.get(jj + n - 2);
+                    var lhs: u64 = qhat * vnext;
+                    var rhs_cmp: u64 = (rhat << NUMBER_BASE_BITS) + u_low;
+                    if (lhs > rhs_cmp) {
+                        qhat = qhat - 1;
+                        rhat = rhat + vtop;
+                        if (rhat < NUMBER_BASE) {
+                            adjusting = 1;
+                        }
+                    }
+                }
+            }
+
+            var borrow: u64 = 0;
+            var carry: u64 = 0;
+            for (var i: u64 = 0; i < n; i = i + 1) {
+                var prod: u64 = qhat * (u64)v.digits.get(i) + carry;
+                carry = NumberBig.limb_carry(prod);
+                var sub_digit: u64 = prod & NUMBER_BASE_MASK;
+                var ui: u64 = (u64)u.digits.get(jj + i);
+                var need: u64 = sub_digit + borrow;
+                if (ui < need) {
+                    u.digits.set(jj + i, (u32)(ui + NUMBER_BASE - need));
+                    borrow = 1;
+                } else {
+                    u.digits.set(jj + i, (u32)(ui - need));
+                    borrow = 0;
+                }
+            }
+
+            var top: u64 = (u64)u.digits.get(jj + n);
+            var need_top: u64 = carry + borrow;
+            var negative: u64 = 0;
+            if (top < need_top) {
+                u.digits.set(jj + n, (u32)(top + NUMBER_BASE - need_top));
+                negative = 1;
+            } else {
+                u.digits.set(jj + n, (u32)(top - need_top));
+            }
+
+            if (negative != 0) {
+                qhat = qhat - 1;
+                var carry_add: u64 = 0;
+                for (var ai: u64 = 0; ai < n; ai = ai + 1) {
+                    var sum: u64 =
+                        (u64)u.digits.get(jj + ai) +
+                        (u64)v.digits.get(ai) +
+                        carry_add;
+                    if (sum >= NUMBER_BASE) {
+                        u.digits.set(jj + ai, (u32)(sum - NUMBER_BASE));
+                        carry_add = 1;
+                    } else {
+                        u.digits.set(jj + ai, (u32)sum);
+                        carry_add = 0;
+                    }
+                }
+                var top2: u64 = (u64)u.digits.get(jj + n) + carry_add;
+                if (top2 >= NUMBER_BASE) { top2 = top2 - NUMBER_BASE; }
+                u.digits.set(jj + n, (u32)top2);
+            }
+
+            q.digits.set(jj, (u32)qhat);
+        }
+
+        q.trim_inplace();
+        u.trim_inplace();
+        out.q = q;
+        if (norm == 1) {
+            out.r = u;
+        } else {
+            out.r = u.div_small_abs(norm);
+        }
+        out.r.trim_inplace();
+        return out;
+    }
+
+    public func abs_divmod_divide_conquer(self: *NumberBig, rhs: *NumberBig) -> NumberBigDivMod {
+        var out: NumberBigDivMod = NumberBigDivMod { 0, 0 };
+
+        if (self == 0 || rhs == 0 || rhs.sign == 0 || self.sign == 0) {
+            out.q = NumberBig.zero();
+            out.r = NumberBig.zero();
+            return out;
+        }
+
+        var cmp0: i64 = self.abs_cmp(rhs);
+        if (cmp0 < 0) {
+            out.q = NumberBig.zero();
+            out.r = self.abs_copy();
+            return out;
+        }
+        if (cmp0 == 0) {
+            out.q = NumberBig.from_u64_raw(1);
+            out.r = NumberBig.zero();
+            return out;
+        }
+
+        var an: u64 = self.digits.len();
+        var bn: u64 = rhs.digits.len();
+        if (bn < NUMBER_DIV_DC_THRESHOLD || an <= bn * 2) {
+            return self.abs_divmod_knuth(rhs);
+        }
+
+        var split: u64 = an / 2;
+        if (split == 0 || split >= an) {
+            return self.abs_divmod_knuth(rhs);
+        }
+
+        var low: *NumberBig = self.slice_abs(0, split);
+        var high: *NumberBig = self.slice_abs(split, an - split);
+        var high_dm: NumberBigDivMod = high.abs_divmod_divide_conquer(rhs);
+
+        var shifted_r: *NumberBig = high_dm.r.shift_limbs_abs(split);
+        var combined: *NumberBig = shifted_r.add_abs(low);
+        var low_dm: NumberBigDivMod = combined.abs_divmod_divide_conquer(rhs);
+
+        var shifted_q: *NumberBig = high_dm.q.shift_limbs_abs(split);
+        var q: *NumberBig = shifted_q.add_abs(low_dm.q);
+        q.trim_inplace();
+        low_dm.r.trim_inplace();
+        out.q = q;
+        out.r = low_dm.r;
         return out;
     }
 
@@ -1030,14 +1685,14 @@ impl Number {
         var q_abs: *NumberBig = NumberBig.zero();
         var r_abs: Number = Number { NUMBER_TAG_SMALL };
         var bb_u64: u64 = 0;
-        if (bb.abs_to_u64_checked(&bb_u64) != 0) {
+        if (bb.abs_to_u64_checked(&bb_u64) != 0 && bb_u64 < NUMBER_BASE) {
             q_abs = aa.div_small_abs(bb_u64);
             var rem: u64 = aa.mod_small_abs(bb_u64);
             if (rem != 0) {
                 r_abs.set_u64(rem);
             }
         } else {
-            var dm: NumberBigDivMod = aa.abs_divmod_long(bb);
+            var dm: NumberBigDivMod = aa.abs_divmod_divide_conquer(bb);
             q_abs = dm.q;
             r_abs = Number.from_big_normalized(dm.r);
         }
@@ -1140,6 +1795,12 @@ impl Number {
             return Number { NUMBER_TAG_SMALL };
         }
         if (self.signum() == 0) { return Number { NUMBER_TAG_SMALL }; }
+        if (m >= NUMBER_BASE) {
+            var absn: Number = self.abs_clone();
+            var divisor: Number = Number.from_u64(m);
+            var out_large_small_div: Number = absn.div_values(&divisor);
+            return out_large_small_div;
+        }
 
         if (self.is_small() != 0) {
             var mag: u64 = 0;
@@ -1165,6 +1826,14 @@ impl Number {
             return 0;
         }
         if (self.signum() == 0) { return 0; }
+        if (m >= NUMBER_BASE) {
+            var absn: Number = self.abs_clone();
+            var divisor: Number = Number.from_u64(m);
+            var remn: Number = absn.mod_values(&divisor);
+            var rem_out: u64 = 0;
+            remn.to_u64_checked(&rem_out);
+            return rem_out;
+        }
 
         if (self.is_small() != 0) {
             var mag: u64 = 0;
@@ -1178,35 +1847,20 @@ impl Number {
 
     public func scale_pow2_abs(self: *Number, bits: u64, divide: u64) -> Number {
         if (self == 0 || self.signum() == 0) { return Number { NUMBER_TAG_SMALL }; }
-        var out: Number = self.abs_clone();
-        var rem: u64 = bits;
-        while (rem >= NUMBER_POW2_CHUNK_BITS) {
-            if (divide != 0) {
-                out = out.div_small_abs(NUMBER_POW2_CHUNK_VALUE);
-            } else {
-                out = out.mul_small(NUMBER_POW2_CHUNK_VALUE);
-            }
-            rem = rem - NUMBER_POW2_CHUNK_BITS;
-            if (out.signum() == 0) { return out; }
+        var aa: *NumberBig = self.to_abs_big();
+        var out_big: *NumberBig = 0;
+        if (divide != 0) {
+            out_big = aa.shr_bits_abs(bits);
+        } else {
+            out_big = aa.shl_bits_abs(bits);
         }
-        if (rem != 0) {
-            var m: u64 = 1;
-            for (var i: u64 = 0; i < rem; i = i + 1) {
-                m = m * 2;
-            }
-            if (divide != 0) {
-                out = out.div_small_abs(m);
-            } else {
-                out = out.mul_small(m);
-            }
-        }
+        var out: Number = Number.from_big_normalized(out_big);
         return out;
     }
 
     public static func pow2(bits: u64) -> Number {
-        var one: Number = Number { NUMBER_TAG_SMALL };
-        one.set_i64(1);
-        var out: Number = one.scale_pow2_abs(bits, 0);
+        var out_big: *NumberBig = NumberBig.pow2_abs(bits);
+        var out: Number = Number.from_big_normalized(out_big);
         return out;
     }
 
@@ -1217,26 +1871,14 @@ impl Number {
             Number.i64_abs_mag(self.small_value(), &mag);
             var small_bits: u64 = 0;
             while (mag != 0) {
-                mag = mag / 2;
+                mag = mag >> 1;
                 small_bits = small_bits + 1;
             }
             return small_bits;
         }
-        var t: Number = self.abs_clone();
-        var bits: u64 = 0;
-        var chunk: Number = Number { NUMBER_TAG_SMALL };
-        chunk.set_u64(NUMBER_POW2_CHUNK_VALUE);
-        while (t.abs_cmp(&chunk) >= 0) {
-            t = t.div_small_abs(NUMBER_POW2_CHUNK_VALUE);
-            bits = bits + NUMBER_POW2_CHUNK_BITS;
-        }
-        var tail: u64 = 0;
-        t.to_u64_checked(&tail);
-        while (tail != 0) {
-            tail = tail / 2;
-            bits = bits + 1;
-        }
-        return bits;
+        var b: *NumberBig = self.big_ptr();
+        if (b == 0) { return 0; }
+        return b.bit_length_abs();
     }
 
     public func shl_values(self: *Number, sh: u64) -> Number {
@@ -1260,28 +1902,37 @@ impl Number {
         rhs: *Number,
         mode: u64
     ) -> Number {
-        var aa: Number = self.abs_clone();
-        var bb: Number = rhs.abs_clone();
-        var place: Number = Number { NUMBER_TAG_SMALL };
-        place.set_i64(1);
-        var out: Number = Number { NUMBER_TAG_SMALL };
+        var aa: *NumberBig = self.to_abs_big();
+        var bb: *NumberBig = rhs.to_abs_big();
+        var an: u64 = 0;
+        var bn: u64 = 0;
+        if (aa != 0 && aa.digits != 0) { an = aa.digits.len(); }
+        if (bb != 0 && bb.digits != 0) { bn = bb.digits.len(); }
+        var n: u64 = an;
+        if (bn > n) { n = bn; }
+        var out_big: *NumberBig = NumberBig.alloc(1, n + 1);
 
-        while (aa.signum() != 0 || bb.signum() != 0) {
-            var abit: u64 = aa.mod_small_abs(2);
-            var bbit: u64 = bb.mod_small_abs(2);
-            var obit: u64 = 0;
-            if (mode == NUMBER_BITWISE_AND) { obit = abit & bbit; }
-            else if (mode == NUMBER_BITWISE_OR) { obit = abit | bbit; }
-            else { obit = abit ^ bbit; }
-
-            if (obit != 0) {
-                out = out.add_values(&place);
+        if (mode == NUMBER_BITWISE_AND) {
+            for (var i_and: u64 = 0; i_and < n; i_and = i_and + 1) {
+                var av_and: u64 = NumberBig.digit_or_zero(aa, an, i_and);
+                var bv_and: u64 = NumberBig.digit_or_zero(bb, bn, i_and);
+                out_big.digits.push((u32)NumberBig.limb_and_value(av_and, bv_and));
             }
-
-            aa = aa.div_small_abs(2);
-            bb = bb.div_small_abs(2);
-            place = place.mul_small(2);
+        } else if (mode == NUMBER_BITWISE_OR) {
+            for (var i_or: u64 = 0; i_or < n; i_or = i_or + 1) {
+                var av_or: u64 = NumberBig.digit_or_zero(aa, an, i_or);
+                var bv_or: u64 = NumberBig.digit_or_zero(bb, bn, i_or);
+                out_big.digits.push((u32)NumberBig.limb_or_value(av_or, bv_or));
+            }
+        } else {
+            for (var i_xor: u64 = 0; i_xor < n; i_xor = i_xor + 1) {
+                var av_xor: u64 = NumberBig.digit_or_zero(aa, an, i_xor);
+                var bv_xor: u64 = NumberBig.digit_or_zero(bb, bn, i_xor);
+                out_big.digits.push((u32)NumberBig.limb_xor_value(av_xor, bv_xor));
+            }
         }
+        out_big.trim_inplace();
+        var out: Number = Number.from_big_normalized(out_big);
         return out;
     }
 
@@ -1290,6 +1941,18 @@ impl Number {
         rhs: *Number,
         mode: u64
     ) -> Number {
+        var self_sign0: i64 = self.signum();
+        var rhs_sign0: i64 = rhs.signum();
+        if (self_sign0 >= 0 && rhs_sign0 >= 0) {
+            if (mode == NUMBER_BITWISE_AND) {
+                return self.bitwise_nonneg_abs(rhs, NUMBER_BITWISE_AND);
+            }
+            if (mode == NUMBER_BITWISE_OR) {
+                return self.bitwise_nonneg_abs(rhs, NUMBER_BITWISE_OR);
+            }
+            return self.bitwise_nonneg_abs(rhs, NUMBER_BITWISE_XOR);
+        }
+
         var abit: u64 = self.bit_length_abs();
         var bbit: u64 = rhs.bit_length_abs();
         var width: u64 = abit;
@@ -1306,7 +1969,14 @@ impl Number {
             var bbase: Number = Number.pow2(width);
             btc = bbase.add_values(rhs);
         }
-        var otc: Number = atc.bitwise_nonneg_abs(&btc, mode);
+        var otc: Number = Number { NUMBER_TAG_SMALL };
+        if (mode == NUMBER_BITWISE_AND) {
+            otc = atc.bitwise_nonneg_abs(&btc, NUMBER_BITWISE_AND);
+        } else if (mode == NUMBER_BITWISE_OR) {
+            otc = atc.bitwise_nonneg_abs(&btc, NUMBER_BITWISE_OR);
+        } else {
+            otc = atc.bitwise_nonneg_abs(&btc, NUMBER_BITWISE_XOR);
+        }
         if (otc.signum() == 0 || width == 0) {
             return Number { NUMBER_TAG_SMALL };
         }
