@@ -112,6 +112,26 @@ func call_fill_missing_defaults(call_name: []u8, params: *Vec<*Param>, params_st
     return 0;
 }
 
+func lower_param_expects_u8_slice(param: *Param) -> u64 {
+    if (param == 0) { return 0; }
+    if (param.type_kind != TYPE_SLICE || param.ptr_depth != 0) { return 0; }
+    if (param.elem_type_kind != TYPE_U8 || param.elem_ptr_depth != 0) { return 0; }
+    return 1;
+}
+
+func lower_should_consume_legacy_string_len_arg(arg_expr: *AstNode, arg_names: *Vec<*NameInfo>, arg_index: u64, arg_count: u64, param: *Param, next_positional: u64, fixed_count: u64, has_variadic: u64) -> u64 {
+    if (arg_expr == 0 || ast_kind(arg_expr) != AST_STRING) { return 0; }
+    if (lower_param_expects_u8_slice(param) == 0) { return 0; }
+    if (has_variadic != 0) { return 0; }
+    if (arg_index + 1 >= arg_count) { return 0; }
+    if (call_named_at(arg_names, arg_index + 1) != 0) { return 0; }
+
+    var input_remaining: u64 = arg_count - arg_index;
+    var params_remaining: u64 = fixed_count - next_positional;
+    if (input_remaining > params_remaining) { return 1; }
+    return 0;
+}
+
 func lower_normalize_call_args_for_params(call_name: []u8, params: *Vec<*Param>, params_start: u64, args: *Vec<*AstNode>, arg_names: *Vec<*NameInfo>) -> *Vec<*AstNode> {
     var input_args: *Vec<*AstNode> = args;
     if (input_args == 0) { input_args = new Vec<*AstNode>{heap_alloc((0) * sizeof(*AstNode)), 0, (0)}; }
@@ -134,11 +154,30 @@ func lower_normalize_call_args_for_params(call_name: []u8, params: *Vec<*Param>,
             simple_fixed_count = simple_fixed_count - 1;
         }
         var simple_arg_count: u64 = input_args.len();
-        for (var sai: u64 = 0; sai < simple_arg_count && sai < simple_fixed_count; sai++) {
+        var simple_out: *Vec<*AstNode> = new Vec<*AstNode>{heap_alloc((simple_arg_count + 1) * sizeof(*AstNode)), 0, (simple_arg_count + 1)};
+        var simple_needs_out: u64 = 0;
+        var simple_pos: u64 = 0;
+        for (var sai: u64 = 0; sai < simple_arg_count && simple_pos < simple_fixed_count; sai++) {
             var simple_arg_expr: *AstNode = input_args.get(sai);
-            var simple_param: *Param = params.get(params_start + sai);
-            input_args.set(sai, lower_parse_sugar_expr_for_type(simple_arg_expr, lower_make_typeinfo_from_param(simple_param)));
+            var simple_param: *Param = params.get(params_start + simple_pos);
+            var simple_lowered: *AstNode = lower_parse_sugar_expr_for_type(simple_arg_expr, lower_make_typeinfo_from_param(simple_param));
+            if (simple_needs_out != 0) {
+                simple_out.push(simple_lowered);
+            } else {
+                input_args.set(sai, simple_lowered);
+            }
+            if (lower_should_consume_legacy_string_len_arg(simple_arg_expr, arg_names, sai, simple_arg_count, simple_param, simple_pos, simple_fixed_count, has_variadic) != 0) {
+                if (simple_needs_out == 0) {
+                    for (var copy_i: u64 = 0; copy_i <= simple_pos; copy_i++) {
+                        simple_out.push(input_args.get(copy_i));
+                    }
+                    simple_needs_out = 1;
+                }
+                sai = sai + 1;
+            }
+            simple_pos = simple_pos + 1;
         }
+        if (simple_needs_out != 0) { return simple_out; }
         return input_args;
     }
 
@@ -201,6 +240,9 @@ func lower_normalize_call_args_for_params(call_name: []u8, params: *Vec<*Param>,
             var positional_param: *Param = params.get(params_start + next_positional);
             out_fixed.set(next_positional, lower_parse_sugar_expr_for_type(arg_expr, lower_make_typeinfo_from_param(positional_param)));
             assigned.set(next_positional, 1);
+            if (lower_should_consume_legacy_string_len_arg(arg_expr, arg_names, ai, arg_count, positional_param, next_positional, fixed_count, has_variadic) != 0) {
+                ai = ai + 1;
+            }
             next_positional = next_positional + 1;
             continue;
         }
@@ -217,6 +259,112 @@ func lower_normalize_call_args_for_params(call_name: []u8, params: *Vec<*Param>,
         return out_fixed;
     }
     return call_pack_variadic_args(out_fixed, variadic_args);
+}
+
+func lower_method_func_name_matches(fn: *AstFunc, method: []u8) -> u64 {
+    if (fn == 0 || method.ptr == 0 || method.len == 0) { return 0; }
+    var cand_ptr: u64 = u8_slice_ptr(fn.impl_original_name);
+    var cand_len: u64 = u8_slice_len(fn.impl_original_name);
+    if (cand_ptr == 0 || cand_len == 0) {
+        cand_ptr = u8_slice_ptr(fn.name);
+        cand_len = u8_slice_len(fn.name);
+    }
+    if (cand_ptr == 0 || cand_len == 0) { return 0; }
+    if (str_eq(slice(cand_ptr, cand_len), slice(method.ptr, method.len)) != 0) { return 1; }
+    return 0;
+}
+
+func lower_method_signature_can_normalize_args(fn: *AstFunc, mc: *AstMethodCall) -> u64 {
+    if (fn == 0 || mc == 0 || fn.params_vec == 0) { return 0; }
+    var params: *Vec<*Param> = fn.params_vec;
+    var param_count: u64 = params.len();
+    var params_start: u64 = sym_method_param_start_index(fn);
+    if (params_start > param_count) { params_start = param_count; }
+    var effective_count: u64 = param_count - params_start;
+    var has_variadic: u64 = call_has_variadic_param(params, param_count, effective_count);
+    var fixed_count: u64 = effective_count;
+    if (has_variadic != 0 && fixed_count > 0) {
+        fixed_count = fixed_count - 1;
+    }
+
+    var assigned: *Vec<u64> = new Vec<u64>{heap_alloc((fixed_count + 1) * sizeof(u64)), 0, (fixed_count + 1)};
+    for (var i: u64 = 0; i < fixed_count; i++) {
+        assigned.push(0);
+    }
+
+    var seen_named: u64 = 0;
+    var next_positional: u64 = 0;
+    var arg_count: u64 = 0;
+    if (mc.args_vec != 0) { arg_count = mc.args_vec.len(); }
+    for (var ai: u64 = 0; ai < arg_count; ai++) {
+        var arg_name: *NameInfo = call_named_at(mc.arg_names_vec, ai);
+        if (arg_name != 0) {
+            seen_named = 1;
+            var named_idx: u64 = call_find_param_index_by_name(params, params_start, fixed_count, slice(arg_name.ptr, arg_name.len));
+            if (named_idx == COMPILER_CALL_UTILS_NOT_FOUND_U64) { return 0; }
+            if (assigned.get(named_idx) != 0) { return 0; }
+            assigned.set(named_idx, 1);
+            continue;
+        }
+
+        if (seen_named != 0) { return 0; }
+        if (next_positional < fixed_count) {
+            var positional_param: *Param = params.get(params_start + next_positional);
+            assigned.set(next_positional, 1);
+            if (lower_should_consume_legacy_string_len_arg(mc.args_vec.get(ai), mc.arg_names_vec, ai, arg_count, positional_param, next_positional, fixed_count, has_variadic) != 0) {
+                ai = ai + 1;
+            }
+            next_positional = next_positional + 1;
+            continue;
+        }
+        if (has_variadic == 0) { return 0; }
+    }
+
+    for (var fi: u64 = 0; fi < fixed_count; fi++) {
+        if (assigned.get(fi) != 0) { continue; }
+        var p: *Param = params.get(params_start + fi);
+        if (p == 0 || p.has_default == 0) { return 0; }
+    }
+    return 1;
+}
+
+func lower_find_method_signature_by_name_for_call_in_vec(funcs: *Vec<*AstFunc>, recv_struct: []u8, method: []u8, mc: *AstMethodCall) -> *AstFunc {
+    if (funcs == 0) { return 0; }
+    var best_fn: *AstFunc = 0;
+    var best_dist: u64 = COMPILER_INHERIT_DIST_NOT_FOUND;
+    var ambiguous: u64 = 0;
+    var n: u64 = funcs.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var fn: *AstFunc = funcs.get(i);
+        if (fn == 0) { continue; }
+        if (u8_slice_ptr(fn.impl_owner) == 0 || u8_slice_len(fn.impl_owner) == 0) { continue; }
+        if (lower_method_func_name_matches(fn, slice(method.ptr, method.len)) == 0) { continue; }
+        var dist: u64 = sym_struct_distance_to_ancestor(slice(recv_struct.ptr, recv_struct.len), fn.impl_owner);
+        if (dist == COMPILER_INHERIT_DIST_NOT_FOUND) { continue; }
+        if (lower_method_signature_can_normalize_args(fn, mc) == 0) { continue; }
+        if (best_fn == 0 || dist < best_dist) {
+            best_fn = fn;
+            best_dist = dist;
+            ambiguous = 0;
+            continue;
+        }
+        if (dist == best_dist && best_fn != fn) {
+            ambiguous = 1;
+        }
+    }
+    if (ambiguous != 0) {
+        diag_emit_error_tag("lowering", "method-overload", "ambiguous method signature for argument normalization");
+        diag_emit_labelled_member("method: ", slice(recv_struct.ptr, recv_struct.len), slice(method.ptr, method.len));
+        diag_error("Compiler error");
+        return 0;
+    }
+    return best_fn;
+}
+
+func lower_find_method_signature_by_name_for_call(recv_struct: []u8, method: []u8, mc: *AstMethodCall) -> *AstFunc {
+    var found: *AstFunc = lower_find_method_signature_by_name_for_call_in_vec(g_compiler_ctx.all_funcs, slice(recv_struct.ptr, recv_struct.len), slice(method.ptr, method.len), mc);
+    if (found != 0) { return found; }
+    return lower_find_method_signature_by_name_for_call_in_vec(g_compiler_ctx.all_func_sigs, slice(recv_struct.ptr, recv_struct.len), slice(method.ptr, method.len), mc);
 }
 
 func lower_find_func_signature_for_call(name: []u8) -> *AstFunc {
@@ -321,6 +469,46 @@ func lower_normalize_generic_call_args(gcall: *AstGenericCall) -> u64 {
     gcall.args_vec = lower_normalize_call_args_for_params(gcall.name, fn.params_vec, 0, gcall.args_vec, gcall.arg_names_vec);
     gcall.arg_names_vec = 0;
     return 0;
+}
+
+func lower_normalize_method_call_args_for_func(mc: *AstMethodCall, fn: *AstFunc) -> u64 {
+    if (mc == 0 || fn == 0) { return 0; }
+    mc.args_vec = lower_normalize_call_args_for_params(mc.method, fn.params_vec, sym_method_param_start_index(fn), mc.args_vec, mc.arg_names_vec);
+    mc.arg_names_vec = 0;
+    return 0;
+}
+
+func lower_normalize_method_call_args(mc: *AstMethodCall) -> u64 {
+    if (mc == 0) { return 0; }
+    var recv_ti: *TypeInfo = generic_infer_expr_type(mc.receiver, g_lower_parse_sugar_symtab);
+    if (recv_ti == 0 || recv_ti.type_kind != TYPE_STRUCT) { return 0; }
+    if (u8_slice_ptr(recv_ti.struct_name) == 0 || u8_slice_len(recv_ti.struct_name) == 0) {
+        if (recv_ti.struct_def != 0) {
+            recv_ti.struct_name = recv_ti.struct_def.name;
+        }
+    }
+    if (u8_slice_ptr(recv_ti.struct_name) == 0 || u8_slice_len(recv_ti.struct_name) == 0) { return 0; }
+
+    var arg_count_hint: u64 = 0;
+    if (mc.args_vec != 0) { arg_count_hint = mc.args_vec.len(); }
+    var arg_types: *Vec<*TypeInfo> = generic_collect_call_arg_types(mc.args_vec, g_lower_parse_sugar_symtab);
+    var resolved: CompilerMethodResolveResult =
+        sym_resolve_method_overload_with_count_fallback(recv_ti.struct_name, mc.method, arg_types, arg_count_hint);
+    if (resolved.found == 0 || resolved.fn == 0) {
+        var fallback_fn: *AstFunc = lower_find_method_signature_by_name_for_call(recv_ti.struct_name, mc.method, mc);
+        if (fallback_fn != 0) {
+            return lower_normalize_method_call_args_for_func(mc, fallback_fn);
+        }
+        if (call_has_named_args(mc.arg_names_vec) != 0) {
+            diag_emit_error_tag("lowering", "L1007", "named arguments require a known method signature");
+            diag_emit_labelled_name("method: ", mc.method);
+            diag_error("Compiler error");
+            return 0;
+        }
+        return 0;
+    }
+
+    return lower_normalize_method_call_args_for_func(mc, resolved.fn);
 }
 
 func lower_call_name_matches(name: []u8, target: []u8) -> u64 {
@@ -873,16 +1061,26 @@ func lower_operator_receiver_type(expr: *AstNode) -> *TypeInfo {
     return ti;
 }
 
+func lower_operator_arg_type_for_overload(arg: *AstNode) -> *TypeInfo {
+    if (lower_is_integer_literal_expr(arg) != 0) {
+        if (lower_integer_literal_is_negative(arg) != 0) {
+            return generic_make_typeinfo_from_fields(TYPE_I64, 0, 0, slice(0, 0), slice(0, 0), 0, 0, 0, 0, slice(0, 0));
+        }
+        return generic_make_typeinfo_from_fields(TYPE_U64, 0, 0, slice(0, 0), slice(0, 0), 0, 0, 0, 0, slice(0, 0));
+    }
+    return generic_infer_expr_type(arg, g_lower_parse_sugar_symtab);
+}
+
 func lower_operator_arg_type_vec1(arg0: *AstNode) -> *Vec<*TypeInfo> {
     var out: *Vec<*TypeInfo> = new Vec<*TypeInfo>{heap_alloc((1) * sizeof(*TypeInfo)), 0, (1)};
-    out.push(generic_infer_expr_type(arg0, g_lower_parse_sugar_symtab));
+    out.push(lower_operator_arg_type_for_overload(arg0));
     return out;
 }
 
 func lower_operator_arg_type_vec2(arg0: *AstNode, arg1: *AstNode) -> *Vec<*TypeInfo> {
     var out: *Vec<*TypeInfo> = new Vec<*TypeInfo>{heap_alloc((2) * sizeof(*TypeInfo)), 0, (2)};
-    out.push(generic_infer_expr_type(arg0, g_lower_parse_sugar_symtab));
-    out.push(generic_infer_expr_type(arg1, g_lower_parse_sugar_symtab));
+    out.push(lower_operator_arg_type_for_overload(arg0));
+    out.push(lower_operator_arg_type_for_overload(arg1));
     return out;
 }
 
@@ -932,9 +1130,13 @@ func lower_name_is_number_builtin(name: []u8, base: []u8) -> u64 {
 
 func lower_name_is_number_returning_builtin(name: []u8) -> u64 {
     if (str_eq(slice(name.ptr, name.len), slice("std_number__Number_from_i64", str_len("std_number__Number_from_i64"))) != 0) { return 1; }
+    if (str_eq(slice(name.ptr, name.len), slice("Number_from_i64", str_len("Number_from_i64"))) != 0) { return 1; }
     if (str_eq(slice(name.ptr, name.len), slice("std_number__Number_from_u64", str_len("std_number__Number_from_u64"))) != 0) { return 1; }
+    if (str_eq(slice(name.ptr, name.len), slice("Number_from_u64", str_len("Number_from_u64"))) != 0) { return 1; }
     if (str_eq(slice(name.ptr, name.len), slice("std_number__Number_from_str", str_len("std_number__Number_from_str"))) != 0) { return 1; }
+    if (str_eq(slice(name.ptr, name.len), slice("Number_from_str", str_len("Number_from_str"))) != 0) { return 1; }
     if (str_eq(slice(name.ptr, name.len), slice("std_number__Number_input", str_len("std_number__Number_input"))) != 0) { return 1; }
+    if (str_eq(slice(name.ptr, name.len), slice("Number_input", str_len("Number_input"))) != 0) { return 1; }
     return 0;
 }
 
@@ -949,6 +1151,37 @@ func lower_call_expr_returns_number(call: *AstCall) -> u64 {
         if (lower_is_number_struct_type(ret_ti) != 0) { return 1; }
     }
     return 0;
+}
+
+func lower_number_method_returns_number(method: []u8) -> u64 {
+    if (method.ptr == 0 || method.len == 0) { return 0; }
+    if (str_eq(slice(method.ptr, method.len), slice("clone", str_len("clone"))) != 0) { return 1; }
+    if (str_eq(slice(method.ptr, method.len), slice("negated", str_len("negated"))) != 0) { return 1; }
+    if (str_eq(slice(method.ptr, method.len), slice("abs_with_sign", str_len("abs_with_sign"))) != 0) { return 1; }
+    if (str_eq(slice(method.ptr, method.len), slice("add_values", str_len("add_values"))) != 0) { return 1; }
+    if (str_eq(slice(method.ptr, method.len), slice("sub_values", str_len("sub_values"))) != 0) { return 1; }
+    if (str_eq(slice(method.ptr, method.len), slice("mul_values", str_len("mul_values"))) != 0) { return 1; }
+    if (str_eq(slice(method.ptr, method.len), slice("div_values", str_len("div_values"))) != 0) { return 1; }
+    if (str_eq(slice(method.ptr, method.len), slice("mod_values", str_len("mod_values"))) != 0) { return 1; }
+    if (str_eq(slice(method.ptr, method.len), slice("mul_small", str_len("mul_small"))) != 0) { return 1; }
+    if (str_eq(slice(method.ptr, method.len), slice("abs_clone", str_len("abs_clone"))) != 0) { return 1; }
+    if (str_eq(slice(method.ptr, method.len), slice("div_small_abs", str_len("div_small_abs"))) != 0) { return 1; }
+    if (str_eq(slice(method.ptr, method.len), slice("bitwise_nonneg_abs", str_len("bitwise_nonneg_abs"))) != 0) { return 1; }
+    if (str_eq(slice(method.ptr, method.len), slice("bitwise_values", str_len("bitwise_values"))) != 0) { return 1; }
+    if (str_eq(slice(method.ptr, method.len), slice("bitnot_values", str_len("bitnot_values"))) != 0) { return 1; }
+    if (str_eq(slice(method.ptr, method.len), slice("shl_values", str_len("shl_values"))) != 0) { return 1; }
+    if (str_eq(slice(method.ptr, method.len), slice("shr_values", str_len("shr_values"))) != 0) { return 1; }
+    return 0;
+}
+
+func lower_method_expr_returns_number(expr: *AstNode) -> u64 {
+    if (expr == 0) { return 0; }
+    var expr_kind: u64 = ast_kind(expr);
+    if (expr_kind != AST_METHOD_CALL && expr_kind != AST_SAFE_METHOD_CALL) { return 0; }
+    var mc: *AstMethodCall = (*AstMethodCall)expr;
+    if (lower_number_method_returns_number(mc.method) == 0) { return 0; }
+    var receiver_ti: *TypeInfo = generic_infer_expr_type(mc.receiver, g_lower_parse_sugar_symtab);
+    return lower_is_number_struct_type(receiver_ti);
 }
 
 func lower_is_number_struct_type(ti: *TypeInfo) -> u64 {
@@ -976,6 +1209,74 @@ func lower_is_integer_literal_expr(expr: *AstNode) -> u64 {
             return 1;
         }
     }
+    return 0;
+}
+
+func lower_is_integer_const_expr(expr: *AstNode) -> u64 {
+    if (expr == 0) { return 0; }
+    if (lower_is_integer_literal_expr(expr) != 0) { return 1; }
+    var k: u64 = ast_kind(expr);
+    if (k == AST_UNARY) {
+        var un: *AstUnary = (*AstUnary)expr;
+        if (un.op != TOKEN_PLUS && un.op != TOKEN_MINUS && un.op != TOKEN_TILDE) { return 0; }
+        return lower_is_integer_const_expr(un.operand);
+    }
+    if (k == AST_BINARY) {
+        var bin: *AstBinary = (*AstBinary)expr;
+        if (generic_number_binary_result_op(bin.op) == 0) { return 0; }
+        if (lower_is_integer_const_expr(bin.left) == 0) { return 0; }
+        if (lower_is_integer_const_expr(bin.right) == 0) { return 0; }
+        return 1;
+    }
+    return 0;
+}
+
+func lower_typeinfo_is_integer_scalar(ti: *TypeInfo) -> u64 {
+    if (ti == 0 || ti.ptr_depth != 0) { return 0; }
+    return lower_type_kind_is_integer(ti.type_kind);
+}
+
+func lower_binary_uses_number_semantics_with_types(bin: *AstBinary, left_ti: *TypeInfo, right_ti: *TypeInfo) -> u64 {
+    if (bin == 0) { return 0; }
+    var left_is_number: u64 = lower_is_number_struct_type(left_ti);
+    var right_is_number: u64 = lower_is_number_struct_type(right_ti);
+    if (left_is_number == 0 && ast_kind(bin.left) == AST_CALL && lower_call_expr_returns_number((*AstCall)bin.left) != 0) {
+        left_is_number = 1;
+    }
+    if (right_is_number == 0 && ast_kind(bin.right) == AST_CALL && lower_call_expr_returns_number((*AstCall)bin.right) != 0) {
+        right_is_number = 1;
+    }
+    if (left_is_number == 0 && lower_method_expr_returns_number(bin.left) != 0) {
+        left_is_number = 1;
+    }
+    if (right_is_number == 0 && lower_method_expr_returns_number(bin.right) != 0) {
+        right_is_number = 1;
+    }
+    if (left_is_number == 0 && right_is_number == 0) { return 0; }
+
+    if (left_is_number != 0 &&
+        lower_is_integer_literal_expr(bin.left) != 0 &&
+        lower_typeinfo_is_integer_scalar(right_ti) != 0) {
+        left_is_number = 0;
+    }
+    if (right_is_number != 0 &&
+        lower_is_integer_literal_expr(bin.right) != 0 &&
+        lower_typeinfo_is_integer_scalar(left_ti) != 0) {
+        right_is_number = 0;
+    }
+    if (left_is_number != 0 &&
+        lower_is_integer_literal_expr(bin.left) != 0 &&
+        right_ti != 0 && right_ti.type_kind == TYPE_STRUCT &&
+        lower_is_number_struct_type(right_ti) == 0) {
+        left_is_number = 0;
+    }
+    if (right_is_number != 0 &&
+        lower_is_integer_literal_expr(bin.right) != 0 &&
+        left_ti != 0 && left_ti.type_kind == TYPE_STRUCT &&
+        lower_is_number_struct_type(left_ti) == 0) {
+        right_is_number = 0;
+    }
+    if (left_is_number != 0 || right_is_number != 0) { return 1; }
     return 0;
 }
 
@@ -1061,6 +1362,31 @@ func lower_wrap_integer_literal_to_number(expr: *AstNode) -> *AstNode {
     return lower_make_number_from_u64_call(args);
 }
 
+func lower_wrap_integer_const_expr_parts_to_number(expr: *AstNode) -> *AstNode {
+    if (expr == 0) { return 0; }
+    if (lower_is_integer_literal_expr(expr) != 0) {
+        return lower_wrap_integer_literal_to_number(expr);
+    }
+
+    var k: u64 = ast_kind(expr);
+    if (k == AST_UNARY) {
+        var un: *AstUnary = (*AstUnary)expr;
+        if (un.op != TOKEN_PLUS && un.op != TOKEN_MINUS && un.op != TOKEN_TILDE) { return 0; }
+        var wrapped_operand: *AstNode = lower_wrap_integer_const_expr_parts_to_number(un.operand);
+        if (wrapped_operand == 0) { return 0; }
+        return (*AstNode)ast_unary(un.op, wrapped_operand);
+    }
+    if (k == AST_BINARY) {
+        var bin: *AstBinary = (*AstBinary)expr;
+        if (generic_number_binary_result_op(bin.op) == 0) { return 0; }
+        var wrapped_left: *AstNode = lower_wrap_integer_const_expr_parts_to_number(bin.left);
+        var wrapped_right: *AstNode = lower_wrap_integer_const_expr_parts_to_number(bin.right);
+        if (wrapped_left == 0 || wrapped_right == 0) { return 0; }
+        return (*AstNode)ast_binary(bin.op, wrapped_left, wrapped_right);
+    }
+    return 0;
+}
+
 func lower_make_cast_for_typeinfo(expr: *AstNode, expected_ti: *TypeInfo) -> *AstNode {
     if (expr == 0 || expected_ti == 0) { return expr; }
     return (*AstNode)ast_cast_ex(expr, expected_ti.type_kind, expected_ti.ptr_depth, expected_ti.is_tagged, expected_ti.struct_name, expected_ti.tag_layout);
@@ -1071,10 +1397,12 @@ func lower_expr_already_number_semantic(expr: *AstNode, actual_ti: *TypeInfo) ->
     if (lower_is_number_struct_type(actual_ti) != 0) { return 1; }
     var expr_kind: u64 = ast_kind(expr);
     if (expr_kind == AST_CALL && lower_call_expr_returns_number((*AstCall)expr) != 0) { return 1; }
+    if (lower_method_expr_returns_number(expr) != 0) { return 1; }
     if (expr_kind == AST_BINARY) {
         var bin: *AstBinary = (*AstBinary)expr;
-        if (lower_is_number_struct_type(lower_operator_receiver_type(bin.left)) != 0) { return 1; }
-        if (lower_is_number_struct_type(lower_operator_receiver_type(bin.right)) != 0) { return 1; }
+        var left_ti: *TypeInfo = generic_infer_expr_type(bin.left, g_lower_parse_sugar_symtab);
+        var right_ti: *TypeInfo = generic_infer_expr_type(bin.right, g_lower_parse_sugar_symtab);
+        if (lower_binary_uses_number_semantics_with_types(bin, left_ti, right_ti) != 0) { return 1; }
     }
     if (expr_kind == AST_UNARY) {
         var un: *AstUnary = (*AstUnary)expr;
@@ -1094,11 +1422,13 @@ func lower_expr_returns_number_value(expr: *AstNode, actual_ti: *TypeInfo) -> u6
     if (lower_is_number_struct_type(actual_ti) != 0) { return 1; }
     var expr_kind: u64 = ast_kind(expr);
     if (expr_kind == AST_CALL && lower_call_expr_returns_number((*AstCall)expr) != 0) { return 1; }
+    if (lower_method_expr_returns_number(expr) != 0) { return 1; }
     if (expr_kind == AST_BINARY) {
         var bin: *AstBinary = (*AstBinary)expr;
         if (lower_binary_operator_returns_bool(bin.op) != 0) { return 0; }
-        if (lower_is_number_struct_type(lower_operator_receiver_type(bin.left)) != 0) { return 1; }
-        if (lower_is_number_struct_type(lower_operator_receiver_type(bin.right)) != 0) { return 1; }
+        var left_ti: *TypeInfo = generic_infer_expr_type(bin.left, g_lower_parse_sugar_symtab);
+        var right_ti: *TypeInfo = generic_infer_expr_type(bin.right, g_lower_parse_sugar_symtab);
+        if (lower_binary_uses_number_semantics_with_types(bin, left_ti, right_ti) != 0) { return 1; }
     }
     if (expr_kind == AST_UNARY) {
         var un: *AstUnary = (*AstUnary)expr;
@@ -1146,6 +1476,9 @@ func lower_wrap_integer_expr_to_number(expr: *AstNode, actual_ti: *TypeInfo) -> 
     if (expr == 0) { return 0; }
     if (lower_is_integer_literal_expr(expr) != 0) {
         return lower_wrap_integer_literal_to_number(expr);
+    }
+    if (lower_is_integer_const_expr(expr) != 0) {
+        return lower_wrap_integer_const_expr_parts_to_number(expr);
     }
     var expr_kind: u64 = ast_kind(expr);
     if (expr_kind == AST_STRUCT_LITERAL || expr_kind == AST_GENERIC_STRUCT_LITERAL || expr_kind == AST_STACK_CTOR || expr_kind == AST_NEW) {
@@ -1396,9 +1729,6 @@ func lower_parse_sugar_numeric_for_type(expr: *AstNode, expected_ti: *TypeInfo) 
     }
 
     if (lower_type_kind_is_integer(expected_ti.type_kind) != 0) {
-        var unboxed: *AstNode = lower_wrap_number_expr_to_integer(expr, expected_ti.type_kind, actual_ti);
-        if (unboxed != 0) { return unboxed; }
-
         if (actual_ti != 0 && actual_ti.ptr_depth == 0 && actual_ti.type_kind == expected_ti.type_kind) {
             return expr;
         }
@@ -1409,6 +1739,12 @@ func lower_parse_sugar_numeric_for_type(expr: *AstNode, expected_ti: *TypeInfo) 
             }
             return expr;
         }
+        if (lower_is_integer_const_expr(expr) != 0) {
+            return lower_make_cast_for_typeinfo(expr, expected_ti);
+        }
+
+        var unboxed: *AstNode = lower_wrap_number_expr_to_integer(expr, expected_ti.type_kind, actual_ti);
+        if (unboxed != 0) { return unboxed; }
 
         if (actual_ti != 0 && actual_ti.ptr_depth == 0 &&
             lower_can_implicit_integer_widen(actual_ti.type_kind, expected_ti.type_kind) != 0) {
@@ -1434,6 +1770,7 @@ func lower_parse_sugar_cast_expr(cast_expr: *AstCast) -> *AstNode {
     if (cast_expr == 0 || cast_expr.expr == 0) { return (*AstNode)cast_expr; }
     if (cast_expr.target_ptr_depth != 0) { return (*AstNode)cast_expr; }
     if (lower_type_kind_is_integer(cast_expr.target_type) == 0) { return (*AstNode)cast_expr; }
+    if (lower_is_integer_const_expr(cast_expr.expr) != 0) { return (*AstNode)cast_expr; }
     var actual_ti: *TypeInfo = generic_infer_expr_type(cast_expr.expr, g_lower_parse_sugar_symtab);
     var lowered: *AstNode = lower_wrap_number_expr_to_integer(cast_expr.expr, cast_expr.target_type, actual_ti);
     if (lowered != 0) { return lowered; }
@@ -1448,12 +1785,26 @@ func lower_parse_sugar_expr_for_type(expr: *AstNode, expected_ti: *TypeInfo) -> 
 
 func lower_parse_sugar_binary_operator(bin: *AstBinary) -> *AstNode {
     if (bin == 0) { return 0; }
+    var literal_method_name: *NameInfo = compiler_operator_binary_name(bin.op);
+    if (literal_method_name != 0 && lower_is_integer_literal_expr(bin.right) != 0) {
+        var literal_recv_ti: *TypeInfo = lower_operator_receiver_type(bin.left);
+        if (literal_recv_ti != 0 && lower_is_number_struct_type(literal_recv_ti) == 0) {
+            var literal_target_type: u64 = TYPE_U64;
+            if (lower_integer_literal_is_negative(bin.right) != 0) { literal_target_type = TYPE_I64; }
+            bin.right = lower_make_scalar_cast(bin.right, literal_target_type);
+        }
+    }
+
+    var left_actual_ti: *TypeInfo = generic_infer_expr_type(bin.left, g_lower_parse_sugar_symtab);
+    var right_actual_ti: *TypeInfo = generic_infer_expr_type(bin.right, g_lower_parse_sugar_symtab);
+    if (lower_binary_uses_number_semantics_with_types(bin, left_actual_ti, right_actual_ti) != 0) {
+        return (*AstNode)bin;
+    }
+
     var left_ti: *TypeInfo = lower_operator_receiver_type(bin.left);
     var right_ti: *TypeInfo = lower_operator_receiver_type(bin.right);
     var left_is_number: u64 = lower_is_number_struct_type(left_ti);
     var right_is_number: u64 = lower_is_number_struct_type(right_ti);
-    // Number operators are lowered in emitter (number_*_values fast path).
-    // Keeping them as binary ops avoids fragile method-dispatch type recovery.
     if (left_is_number != 0 || right_is_number != 0) { return (*AstNode)bin; }
 
     var method_name: *NameInfo = compiler_operator_binary_name(bin.op);
@@ -1490,6 +1841,11 @@ func lower_parse_sugar_index_operator(ix: *AstIndex) -> *AstNode {
     var method_name: *NameInfo = compiler_operator_index_get_name();
     var arg_types: *Vec<*TypeInfo> = lower_operator_arg_type_vec1(ix.index);
     if (lower_operator_can_dispatch(ix.base, slice(method_name.ptr, method_name.len), arg_types, 1) == 0) {
+        var base_ti: *TypeInfo = generic_infer_expr_type(ix.base, g_lower_parse_sugar_symtab);
+        if (base_ti != 0 &&
+            (base_ti.ptr_depth != 0 || base_ti.type_kind == TYPE_ARRAY || base_ti.type_kind == TYPE_SLICE)) {
+            ix.index = lower_parse_sugar_expr_for_type(ix.index, generic_type_u64());
+        }
         return (*AstNode)ix;
     }
 
