@@ -1,5 +1,6 @@
 // Builtin dynamic numeric value (Number).
-// Tagged storage: small signed 63-bit immediate or pointer to a heap payload.
+// NaN-boxed storage: non-NaN f64 values are stored directly, while integers
+// and heap payloads live in quiet-NaN payload space.
 // Lifetime is arena-style monotonic allocation.
 
 import std.io;
@@ -14,22 +15,30 @@ const NUMBER_MAX_U64 = 18446744073709551615;
 const NUMBER_MAX_I64_U64 = 9223372036854775807;
 const NUMBER_MIN_I64_MAG = 9223372036854775808;
 
-const NUMBER_TAG_SMALL = 1;
-const NUMBER_TAG_MASK = 1;
-const NUMBER_HEAP_TAG_MASK = 7;
-const NUMBER_TAG_BIG = 0;
-const NUMBER_TAG_REAL = 2;
-const NUMBER_TAG_COMPLEX = 4;
-const NUMBER_TAG_EXT = 6;
-const NUMBER_PTR_MASK = 18446744073709551608;
+const NUMBER_BOX_MASK = 9221120237041090560;
+const NUMBER_BOX_BASE = 9221120237041090560;
+const NUMBER_BOX_TAG_MASK = 1970324836974592;
+const NUMBER_BOX_TAG_SHIFT = 48;
+const NUMBER_PTR_MASK = 281474976710655;
+const NUMBER_NAN_EXP_MASK = 9218868437227405312;
+const NUMBER_NAN_MANT_MASK = 4503599627370495;
+const NUMBER_SMALL_SIGN_BIT = 140737488355328;
+const NUMBER_SMALL_SIGN_EXT_MASK = 18446462598732840960;
+
+const NUMBER_BOX_TAG_SMALL = 1;
+const NUMBER_BOX_TAG_BIG = 2;
+const NUMBER_BOX_TAG_REAL = 3;
+const NUMBER_BOX_TAG_COMPLEX = 4;
+const NUMBER_BOX_TAG_EXT = 5;
+const NUMBER_TAG_SMALL = 9221401712017801216;
 
 const NUMBER_EXT_RATIONAL = 1;
 const NUMBER_EXT_DECIMAL = 2;
 const NUMBER_EXT_BIGFLOAT = 3;
 
-const NUMBER_SMALL_MAX_U64 = 4611686018427387903;
-const NUMBER_SMALL_MIN_I64 = -4611686018427387904;
-const NUMBER_SMALL_MAX_I64 = 4611686018427387903;
+const NUMBER_SMALL_MAX_U64 = 140737488355327;
+const NUMBER_SMALL_MIN_I64 = -140737488355328;
+const NUMBER_SMALL_MAX_I64 = 140737488355327;
 
 const NUMBER_BITWISE_AND = 0;
 const NUMBER_BITWISE_OR = 1;
@@ -59,6 +68,11 @@ struct NumberBig {
 
 struct NumberReal {
     public value: f64;
+}
+
+union NumberF64Bits {
+    public f: f64;
+    public u: u64;
 }
 
 struct NumberComplex {
@@ -100,8 +114,10 @@ struct NumberDivMod {
 }
 
 func number_make_real(v: f64) -> Number {
+    var raw: u64 = number_f64_to_bits(v);
+    if (number_bits_is_nan(raw) == 0) { return Number { raw }; }
     var real: *NumberReal = new NumberReal{v};
-    return Number { (((u64)real) & NUMBER_PTR_MASK) | NUMBER_TAG_REAL };
+    return number_box_ptr(NUMBER_BOX_TAG_REAL, (u64)real);
 }
 
 func number_make_complex(real: Number, imag: Number) -> Number {
@@ -109,12 +125,49 @@ func number_make_complex(real: Number, imag: Number) -> Number {
         return Number { real.bits };
     }
     var c: *NumberComplex = new NumberComplex{real, imag};
-    return Number { (((u64)c) & NUMBER_PTR_MASK) | NUMBER_TAG_COMPLEX };
+    return number_box_ptr(NUMBER_BOX_TAG_COMPLEX, (u64)c);
 }
 
 func number_make_ext(ptr: u64) -> Number {
     if (ptr == 0) { return Number { NUMBER_TAG_SMALL }; }
-    return Number { (ptr & NUMBER_PTR_MASK) | NUMBER_TAG_EXT };
+    return number_box_ptr(NUMBER_BOX_TAG_EXT, ptr);
+}
+
+func number_f64_to_bits(v: f64) -> u64 {
+    var bits: NumberF64Bits;
+    bits.f = v;
+    return bits.u;
+}
+
+func number_bits_to_f64(v: u64) -> f64 {
+    var bits: NumberF64Bits;
+    bits.u = v;
+    return bits.f;
+}
+
+func number_bits_is_nan(v: u64) -> u64 {
+    if ((v & NUMBER_NAN_EXP_MASK) != NUMBER_NAN_EXP_MASK) { return 0; }
+    return (v & NUMBER_NAN_MANT_MASK) != 0;
+}
+
+func number_bits_is_boxed(v: u64) -> u64 {
+    return (v & NUMBER_BOX_MASK) == NUMBER_BOX_BASE;
+}
+
+func number_box_tag(v: u64) -> u64 {
+    return (v & NUMBER_BOX_TAG_MASK) >> NUMBER_BOX_TAG_SHIFT;
+}
+
+func number_box_ptr(tag: u64, ptr: u64) -> Number {
+    return Number { NUMBER_BOX_BASE | (tag << NUMBER_BOX_TAG_SHIFT) | (ptr & NUMBER_PTR_MASK) };
+}
+
+func number_box_small_i64(v: i64) -> Number {
+    return Number { NUMBER_BOX_BASE | (NUMBER_BOX_TAG_SMALL << NUMBER_BOX_TAG_SHIFT) | (((u64)v) & NUMBER_PTR_MASK) };
+}
+
+func number_box_small_u64(v: u64) -> Number {
+    return Number { NUMBER_BOX_BASE | (NUMBER_BOX_TAG_SMALL << NUMBER_BOX_TAG_SHIFT) | (v & NUMBER_PTR_MASK) };
 }
 
 func number_pow10(scale: u64) -> Number {
@@ -1429,25 +1482,26 @@ impl Number {
             panic("Number.is_small: null Number*");
             return 0;
         }
-        return (self.bits & NUMBER_TAG_MASK) != 0;
+        if (number_bits_is_boxed(self.bits) == 0) { return 0; }
+        return number_box_tag(self.bits) == NUMBER_BOX_TAG_SMALL;
     }
 
     public func is_real(self: *Number) -> u64 {
         if (self == 0) { return 0; }
-        if (self.is_small() != 0) { return 0; }
-        return (self.bits & NUMBER_HEAP_TAG_MASK) == NUMBER_TAG_REAL;
+        if (number_bits_is_boxed(self.bits) == 0) { return 1; }
+        return number_box_tag(self.bits) == NUMBER_BOX_TAG_REAL;
     }
 
     public func is_complex(self: *Number) -> u64 {
         if (self == 0) { return 0; }
-        if (self.is_small() != 0) { return 0; }
-        return (self.bits & NUMBER_HEAP_TAG_MASK) == NUMBER_TAG_COMPLEX;
+        if (number_bits_is_boxed(self.bits) == 0) { return 0; }
+        return number_box_tag(self.bits) == NUMBER_BOX_TAG_COMPLEX;
     }
 
     public func is_ext(self: *Number) -> u64 {
         if (self == 0) { return 0; }
-        if (self.is_small() != 0) { return 0; }
-        return (self.bits & NUMBER_HEAP_TAG_MASK) == NUMBER_TAG_EXT;
+        if (number_bits_is_boxed(self.bits) == 0) { return 0; }
+        return number_box_tag(self.bits) == NUMBER_BOX_TAG_EXT;
     }
 
     public func ext_kind(self: *Number) -> u64 {
@@ -1481,20 +1535,33 @@ impl Number {
             panic("Number.small_value: null Number*");
             return 0;
         }
-        return ((i64)self.bits) >> 1;
+        var payload: u64 = self.bits & NUMBER_PTR_MASK;
+        if ((payload & NUMBER_SMALL_SIGN_BIT) != 0) {
+            payload = payload | NUMBER_SMALL_SIGN_EXT_MASK;
+        }
+        return (i64)payload;
     }
 
     public func big_ptr(self: *Number) -> *NumberBig {
         if (self == 0) { return 0; }
-        if (self.is_small() != 0) { return 0; }
-        if ((self.bits & NUMBER_HEAP_TAG_MASK) != NUMBER_TAG_BIG) { return 0; }
+        if (number_bits_is_boxed(self.bits) == 0) { return 0; }
+        if (number_box_tag(self.bits) != NUMBER_BOX_TAG_BIG) { return 0; }
         return (*NumberBig)(self.bits & NUMBER_PTR_MASK);
     }
 
     public func real_ptr(self: *Number) -> *NumberReal {
         if (self == 0) { return 0; }
-        if (self.is_real() == 0) { return 0; }
+        if (number_bits_is_boxed(self.bits) == 0) { return 0; }
+        if (number_box_tag(self.bits) != NUMBER_BOX_TAG_REAL) { return 0; }
         return (*NumberReal)(self.bits & NUMBER_PTR_MASK);
+    }
+
+    public func real_value(self: *Number) -> f64 {
+        if (self == 0) { return 0.0; }
+        if (number_bits_is_boxed(self.bits) == 0) { return number_bits_to_f64(self.bits); }
+        var real: *NumberReal = self.real_ptr();
+        if (real == 0) { return 0.0; }
+        return real.value;
     }
 
     public func complex_ptr(self: *Number) -> *NumberComplex {
@@ -1520,42 +1587,42 @@ impl Number {
 
     public static func from_i64(v: i64) -> Number {
         if (Number.fits_small_i64(v) != 0) {
-            return Number { (((u64)v) << 1) | NUMBER_TAG_SMALL };
+            return number_box_small_i64(v);
         }
         var big: *NumberBig = NumberBig.from_i64_raw(v);
-        return Number { ((u64)big) & NUMBER_PTR_MASK };
+        return number_box_ptr(NUMBER_BOX_TAG_BIG, (u64)big);
     }
 
     public static func from_i8(v: i8) -> Number {
-        return Number { (((u64)((i64)v)) << 1) | NUMBER_TAG_SMALL };
+        return number_box_small_i64((i64)v);
     }
 
     public static func from_i16(v: i16) -> Number {
-        return Number { (((u64)((i64)v)) << 1) | NUMBER_TAG_SMALL };
+        return number_box_small_i64((i64)v);
     }
 
     public static func from_i32(v: i32) -> Number {
-        return Number { (((u64)((i64)v)) << 1) | NUMBER_TAG_SMALL };
+        return number_box_small_i64((i64)v);
     }
 
     public static func from_u64(v: u64) -> Number {
         if (v <= NUMBER_SMALL_MAX_U64) {
-            return Number { (((u64)((i64)v)) << 1) | NUMBER_TAG_SMALL };
+            return number_box_small_u64(v);
         }
         var big: *NumberBig = NumberBig.from_u64_raw(v);
-        return Number { ((u64)big) & NUMBER_PTR_MASK };
+        return number_box_ptr(NUMBER_BOX_TAG_BIG, (u64)big);
     }
 
     public static func from_u8(v: u8) -> Number {
-        return Number { (((u64)v) << 1) | NUMBER_TAG_SMALL };
+        return number_box_small_u64((u64)v);
     }
 
     public static func from_u16(v: u16) -> Number {
-        return Number { (((u64)v) << 1) | NUMBER_TAG_SMALL };
+        return number_box_small_u64((u64)v);
     }
 
     public static func from_u32(v: u32) -> Number {
-        return Number { (((u64)v) << 1) | NUMBER_TAG_SMALL };
+        return number_box_small_u64((u64)v);
     }
 
     public static func from_f64(v: f64) -> Number {
@@ -1607,10 +1674,10 @@ impl Number {
         var iv: i64 = 0;
         if (big.try_to_i64(&iv) != 0) {
             if (Number.fits_small_i64(iv) != 0) {
-                return Number { (((u64)iv) << 1) | NUMBER_TAG_SMALL };
+                return number_box_small_i64(iv);
             }
         }
-        return Number { ((u64)big) & NUMBER_PTR_MASK };
+        return number_box_ptr(NUMBER_BOX_TAG_BIG, (u64)big);
     }
 
     public func to_abs_big(self: *Number) -> *NumberBig {
@@ -1627,7 +1694,7 @@ impl Number {
             return NumberBig.from_u64_raw(mag);
         }
         if (self.is_real() != 0) {
-            var rv: f64 = self.real_ptr().value;
+            var rv: f64 = self.real_value();
             if (rv < 0.0) { rv = 0.0 - rv; }
             return NumberBig.from_u64_raw((u64)rv);
         }
@@ -1644,20 +1711,24 @@ impl Number {
     public func set_i64(self: *Number, v: i64) -> u64 {
         if (self == 0) { return 0; }
         if (Number.fits_small_i64(v) != 0) {
-            self.bits = (((u64)v) << 1) | NUMBER_TAG_SMALL;
+            var boxed_small: Number = number_box_small_i64(v);
+            self.bits = boxed_small.bits;
             return 0;
         }
-        self.bits = ((u64)NumberBig.from_i64_raw(v)) & NUMBER_PTR_MASK;
+        var boxed_big: Number = number_box_ptr(NUMBER_BOX_TAG_BIG, (u64)NumberBig.from_i64_raw(v));
+        self.bits = boxed_big.bits;
         return 0;
     }
 
     public func set_u64(self: *Number, v: u64) -> u64 {
         if (self == 0) { return 0; }
         if (v <= NUMBER_SMALL_MAX_U64) {
-            self.bits = (((u64)((i64)v)) << 1) | NUMBER_TAG_SMALL;
+            var boxed_small: Number = number_box_small_u64(v);
+            self.bits = boxed_small.bits;
             return 0;
         }
-        self.bits = ((u64)NumberBig.from_u64_raw(v)) & NUMBER_PTR_MASK;
+        var boxed_big: Number = number_box_ptr(NUMBER_BOX_TAG_BIG, (u64)NumberBig.from_u64_raw(v));
+        self.bits = boxed_big.bits;
         return 0;
     }
 
@@ -1717,7 +1788,7 @@ impl Number {
             return 0;
         }
         if (self.is_real() != 0) {
-            var rv: f64 = self.real_ptr().value;
+            var rv: f64 = self.real_value();
             if (rv > 0.0) { return 1; }
             if (rv < 0.0) { return -1; }
             return 0;
@@ -1761,7 +1832,7 @@ impl Number {
             return out_small;
         }
         if (self.is_real() != 0) {
-            return number_make_real(0.0 - self.real_ptr().value);
+            return number_make_real(0.0 - self.real_value());
         }
         if (self.is_complex() != 0) {
             var c: *NumberComplex = self.complex_ptr();
@@ -1824,7 +1895,7 @@ impl Number {
             return out_small_abs;
         }
         if (self.is_real() != 0) {
-            var rv: f64 = self.real_ptr().value;
+            var rv: f64 = self.real_value();
             if (rv < 0.0) { rv = 0.0 - rv; }
             if (sign < 0) { rv = 0.0 - rv; }
             return number_make_real(rv);
@@ -2414,7 +2485,7 @@ impl Number {
         if (self.is_small() != 0) {
             var sv: i64 = self.small_value();
             if (sv >= 0) {
-                return Number { (((u64)sv) << 1) | NUMBER_TAG_SMALL };
+                return number_box_small_i64(sv);
             }
             var mag: u64 = 0;
             Number.i64_abs_mag(sv, &mag);
@@ -2423,7 +2494,7 @@ impl Number {
             return out_small;
         }
         if (self.is_real() != 0) {
-            var rv: f64 = self.real_ptr().value;
+            var rv: f64 = self.real_value();
             if (rv < 0.0) { rv = 0.0 - rv; }
             return number_make_real(rv);
         }
@@ -2802,7 +2873,7 @@ impl Number {
             return 1;
         }
         if (self.is_real() != 0) {
-            var rv: f64 = self.real_ptr().value;
+            var rv: f64 = self.real_value();
             var iv: i64 = (i64)rv;
             if ((f64)iv == rv) {
                 out[0] = iv;
@@ -2836,7 +2907,7 @@ impl Number {
             return 1;
         }
         if (self.is_real() != 0) {
-            var rv: f64 = self.real_ptr().value;
+            var rv: f64 = self.real_value();
             if (rv < 0.0) { return 0; }
             var uv: u64 = (u64)rv;
             if ((f64)uv == rv) {
@@ -2916,7 +2987,7 @@ impl Number {
 
     public func to_str(self: *Number) -> u64 {
         if (self != 0 && self.is_real() != 0) {
-            return to_str_f64(self.real_ptr().value);
+            return to_str_f64(self.real_value());
         }
         if (self != 0 && self.is_complex() != 0) {
             var c: *NumberComplex = self.complex_ptr();
@@ -2991,7 +3062,7 @@ impl Number {
 
     public func to_f64_lossy(self: *Number) -> f64 {
         if (self == 0) { return 0.0; }
-        if (self.is_real() != 0) { return self.real_ptr().value; }
+        if (self.is_real() != 0) { return self.real_value(); }
         if (self.is_complex() != 0) {
             var rp: Number = self.real_part();
             return rp.to_f64_lossy();
@@ -3047,7 +3118,7 @@ impl Number {
         if (self.to_i64_checked(&out) != 0) { return out; }
 
         if (self == 0) { return 0; }
-        if (self.is_real() != 0) { return (i64)self.real_ptr().value; }
+        if (self.is_real() != 0) { return (i64)self.real_value(); }
         if (self.is_complex() != 0) {
             var rp: Number = self.real_part();
             return rp.to_i64_lossy();
