@@ -402,6 +402,11 @@ func emit_call_resolved_expr(name: []u8) -> u64 {
         resolved_ptr = resolved.ptr;
         resolved_len = resolved.len;
     }
+    var canonical_number_call: *NameInfo = emit_number_canonical_lower_call_name(slice(resolved_ptr, resolved_len));
+    if (canonical_number_call != 0) {
+        resolved_ptr = canonical_number_call.ptr;
+        resolved_len = canonical_number_call.len;
+    }
     emit("    call ");
     emit_len(resolved_ptr, resolved_len);
     emit_nl();
@@ -750,6 +755,11 @@ func _cg_emit_direct_call_resolved(name: []u8, stack_words: u64, extra_words: u6
         resolved_ptr = resolved.ptr;
         resolved_len = resolved.len;
     }
+    var canonical_number_call: *NameInfo = emit_number_canonical_lower_call_name(slice(resolved_ptr, resolved_len));
+    if (canonical_number_call != 0) {
+        resolved_ptr = canonical_number_call.ptr;
+        resolved_len = canonical_number_call.len;
+    }
     return _cg_emit_direct_call_name(slice(resolved_ptr, resolved_len), stack_words, extra_words);
 }
 
@@ -829,6 +839,21 @@ func emit_target_push_struct_arg(arg: *AstNode, arg_kind: u64, struct_size: u64,
         emit("]\n");
         emit("    push rax\n");
         return 1;
+    }
+    if (emit_binary_is_addressable(arg) == 0) {
+        if (struct_size <= 8) {
+            emit_expr((u64)arg);
+            emit("    push rax\n");
+            return 1;
+        } else if (struct_size <= 16) {
+            emit_expr((u64)arg);
+            emit("    push rdx\n");
+            emit("    push rax\n");
+            return 2;
+        }
+        emit_stderr("[ERROR] large non-addressable struct argument is unsupported\n");
+        diag_force_stop_pass();
+        return 0;
     }
     if (struct_size <= 8) {
         emit_lvalue(arg);
@@ -1074,12 +1099,23 @@ func emit_try_materialize_operand(operand: u64, op_kind: u64, struct_size: u64, 
             emit("    mov [rbx+8], rdx\n");
         }
     } else {
-        emit_lvalue(operand);
-        emit("    mov rbx, rax\n");
-        emit("    lea r8, [rbp");
-        emit_signed_disp(tmp_offset);
-        emit("]\n");
-        emit_copy_bytes_with_regs(slice("rbx", 3), slice("r8", 2), struct_size);
+        if (emit_binary_is_addressable((*AstNode)operand) == 0) {
+            emit_expr(operand);
+            emit("    lea rbx, [rbp");
+            emit_signed_disp(tmp_offset);
+            emit("]\n");
+            emit("    mov [rbx], rax\n");
+            if (struct_size > 8) {
+                emit("    mov [rbx+8], rdx\n");
+            }
+        } else {
+            emit_lvalue(operand);
+            emit("    mov rbx, rax\n");
+            emit("    lea r8, [rbp");
+            emit_signed_disp(tmp_offset);
+            emit("]\n");
+            emit_copy_bytes_with_regs(slice("rbx", 3), slice("r8", 2), struct_size);
+        }
     }
     return;
 }
@@ -1262,6 +1298,111 @@ func emit_try_expr(node: u64, symtab: *Symtab) -> u64 {
     return;
 }
 
+func emit_number_ctor_name_is(name: []u8, base: []u8) -> u64 {
+    if (name.ptr == 0 || name.len == 0 || base.ptr == 0 || base.len == 0) { return 0; }
+    if (str_eq(slice(name.ptr, name.len), slice(base.ptr, base.len)) != 0) { return 1; }
+    var prefix_ptr: u64 = (u64)"std_number__";
+    var prefix_len: u64 = 12;
+    if (name.len == prefix_len + base.len &&
+        str_eq(slice(name.ptr, prefix_len), slice(prefix_ptr, prefix_len)) != 0 &&
+        str_eq(slice(name.ptr + prefix_len, base.len), slice(base.ptr, base.len)) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+func emit_number_small_ctor_kind(name: []u8) -> u64 {
+    if (emit_number_ctor_name_is(name, slice("Number_from_i8", 14)) != 0) { return TYPE_I8; }
+    if (emit_number_ctor_name_is(name, slice("Number_from_i16", 15)) != 0) { return TYPE_I16; }
+    if (emit_number_ctor_name_is(name, slice("Number_from_i32", 15)) != 0) { return TYPE_I32; }
+    if (emit_number_ctor_name_is(name, slice("Number_from_u8", 14)) != 0) { return TYPE_U8; }
+    if (emit_number_ctor_name_is(name, slice("Number_from_u16", 15)) != 0) { return TYPE_U16; }
+    if (emit_number_ctor_name_is(name, slice("Number_from_u32", 15)) != 0) { return TYPE_U32; }
+    return 0;
+}
+
+func emit_number_ctor_returns_number(name: []u8) -> u64 {
+    if (emit_number_small_ctor_kind(name) != 0) { return 1; }
+    if (emit_number_ctor_name_is(name, slice("Number_from_i64", 15)) != 0) { return 1; }
+    if (emit_number_ctor_name_is(name, slice("Number_from_u64", 15)) != 0) { return 1; }
+    if (emit_number_ctor_name_is(name, slice("Number_from_f64", 15)) != 0) { return 1; }
+    if (emit_number_ctor_name_is(name, slice("Number_from_complex", 19)) != 0) { return 1; }
+    if (emit_number_ctor_name_is(name, slice("Number_from_complex_f64", 23)) != 0) { return 1; }
+    if (emit_number_ctor_name_is(name, slice("Number_from_str", str_len("Number_from_str"))) != 0) { return 1; }
+    return 0;
+}
+
+func emit_number_canonical_lower_call_name(name: []u8) -> *NameInfo {
+    if (name.ptr == 0 || name.len == 0) { return 0; }
+    if (str_eq(name, slice("number_from_i8", str_len("number_from_i8"))) != 0 ||
+        str_eq(name, slice("std_number__number_from_i8", str_len("std_number__number_from_i8"))) != 0) {
+        return new NameInfo{(u64)"std_number__Number_from_i8", str_len("std_number__Number_from_i8")};
+    }
+    if (str_eq(name, slice("number_from_i16", str_len("number_from_i16"))) != 0 ||
+        str_eq(name, slice("std_number__number_from_i16", str_len("std_number__number_from_i16"))) != 0) {
+        return new NameInfo{(u64)"std_number__Number_from_i16", str_len("std_number__Number_from_i16")};
+    }
+    if (str_eq(name, slice("number_from_i32", str_len("number_from_i32"))) != 0 ||
+        str_eq(name, slice("std_number__number_from_i32", str_len("std_number__number_from_i32"))) != 0) {
+        return new NameInfo{(u64)"std_number__Number_from_i32", str_len("std_number__Number_from_i32")};
+    }
+    if (str_eq(name, slice("number_from_i64", str_len("number_from_i64"))) != 0 ||
+        str_eq(name, slice("std_number__number_from_i64", str_len("std_number__number_from_i64"))) != 0) {
+        return new NameInfo{(u64)"std_number__Number_from_i64", str_len("std_number__Number_from_i64")};
+    }
+    if (str_eq(name, slice("number_from_u8", str_len("number_from_u8"))) != 0 ||
+        str_eq(name, slice("std_number__number_from_u8", str_len("std_number__number_from_u8"))) != 0) {
+        return new NameInfo{(u64)"std_number__Number_from_u8", str_len("std_number__Number_from_u8")};
+    }
+    if (str_eq(name, slice("number_from_u16", str_len("number_from_u16"))) != 0 ||
+        str_eq(name, slice("std_number__number_from_u16", str_len("std_number__number_from_u16"))) != 0) {
+        return new NameInfo{(u64)"std_number__Number_from_u16", str_len("std_number__Number_from_u16")};
+    }
+    if (str_eq(name, slice("number_from_u32", str_len("number_from_u32"))) != 0 ||
+        str_eq(name, slice("std_number__number_from_u32", str_len("std_number__number_from_u32"))) != 0) {
+        return new NameInfo{(u64)"std_number__Number_from_u32", str_len("std_number__Number_from_u32")};
+    }
+    if (str_eq(name, slice("number_from_u64", str_len("number_from_u64"))) != 0 ||
+        str_eq(name, slice("std_number__number_from_u64", str_len("std_number__number_from_u64"))) != 0) {
+        return new NameInfo{(u64)"std_number__Number_from_u64", str_len("std_number__Number_from_u64")};
+    }
+    if (str_eq(name, slice("number_from_f64", str_len("number_from_f64"))) != 0 ||
+        str_eq(name, slice("std_number__number_from_f64", str_len("std_number__number_from_f64"))) != 0) {
+        return new NameInfo{(u64)"std_number__Number_from_f64", str_len("std_number__Number_from_f64")};
+    }
+    if (str_eq(name, slice("number_cmp_ptr", str_len("number_cmp_ptr"))) != 0 ||
+        str_eq(name, slice("std_number__number_cmp_ptr", str_len("std_number__number_cmp_ptr"))) != 0) {
+        return new NameInfo{(u64)"std_number__Number_cmp_ptr", str_len("std_number__Number_cmp_ptr")};
+    }
+    return 0;
+}
+
+func emit_number_small_ctor_normalize(kind: u64) -> u64 {
+    if (kind == TYPE_I8) { emit("    movsx rax, al\n"); return 1; }
+    if (kind == TYPE_I16) { emit("    movsx rax, ax\n"); return 1; }
+    if (kind == TYPE_I32) { emit("    movsxd rax, eax\n"); return 1; }
+    if (kind == TYPE_U8 || kind == TYPE_BOOL) { emit("    movzx eax, al\n"); return 1; }
+    if (kind == TYPE_U16) { emit("    movzx eax, ax\n"); return 1; }
+    if (kind == TYPE_U32) { emit("    mov eax, eax\n"); return 1; }
+    return 0;
+}
+
+func emit_number_try_inline_small_ctor(call: *AstCall, resolved_name: []u8) -> u64 {
+    if (call == 0) { return 0; }
+    var kind: u64 = emit_number_small_ctor_kind(call.name);
+    if (kind == 0) {
+        kind = emit_number_small_ctor_kind(resolved_name);
+    }
+    if (kind == 0) { return 0; }
+    var args: *Vec<*AstNode> = call.args_vec;
+    if (args == 0 || args.len() != 1) { return 0; }
+    emit_expr(args.get(0));
+    if (emit_number_small_ctor_normalize(kind) == 0) { return 0; }
+    emit("    shl rax, 1\n");
+    emit("    or rax, 1\n");
+    return 1;
+}
+
 func emit_expr_call(node: u64, symtab: *Symtab) -> u64 {
     var call: *AstCall = (*AstCall)node;
     var name: []u8 = call.name;
@@ -1293,6 +1434,10 @@ func emit_expr_call(node: u64, symtab: *Symtab) -> u64 {
             diag_force_stop_pass();
         return 0;
         }
+    }
+
+    if (emit_number_try_inline_small_ctor(call, slice(resolved_ptr, resolved_len)) != 0) {
+        return 1;
     }
 
     var var_type: *TypeInfo = symtab_get_type(symtab, name);
@@ -1625,8 +1770,64 @@ func emit_expr_stack_ctor(node: u64, symtab: *Symtab) -> u64 {
         return 0;
 }
 
+func emit_expr_emit_number_storage_raw(kind: u64, offset: u64) -> u64 {
+    if (kind == TYPE_U8 || kind == TYPE_BOOL) {
+        emit("    movzx rax, byte [rbp");
+        emit_signed_disp(offset);
+        emit("]\n");
+        return 1;
+    }
+    if (kind == TYPE_U16) {
+        emit("    movzx rax, word [rbp");
+        emit_signed_disp(offset);
+        emit("]\n");
+        return 1;
+    }
+    if (kind == TYPE_U32) {
+        emit("    mov eax, [rbp");
+        emit_signed_disp(offset);
+        emit("]\n");
+        return 1;
+    }
+    if (kind == TYPE_I8) {
+        emit("    movsx rax, byte [rbp");
+        emit_signed_disp(offset);
+        emit("]\n");
+        return 1;
+    }
+    if (kind == TYPE_I16) {
+        emit("    movsx rax, word [rbp");
+        emit_signed_disp(offset);
+        emit("]\n");
+        return 1;
+    }
+    if (kind == TYPE_I32) {
+        emit("    movsxd rax, dword [rbp");
+        emit_signed_disp(offset);
+        emit("]\n");
+        return 1;
+    }
+    if (kind == TYPE_I64 || kind == TYPE_U64 || kind == TYPE_F64) {
+        emit("    mov rax, [rbp");
+        emit_signed_disp(offset);
+        emit("]\n");
+        return 1;
+    }
+    return 0;
+}
+
+func emit_expr_emit_number_storage_local(var_type: *TypeInfo, offset: u64) -> u64 {
+    if (typeinfo_number_storage_is_specialized(var_type) == 0) { return 0; }
+    var raw_kind: u64 = var_type.number_storage_kind;
+    if (emit_expr_emit_number_storage_raw(raw_kind, offset) == 0) { return 0; }
+    var raw_ti: *TypeInfo = typeinfo_new(raw_kind, 0);
+    emit_binary_emit_number_from_rax(raw_ti, 0, symtab_current());
+    return 1;
+}
+
 func emit_expr_emit_local_typed(var_type: *TypeInfo, offset: u64) -> u64 {
     if (var_type == 0) { return 0; }
+    if (emit_expr_emit_number_storage_local(var_type, offset) != 0) { return 1; }
     if (var_type.ptr_depth != 0) { return 0; }
     if (var_type.type_kind == TYPE_ARRAY) {
         emit("    lea rax, [rbp");
@@ -3716,7 +3917,13 @@ func emit_binary_is_number_type(ti: *TypeInfo) -> u64 {
 func emit_binary_is_addressable(node: *AstNode) -> u64 {
     if (node == 0) { return 0; }
     var kind: u64 = ast_kind(node);
-    if (kind == AST_IDENT || kind == AST_DEREF || kind == AST_DEREF8 || kind == AST_INDEX || kind == AST_MEMBER_ACCESS) {
+    if (kind == AST_IDENT) {
+        var idn: *AstIdent = (*AstIdent)node;
+        var ti: *TypeInfo = symtab_get_type(symtab_current(), idn.name);
+        if (typeinfo_number_storage_is_specialized(ti) != 0) { return 0; }
+        return 1;
+    }
+    if (kind == AST_DEREF || kind == AST_DEREF8 || kind == AST_INDEX || kind == AST_MEMBER_ACCESS) {
         return 1;
     }
     return 0;
@@ -3772,6 +3979,10 @@ func emit_binary_expr_is_number(node: *AstNode, ti: *TypeInfo, symtab: *Symtab) 
         if (emit_binary_expr_is_number(mc.receiver, 0, symtab) != 0) { return 1; }
     }
     if (emit_binary_is_number_type(ti) != 0) { return 1; }
+    if (kind == AST_CALL || kind == AST_BINARY || kind == AST_UNARY || kind == AST_CAST) {
+        var inferred_ti: *TypeInfo = get_expr_type_with_symtab(node, symtab);
+        if (emit_binary_is_number_type(inferred_ti) != 0) { return 1; }
+    }
     if (kind == AST_CAST) {
         var c: *AstCast = (*AstCast)node;
         return emit_binary_expr_is_number((*AstNode)c.expr, 0, symtab);
@@ -3820,9 +4031,7 @@ func emit_binary_expr_is_number(node: *AstNode, ti: *TypeInfo, symtab: *Symtab) 
             rp = resolved.ptr;
             rl = resolved.len;
         }
-        if (str_eq(slice(rp, rl), slice("std_number__Number_from_i64", str_len("std_number__Number_from_i64"))) != 0 || str_eq(slice(rp, rl), slice("Number_from_i64", str_len("Number_from_i64"))) != 0) { return 1; }
-        if (str_eq(slice(rp, rl), slice("std_number__Number_from_u64", str_len("std_number__Number_from_u64"))) != 0 || str_eq(slice(rp, rl), slice("Number_from_u64", str_len("Number_from_u64"))) != 0) { return 1; }
-        if (str_eq(slice(rp, rl), slice("std_number__Number_from_str", str_len("std_number__Number_from_str"))) != 0 || str_eq(slice(rp, rl), slice("Number_from_str", str_len("Number_from_str"))) != 0) { return 1; }
+        if (emit_number_ctor_returns_number(slice(rp, rl)) != 0) { return 1; }
     }
     return 0;
 }
@@ -3853,12 +4062,6 @@ func emit_binary_emit_int_rax_normalize(ti: *TypeInfo) -> u64 {
 
 func emit_binary_emit_number_from_rax(ti: *TypeInfo, node: *AstNode, symtab: *Symtab) -> u64 {
     if (emit_binary_expr_is_number(node, ti, symtab) != 0) { return 1; }
-    if (node != 0 && ast_kind(node) == AST_IDENT) { return 1; }
-    if (node != 0 && ti != 0 && ti.ptr_depth == 0 && emit_binary_is_integer_expr(node) == 0 &&
-        (ti.type_kind == TYPE_I8 || ti.type_kind == TYPE_I16 || ti.type_kind == TYPE_I32 || ti.type_kind == TYPE_I64 ||
-         ti.type_kind == TYPE_U8 || ti.type_kind == TYPE_U16 || ti.type_kind == TYPE_U32 || ti.type_kind == TYPE_U64 || ti.type_kind == TYPE_BOOL)) {
-        return 1;
-    }
     if (ti == 0) {
         _cg_emit_mov_user_arg_from_reg(0, 0, slice("rax", 3));
         _cg_emit_direct_call_name(slice("std_number__Number_from_i64", str_len("std_number__Number_from_i64")), 0, 0);
@@ -3869,14 +4072,29 @@ func emit_binary_emit_number_from_rax(ti: *TypeInfo, node: *AstNode, symtab: *Sy
         _cg_emit_direct_call_name(slice("std_number__Number_from_u64", str_len("std_number__Number_from_u64")), 0, 0);
         return 1;
     }
+    if (ti.type_kind == TYPE_F64) {
+        _cg_emit_mov_user_arg_from_reg(0, 0, slice("rax", 3));
+        _cg_emit_direct_call_name(slice("std_number__Number_from_f64", str_len("std_number__Number_from_f64")), 0, 0);
+        return 1;
+    }
     if (emit_binary_is_signed_integer_type(ti) != 0) {
         emit_binary_emit_int_rax_normalize(ti);
+        if (ti.type_kind != TYPE_I64) {
+            emit("    shl rax, 1\n");
+            emit("    or rax, 1\n");
+            return 1;
+        }
         _cg_emit_mov_user_arg_from_reg(0, 0, slice("rax", 3));
         _cg_emit_direct_call_name(slice("std_number__Number_from_i64", str_len("std_number__Number_from_i64")), 0, 0);
         return 1;
     }
     if (emit_binary_is_unsigned_integer_type(ti) != 0) {
         emit_binary_emit_int_rax_normalize(ti);
+        if (ti.type_kind != TYPE_U64) {
+            emit("    shl rax, 1\n");
+            emit("    or rax, 1\n");
+            return 1;
+        }
         _cg_emit_mov_user_arg_from_reg(0, 0, slice("rax", 3));
         _cg_emit_direct_call_name(slice("std_number__Number_from_u64", str_len("std_number__Number_from_u64")), 0, 0);
         return 1;

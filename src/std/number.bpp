@@ -1,5 +1,5 @@
-// Builtin arbitrary-precision signed integer (Number).
-// Tagged storage: small signed 63-bit immediate or pointer to NumberBig.
+// Builtin dynamic numeric value (Number).
+// Tagged storage: small signed 63-bit immediate or pointer to a heap payload.
 // Lifetime is arena-style monotonic allocation.
 
 import std.io;
@@ -16,7 +16,11 @@ const NUMBER_MIN_I64_MAG = 9223372036854775808;
 
 const NUMBER_TAG_SMALL = 1;
 const NUMBER_TAG_MASK = 1;
-const NUMBER_PTR_MASK = 18446744073709551614;
+const NUMBER_HEAP_TAG_MASK = 7;
+const NUMBER_TAG_BIG = 0;
+const NUMBER_TAG_REAL = 2;
+const NUMBER_TAG_COMPLEX = 4;
+const NUMBER_PTR_MASK = 18446744073709551608;
 
 const NUMBER_SMALL_MAX_U64 = 4611686018427387903;
 const NUMBER_SMALL_MIN_I64 = -4611686018427387904;
@@ -48,6 +52,15 @@ struct NumberBig {
     public digits: *Vec<u32>;
 }
 
+struct NumberReal {
+    public value: f64;
+}
+
+struct NumberComplex {
+    public real: Number;
+    public imag: Number;
+}
+
 struct NumberBigDivMod {
     public q: *NumberBig;
     public r: *NumberBig;
@@ -56,6 +69,19 @@ struct NumberBigDivMod {
 struct NumberDivMod {
     public q: Number;
     public r: Number;
+}
+
+func number_make_real(v: f64) -> Number {
+    var real: *NumberReal = new NumberReal{v};
+    return Number { (((u64)real) & NUMBER_PTR_MASK) | NUMBER_TAG_REAL };
+}
+
+func number_make_complex(real: Number, imag: Number) -> Number {
+    if (imag.signum() == 0) {
+        return Number { real.bits };
+    }
+    var c: *NumberComplex = new NumberComplex{real, imag};
+    return Number { (((u64)c) & NUMBER_PTR_MASK) | NUMBER_TAG_COMPLEX };
 }
 
 impl NumberBig {
@@ -1258,12 +1284,28 @@ impl Number {
         return 1;
     }
 
+    public static func zero() -> Number {
+        return Number { NUMBER_TAG_SMALL };
+    }
+
     public func is_small(self: *Number) -> u64 {
         if (self == 0) {
             panic("Number.is_small: null Number*");
             return 0;
         }
         return (self.bits & NUMBER_TAG_MASK) != 0;
+    }
+
+    public func is_real(self: *Number) -> u64 {
+        if (self == 0) { return 0; }
+        if (self.is_small() != 0) { return 0; }
+        return (self.bits & NUMBER_HEAP_TAG_MASK) == NUMBER_TAG_REAL;
+    }
+
+    public func is_complex(self: *Number) -> u64 {
+        if (self == 0) { return 0; }
+        if (self.is_small() != 0) { return 0; }
+        return (self.bits & NUMBER_HEAP_TAG_MASK) == NUMBER_TAG_COMPLEX;
     }
 
     public func small_value(self: *Number) -> i64 {
@@ -1277,7 +1319,20 @@ impl Number {
     public func big_ptr(self: *Number) -> *NumberBig {
         if (self == 0) { return 0; }
         if (self.is_small() != 0) { return 0; }
+        if ((self.bits & NUMBER_HEAP_TAG_MASK) != NUMBER_TAG_BIG) { return 0; }
         return (*NumberBig)(self.bits & NUMBER_PTR_MASK);
+    }
+
+    public func real_ptr(self: *Number) -> *NumberReal {
+        if (self == 0) { return 0; }
+        if (self.is_real() == 0) { return 0; }
+        return (*NumberReal)(self.bits & NUMBER_PTR_MASK);
+    }
+
+    public func complex_ptr(self: *Number) -> *NumberComplex {
+        if (self == 0) { return 0; }
+        if (self.is_complex() == 0) { return 0; }
+        return (*NumberComplex)(self.bits & NUMBER_PTR_MASK);
     }
 
     public static func from_i64(v: i64) -> Number {
@@ -1288,12 +1343,50 @@ impl Number {
         return Number { ((u64)big) & NUMBER_PTR_MASK };
     }
 
+    public static func from_i8(v: i8) -> Number {
+        return Number { (((u64)((i64)v)) << 1) | NUMBER_TAG_SMALL };
+    }
+
+    public static func from_i16(v: i16) -> Number {
+        return Number { (((u64)((i64)v)) << 1) | NUMBER_TAG_SMALL };
+    }
+
+    public static func from_i32(v: i32) -> Number {
+        return Number { (((u64)((i64)v)) << 1) | NUMBER_TAG_SMALL };
+    }
+
     public static func from_u64(v: u64) -> Number {
         if (v <= NUMBER_SMALL_MAX_U64) {
             return Number { (((u64)((i64)v)) << 1) | NUMBER_TAG_SMALL };
         }
         var big: *NumberBig = NumberBig.from_u64_raw(v);
         return Number { ((u64)big) & NUMBER_PTR_MASK };
+    }
+
+    public static func from_u8(v: u8) -> Number {
+        return Number { (((u64)v) << 1) | NUMBER_TAG_SMALL };
+    }
+
+    public static func from_u16(v: u16) -> Number {
+        return Number { (((u64)v) << 1) | NUMBER_TAG_SMALL };
+    }
+
+    public static func from_u32(v: u32) -> Number {
+        return Number { (((u64)v) << 1) | NUMBER_TAG_SMALL };
+    }
+
+    public static func from_f64(v: f64) -> Number {
+        return number_make_real(v);
+    }
+
+    public static func from_complex(real: Number, imag: Number) -> Number {
+        return number_make_complex(real, imag);
+    }
+
+    public static func from_complex_f64(real: f64, imag: f64) -> Number {
+        var r: Number = number_make_real(real);
+        var i: Number = number_make_real(imag);
+        return number_make_complex(r, i);
     }
 
     public static func from_str(src: []u8) -> Number {
@@ -1337,6 +1430,14 @@ impl Number {
             var mag: u64 = 0;
             Number.i64_abs_mag(sv, &mag);
             return NumberBig.from_u64_raw(mag);
+        }
+        if (self.is_real() != 0) {
+            var rv: f64 = self.real_ptr().value;
+            if (rv < 0.0) { rv = 0.0 - rv; }
+            return NumberBig.from_u64_raw((u64)rv);
+        }
+        if (self.is_complex() != 0) {
+            return NumberBig.zero();
         }
         return self.big_ptr().abs_copy();
     }
@@ -1416,6 +1517,18 @@ impl Number {
             if (sv < 0) { return -1; }
             return 0;
         }
+        if (self.is_real() != 0) {
+            var rv: f64 = self.real_ptr().value;
+            if (rv > 0.0) { return 1; }
+            if (rv < 0.0) { return -1; }
+            return 0;
+        }
+        if (self.is_complex() != 0) {
+            var c: *NumberComplex = self.complex_ptr();
+            if (c == 0) { return 0; }
+            if (c.real.signum() != 0 || c.imag.signum() != 0) { return 1; }
+            return 0;
+        }
         var b: *NumberBig = self.big_ptr();
         if (b == 0) { return 0; }
         if (b.sign > 0) { return 1; }
@@ -1432,6 +1545,16 @@ impl Number {
             var out_small: Number = Number { NUMBER_TAG_SMALL };
             out_small.set_i64(0 - self.small_value());
             return out_small;
+        }
+        if (self.is_real() != 0) {
+            return number_make_real(0.0 - self.real_ptr().value);
+        }
+        if (self.is_complex() != 0) {
+            var c: *NumberComplex = self.complex_ptr();
+            if (c == 0) { return Number { NUMBER_TAG_SMALL }; }
+            var nr: Number = c.real.negated();
+            var ni: Number = c.imag.negated();
+            return number_make_complex(nr, ni);
         }
         var src: *NumberBig = self.big_ptr();
         if (src == 0 || src.sign == 0) { return Number { NUMBER_TAG_SMALL }; }
@@ -1486,6 +1609,15 @@ impl Number {
             panic("number_abs_cmp: null rhs");
             return 0;
         }
+        if (self.is_real() != 0 || rhs.is_real() != 0 || self.is_complex() != 0 || rhs.is_complex() != 0) {
+            var avf: f64 = self.to_f64_lossy();
+            var bvf: f64 = rhs.to_f64_lossy();
+            if (avf < 0.0) { avf = 0.0 - avf; }
+            if (bvf < 0.0) { bvf = 0.0 - bvf; }
+            if (avf < bvf) { return -1; }
+            if (avf > bvf) { return 1; }
+            return 0;
+        }
         var a_small: u64 = self.is_small();
         var b_small: u64 = rhs.is_small();
         if (a_small != 0 && b_small != 0) {
@@ -1518,6 +1650,26 @@ impl Number {
         return self.big_ptr().abs_cmp(rhs.big_ptr());
     }
 
+    public func real_part(self: *Number) -> Number {
+        if (self == 0) { return Number { NUMBER_TAG_SMALL }; }
+        if (self.is_complex() != 0) {
+            var c: *NumberComplex = self.complex_ptr();
+            if (c == 0) { return Number { NUMBER_TAG_SMALL }; }
+            return Number { c.real.bits };
+        }
+        return Number { self.bits };
+    }
+
+    public func imag_part(self: *Number) -> Number {
+        if (self == 0) { return Number { NUMBER_TAG_SMALL }; }
+        if (self.is_complex() != 0) {
+            var c: *NumberComplex = self.complex_ptr();
+            if (c == 0) { return Number { NUMBER_TAG_SMALL }; }
+            return Number { c.imag.bits };
+        }
+        return Number { NUMBER_TAG_SMALL };
+    }
+
     public func cmp_ptr(self: *Number, rhs: *Number) -> i64 {
         if (self == 0) {
             panic("number_cmp_ptr: null lhs");
@@ -1525,6 +1677,24 @@ impl Number {
         }
         if (rhs == 0) {
             panic("number_cmp_ptr: null rhs");
+            return 0;
+        }
+
+        if (self.is_complex() != 0 || rhs.is_complex() != 0) {
+            var ar: Number = self.real_part();
+            var ai: Number = self.imag_part();
+            var br: Number = rhs.real_part();
+            var bi: Number = rhs.imag_part();
+            var rc: i64 = ar.cmp_ptr(&br);
+            if (rc != 0) { return rc; }
+            return ai.cmp_ptr(&bi);
+        }
+
+        if (self.is_real() != 0 || rhs.is_real() != 0) {
+            var avf: f64 = self.to_f64_lossy();
+            var bvf: f64 = rhs.to_f64_lossy();
+            if (avf < bvf) { return -1; }
+            if (avf > bvf) { return 1; }
             return 0;
         }
 
@@ -1559,6 +1729,19 @@ impl Number {
     }
 
     public func add_values(self: *Number, rhs: *Number) -> Number {
+        if (self.is_complex() != 0 || rhs.is_complex() != 0) {
+            var ar: Number = self.real_part();
+            var ai: Number = self.imag_part();
+            var br: Number = rhs.real_part();
+            var bi: Number = rhs.imag_part();
+            var rr: Number = ar.add_values(&br);
+            var ii: Number = ai.add_values(&bi);
+            return number_make_complex(rr, ii);
+        }
+        if (self.is_real() != 0 || rhs.is_real() != 0) {
+            return number_make_real(self.to_f64_lossy() + rhs.to_f64_lossy());
+        }
+
         var a_sign: i64 = self.signum();
         var bs: i64 = rhs.signum();
         if (a_sign == 0) { return Number { rhs.bits }; }
@@ -1609,6 +1792,23 @@ impl Number {
     }
 
     public func mul_values(self: *Number, rhs: *Number) -> Number {
+        if (self.is_complex() != 0 || rhs.is_complex() != 0) {
+            var ar: Number = self.real_part();
+            var ai: Number = self.imag_part();
+            var br: Number = rhs.real_part();
+            var bi: Number = rhs.imag_part();
+            var ac: Number = ar.mul_values(&br);
+            var bd: Number = ai.mul_values(&bi);
+            var ad: Number = ar.mul_values(&bi);
+            var bc: Number = ai.mul_values(&br);
+            var rr: Number = ac.sub_values(&bd);
+            var ii: Number = ad.add_values(&bc);
+            return number_make_complex(rr, ii);
+        }
+        if (self.is_real() != 0 || rhs.is_real() != 0) {
+            return number_make_real(self.to_f64_lossy() * rhs.to_f64_lossy());
+        }
+
         var a_sign: i64 = self.signum();
         var bs: i64 = rhs.signum();
         if (a_sign == 0 || bs == 0) { return Number { NUMBER_TAG_SMALL }; }
@@ -1715,6 +1915,32 @@ impl Number {
             panic("number_div_values: null rhs");
             return Number { NUMBER_TAG_SMALL };
         }
+        if (self.is_complex() != 0 || rhs.is_complex() != 0) {
+            var ar_num: Number = self.real_part();
+            var ai_num: Number = self.imag_part();
+            var br_num: Number = rhs.real_part();
+            var bi_num: Number = rhs.imag_part();
+            var ar: f64 = ar_num.to_f64_lossy();
+            var ai: f64 = ai_num.to_f64_lossy();
+            var br: f64 = br_num.to_f64_lossy();
+            var bi: f64 = bi_num.to_f64_lossy();
+            var denom: f64 = (br * br) + (bi * bi);
+            if (denom == 0.0) {
+                panic("Number complex divide by zero");
+                return Number { NUMBER_TAG_SMALL };
+            }
+            var rr: Number = number_make_real(((ar * br) + (ai * bi)) / denom);
+            var ii: Number = number_make_real(((ai * br) - (ar * bi)) / denom);
+            return number_make_complex(rr, ii);
+        }
+        if (self.is_real() != 0 || rhs.is_real() != 0) {
+            var rv: f64 = rhs.to_f64_lossy();
+            if (rv == 0.0) {
+                panic("Number divide by zero");
+                return Number { NUMBER_TAG_SMALL };
+            }
+            return number_make_real(self.to_f64_lossy() / rv);
+        }
         if (rhs.signum() == 0) {
             panic("Number divide by zero");
             return Number { NUMBER_TAG_SMALL };
@@ -1730,6 +1956,10 @@ impl Number {
         }
         if (rhs == 0) {
             panic("number_mod_values: null rhs");
+            return Number { NUMBER_TAG_SMALL };
+        }
+        if (self.is_real() != 0 || rhs.is_real() != 0 || self.is_complex() != 0 || rhs.is_complex() != 0) {
+            panic("Number modulo requires integer operands");
             return Number { NUMBER_TAG_SMALL };
         }
         if (rhs.signum() == 0) {
@@ -1779,6 +2009,15 @@ impl Number {
             var out_small: Number = Number { NUMBER_TAG_SMALL };
             out_small.set_u64(mag);
             return out_small;
+        }
+        if (self.is_real() != 0) {
+            var rv: f64 = self.real_ptr().value;
+            if (rv < 0.0) { rv = 0.0 - rv; }
+            return number_make_real(rv);
+        }
+        if (self.is_complex() != 0) {
+            var rp: Number = self.real_part();
+            return rp.abs_clone();
         }
         var out_big: *NumberBig = self.big_ptr().abs_copy();
         var out: Number = Number.from_big_normalized(out_big);
@@ -1941,6 +2180,10 @@ impl Number {
         rhs: *Number,
         mode: u64
     ) -> Number {
+        if (self.is_real() != 0 || rhs.is_real() != 0 || self.is_complex() != 0 || rhs.is_complex() != 0) {
+            panic("Number bitwise operation requires integer operands");
+            return Number { NUMBER_TAG_SMALL };
+        }
         var self_sign0: i64 = self.signum();
         var rhs_sign0: i64 = rhs.signum();
         if (self_sign0 >= 0 && rhs_sign0 >= 0) {
@@ -2006,6 +2249,10 @@ impl Number {
             panic("number_shift_amount_from_number: null rhs");
             return 0;
         }
+        if (self.is_real() != 0 || self.is_complex() != 0) {
+            panic("Number shift amount requires integer operand");
+            return 0;
+        }
         if (self.signum() <= 0) { return 0; }
         if (self.is_small() != 0) {
             var mag: u64 = 0;
@@ -2043,16 +2290,20 @@ impl Number {
     public func operator +(self: *Number, rhs: Number) -> Number { var out: Number = self.add_values(&rhs); return out; }
     public func operator +(self: *Number, rhs: i64) -> Number { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_i64(rhs); var out: Number = self.add_values(&rv); return out; }
     public func operator +(self: *Number, rhs: u64) -> Number { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_u64(rhs); var out: Number = self.add_values(&rv); return out; }
+    public func operator +(self: *Number, rhs: f64) -> Number { var rv: Number = number_make_real(rhs); var out: Number = self.add_values(&rv); return out; }
     public func operator -(self: *Number, rhs: Number) -> Number { var out: Number = self.sub_values(&rhs); return out; }
     public func operator -(self: *Number, rhs: i64) -> Number { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_i64(rhs); var out: Number = self.sub_values(&rv); return out; }
     public func operator -(self: *Number, rhs: u64) -> Number { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_u64(rhs); var out: Number = self.sub_values(&rv); return out; }
+    public func operator -(self: *Number, rhs: f64) -> Number { var rv: Number = number_make_real(rhs); var out: Number = self.sub_values(&rv); return out; }
     public func operator -(self: *Number) -> Number { var out: Number = self.negated(); return out; }
     public func operator *(self: *Number, rhs: Number) -> Number { var out: Number = self.mul_values(&rhs); return out; }
     public func operator *(self: *Number, rhs: i64) -> Number { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_i64(rhs); var out: Number = self.mul_values(&rv); return out; }
     public func operator *(self: *Number, rhs: u64) -> Number { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_u64(rhs); var out: Number = self.mul_values(&rv); return out; }
+    public func operator *(self: *Number, rhs: f64) -> Number { var rv: Number = number_make_real(rhs); var out: Number = self.mul_values(&rv); return out; }
     public func operator /(self: *Number, rhs: Number) -> Number { var out: Number = self.div_values(&rhs); return out; }
     public func operator /(self: *Number, rhs: i64) -> Number { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_i64(rhs); var out: Number = self.div_values(&rv); return out; }
     public func operator /(self: *Number, rhs: u64) -> Number { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_u64(rhs); var out: Number = self.div_values(&rv); return out; }
+    public func operator /(self: *Number, rhs: f64) -> Number { var rv: Number = number_make_real(rhs); var out: Number = self.div_values(&rv); return out; }
     public func operator %(self: *Number, rhs: Number) -> Number { var out: Number = self.mod_values(&rhs); return out; }
     public func operator %(self: *Number, rhs: i64) -> Number { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_i64(rhs); var out: Number = self.mod_values(&rv); return out; }
     public func operator %(self: *Number, rhs: u64) -> Number { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_u64(rhs); var out: Number = self.mod_values(&rv); return out; }
@@ -2074,21 +2325,27 @@ impl Number {
     public func operator ~(self: *Number) -> Number { var out: Number = self.bitnot_values(); return out; }
 
     public func __op_eq(self: *Number, rhs: Number) -> u64 { return self.cmp_ptr(&rhs) == 0; }
+    public func __op_eq(self: *Number, rhs: f64) -> u64 { var rv: Number = number_make_real(rhs); return self.cmp_ptr(&rv) == 0; }
     public func __op_ne(self: *Number, rhs: Number) -> u64 { return self.cmp_ptr(&rhs) != 0; }
     public func __op_ne(self: *Number, rhs: i64) -> u64 { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_i64(rhs); return self.cmp_ptr(&rv) != 0; }
     public func __op_ne(self: *Number, rhs: u64) -> u64 { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_u64(rhs); return self.cmp_ptr(&rv) != 0; }
+    public func __op_ne(self: *Number, rhs: f64) -> u64 { var rv: Number = number_make_real(rhs); return self.cmp_ptr(&rv) != 0; }
     public func __op_lt(self: *Number, rhs: Number) -> u64 { return self.cmp_ptr(&rhs) < 0; }
     public func __op_lt(self: *Number, rhs: i64) -> u64 { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_i64(rhs); return self.cmp_ptr(&rv) < 0; }
     public func __op_lt(self: *Number, rhs: u64) -> u64 { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_u64(rhs); return self.cmp_ptr(&rv) < 0; }
+    public func __op_lt(self: *Number, rhs: f64) -> u64 { var rv: Number = number_make_real(rhs); return self.cmp_ptr(&rv) < 0; }
     public func __op_le(self: *Number, rhs: Number) -> u64 { return self.cmp_ptr(&rhs) <= 0; }
     public func __op_le(self: *Number, rhs: i64) -> u64 { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_i64(rhs); return self.cmp_ptr(&rv) <= 0; }
     public func __op_le(self: *Number, rhs: u64) -> u64 { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_u64(rhs); return self.cmp_ptr(&rv) <= 0; }
+    public func __op_le(self: *Number, rhs: f64) -> u64 { var rv: Number = number_make_real(rhs); return self.cmp_ptr(&rv) <= 0; }
     public func __op_gt(self: *Number, rhs: Number) -> u64 { return self.cmp_ptr(&rhs) > 0; }
     public func __op_gt(self: *Number, rhs: i64) -> u64 { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_i64(rhs); return self.cmp_ptr(&rv) > 0; }
     public func __op_gt(self: *Number, rhs: u64) -> u64 { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_u64(rhs); return self.cmp_ptr(&rv) > 0; }
+    public func __op_gt(self: *Number, rhs: f64) -> u64 { var rv: Number = number_make_real(rhs); return self.cmp_ptr(&rv) > 0; }
     public func __op_ge(self: *Number, rhs: Number) -> u64 { return self.cmp_ptr(&rhs) >= 0; }
     public func __op_ge(self: *Number, rhs: i64) -> u64 { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_i64(rhs); return self.cmp_ptr(&rv) >= 0; }
     public func __op_ge(self: *Number, rhs: u64) -> u64 { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_u64(rhs); return self.cmp_ptr(&rv) >= 0; }
+    public func __op_ge(self: *Number, rhs: f64) -> u64 { var rv: Number = number_make_real(rhs); return self.cmp_ptr(&rv) >= 0; }
 
     public func cmp(self: *Number, rhs: Number) -> i64 { return self.cmp_ptr(&rhs); }
 
@@ -2100,6 +2357,18 @@ impl Number {
         if (self.is_small() != 0) {
             out[0] = self.small_value();
             return 1;
+        }
+        if (self.is_real() != 0) {
+            var rv: f64 = self.real_ptr().value;
+            var iv: i64 = (i64)rv;
+            if ((f64)iv == rv) {
+                out[0] = iv;
+                return 1;
+            }
+            return 0;
+        }
+        if (self.is_complex() != 0) {
+            return 0;
         }
 
         return self.big_ptr().try_to_i64(out);
@@ -2115,6 +2384,19 @@ impl Number {
             if (sv < 0) { return 0; }
             out[0] = (u64)sv;
             return 1;
+        }
+        if (self.is_real() != 0) {
+            var rv: f64 = self.real_ptr().value;
+            if (rv < 0.0) { return 0; }
+            var uv: u64 = (u64)rv;
+            if ((f64)uv == rv) {
+                out[0] = uv;
+                return 1;
+            }
+            return 0;
+        }
+        if (self.is_complex() != 0) {
+            return 0;
         }
 
         var b: *NumberBig = self.big_ptr();
@@ -2176,6 +2458,18 @@ impl Number {
     }
 
     public func to_str(self: *Number) -> u64 {
+        if (self != 0 && self.is_real() != 0) {
+            return to_str_f64(self.real_ptr().value);
+        }
+        if (self != 0 && self.is_complex() != 0) {
+            var c: *NumberComplex = self.complex_ptr();
+            if (c == 0) { return "0"; }
+            var rs: u64 = c.real.to_str();
+            var is: u64 = c.imag.to_str();
+            var joined: u64 = str_concat3(rs, str_len(rs), "+", 1, is, str_len(is));
+            return str_concat(joined, str_len(joined), "i", 1);
+        }
+
         var sign: i64 = 0;
         if (self != 0) {
             sign = self.signum();
@@ -2217,11 +2511,39 @@ impl Number {
         return out;
     }
 
+    public func to_f64_lossy(self: *Number) -> f64 {
+        if (self == 0) { return 0.0; }
+        if (self.is_real() != 0) { return self.real_ptr().value; }
+        if (self.is_complex() != 0) {
+            var rp: Number = self.real_part();
+            return rp.to_f64_lossy();
+        }
+        if (self.is_small() != 0) { return (f64)self.small_value(); }
+
+        var b: *NumberBig = self.big_ptr();
+        if (b == 0 || b.sign == 0) { return 0.0; }
+
+        var n: u64 = b.digits.len();
+        var acc: f64 = 0.0;
+        var i: u64 = n;
+        while (i > 0) {
+            i = i - 1;
+            acc = (acc * (f64)NUMBER_BASE) + (f64)b.digits.get(i);
+        }
+        if (b.sign < 0) { return 0.0 - acc; }
+        return acc;
+    }
+
     public func to_i64_lossy(self: *Number) -> i64 {
         var out: i64 = 0;
         if (self.to_i64_checked(&out) != 0) { return out; }
 
         if (self == 0) { return 0; }
+        if (self.is_real() != 0) { return (i64)self.real_ptr().value; }
+        if (self.is_complex() != 0) {
+            var rp: Number = self.real_part();
+            return rp.to_i64_lossy();
+        }
         if (self.is_small() != 0) { return self.small_value(); }
         var b: *NumberBig = self.big_ptr();
         if (b == 0 || b.sign == 0) { return 0; }
@@ -2237,3 +2559,14 @@ impl Number {
         return (i64)acc;
     }
 }
+
+func number_from_i8(v: i8) -> Number { var out: Number = Number { NUMBER_TAG_SMALL }; out.set_i64((i64)v); return out; }
+func number_from_i16(v: i16) -> Number { var out: Number = Number { NUMBER_TAG_SMALL }; out.set_i64((i64)v); return out; }
+func number_from_i32(v: i32) -> Number { var out: Number = Number { NUMBER_TAG_SMALL }; out.set_i64((i64)v); return out; }
+func number_from_i64(v: i64) -> Number { var out: Number = Number { NUMBER_TAG_SMALL }; out.set_i64(v); return out; }
+func number_from_u8(v: u8) -> Number { var out: Number = Number { NUMBER_TAG_SMALL }; out.set_u64((u64)v); return out; }
+func number_from_u16(v: u16) -> Number { var out: Number = Number { NUMBER_TAG_SMALL }; out.set_u64((u64)v); return out; }
+func number_from_u32(v: u32) -> Number { var out: Number = Number { NUMBER_TAG_SMALL }; out.set_u64((u64)v); return out; }
+func number_from_u64(v: u64) -> Number { var out: Number = Number { NUMBER_TAG_SMALL }; out.set_u64(v); return out; }
+func number_from_f64(v: f64) -> Number { return number_make_real(v); }
+func number_cmp_ptr(lhs: *Number, rhs: *Number) -> i64 { return lhs.cmp_ptr(rhs); }
