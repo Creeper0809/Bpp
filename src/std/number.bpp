@@ -20,7 +20,12 @@ const NUMBER_HEAP_TAG_MASK = 7;
 const NUMBER_TAG_BIG = 0;
 const NUMBER_TAG_REAL = 2;
 const NUMBER_TAG_COMPLEX = 4;
+const NUMBER_TAG_EXT = 6;
 const NUMBER_PTR_MASK = 18446744073709551608;
+
+const NUMBER_EXT_RATIONAL = 1;
+const NUMBER_EXT_DECIMAL = 2;
+const NUMBER_EXT_BIGFLOAT = 3;
 
 const NUMBER_SMALL_MAX_U64 = 4611686018427387903;
 const NUMBER_SMALL_MIN_I64 = -4611686018427387904;
@@ -61,6 +66,29 @@ struct NumberComplex {
     public imag: Number;
 }
 
+struct NumberExtHeader {
+    public kind: u64;
+}
+
+struct NumberRational {
+    public kind: u64;
+    public num: Number;
+    public den: Number;
+}
+
+struct NumberDecimal {
+    public kind: u64;
+    public coeff: Number;
+    public scale: u64;
+}
+
+struct NumberBigFloat {
+    public kind: u64;
+    public mant: Number;
+    public exp: i64;
+    public precision: u64;
+}
+
 struct NumberBigDivMod {
     public q: *NumberBig;
     public r: *NumberBig;
@@ -82,6 +110,114 @@ func number_make_complex(real: Number, imag: Number) -> Number {
     }
     var c: *NumberComplex = new NumberComplex{real, imag};
     return Number { (((u64)c) & NUMBER_PTR_MASK) | NUMBER_TAG_COMPLEX };
+}
+
+func number_make_ext(ptr: u64) -> Number {
+    if (ptr == 0) { return Number { NUMBER_TAG_SMALL }; }
+    return Number { (ptr & NUMBER_PTR_MASK) | NUMBER_TAG_EXT };
+}
+
+func number_pow10(scale: u64) -> Number {
+    var out: Number = Number.from_u64(1);
+    for (var i: u64 = 0; i < scale; i = i + 1) {
+        out = out.mul_small(10);
+    }
+    return out;
+}
+
+func number_gcd_values(a0: Number, b0: Number) -> Number {
+    var a: Number = a0.abs_clone();
+    var b: Number = b0.abs_clone();
+    while (b.signum() != 0) {
+        var r: Number = a.mod_values(&b);
+        a = b;
+        b = r.abs_clone();
+    }
+    return a;
+}
+
+func number_make_rational(num0: Number, den0: Number) -> Number {
+    if (num0.is_real() != 0 || den0.is_real() != 0 || num0.is_complex() != 0 || den0.is_complex() != 0) {
+        var rv: f64 = den0.to_f64_lossy();
+        if (rv == 0.0) {
+            panic("Number rational denominator is zero");
+            return Number { NUMBER_TAG_SMALL };
+        }
+        var nv: f64 = num0.to_f64_lossy();
+        var qv: f64 = nv / rv;
+        return number_make_real(qv);
+    }
+
+    var nn: Number = num0.numerator();
+    var nd: Number = num0.denominator();
+    var dn: Number = den0.numerator();
+    var dd: Number = den0.denominator();
+
+    if (dn.signum() == 0) {
+        panic("Number rational denominator is zero");
+        return Number { NUMBER_TAG_SMALL };
+    }
+
+    var left_num: Number = nn.mul_values(&dd);
+    var left_den: Number = nd.mul_values(&dn);
+    var num: Number = left_num;
+    var den: Number = left_den;
+
+    if (den.signum() < 0) {
+        num = num.negated();
+        den = den.negated();
+    }
+    if (num.signum() == 0) {
+        return Number { NUMBER_TAG_SMALL };
+    }
+
+    var g: Number = number_gcd_values(num, den);
+    var one: Number = Number.from_u64(1);
+    if (g.cmp_ptr(&one) != 0) {
+        num = num.div_values(&g);
+        den = den.div_values(&g);
+    }
+    if (den.cmp_ptr(&one) == 0) {
+        return num;
+    }
+
+    var r: *NumberRational = new NumberRational{NUMBER_EXT_RATIONAL, num, den};
+    return number_make_ext((u64)r);
+}
+
+func number_make_decimal(coeff0: Number, scale0: u64) -> Number {
+    if (coeff0.signum() == 0) { return Number { NUMBER_TAG_SMALL }; }
+    var coeff: Number = coeff0;
+    var scale: u64 = scale0;
+    var ten: Number = Number.from_u64(10);
+    while (scale > 0) {
+        var dm: NumberDivMod = coeff.divmod_values_nonzero(&ten);
+        if (dm.r.signum() != 0) { break; }
+        coeff = dm.q;
+        scale = scale - 1;
+    }
+    if (scale == 0) { return coeff; }
+    var d: *NumberDecimal = new NumberDecimal{NUMBER_EXT_DECIMAL, coeff, scale};
+    return number_make_ext((u64)d);
+}
+
+func number_make_bigfloat(mant0: Number, exp0: i64, precision0: u64) -> Number {
+    if (mant0.signum() == 0) { return Number { NUMBER_TAG_SMALL }; }
+    var mant: Number = mant0;
+    var exp: i64 = exp0;
+    var two: Number = Number.from_u64(2);
+    while (mant.mod_small_abs(2) == 0) {
+        mant = mant.div_values(&two);
+        exp = exp + 1;
+    }
+    if (exp >= 0) {
+        var shifted: Number = mant.shl_values((u64)exp);
+        return shifted;
+    }
+    var precision: u64 = precision0;
+    if (precision == 0) { precision = 53; }
+    var bf: *NumberBigFloat = new NumberBigFloat{NUMBER_EXT_BIGFLOAT, mant, exp, precision};
+    return number_make_ext((u64)bf);
 }
 
 impl NumberBig {
@@ -1308,6 +1444,38 @@ impl Number {
         return (self.bits & NUMBER_HEAP_TAG_MASK) == NUMBER_TAG_COMPLEX;
     }
 
+    public func is_ext(self: *Number) -> u64 {
+        if (self == 0) { return 0; }
+        if (self.is_small() != 0) { return 0; }
+        return (self.bits & NUMBER_HEAP_TAG_MASK) == NUMBER_TAG_EXT;
+    }
+
+    public func ext_kind(self: *Number) -> u64 {
+        if (self == 0 || self.is_ext() == 0) { return 0; }
+        var h: *NumberExtHeader = (*NumberExtHeader)(self.bits & NUMBER_PTR_MASK);
+        if (h == 0) { return 0; }
+        return h.kind;
+    }
+
+    public func is_rational(self: *Number) -> u64 {
+        return self.ext_kind() == NUMBER_EXT_RATIONAL;
+    }
+
+    public func is_decimal(self: *Number) -> u64 {
+        return self.ext_kind() == NUMBER_EXT_DECIMAL;
+    }
+
+    public func is_bigfloat(self: *Number) -> u64 {
+        return self.ext_kind() == NUMBER_EXT_BIGFLOAT;
+    }
+
+    public func is_exact_extended(self: *Number) -> u64 {
+        if (self.is_rational() != 0) { return 1; }
+        if (self.is_decimal() != 0) { return 1; }
+        if (self.is_bigfloat() != 0) { return 1; }
+        return 0;
+    }
+
     public func small_value(self: *Number) -> i64 {
         if (self == 0) {
             panic("Number.small_value: null Number*");
@@ -1333,6 +1501,21 @@ impl Number {
         if (self == 0) { return 0; }
         if (self.is_complex() == 0) { return 0; }
         return (*NumberComplex)(self.bits & NUMBER_PTR_MASK);
+    }
+
+    public func rational_ptr(self: *Number) -> *NumberRational {
+        if (self == 0 || self.is_rational() == 0) { return 0; }
+        return (*NumberRational)(self.bits & NUMBER_PTR_MASK);
+    }
+
+    public func decimal_ptr(self: *Number) -> *NumberDecimal {
+        if (self == 0 || self.is_decimal() == 0) { return 0; }
+        return (*NumberDecimal)(self.bits & NUMBER_PTR_MASK);
+    }
+
+    public func bigfloat_ptr(self: *Number) -> *NumberBigFloat {
+        if (self == 0 || self.is_bigfloat() == 0) { return 0; }
+        return (*NumberBigFloat)(self.bits & NUMBER_PTR_MASK);
     }
 
     public static func from_i64(v: i64) -> Number {
@@ -1389,6 +1572,18 @@ impl Number {
         return number_make_complex(r, i);
     }
 
+    public static func from_rational(num: Number, den: Number) -> Number {
+        return number_make_rational(num, den);
+    }
+
+    public static func from_decimal(coeff: Number, scale: u64) -> Number {
+        return number_make_decimal(coeff, scale);
+    }
+
+    public static func from_bigfloat(mant: Number, exp: i64, precision: u64) -> Number {
+        return number_make_bigfloat(mant, exp, precision);
+    }
+
     public static func from_str(src: []u8) -> Number {
         var out: Number = Number { NUMBER_TAG_SMALL };
         out.set_from_str(slice(src.ptr, src.len));
@@ -1438,6 +1633,10 @@ impl Number {
         }
         if (self.is_complex() != 0) {
             return NumberBig.zero();
+        }
+        if (self.is_exact_extended() != 0) {
+            var n: Number = self.numerator();
+            return n.to_abs_big();
         }
         return self.big_ptr().abs_copy();
     }
@@ -1529,6 +1728,21 @@ impl Number {
             if (c.real.signum() != 0 || c.imag.signum() != 0) { return 1; }
             return 0;
         }
+        if (self.is_rational() != 0) {
+            var r: *NumberRational = self.rational_ptr();
+            if (r == 0) { return 0; }
+            return r.num.signum();
+        }
+        if (self.is_decimal() != 0) {
+            var d: *NumberDecimal = self.decimal_ptr();
+            if (d == 0) { return 0; }
+            return d.coeff.signum();
+        }
+        if (self.is_bigfloat() != 0) {
+            var bf: *NumberBigFloat = self.bigfloat_ptr();
+            if (bf == 0) { return 0; }
+            return bf.mant.signum();
+        }
         var b: *NumberBig = self.big_ptr();
         if (b == 0) { return 0; }
         if (b.sign > 0) { return 1; }
@@ -1555,6 +1769,24 @@ impl Number {
             var nr: Number = c.real.negated();
             var ni: Number = c.imag.negated();
             return number_make_complex(nr, ni);
+        }
+        if (self.is_rational() != 0) {
+            var r: *NumberRational = self.rational_ptr();
+            if (r == 0) { return Number { NUMBER_TAG_SMALL }; }
+            var rn: Number = r.num.negated();
+            return number_make_rational(rn, r.den);
+        }
+        if (self.is_decimal() != 0) {
+            var d: *NumberDecimal = self.decimal_ptr();
+            if (d == 0) { return Number { NUMBER_TAG_SMALL }; }
+            var dc: Number = d.coeff.negated();
+            return number_make_decimal(dc, d.scale);
+        }
+        if (self.is_bigfloat() != 0) {
+            var bf: *NumberBigFloat = self.bigfloat_ptr();
+            if (bf == 0) { return Number { NUMBER_TAG_SMALL }; }
+            var bm: Number = bf.mant.negated();
+            return number_make_bigfloat(bm, bf.exp, bf.precision);
         }
         var src: *NumberBig = self.big_ptr();
         if (src == 0 || src.sign == 0) { return Number { NUMBER_TAG_SMALL }; }
@@ -1591,6 +1823,30 @@ impl Number {
             out_small_abs.set_u64(mag);
             return out_small_abs;
         }
+        if (self.is_real() != 0) {
+            var rv: f64 = self.real_ptr().value;
+            if (rv < 0.0) { rv = 0.0 - rv; }
+            if (sign < 0) { rv = 0.0 - rv; }
+            return number_make_real(rv);
+        }
+        if (self.is_rational() != 0) {
+            var r: *NumberRational = self.rational_ptr();
+            if (r == 0) { return Number { NUMBER_TAG_SMALL }; }
+            var rn: Number = r.num.abs_with_sign(sign);
+            return number_make_rational(rn, r.den);
+        }
+        if (self.is_decimal() != 0) {
+            var d: *NumberDecimal = self.decimal_ptr();
+            if (d == 0) { return Number { NUMBER_TAG_SMALL }; }
+            var dc: Number = d.coeff.abs_with_sign(sign);
+            return number_make_decimal(dc, d.scale);
+        }
+        if (self.is_bigfloat() != 0) {
+            var bf: *NumberBigFloat = self.bigfloat_ptr();
+            if (bf == 0) { return Number { NUMBER_TAG_SMALL }; }
+            var bm: Number = bf.mant.abs_with_sign(sign);
+            return number_make_bigfloat(bm, bf.exp, bf.precision);
+        }
         var srcb: *NumberBig = self.big_ptr();
         if (srcb == 0) { return Number { NUMBER_TAG_SMALL }; }
         var copyb: *NumberBig = srcb.abs_copy();
@@ -1617,6 +1873,17 @@ impl Number {
             if (avf < bvf) { return -1; }
             if (avf > bvf) { return 1; }
             return 0;
+        }
+        if (self.is_exact_extended() != 0 || rhs.is_exact_extended() != 0) {
+            var an0: Number = self.numerator();
+            var an: Number = an0.abs_clone();
+            var ad: Number = self.denominator();
+            var bn0: Number = rhs.numerator();
+            var bn: Number = bn0.abs_clone();
+            var bd: Number = rhs.denominator();
+            var left_abs: Number = an.mul_values(&bd);
+            var right_abs: Number = bn.mul_values(&ad);
+            return left_abs.cmp_ptr(&right_abs);
         }
         var a_small: u64 = self.is_small();
         var b_small: u64 = rhs.is_small();
@@ -1670,6 +1937,102 @@ impl Number {
         return Number { NUMBER_TAG_SMALL };
     }
 
+    public func numerator(self: *Number) -> Number {
+        if (self == 0) { return Number { NUMBER_TAG_SMALL }; }
+        if (self.is_rational() != 0) {
+            var r: *NumberRational = self.rational_ptr();
+            if (r == 0) { return Number { NUMBER_TAG_SMALL }; }
+            return Number { r.num.bits };
+        }
+        if (self.is_decimal() != 0) {
+            var d: *NumberDecimal = self.decimal_ptr();
+            if (d == 0) { return Number { NUMBER_TAG_SMALL }; }
+            return Number { d.coeff.bits };
+        }
+        if (self.is_bigfloat() != 0) {
+            var bf: *NumberBigFloat = self.bigfloat_ptr();
+            if (bf == 0) { return Number { NUMBER_TAG_SMALL }; }
+            if (bf.exp >= 0) {
+                return bf.mant.shl_values((u64)bf.exp);
+            }
+            return Number { bf.mant.bits };
+        }
+        if (self.is_complex() != 0) {
+            return self.real_part();
+        }
+        return Number { self.bits };
+    }
+
+    public func denominator(self: *Number) -> Number {
+        if (self == 0) {
+            var one_null: Number = Number.from_u64(1);
+            return one_null;
+        }
+        if (self.is_rational() != 0) {
+            var r: *NumberRational = self.rational_ptr();
+            if (r == 0) {
+                var one_r: Number = Number.from_u64(1);
+                return one_r;
+            }
+            return Number { r.den.bits };
+        }
+        if (self.is_decimal() != 0) {
+            var d: *NumberDecimal = self.decimal_ptr();
+            if (d == 0) {
+                var one_d: Number = Number.from_u64(1);
+                return one_d;
+            }
+            return number_pow10(d.scale);
+        }
+        if (self.is_bigfloat() != 0) {
+            var bf: *NumberBigFloat = self.bigfloat_ptr();
+            if (bf == 0 || bf.exp >= 0) {
+                var one_bf: Number = Number.from_u64(1);
+                return one_bf;
+            }
+            var den_bf: Number = Number.pow2((u64)(0 - bf.exp));
+            return den_bf;
+        }
+        var one: Number = Number.from_u64(1);
+        return one;
+    }
+
+    public func fraction_add_values(self: *Number, rhs: *Number) -> Number {
+        var an: Number = self.numerator();
+        var ad: Number = self.denominator();
+        var bn: Number = rhs.numerator();
+        var bd: Number = rhs.denominator();
+        var left: Number = an.mul_values(&bd);
+        var right: Number = bn.mul_values(&ad);
+        var num: Number = left.add_values(&right);
+        var den: Number = ad.mul_values(&bd);
+        return number_make_rational(num, den);
+    }
+
+    public func fraction_mul_values(self: *Number, rhs: *Number) -> Number {
+        var an: Number = self.numerator();
+        var ad: Number = self.denominator();
+        var bn: Number = rhs.numerator();
+        var bd: Number = rhs.denominator();
+        var num: Number = an.mul_values(&bn);
+        var den: Number = ad.mul_values(&bd);
+        return number_make_rational(num, den);
+    }
+
+    public func fraction_div_values(self: *Number, rhs: *Number) -> Number {
+        var an: Number = self.numerator();
+        var ad: Number = self.denominator();
+        var bn: Number = rhs.numerator();
+        var bd: Number = rhs.denominator();
+        if (bn.signum() == 0) {
+            panic("Number divide by zero");
+            return Number { NUMBER_TAG_SMALL };
+        }
+        var num: Number = an.mul_values(&bd);
+        var den: Number = ad.mul_values(&bn);
+        return number_make_rational(num, den);
+    }
+
     public func cmp_ptr(self: *Number, rhs: *Number) -> i64 {
         if (self == 0) {
             panic("number_cmp_ptr: null lhs");
@@ -1681,13 +2044,15 @@ impl Number {
         }
 
         if (self.is_complex() != 0 || rhs.is_complex() != 0) {
-            var ar: Number = self.real_part();
             var ai: Number = self.imag_part();
-            var br: Number = rhs.real_part();
             var bi: Number = rhs.imag_part();
-            var rc: i64 = ar.cmp_ptr(&br);
-            if (rc != 0) { return rc; }
-            return ai.cmp_ptr(&bi);
+            if (ai.signum() != 0 || bi.signum() != 0) {
+                panic("Number ordered comparison is undefined for complex values");
+                return 0;
+            }
+            var ar: Number = self.real_part();
+            var br: Number = rhs.real_part();
+            return ar.cmp_ptr(&br);
         }
 
         if (self.is_real() != 0 || rhs.is_real() != 0) {
@@ -1696,6 +2061,16 @@ impl Number {
             if (avf < bvf) { return -1; }
             if (avf > bvf) { return 1; }
             return 0;
+        }
+
+        if (self.is_exact_extended() != 0 || rhs.is_exact_extended() != 0) {
+            var an: Number = self.numerator();
+            var ad: Number = self.denominator();
+            var bn: Number = rhs.numerator();
+            var bd: Number = rhs.denominator();
+            var left_exact: Number = an.mul_values(&bd);
+            var right_exact: Number = bn.mul_values(&ad);
+            return left_exact.cmp_ptr(&right_exact);
         }
 
         var a_small: u64 = self.is_small();
@@ -1728,6 +2103,33 @@ impl Number {
         return 0 - cmp;
     }
 
+    public func eq_cmp_ptr(self: *Number, rhs: *Number) -> i64 {
+        if (self == 0) {
+            panic("number_eq_cmp_ptr: null lhs");
+            return 1;
+        }
+        if (rhs == 0) {
+            panic("number_eq_cmp_ptr: null rhs");
+            return 1;
+        }
+        if (self.is_complex() != 0 || rhs.is_complex() != 0) {
+            var ar: Number = self.real_part();
+            var ai: Number = self.imag_part();
+            var br: Number = rhs.real_part();
+            var bi: Number = rhs.imag_part();
+            if (ar.eq_cmp_ptr(&br) != 0) { return 1; }
+            if (ai.eq_cmp_ptr(&bi) != 0) { return 1; }
+            return 0;
+        }
+        if (self.is_real() != 0 || rhs.is_real() != 0) {
+            var avf: f64 = self.to_f64_lossy();
+            var bvf: f64 = rhs.to_f64_lossy();
+            if (avf == bvf) { return 0; }
+            return 1;
+        }
+        return self.cmp_ptr(rhs);
+    }
+
     public func add_values(self: *Number, rhs: *Number) -> Number {
         if (self.is_complex() != 0 || rhs.is_complex() != 0) {
             var ar: Number = self.real_part();
@@ -1740,6 +2142,9 @@ impl Number {
         }
         if (self.is_real() != 0 || rhs.is_real() != 0) {
             return number_make_real(self.to_f64_lossy() + rhs.to_f64_lossy());
+        }
+        if (self.is_exact_extended() != 0 || rhs.is_exact_extended() != 0) {
+            return self.fraction_add_values(rhs);
         }
 
         var a_sign: i64 = self.signum();
@@ -1807,6 +2212,9 @@ impl Number {
         }
         if (self.is_real() != 0 || rhs.is_real() != 0) {
             return number_make_real(self.to_f64_lossy() * rhs.to_f64_lossy());
+        }
+        if (self.is_exact_extended() != 0 || rhs.is_exact_extended() != 0) {
+            return self.fraction_mul_values(rhs);
         }
 
         var a_sign: i64 = self.signum();
@@ -1941,6 +2349,9 @@ impl Number {
             }
             return number_make_real(self.to_f64_lossy() / rv);
         }
+        if (self.is_exact_extended() != 0 || rhs.is_exact_extended() != 0) {
+            return self.fraction_div_values(rhs);
+        }
         if (rhs.signum() == 0) {
             panic("Number divide by zero");
             return Number { NUMBER_TAG_SMALL };
@@ -1958,7 +2369,8 @@ impl Number {
             panic("number_mod_values: null rhs");
             return Number { NUMBER_TAG_SMALL };
         }
-        if (self.is_real() != 0 || rhs.is_real() != 0 || self.is_complex() != 0 || rhs.is_complex() != 0) {
+        if (self.is_real() != 0 || rhs.is_real() != 0 || self.is_complex() != 0 || rhs.is_complex() != 0 ||
+            self.is_exact_extended() != 0 || rhs.is_exact_extended() != 0) {
             panic("Number modulo requires integer operands");
             return Number { NUMBER_TAG_SMALL };
         }
@@ -2018,6 +2430,24 @@ impl Number {
         if (self.is_complex() != 0) {
             var rp: Number = self.real_part();
             return rp.abs_clone();
+        }
+        if (self.is_rational() != 0) {
+            var r: *NumberRational = self.rational_ptr();
+            if (r == 0) { return Number { NUMBER_TAG_SMALL }; }
+            var rn: Number = r.num.abs_clone();
+            return number_make_rational(rn, r.den);
+        }
+        if (self.is_decimal() != 0) {
+            var d: *NumberDecimal = self.decimal_ptr();
+            if (d == 0) { return Number { NUMBER_TAG_SMALL }; }
+            var dc: Number = d.coeff.abs_clone();
+            return number_make_decimal(dc, d.scale);
+        }
+        if (self.is_bigfloat() != 0) {
+            var bf: *NumberBigFloat = self.bigfloat_ptr();
+            if (bf == 0) { return Number { NUMBER_TAG_SMALL }; }
+            var bm: Number = bf.mant.abs_clone();
+            return number_make_bigfloat(bm, bf.exp, bf.precision);
         }
         var out_big: *NumberBig = self.big_ptr().abs_copy();
         var out: Number = Number.from_big_normalized(out_big);
@@ -2122,6 +2552,10 @@ impl Number {
 
     public func shl_values(self: *Number, sh: u64) -> Number {
         if (self == 0 || self.signum() == 0) { return Number { NUMBER_TAG_SMALL }; }
+        if (self.is_real() != 0 || self.is_complex() != 0 || self.is_exact_extended() != 0) {
+            panic("Number shift requires integer operand");
+            return Number { NUMBER_TAG_SMALL };
+        }
         if (sh == 0) {
             var cloned: Number = self.clone();
             return cloned;
@@ -2180,7 +2614,8 @@ impl Number {
         rhs: *Number,
         mode: u64
     ) -> Number {
-        if (self.is_real() != 0 || rhs.is_real() != 0 || self.is_complex() != 0 || rhs.is_complex() != 0) {
+        if (self.is_real() != 0 || rhs.is_real() != 0 || self.is_complex() != 0 || rhs.is_complex() != 0 ||
+            self.is_exact_extended() != 0 || rhs.is_exact_extended() != 0) {
             panic("Number bitwise operation requires integer operands");
             return Number { NUMBER_TAG_SMALL };
         }
@@ -2237,6 +2672,10 @@ impl Number {
     }
 
     public func bitnot_values(self: *Number) -> Number {
+        if (self.is_real() != 0 || self.is_complex() != 0 || self.is_exact_extended() != 0) {
+            panic("Number bitwise operation requires integer operand");
+            return Number { NUMBER_TAG_SMALL };
+        }
         var neg: Number = self.negated();
         var one: Number = Number { NUMBER_TAG_SMALL };
         one.set_i64(1);
@@ -2249,7 +2688,7 @@ impl Number {
             panic("number_shift_amount_from_number: null rhs");
             return 0;
         }
-        if (self.is_real() != 0 || self.is_complex() != 0) {
+        if (self.is_real() != 0 || self.is_complex() != 0 || self.is_exact_extended() != 0) {
             panic("Number shift amount requires integer operand");
             return 0;
         }
@@ -2268,6 +2707,10 @@ impl Number {
 
     public func shr_values(self: *Number, sh: u64) -> Number {
         if (self == 0 || self.signum() == 0) { return Number { NUMBER_TAG_SMALL }; }
+        if (self.is_real() != 0 || self.is_complex() != 0 || self.is_exact_extended() != 0) {
+            panic("Number shift requires integer operand");
+            return Number { NUMBER_TAG_SMALL };
+        }
         if (sh == 0) {
             var cloned: Number = self.clone();
             return cloned;
@@ -2324,12 +2767,12 @@ impl Number {
     public func operator >>(self: *Number, rhs: u64) -> Number { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_u64(rhs); var out: Number = self.shr_values(rv.shift_amount()); return out; }
     public func operator ~(self: *Number) -> Number { var out: Number = self.bitnot_values(); return out; }
 
-    public func __op_eq(self: *Number, rhs: Number) -> u64 { return self.cmp_ptr(&rhs) == 0; }
-    public func __op_eq(self: *Number, rhs: f64) -> u64 { var rv: Number = number_make_real(rhs); return self.cmp_ptr(&rv) == 0; }
-    public func __op_ne(self: *Number, rhs: Number) -> u64 { return self.cmp_ptr(&rhs) != 0; }
-    public func __op_ne(self: *Number, rhs: i64) -> u64 { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_i64(rhs); return self.cmp_ptr(&rv) != 0; }
-    public func __op_ne(self: *Number, rhs: u64) -> u64 { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_u64(rhs); return self.cmp_ptr(&rv) != 0; }
-    public func __op_ne(self: *Number, rhs: f64) -> u64 { var rv: Number = number_make_real(rhs); return self.cmp_ptr(&rv) != 0; }
+    public func __op_eq(self: *Number, rhs: Number) -> u64 { return self.eq_cmp_ptr(&rhs) == 0; }
+    public func __op_eq(self: *Number, rhs: f64) -> u64 { var rv: Number = number_make_real(rhs); return self.eq_cmp_ptr(&rv) == 0; }
+    public func __op_ne(self: *Number, rhs: Number) -> u64 { return self.eq_cmp_ptr(&rhs) != 0; }
+    public func __op_ne(self: *Number, rhs: i64) -> u64 { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_i64(rhs); return self.eq_cmp_ptr(&rv) != 0; }
+    public func __op_ne(self: *Number, rhs: u64) -> u64 { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_u64(rhs); return self.eq_cmp_ptr(&rv) != 0; }
+    public func __op_ne(self: *Number, rhs: f64) -> u64 { var rv: Number = number_make_real(rhs); return self.eq_cmp_ptr(&rv) != 0; }
     public func __op_lt(self: *Number, rhs: Number) -> u64 { return self.cmp_ptr(&rhs) < 0; }
     public func __op_lt(self: *Number, rhs: i64) -> u64 { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_i64(rhs); return self.cmp_ptr(&rv) < 0; }
     public func __op_lt(self: *Number, rhs: u64) -> u64 { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_u64(rhs); return self.cmp_ptr(&rv) < 0; }
@@ -2370,6 +2813,13 @@ impl Number {
         if (self.is_complex() != 0) {
             return 0;
         }
+        if (self.is_exact_extended() != 0) {
+            var n: Number = self.numerator();
+            var d: Number = self.denominator();
+            var dm: NumberDivMod = n.divmod_values_nonzero(&d);
+            if (dm.r.signum() != 0) { return 0; }
+            return dm.q.to_i64_checked(out);
+        }
 
         return self.big_ptr().try_to_i64(out);
     }
@@ -2397,6 +2847,13 @@ impl Number {
         }
         if (self.is_complex() != 0) {
             return 0;
+        }
+        if (self.is_exact_extended() != 0) {
+            var n: Number = self.numerator();
+            var d: Number = self.denominator();
+            var dm: NumberDivMod = n.divmod_values_nonzero(&d);
+            if (dm.r.signum() != 0) { return 0; }
+            return dm.q.to_u64_checked(out);
         }
 
         var b: *NumberBig = self.big_ptr();
@@ -2469,6 +2926,27 @@ impl Number {
             var joined: u64 = str_concat3(rs, str_len(rs), "+", 1, is, str_len(is));
             return str_concat(joined, str_len(joined), "i", 1);
         }
+        if (self != 0 && self.is_rational() != 0) {
+            var r: *NumberRational = self.rational_ptr();
+            if (r == 0) { return "0"; }
+            var ns: u64 = r.num.to_str();
+            var ds: u64 = r.den.to_str();
+            return str_concat3(ns, str_len(ns), "/", 1, ds, str_len(ds));
+        }
+        if (self != 0 && self.is_decimal() != 0) {
+            var d: *NumberDecimal = self.decimal_ptr();
+            if (d == 0) { return "0"; }
+            var cs: u64 = d.coeff.to_str();
+            var ss: u64 = to_str_u64(d.scale);
+            return str_concat3(cs, str_len(cs), "e-", 2, ss, str_len(ss));
+        }
+        if (self != 0 && self.is_bigfloat() != 0) {
+            var bf: *NumberBigFloat = self.bigfloat_ptr();
+            if (bf == 0) { return "0"; }
+            var ms: u64 = bf.mant.to_str();
+            var es: u64 = to_str_i64(bf.exp);
+            return str_concat3(ms, str_len(ms), "p", 1, es, str_len(es));
+        }
 
         var sign: i64 = 0;
         if (self != 0) {
@@ -2518,6 +2996,36 @@ impl Number {
             var rp: Number = self.real_part();
             return rp.to_f64_lossy();
         }
+        if (self.is_rational() != 0) {
+            var r: *NumberRational = self.rational_ptr();
+            if (r == 0) { return 0.0; }
+            return r.num.to_f64_lossy() / r.den.to_f64_lossy();
+        }
+        if (self.is_decimal() != 0) {
+            var d: *NumberDecimal = self.decimal_ptr();
+            if (d == 0) { return 0.0; }
+            var dv: f64 = d.coeff.to_f64_lossy();
+            for (var di: u64 = 0; di < d.scale; di = di + 1) {
+                dv = dv / 10.0;
+            }
+            return dv;
+        }
+        if (self.is_bigfloat() != 0) {
+            var bf: *NumberBigFloat = self.bigfloat_ptr();
+            if (bf == 0) { return 0.0; }
+            var fv: f64 = bf.mant.to_f64_lossy();
+            if (bf.exp >= 0) {
+                for (var ei: u64 = 0; ei < (u64)bf.exp; ei = ei + 1) {
+                    fv = fv * 2.0;
+                }
+            } else {
+                var neg_exp: u64 = (u64)(0 - bf.exp);
+                for (var ej: u64 = 0; ej < neg_exp; ej = ej + 1) {
+                    fv = fv / 2.0;
+                }
+            }
+            return fv;
+        }
         if (self.is_small() != 0) { return (f64)self.small_value(); }
 
         var b: *NumberBig = self.big_ptr();
@@ -2544,6 +3052,9 @@ impl Number {
             var rp: Number = self.real_part();
             return rp.to_i64_lossy();
         }
+        if (self.is_exact_extended() != 0) {
+            return (i64)self.to_f64_lossy();
+        }
         if (self.is_small() != 0) { return self.small_value(); }
         var b: *NumberBig = self.big_ptr();
         if (b == 0 || b.sign == 0) { return 0; }
@@ -2569,4 +3080,8 @@ func number_from_u16(v: u16) -> Number { var out: Number = Number { NUMBER_TAG_S
 func number_from_u32(v: u32) -> Number { var out: Number = Number { NUMBER_TAG_SMALL }; out.set_u64((u64)v); return out; }
 func number_from_u64(v: u64) -> Number { var out: Number = Number { NUMBER_TAG_SMALL }; out.set_u64(v); return out; }
 func number_from_f64(v: f64) -> Number { return number_make_real(v); }
+func number_from_rational(num: Number, den: Number) -> Number { return number_make_rational(num, den); }
+func number_from_decimal(coeff: Number, scale: u64) -> Number { return number_make_decimal(coeff, scale); }
+func number_from_bigfloat(mant: Number, exp: i64, precision: u64) -> Number { return number_make_bigfloat(mant, exp, precision); }
 func number_cmp_ptr(lhs: *Number, rhs: *Number) -> i64 { return lhs.cmp_ptr(rhs); }
+func number_eq_cmp_ptr(lhs: *Number, rhs: *Number) -> i64 { return lhs.eq_cmp_ptr(rhs); }
