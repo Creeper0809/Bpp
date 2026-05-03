@@ -4,6 +4,7 @@
 // Lifetime is arena-style monotonic allocation.
 
 import std.io;
+import std.mem;
 import std.vec;
 
 // Limbs are base 2^31. 31 bits keeps a single limb multiply plus carry
@@ -170,6 +171,40 @@ func number_proof_shape_combine(lhs: u64, rhs: u64) -> u64 {
         return NUMBER_PROOF_SHAPE_INTEGER;
     }
     return NUMBER_PROOF_SHAPE_MIXED;
+}
+
+func number_proof_shape_to_bpp_shape(shape: u64) -> u64 {
+    if (shape == NUMBER_PROOF_SHAPE_EMPTY) { return BPP_TAG_SHAPE_EMPTY; }
+    if (shape == NUMBER_PROOF_SHAPE_I64) { return BPP_TAG_SHAPE_I64; }
+    if (shape == NUMBER_PROOF_SHAPE_F64) { return BPP_TAG_SHAPE_F64; }
+    if (shape == NUMBER_PROOF_SHAPE_MIXED) { return BPP_TAG_SHAPE_MIXED; }
+    if (shape == NUMBER_PROOF_SHAPE_UNKNOWN) { return BPP_TAG_SHAPE_UNKNOWN; }
+    return BPP_TAG_SHAPE_NUMBER;
+}
+
+func number_proof_domain_to_bpp_storage(domain: u64) -> u64 {
+    if (domain == NUMBER_PROOF_DOMAIN_HEAP) { return BPP_TAG_STORAGE_HEAP; }
+    if (domain == NUMBER_PROOF_DOMAIN_ARENA) { return BPP_TAG_STORAGE_ARENA; }
+    if (domain == NUMBER_PROOF_DOMAIN_STACK) { return BPP_TAG_STORAGE_STACK; }
+    if (domain == NUMBER_PROOF_DOMAIN_STATIC) { return BPP_TAG_STORAGE_STATIC; }
+    if (domain == NUMBER_PROOF_DOMAIN_FOREIGN) { return BPP_TAG_STORAGE_FOREIGN; }
+    return BPP_TAG_STORAGE_HEAP;
+}
+
+func number_proof_cap_to_bpp_ownership(cap: u64) -> u64 {
+    if (cap == NUMBER_PROOF_CAP_OWNED) { return BPP_TAG_OWN_OWNED; }
+    if (cap == NUMBER_PROOF_CAP_BORROWED) { return BPP_TAG_OWN_BORROWED; }
+    if (cap == NUMBER_PROOF_CAP_SHARED) { return BPP_TAG_OWN_SHARED; }
+    if (cap == NUMBER_PROOF_CAP_WEAK) { return BPP_TAG_OWN_WEAK; }
+    return BPP_TAG_OWN_UNKNOWN;
+}
+
+func number_proof_lifecycle_for_domain(domain: u64) -> u64 {
+    if (domain == NUMBER_PROOF_DOMAIN_ARENA) { return BPP_TAG_LIFE_ARENA; }
+    if (domain == NUMBER_PROOF_DOMAIN_STACK) { return BPP_TAG_LIFE_BORROWED; }
+    if (domain == NUMBER_PROOF_DOMAIN_STATIC) { return BPP_TAG_LIFE_IMMORTAL; }
+    if (domain == NUMBER_PROOF_DOMAIN_HEAP) { return BPP_TAG_LIFE_YOUNG; }
+    return BPP_TAG_LIFE_BORROWED;
 }
 
 func number_slice_raw_ptr(p: *tagged(NumberProofTag) Number) -> *Number {
@@ -3275,6 +3310,47 @@ impl NumberSlice {
         return (u64)p.bounds == NUMBER_PROOF_BOUNDS_STABLE_LEN;
     }
 
+    public func tagged_slice(self: *NumberSlice) -> BppTaggedSlice<Number> {
+        if (self == 0) {
+            return bpp_tag_slice_from_ptr<Number>((*Number)0, 0, BPP_TAG_SHAPE_EMPTY);
+        }
+        var p: *tagged(NumberProofTag) Number = self.ptr;
+        var domain: u64 = (u64)p.domain;
+        var storage: u64 = number_proof_domain_to_bpp_storage(domain);
+        var lifecycle: u64 = number_proof_lifecycle_for_domain(domain);
+        var ownership: u64 = number_proof_cap_to_bpp_ownership((u64)p.capability);
+        var barrier: u64 = BPP_TAG_BARRIER_CLEAN;
+        if (storage == BPP_TAG_STORAGE_STACK || storage == BPP_TAG_STORAGE_STATIC) {
+            barrier = BPP_TAG_BARRIER_SKIP;
+        }
+        return bpp_tag_slice_from_raw_tag<Number>(
+            number_slice_raw_ptr(p),
+            self.len,
+            lifecycle,
+            ownership,
+            storage,
+            barrier,
+            number_proof_shape_to_bpp_shape((u64)p.shape),
+            0
+        );
+    }
+
+    public func profiled_tagged_slice(self: *NumberSlice) -> BppTaggedSlice<Number> {
+        var out: BppTaggedSlice<Number> = self.tagged_slice();
+        bpp_tag_slice_mark_profiled<Number>(&out);
+        return out;
+    }
+
+    public func common_proof(self: *NumberSlice) -> BppSliceProof {
+        var tagged_slice2: BppTaggedSlice<Number> = self.profiled_tagged_slice();
+        return bpp_slice_proof_from_tagged<Number>(&tagged_slice2);
+    }
+
+    public func vector_plan(self: *NumberSlice, profile: *BppLoopProfile) -> BppVectorPlan {
+        var tagged_slice2: BppTaggedSlice<Number> = self.profiled_tagged_slice();
+        return bpp_tag_slice_vector_plan<Number>(profile, &tagged_slice2);
+    }
+
     public func retag_shape(self: *NumberSlice, shape: u64) -> u64 {
         if (self == 0) { return 0; }
         var p: *tagged(NumberProofTag) Number = self.ptr;
@@ -3416,11 +3492,22 @@ impl NumberSlice {
             return empty;
         }
         var shape: u64 = self.shape();
+        var tagged_slice2: BppTaggedSlice<Number> = self.profiled_tagged_slice();
+        var proof: BppSliceProof = bpp_slice_proof_from_tagged<Number>(&tagged_slice2);
+        var profile: BppLoopProfile = bpp_loop_profile_new(self.len);
+        bpp_loop_profile_record(&profile, self.len, bpp_tag_slice_shape<Number>(&tagged_slice2));
+        var plan: BppVectorPlan = bpp_tag_slice_vector_plan<Number>(&profile, &tagged_slice2);
         if (shape == NUMBER_PROOF_SHAPE_I64) {
+            if (proof.stable_bounds == 0 || plan.fast_path == BPP_FAST_PATH_NONE) {
+                return self.sum_generic_from(0, Number.zero());
+            }
             var out_i64: Number = self.sum_i64_fast();
             return out_i64;
         }
         if (shape == NUMBER_PROOF_SHAPE_F64) {
+            if (proof.stable_bounds == 0 || plan.fast_path == BPP_FAST_PATH_NONE) {
+                return self.sum_generic_from(0, Number.zero());
+            }
             var out_f64: Number = self.sum_f64_fast();
             return out_f64;
         }
