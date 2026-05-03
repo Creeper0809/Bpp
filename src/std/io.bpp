@@ -22,8 +22,13 @@ const IO_INPUT_DEFAULT_MAX_LEN = 4096;
 const IO_OUT_BUFFER_CAP = 4096;
 
 const HEAP_ALIGN = 8;
-const HEAP_ALLOC_HEADER_SIZE = 16;
+const HEAP_PTR_MASK = 281474976710655;
+const HEAP_ALLOC_MAGIC = 4774451407313060417;
+const HEAP_ALLOC_HEADER_SIZE = 40;
 const HEAP_ALLOC_MIN_SPLIT = 8;
+const HEAP_BLOCK_LIVE = 1;
+const HEAP_BLOCK_DROPPING = 2;
+const HEAP_BLOCK_FREED = 3;
 
 func sys_brk(addr: u64) -> u64 { return os_sys_brk(addr); }
 func sys_write(fd: u64, buf: u64, count: u64) -> u64 { return os_sys_write(fd, buf, count); }
@@ -296,26 +301,80 @@ func heap_align8(size: u64) -> u64 {
     return aligned_size;
 }
 
-func heap_block_get_size(block: u64) -> u64 {
+func heap_strip_tags(ptr: u64) -> u64 {
+    if (ptr == 0) { return 0; }
+    return ptr & HEAP_PTR_MASK;
+}
+
+func heap_block_get_magic(block: u64) -> u64 {
     var p: *u64 = (*u64)block;
     return p[0];
 }
 
+func heap_block_set_magic(block: u64, magic: u64) -> u64 {
+    var p: *u64 = (*u64)block;
+    p[0] = magic;
+    return 0;
+}
+
+func heap_block_get_size(block: u64) -> u64 {
+    var p: *u64 = (*u64)block;
+    return p[1];
+}
+
 func heap_block_set_size(block: u64, size: u64) -> u64 {
     var p: *u64 = (*u64)block;
-    p[0] = size;
+    p[1] = size;
     return 0;
 }
 
 func heap_block_get_next(block: u64) -> u64 {
     var p: *u64 = (*u64)block;
-    return p[1];
+    return p[2];
 }
 
 func heap_block_set_next(block: u64, next: u64) -> u64 {
     var p: *u64 = (*u64)block;
-    p[1] = next;
+    p[2] = next;
     return 0;
+}
+
+func heap_block_get_state(block: u64) -> u64 {
+    var p: *u64 = (*u64)block;
+    return p[3];
+}
+
+func heap_block_set_state(block: u64, state: u64) -> u64 {
+    var p: *u64 = (*u64)block;
+    p[3] = state;
+    return 0;
+}
+
+func heap_block_get_generation(block: u64) -> u64 {
+    var p: *u64 = (*u64)block;
+    return p[4];
+}
+
+func heap_block_set_generation(block: u64, generation: u64) -> u64 {
+    var p: *u64 = (*u64)block;
+    p[4] = generation;
+    return 0;
+}
+
+func heap_block_init(block: u64, size: u64, state: u64) -> u64 {
+    heap_block_set_magic(block, HEAP_ALLOC_MAGIC);
+    heap_block_set_size(block, size);
+    heap_block_set_next(block, 0);
+    heap_block_set_state(block, state);
+    heap_block_set_generation(block, 1);
+    return 0;
+}
+
+func heap_block_is_valid(block: u64) -> u64 {
+    if (heap_inited == 0) { return 0; }
+    if (block < heap_base || block >= heap_brk) { return 0; }
+    if (heap_block_get_magic(block) != HEAP_ALLOC_MAGIC) { return 0; }
+    return 1;
 }
 
 func heap_free_list_contains(block: u64) -> u64 {
@@ -377,7 +436,7 @@ func heap_try_alloc_from_free_list(aligned_size: u64) -> u64 {
             if (remaining >= HEAP_ALLOC_HEADER_SIZE + HEAP_ALLOC_MIN_SPLIT) {
                 var split_block: u64 = cur + HEAP_ALLOC_HEADER_SIZE + aligned_size;
                 var split_size: u64 = cur_size - aligned_size - HEAP_ALLOC_HEADER_SIZE;
-                heap_block_set_size(split_block, split_size);
+                heap_block_init(split_block, split_size, HEAP_BLOCK_FREED);
                 heap_block_set_next(split_block, next);
                 if (prev == 0) { heap_free_head = split_block; }
                 else { heap_block_set_next(prev, split_block); }
@@ -387,6 +446,7 @@ func heap_try_alloc_from_free_list(aligned_size: u64) -> u64 {
                 else { heap_block_set_next(prev, next); }
             }
             heap_block_set_next(cur, 0);
+            heap_block_set_state(cur, HEAP_BLOCK_LIVE);
             return cur + HEAP_ALLOC_HEADER_SIZE;
         }
         prev = cur;
@@ -429,25 +489,56 @@ func heap_alloc(size: u64) -> u64 {
     }
 
     heap_brk = new_brk;
-    heap_block_set_size(p, aligned_size);
-    heap_block_set_next(p, 0);
+    heap_block_init(p, aligned_size, HEAP_BLOCK_LIVE);
     return p + HEAP_ALLOC_HEADER_SIZE;
 }
 
 func heap_free(ptr: u64) -> u64 {
+    ptr = heap_strip_tags(ptr);
     if (ptr == 0) { return 0; }
     if (heap_inited == 0) { return 0; }
     if (ptr < HEAP_ALLOC_HEADER_SIZE) { return 0; }
 
     var block: u64 = ptr - HEAP_ALLOC_HEADER_SIZE;
-    if (block < heap_base || block >= heap_brk) { return 0; }
+    if (heap_block_is_valid(block) == 0) { return 0; }
     if (heap_free_list_contains(block) != 0) { return 0; }
+
+    var state: u64 = heap_block_get_state(block);
+    if (state != HEAP_BLOCK_LIVE && state != HEAP_BLOCK_DROPPING) { return 0; }
 
     var size: u64 = heap_block_get_size(block);
     if (size == 0) { return 0; }
 
+    heap_block_set_state(block, HEAP_BLOCK_FREED);
+    heap_block_set_generation(block, heap_block_get_generation(block) + 1);
     heap_free_list_insert(block);
     return 0;
+}
+
+func heap_delete_begin(ptr: u64) -> u64 {
+    ptr = heap_strip_tags(ptr);
+    if (ptr == 0) { return 0; }
+    if (heap_inited == 0) { return 0; }
+    if (ptr < HEAP_ALLOC_HEADER_SIZE) { return 0; }
+
+    var block: u64 = ptr - HEAP_ALLOC_HEADER_SIZE;
+    if (heap_block_is_valid(block) == 0) { return 0; }
+    if (heap_block_get_state(block) != HEAP_BLOCK_LIVE) { return 0; }
+
+    heap_block_set_state(block, HEAP_BLOCK_DROPPING);
+    return ptr;
+}
+
+func heap_delete_end(ptr: u64) -> u64 {
+    ptr = heap_strip_tags(ptr);
+    if (ptr == 0) { return 0; }
+    if (heap_inited == 0) { return 0; }
+    if (ptr < HEAP_ALLOC_HEADER_SIZE) { return 0; }
+
+    var block: u64 = ptr - HEAP_ALLOC_HEADER_SIZE;
+    if (heap_block_is_valid(block) == 0) { return 0; }
+    if (heap_block_get_state(block) != HEAP_BLOCK_DROPPING) { return 0; }
+    return heap_free(ptr);
 }
 
 func io_panic_invalid_cstr(api_name: u64) -> u64 {
