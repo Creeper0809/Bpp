@@ -3,11 +3,73 @@
 import std.io;
 import std.util;
 import std.vec;
+import std.str;
 import ssa.datastruct;
 import ssa.core;
 
 const SSA_O1_DEBUG = 0;
 const SSA_TAGGED_PTR_MASK = 281474976710655;
+const SSA_TAG_LIFECYCLE_SHIFT = 48;
+const SSA_TAG_OWNERSHIP_SHIFT = 51;
+const SSA_TAG_STORAGE_SHIFT = 54;
+const SSA_TAG_BARRIER_SHIFT = 57;
+const SSA_TAG_SHAPE_SHIFT = 59;
+const SSA_TAG_PROFILED_SHIFT = 63;
+
+const SSA_TAG_LIFE_UNKNOWN = 0;
+const SSA_TAG_LIFE_YOUNG = 1;
+const SSA_TAG_LIFE_OLD = 2;
+const SSA_TAG_LIFE_ARENA = 3;
+const SSA_TAG_LIFE_BORROWED = 4;
+const SSA_TAG_LIFE_PINNED = 5;
+const SSA_TAG_LIFE_IMMORTAL = 6;
+const SSA_TAG_LIFE_DEAD = 7;
+
+const SSA_TAG_OWN_UNKNOWN = 0;
+const SSA_TAG_OWN_OWNED = 1;
+const SSA_TAG_OWN_BORROWED = 2;
+const SSA_TAG_OWN_SHARED = 3;
+const SSA_TAG_OWN_WEAK = 4;
+const SSA_TAG_OWN_UNIQUE = 5;
+const SSA_TAG_OWN_ESCAPED = 6;
+const SSA_TAG_OWN_STACK = 7;
+
+const SSA_TAG_STORAGE_UNKNOWN = 0;
+const SSA_TAG_STORAGE_HEAP = 1;
+const SSA_TAG_STORAGE_STACK = 2;
+const SSA_TAG_STORAGE_ARENA = 3;
+const SSA_TAG_STORAGE_STATIC = 4;
+const SSA_TAG_STORAGE_FOREIGN = 5;
+const SSA_TAG_STORAGE_INLINE = 6;
+const SSA_TAG_STORAGE_VECTOR = 7;
+
+const SSA_TAG_BARRIER_UNKNOWN = 0;
+const SSA_TAG_BARRIER_CLEAN = 1;
+const SSA_TAG_BARRIER_DIRTY = 2;
+const SSA_TAG_BARRIER_SKIP = 3;
+
+const SSA_TAG_SHAPE_UNKNOWN = 0;
+const SSA_TAG_SHAPE_EMPTY = 1;
+const SSA_TAG_SHAPE_I64 = 2;
+const SSA_TAG_SHAPE_U64 = 3;
+const SSA_TAG_SHAPE_F64 = 4;
+const SSA_TAG_SHAPE_NUMBER = 5;
+const SSA_TAG_SHAPE_OBJECT = 6;
+const SSA_TAG_SHAPE_POD = 7;
+const SSA_TAG_SHAPE_PTR = 8;
+
+const SSA_TAG_FAST_PATH_NONE = 0;
+const SSA_TAG_FAST_PATH_SCALAR = 1;
+const SSA_TAG_FAST_PATH_UNROLLED = 2;
+const SSA_TAG_FAST_PATH_VECTOR = 3;
+
+const SSA_TAG_HAS_LIFE = 1;
+const SSA_TAG_HAS_OWN = 2;
+const SSA_TAG_HAS_STORAGE = 4;
+const SSA_TAG_HAS_BARRIER = 8;
+const SSA_TAG_HAS_SHAPE = 16;
+const SSA_TAG_HAS_PROFILED = 32;
+const SSA_TAG_HAS_ALL = 63;
 
 struct SSAOptKV {
     public key: u64;
@@ -20,6 +82,58 @@ impl SSAOptKV {
         self.key = 0;
         self.val = 0;
         self.active = 0;
+    }
+}
+
+struct SSAOptEscapeSummary {
+    public has_call: u64;
+    public has_indirect_call: u64;
+    public has_heap_alloc: u64;
+    public has_tag_pack: u64;
+    public has_tag_auto: u64;
+    public has_tagged_access: u64;
+}
+
+impl SSAOptEscapeSummary {
+    public constructor() {
+        self.has_call = 0;
+        self.has_indirect_call = 0;
+        self.has_heap_alloc = 0;
+        self.has_tag_pack = 0;
+        self.has_tag_auto = 0;
+        self.has_tagged_access = 0;
+    }
+}
+
+struct SSAOptTagState {
+    public key: u64;
+    public active: u64;
+    public has_bits: u64;
+    public raw_reg: u64;
+    public raw_const_has: u64;
+    public raw_const: u64;
+    public lifecycle: u64;
+    public ownership: u64;
+    public storage: u64;
+    public barrier: u64;
+    public shape: u64;
+    public profiled: u64;
+}
+
+impl SSAOptTagState {
+    public constructor() {
+        self.key = 0;
+        self.active = 0;
+        self.has_bits = 0;
+        self.raw_reg = 0;
+        self.raw_const_has = 0;
+        self.raw_const = 0;
+        self.lifecycle = 0;
+        self.ownership = 0;
+        self.storage = 0;
+        self.barrier = 0;
+        self.shape = 0;
+        self.profiled = 0;
     }
 }
 
@@ -94,6 +208,170 @@ func raw_ptr_clear(map: *Vec<*SSAOptKV>, key: u64) -> u64 {
 func raw_ptr_get(map: *Vec<*SSAOptKV>, key: u64) -> u64 {
     if (key == 0) { return 0; }
     return kv_get(map, key);
+}
+
+func ssa_tag_name_eq(name: []u8, lit: u64, len: u64) -> u64 {
+    if (name.ptr == 0 || name.len != len) { return 0; }
+    return str_eq(name, slice(lit, len));
+}
+
+func ssa_tag_name_has_prefix(name: []u8, lit: u64, len: u64) -> u64 {
+    if (name.ptr == 0 || name.len < len) { return 0; }
+    return str_eq(slice(name.ptr, len), slice(lit, len));
+}
+
+func ssa_tag_state_find(map: *Vec<*SSAOptTagState>, key: u64) -> *SSAOptTagState {
+    if (map == 0 || key == 0) { return 0; }
+    var n: u64 = map.len();
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var entry: *SSAOptTagState = map.get(i);
+        if (entry != 0 && entry.active != 0 && entry.key == key) {
+            return entry;
+        }
+    }
+    return 0;
+}
+
+func ssa_tag_state_ensure(map: *Vec<*SSAOptTagState>, key: u64) -> *SSAOptTagState {
+    var entry: *SSAOptTagState = ssa_tag_state_find(map, key);
+    if (entry != 0) { return entry; }
+    var new_entry: *SSAOptTagState = new SSAOptTagState{};
+    new_entry.key = key;
+    new_entry.active = 1;
+    map.push(new_entry);
+    return new_entry;
+}
+
+func ssa_tag_state_clear(map: *Vec<*SSAOptTagState>, key: u64) -> u64 {
+    var entry: *SSAOptTagState = ssa_tag_state_find(map, key);
+    if (entry != 0) { entry.active = 0; }
+    return 0;
+}
+
+func ssa_tag_state_copy(map: *Vec<*SSAOptTagState>, dst: u64, src: u64) -> u64 {
+    if (dst == 0) { return 0; }
+    var src_entry: *SSAOptTagState = ssa_tag_state_find(map, src);
+    if (src_entry == 0) {
+        ssa_tag_state_clear(map, dst);
+        return 0;
+    }
+    var dst_entry: *SSAOptTagState = ssa_tag_state_ensure(map, dst);
+    dst_entry.active = 1;
+    dst_entry.has_bits = src_entry.has_bits;
+    dst_entry.raw_reg = src_entry.raw_reg;
+    dst_entry.raw_const_has = src_entry.raw_const_has;
+    dst_entry.raw_const = src_entry.raw_const;
+    dst_entry.lifecycle = src_entry.lifecycle;
+    dst_entry.ownership = src_entry.ownership;
+    dst_entry.storage = src_entry.storage;
+    dst_entry.barrier = src_entry.barrier;
+    dst_entry.shape = src_entry.shape;
+    dst_entry.profiled = src_entry.profiled;
+    return 0;
+}
+
+func ssa_tag_state_set(map: *Vec<*SSAOptTagState>, key: u64, raw_reg: u64, raw_const_has: u64, raw_const: u64, lifecycle: u64, ownership: u64, storage: u64, barrier: u64, shape: u64, profiled: u64) -> u64 {
+    if (key == 0) { return 0; }
+    var entry: *SSAOptTagState = ssa_tag_state_ensure(map, key);
+    entry.active = 1;
+    entry.has_bits = SSA_TAG_HAS_ALL;
+    entry.raw_reg = raw_reg;
+    entry.raw_const_has = raw_const_has;
+    entry.raw_const = raw_const & SSA_TAGGED_PTR_MASK;
+    entry.lifecycle = lifecycle & 7;
+    entry.ownership = ownership & 7;
+    entry.storage = storage & 7;
+    entry.barrier = barrier & 3;
+    entry.shape = shape & 15;
+    entry.profiled = profiled & 1;
+    return 0;
+}
+
+func ssa_tag_pack_const(raw: u64, lifecycle: u64, ownership: u64, storage: u64, barrier: u64, shape: u64, profiled: u64) -> u64 {
+    var out: u64 = raw & SSA_TAGGED_PTR_MASK;
+    out = out | ((lifecycle & 7) << SSA_TAG_LIFECYCLE_SHIFT);
+    out = out | ((ownership & 7) << SSA_TAG_OWNERSHIP_SHIFT);
+    out = out | ((storage & 7) << SSA_TAG_STORAGE_SHIFT);
+    out = out | ((barrier & 3) << SSA_TAG_BARRIER_SHIFT);
+    out = out | ((shape & 15) << SSA_TAG_SHAPE_SHIFT);
+    out = out | ((profiled & 1) << SSA_TAG_PROFILED_SHIFT);
+    return out;
+}
+
+func ssa_tag_lifecycle_const(raw: u64) -> u64 { return (raw >> SSA_TAG_LIFECYCLE_SHIFT) & 7; }
+func ssa_tag_ownership_const(raw: u64) -> u64 { return (raw >> SSA_TAG_OWNERSHIP_SHIFT) & 7; }
+func ssa_tag_storage_const(raw: u64) -> u64 { return (raw >> SSA_TAG_STORAGE_SHIFT) & 7; }
+func ssa_tag_barrier_const(raw: u64) -> u64 { return (raw >> SSA_TAG_BARRIER_SHIFT) & 3; }
+func ssa_tag_shape_const(raw: u64) -> u64 { return (raw >> SSA_TAG_SHAPE_SHIFT) & 15; }
+func ssa_tag_profiled_const(raw: u64) -> u64 { return (raw >> SSA_TAG_PROFILED_SHIFT) & 1; }
+
+func ssa_tag_delete_allowed_fields(lifecycle: u64, ownership: u64, storage: u64) -> u64 {
+    if (lifecycle == SSA_TAG_LIFE_BORROWED) { return 0; }
+    if (lifecycle == SSA_TAG_LIFE_ARENA) { return 0; }
+    if (lifecycle == SSA_TAG_LIFE_IMMORTAL) { return 0; }
+    if (lifecycle == SSA_TAG_LIFE_DEAD) { return 0; }
+    if (ownership == SSA_TAG_OWN_BORROWED) { return 0; }
+    if (ownership == SSA_TAG_OWN_WEAK) { return 0; }
+    if (ownership == SSA_TAG_OWN_STACK) { return 0; }
+    if (storage == SSA_TAG_STORAGE_STACK) { return 0; }
+    if (storage == SSA_TAG_STORAGE_ARENA) { return 0; }
+    if (storage == SSA_TAG_STORAGE_STATIC) { return 0; }
+    if (storage == SSA_TAG_STORAGE_FOREIGN) { return 0; }
+    if (storage == SSA_TAG_STORAGE_INLINE) { return 0; }
+    if (storage == SSA_TAG_STORAGE_VECTOR) { return 0; }
+    return 1;
+}
+
+func ssa_tag_skip_refcount_fields(lifecycle: u64, ownership: u64) -> u64 {
+    if (lifecycle == SSA_TAG_LIFE_IMMORTAL) { return 1; }
+    if (ownership == SSA_TAG_OWN_UNIQUE) { return 1; }
+    if (ownership == SSA_TAG_OWN_BORROWED) { return 1; }
+    if (ownership == SSA_TAG_OWN_WEAK) { return 1; }
+    if (ownership == SSA_TAG_OWN_STACK) { return 1; }
+    return 0;
+}
+
+func ssa_tag_skip_barrier_fields(lifecycle: u64, storage: u64, barrier: u64) -> u64 {
+    if (barrier == SSA_TAG_BARRIER_SKIP) { return 1; }
+    if (barrier == SSA_TAG_BARRIER_CLEAN) { return 1; }
+    if (lifecycle == SSA_TAG_LIFE_IMMORTAL) { return 1; }
+    if (storage == SSA_TAG_STORAGE_STACK) { return 1; }
+    if (storage == SSA_TAG_STORAGE_STATIC) { return 1; }
+    return 0;
+}
+
+func ssa_tag_shape_vectorizable(shape: u64) -> u64 {
+    if (shape == SSA_TAG_SHAPE_I64) { return 1; }
+    if (shape == SSA_TAG_SHAPE_U64) { return 1; }
+    if (shape == SSA_TAG_SHAPE_F64) { return 1; }
+    if (shape == SSA_TAG_SHAPE_POD) { return 1; }
+    return 0;
+}
+
+func ssa_tag_vector_lanes(shape: u64, elem_size: u64) -> u64 {
+    if (ssa_tag_shape_vectorizable(shape) == 0) { return 1; }
+    if (elem_size == 0) { return 1; }
+    var lanes: u64 = 32 / elem_size;
+    if (lanes < 1) { lanes = 1; }
+    if (lanes > 8) { lanes = 8; }
+    return lanes;
+}
+
+func ssa_tag_len_class(len: u64) -> u64 {
+    if (len == 0) { return 0; }
+    if (len < 4) { return 1; }
+    if (len < 16) { return 2; }
+    if (len < 1024) { return 3; }
+    return 4;
+}
+
+func ssa_tag_fast_path_for(shape: u64, hot: u64, profiled: u64, elem_size: u64, len: u64) -> u64 {
+    if (len == 0) { return SSA_TAG_FAST_PATH_NONE; }
+    if (ssa_tag_shape_vectorizable(shape) == 0) { return SSA_TAG_FAST_PATH_SCALAR; }
+    var lanes: u64 = ssa_tag_vector_lanes(shape, elem_size);
+    if (hot != 0 && profiled != 0 && lanes >= 2 && len >= lanes) { return SSA_TAG_FAST_PATH_VECTOR; }
+    if (len >= 2 && lanes >= 2) { return SSA_TAG_FAST_PATH_UNROLLED; }
+    return SSA_TAG_FAST_PATH_SCALAR;
 }
 
 // ============================================
@@ -560,7 +838,95 @@ func operand_const_value(reg_consts: *Vec<*SSAOptKV>, opr: u64) -> SSAOptConstVa
     return result;
 }
 
-func handle_copy(cur: *SSAInstruction, reg_consts: *Vec<*SSAOptKV>, raw_ptr_regs: *Vec<*SSAOptKV>) -> u64 {
+func reg_const_value(reg_consts: *Vec<*SSAOptKV>, reg: u64) -> SSAOptConstValue {
+    var result: SSAOptConstValue;
+    result.has = 0;
+    result.val = 0;
+    if (reg == 0) { return result; }
+    var entry: *SSAOptKV = const_find(slice(reg_consts, reg));
+    if (entry != 0) {
+        result.has = 1;
+        result.val = entry.val;
+    }
+    return result;
+}
+
+func ssa_call_arg(info: *SSACallInfo, idx: u64) -> u64 {
+    if (info == 0 || info.args_vec == 0 || idx >= info.nargs) { return 0; }
+    return info.args_vec.get(idx);
+}
+
+func ssa_call_arg_const(info: *SSACallInfo, idx: u64, reg_consts: *Vec<*SSAOptKV>) -> SSAOptConstValue {
+    return reg_const_value(reg_consts, ssa_call_arg(info, idx));
+}
+
+func ssa_tag_call_name_is_pack(name: []u8) -> u64 {
+    return ssa_tag_name_eq(name, "std_mem__bpp_tag_pack", 21);
+}
+
+func ssa_tag_call_name_is_strip(name: []u8) -> u64 {
+    return ssa_tag_name_eq(name, "std_mem__bpp_tag_strip", 22);
+}
+
+func ssa_tag_call_name_is_heap_alloc(name: []u8) -> u64 {
+    return ssa_tag_name_eq(name, "std_io__heap_alloc", 18);
+}
+
+func ssa_tag_call_name_is_object_auto(name: []u8) -> u64 {
+    return ssa_tag_name_has_prefix(name, "std_mem__bpp_tag_object_auto__G__T_", 35);
+}
+
+func ssa_tag_call_name_is_object_from_raw(name: []u8) -> u64 {
+    return ssa_tag_name_has_prefix(name, "std_mem__bpp_tag_object_from_raw__G__T_", 39);
+}
+
+func ssa_tag_call_name_is_slice_from_ptr(name: []u8) -> u64 {
+    return ssa_tag_name_has_prefix(name, "std_mem__bpp_tag_slice_from_ptr__G__T_", 38);
+}
+
+func ssa_tag_call_name_is_slice_from_raw_tag(name: []u8) -> u64 {
+    return ssa_tag_name_has_prefix(name, "std_mem__bpp_tag_slice_from_raw_tag__G__T_", 42);
+}
+
+func ssa_tag_generic_elem_size(name: []u8, prefix_len: u64) -> u64 {
+    if (name.ptr == 0 || name.len <= prefix_len) { return 0; }
+    var suffix_len: u64 = name.len - prefix_len;
+    var suffix: []u8 = slice(name.ptr + prefix_len, suffix_len);
+    if (suffix_len == 3 && str_eq(suffix, slice("u64", 3)) != 0) { return 8; }
+    if (suffix_len == 3 && str_eq(suffix, slice("i64", 3)) != 0) { return 8; }
+    if (suffix_len == 3 && str_eq(suffix, slice("f64", 3)) != 0) { return 8; }
+    if (suffix_len == 3 && str_eq(suffix, slice("u32", 3)) != 0) { return 4; }
+    if (suffix_len == 3 && str_eq(suffix, slice("i32", 3)) != 0) { return 4; }
+    if (suffix_len == 3 && str_eq(suffix, slice("f32", 3)) != 0) { return 4; }
+    if (suffix_len == 3 && str_eq(suffix, slice("u16", 3)) != 0) { return 2; }
+    if (suffix_len == 3 && str_eq(suffix, slice("i16", 3)) != 0) { return 2; }
+    if (suffix_len == 2 && str_eq(suffix, slice("u8", 2)) != 0) { return 1; }
+    if (suffix_len == 2 && str_eq(suffix, slice("i8", 2)) != 0) { return 1; }
+    if (suffix_len == 7 && str_eq(suffix, slice("SNumber", 7)) != 0) { return 8; }
+    if (suffix_len == 1 && str_eq(suffix, slice("t", 1)) != 0) { return 8; }
+    return 8;
+}
+
+func ssa_tag_object_auto_elem_size(name: []u8) -> u64 {
+    if (ssa_tag_call_name_is_object_auto(name) == 0) { return 0; }
+    return ssa_tag_generic_elem_size(name, 35);
+}
+
+func ssa_tag_known_field_value(state: *SSAOptTagState, field: u64) -> SSAOptConstValue {
+    var out: SSAOptConstValue;
+    out.has = 0;
+    out.val = 0;
+    if (state == 0) { return out; }
+    if (field == SSA_TAG_HAS_LIFE && (state.has_bits & SSA_TAG_HAS_LIFE) != 0) { out.has = 1; out.val = state.lifecycle; return out; }
+    if (field == SSA_TAG_HAS_OWN && (state.has_bits & SSA_TAG_HAS_OWN) != 0) { out.has = 1; out.val = state.ownership; return out; }
+    if (field == SSA_TAG_HAS_STORAGE && (state.has_bits & SSA_TAG_HAS_STORAGE) != 0) { out.has = 1; out.val = state.storage; return out; }
+    if (field == SSA_TAG_HAS_BARRIER && (state.has_bits & SSA_TAG_HAS_BARRIER) != 0) { out.has = 1; out.val = state.barrier; return out; }
+    if (field == SSA_TAG_HAS_SHAPE && (state.has_bits & SSA_TAG_HAS_SHAPE) != 0) { out.has = 1; out.val = state.shape; return out; }
+    if (field == SSA_TAG_HAS_PROFILED && (state.has_bits & SSA_TAG_HAS_PROFILED) != 0) { out.has = 1; out.val = state.profiled; return out; }
+    return out;
+}
+
+func handle_copy(cur: *SSAInstruction, reg_consts: *Vec<*SSAOptKV>, raw_ptr_regs: *Vec<*SSAOptKV>, tag_states: *Vec<*SSAOptTagState>) -> u64 {
     if (op_of(cur) != SSA_OP_COPY) { return 0; }
     var value: SSAOptConstValue = operand_const_value(reg_consts, cur.src1);
     if (value.has != 0) {
@@ -569,12 +935,18 @@ func handle_copy(cur: *SSAInstruction, reg_consts: *Vec<*SSAOptKV>, raw_ptr_regs
         cur.src2 = 0;
         const_set(reg_consts, cur.dest, value.val);
         raw_ptr_clear(raw_ptr_regs, cur.dest);
+        ssa_tag_state_clear(tag_states, cur.dest);
     } else {
         const_clear(reg_consts, cur.dest);
         if (cur.dest != 0 && operand_is_const(cur.src1) == 0 && raw_ptr_get(raw_ptr_regs, operand_value(cur.src1)) != 0) {
             raw_ptr_set(raw_ptr_regs, cur.dest);
         } else {
             raw_ptr_clear(raw_ptr_regs, cur.dest);
+        }
+        if (cur.dest != 0 && operand_is_const(cur.src1) == 0) {
+            ssa_tag_state_copy(tag_states, cur.dest, operand_value(cur.src1));
+        } else {
+            ssa_tag_state_clear(tag_states, cur.dest);
         }
     }
     return 1;
@@ -594,7 +966,7 @@ func handle_store(cur: *SSAInstruction, reg_consts: *Vec<*SSAOptKV>, var_consts:
     return 1;
 }
 
-func handle_load(cur: *SSAInstruction, reg_consts: *Vec<*SSAOptKV>, var_consts: *Vec<*SSAOptKV>, raw_ptr_regs: *Vec<*SSAOptKV>) -> u64 {
+func handle_load(cur: *SSAInstruction, reg_consts: *Vec<*SSAOptKV>, var_consts: *Vec<*SSAOptKV>, raw_ptr_regs: *Vec<*SSAOptKV>, tag_states: *Vec<*SSAOptTagState>) -> u64 {
     if (op_of(cur) != SSA_OP_LOAD) { return 0; }
     if (operand_is_const(cur.src1)) {
         var var_id2: u64 = operand_value(cur.src1);
@@ -606,11 +978,13 @@ func handle_load(cur: *SSAInstruction, reg_consts: *Vec<*SSAOptKV>, var_consts: 
             cur.src2 = 0;
             const_set(reg_consts, cur.dest, v3);
             raw_ptr_clear(raw_ptr_regs, cur.dest);
+            ssa_tag_state_clear(tag_states, cur.dest);
             return 1;
         }
     }
     const_clear(reg_consts, cur.dest);
     raw_ptr_clear(raw_ptr_regs, cur.dest);
+    ssa_tag_state_clear(tag_states, cur.dest);
     return 1;
 }
 
@@ -638,7 +1012,7 @@ func handle_tagged_ptr_mask(cur: *SSAInstruction, reg_consts: *Vec<*SSAOptKV>, r
     return 1;
 }
 
-func handle_foldable(cur: *SSAInstruction, reg_consts: *Vec<*SSAOptKV>, raw_ptr_regs: *Vec<*SSAOptKV>) -> u64 {
+func handle_foldable(cur: *SSAInstruction, reg_consts: *Vec<*SSAOptKV>, raw_ptr_regs: *Vec<*SSAOptKV>, tag_states: *Vec<*SSAOptTagState>) -> u64 {
     var op: u64 = op_of(cur);
     if (is_foldable(op) == 0) { return 0; }
 
@@ -658,25 +1032,382 @@ func handle_foldable(cur: *SSAInstruction, reg_consts: *Vec<*SSAOptKV>, raw_ptr_
     }
 
     if (handle_tagged_ptr_mask(cur, reg_consts, raw_ptr_regs) != 0) {
+        if (cur.dest != 0) { ssa_tag_state_clear(tag_states, cur.dest); }
         return 1;
     }
     if (fold_inst(cur) != 0) {
         const_set(reg_consts, cur.dest, operand_value(cur.src1));
         raw_ptr_clear(raw_ptr_regs, cur.dest);
+        ssa_tag_state_clear(tag_states, cur.dest);
     } else if (strength_reduce_inst(cur, reg_consts) != 0) {
         raw_ptr_clear(raw_ptr_regs, cur.dest);
+        ssa_tag_state_clear(tag_states, cur.dest);
         return 1;
     } else if (cur.dest != 0) {
         const_clear(reg_consts, cur.dest);
         raw_ptr_clear(raw_ptr_regs, cur.dest);
+        ssa_tag_state_clear(tag_states, cur.dest);
     }
     return 1;
 }
 
-func run_block(b: *SSABlock) -> u64 {
+func ssa_tag_try_const_from_raw(cur: *SSAInstruction, raw: u64, reg_consts: *Vec<*SSAOptKV>, tag_states: *Vec<*SSAOptTagState>) -> u64 {
+    if (cur.dest == 0) { return 0; }
+    opt_set_const(cur, raw & SSA_TAGGED_PTR_MASK, reg_consts);
+    ssa_tag_state_clear(tag_states, cur.dest);
+    return 1;
+}
+
+func ssa_tag_fold_field_call(cur: *SSAInstruction, name: []u8, arg: u64, reg_consts: *Vec<*SSAOptKV>, tag_states: *Vec<*SSAOptTagState>) -> u64 {
+    if (cur.dest == 0 || arg == 0) { return 0; }
+    var const_arg: SSAOptConstValue = reg_const_value(reg_consts, arg);
+    if (const_arg.has != 0) {
+        if (ssa_tag_name_eq(name, "std_mem__bpp_tag_lifecycle_raw", 30) != 0) { return opt_set_const(cur, ssa_tag_lifecycle_const(const_arg.val), reg_consts); }
+        if (ssa_tag_name_eq(name, "std_mem__bpp_tag_ownership_raw", 30) != 0) { return opt_set_const(cur, ssa_tag_ownership_const(const_arg.val), reg_consts); }
+        if (ssa_tag_name_eq(name, "std_mem__bpp_tag_storage_raw", 28) != 0) { return opt_set_const(cur, ssa_tag_storage_const(const_arg.val), reg_consts); }
+        if (ssa_tag_name_eq(name, "std_mem__bpp_tag_barrier_raw", 28) != 0) { return opt_set_const(cur, ssa_tag_barrier_const(const_arg.val), reg_consts); }
+        if (ssa_tag_name_eq(name, "std_mem__bpp_tag_shape_raw", 26) != 0) { return opt_set_const(cur, ssa_tag_shape_const(const_arg.val), reg_consts); }
+        if (ssa_tag_name_eq(name, "std_mem__bpp_tag_profiled_raw", 29) != 0) { return opt_set_const(cur, ssa_tag_profiled_const(const_arg.val), reg_consts); }
+    }
+
+    var state: *SSAOptTagState = ssa_tag_state_find(tag_states, arg);
+    if (state == 0) { return 0; }
+    var out: SSAOptConstValue;
+    out.has = 0;
+    out.val = 0;
+    if (ssa_tag_name_eq(name, "std_mem__bpp_tag_lifecycle_raw", 30) != 0) { out = ssa_tag_known_field_value(state, SSA_TAG_HAS_LIFE); }
+    else if (ssa_tag_name_eq(name, "std_mem__bpp_tag_ownership_raw", 30) != 0) { out = ssa_tag_known_field_value(state, SSA_TAG_HAS_OWN); }
+    else if (ssa_tag_name_eq(name, "std_mem__bpp_tag_storage_raw", 28) != 0) { out = ssa_tag_known_field_value(state, SSA_TAG_HAS_STORAGE); }
+    else if (ssa_tag_name_eq(name, "std_mem__bpp_tag_barrier_raw", 28) != 0) { out = ssa_tag_known_field_value(state, SSA_TAG_HAS_BARRIER); }
+    else if (ssa_tag_name_eq(name, "std_mem__bpp_tag_shape_raw", 26) != 0) { out = ssa_tag_known_field_value(state, SSA_TAG_HAS_SHAPE); }
+    else if (ssa_tag_name_eq(name, "std_mem__bpp_tag_profiled_raw", 29) != 0) { out = ssa_tag_known_field_value(state, SSA_TAG_HAS_PROFILED); }
+    if (out.has == 0) { return 0; }
+    return opt_set_const(cur, out.val, reg_consts);
+}
+
+func ssa_tag_fold_lifecycle_predicate(cur: *SSAInstruction, name: []u8, info: *SSACallInfo, reg_consts: *Vec<*SSAOptKV>, tag_states: *Vec<*SSAOptTagState>) -> u64 {
+    if (cur.dest == 0 || info == 0 || info.nargs == 0) { return 0; }
+    var arg0: u64 = ssa_call_arg(info, 0);
+    var c0: SSAOptConstValue = reg_const_value(reg_consts, arg0);
+    var lifecycle: u64 = 0;
+    var ownership: u64 = 0;
+    var storage: u64 = 0;
+    var barrier: u64 = 0;
+    var has_all: u64 = 0;
+
+    if (c0.has != 0) {
+        lifecycle = ssa_tag_lifecycle_const(c0.val);
+        ownership = ssa_tag_ownership_const(c0.val);
+        storage = ssa_tag_storage_const(c0.val);
+        barrier = ssa_tag_barrier_const(c0.val);
+        has_all = 1;
+    } else {
+        var state: *SSAOptTagState = ssa_tag_state_find(tag_states, arg0);
+        if (state != 0 && (state.has_bits & (SSA_TAG_HAS_LIFE | SSA_TAG_HAS_OWN | SSA_TAG_HAS_STORAGE | SSA_TAG_HAS_BARRIER)) == (SSA_TAG_HAS_LIFE | SSA_TAG_HAS_OWN | SSA_TAG_HAS_STORAGE | SSA_TAG_HAS_BARRIER)) {
+            lifecycle = state.lifecycle;
+            ownership = state.ownership;
+            storage = state.storage;
+            barrier = state.barrier;
+            has_all = 1;
+        }
+    }
+    if (has_all == 0) { return 0; }
+
+    if (ssa_tag_name_eq(name, "std_mem__bpp_tag_delete_allowed_raw", 35) != 0) {
+        return opt_set_const(cur, ssa_tag_delete_allowed_fields(lifecycle, ownership, storage), reg_consts);
+    }
+    if (ssa_tag_name_eq(name, "std_mem__bpp_tag_can_skip_refcount_raw", 38) != 0) {
+        return opt_set_const(cur, ssa_tag_skip_refcount_fields(lifecycle, ownership), reg_consts);
+    }
+    if (ssa_tag_name_eq(name, "std_mem__bpp_tag_refcount_retain_needed_raw", 43) != 0) {
+        return opt_set_const(cur, ssa_tag_skip_refcount_fields(lifecycle, ownership) == 0, reg_consts);
+    }
+    if (ssa_tag_name_eq(name, "std_mem__bpp_tag_refcount_release_needed_raw", 44) != 0) {
+        if (ssa_tag_skip_refcount_fields(lifecycle, ownership) != 0) { return opt_set_const(cur, 0, reg_consts); }
+        if (ownership == SSA_TAG_OWN_SHARED || ownership == SSA_TAG_OWN_ESCAPED) { return opt_set_const(cur, 1, reg_consts); }
+        return opt_set_const(cur, 0, reg_consts);
+    }
+    if (ssa_tag_name_eq(name, "std_mem__bpp_tag_can_skip_gc_barrier_raw", 40) != 0) {
+        return opt_set_const(cur, ssa_tag_skip_barrier_fields(lifecycle, storage, barrier), reg_consts);
+    }
+    return 0;
+}
+
+func ssa_tag_fold_gc_barrier_call(cur: *SSAInstruction, info: *SSACallInfo, reg_consts: *Vec<*SSAOptKV>, tag_states: *Vec<*SSAOptTagState>) -> u64 {
+    if (cur.dest == 0 || info == 0 || info.nargs < 2) { return 0; }
+    var parent_reg: u64 = ssa_call_arg(info, 0);
+    var child_reg: u64 = ssa_call_arg(info, 1);
+    var parent_state: *SSAOptTagState = ssa_tag_state_find(tag_states, parent_reg);
+    var child_state: *SSAOptTagState = ssa_tag_state_find(tag_states, child_reg);
+    if (parent_state == 0 || child_state == 0) { return 0; }
+    if ((parent_state.has_bits & (SSA_TAG_HAS_LIFE | SSA_TAG_HAS_STORAGE | SSA_TAG_HAS_BARRIER)) != (SSA_TAG_HAS_LIFE | SSA_TAG_HAS_STORAGE | SSA_TAG_HAS_BARRIER)) { return 0; }
+    if ((child_state.has_bits & (SSA_TAG_HAS_LIFE | SSA_TAG_HAS_STORAGE)) != (SSA_TAG_HAS_LIFE | SSA_TAG_HAS_STORAGE)) { return 0; }
+    if (ssa_tag_skip_barrier_fields(parent_state.lifecycle, parent_state.storage, parent_state.barrier) != 0) {
+        return opt_set_const(cur, 0, reg_consts);
+    }
+    if (child_state.lifecycle == SSA_TAG_LIFE_IMMORTAL) { return opt_set_const(cur, 0, reg_consts); }
+    if (child_state.storage == SSA_TAG_STORAGE_STATIC) { return opt_set_const(cur, 0, reg_consts); }
+    return opt_set_const(cur, 1, reg_consts);
+}
+
+func ssa_tag_record_pack_result(cur: *SSAInstruction, info: *SSACallInfo, reg_consts: *Vec<*SSAOptKV>, raw_ptr_regs: *Vec<*SSAOptKV>, tag_states: *Vec<*SSAOptTagState>) -> u64 {
+    if (cur.dest == 0 || info == 0 || info.nargs < 7) { return 0; }
+    var c_life: SSAOptConstValue = ssa_call_arg_const(info, 1, reg_consts);
+    var c_own: SSAOptConstValue = ssa_call_arg_const(info, 2, reg_consts);
+    var c_storage: SSAOptConstValue = ssa_call_arg_const(info, 3, reg_consts);
+    var c_barrier: SSAOptConstValue = ssa_call_arg_const(info, 4, reg_consts);
+    var c_shape: SSAOptConstValue = ssa_call_arg_const(info, 5, reg_consts);
+    var c_profiled: SSAOptConstValue = ssa_call_arg_const(info, 6, reg_consts);
+    if (c_life.has == 0 || c_own.has == 0 || c_storage.has == 0 || c_barrier.has == 0 || c_shape.has == 0 || c_profiled.has == 0) { return 0; }
+    var raw_reg: u64 = 0;
+    var raw_const_has: u64 = 0;
+    var raw_const: u64 = 0;
+    var arg0: u64 = ssa_call_arg(info, 0);
+    var c_raw: SSAOptConstValue = reg_const_value(reg_consts, arg0);
+    if (c_raw.has != 0) {
+        raw_const_has = 1;
+        raw_const = c_raw.val;
+        opt_set_const(cur, ssa_tag_pack_const(raw_const, c_life.val, c_own.val, c_storage.val, c_barrier.val, c_shape.val, c_profiled.val), reg_consts);
+        ssa_tag_state_set(tag_states, cur.dest, 0, 1, raw_const, c_life.val, c_own.val, c_storage.val, c_barrier.val, c_shape.val, c_profiled.val);
+        return 1;
+    }
+    if (raw_ptr_get(raw_ptr_regs, arg0) != 0) { raw_reg = arg0; }
+    ssa_tag_state_set(tag_states, cur.dest, raw_reg, raw_const_has, raw_const, c_life.val, c_own.val, c_storage.val, c_barrier.val, c_shape.val, c_profiled.val);
+    return 1;
+}
+
+func ssa_tag_record_object_from_raw(cur: *SSAInstruction, info: *SSACallInfo, reg_consts: *Vec<*SSAOptKV>, raw_ptr_regs: *Vec<*SSAOptKV>, tag_states: *Vec<*SSAOptTagState>) -> u64 {
+    if (cur.dest == 0 || info == 0 || info.nargs < 4) { return 0; }
+    var c_life: SSAOptConstValue = ssa_call_arg_const(info, 1, reg_consts);
+    var c_own: SSAOptConstValue = ssa_call_arg_const(info, 2, reg_consts);
+    var c_storage: SSAOptConstValue = ssa_call_arg_const(info, 3, reg_consts);
+    if (c_life.has == 0 || c_own.has == 0 || c_storage.has == 0) { return 0; }
+    var raw_reg: u64 = 0;
+    var raw_const_has: u64 = 0;
+    var raw_const: u64 = 0;
+    var arg0: u64 = ssa_call_arg(info, 0);
+    var c_raw: SSAOptConstValue = reg_const_value(reg_consts, arg0);
+    if (c_raw.has != 0) {
+        raw_const_has = 1;
+        raw_const = c_raw.val;
+        opt_set_const(cur, ssa_tag_pack_const(raw_const, c_life.val, c_own.val, c_storage.val, SSA_TAG_BARRIER_CLEAN, SSA_TAG_SHAPE_OBJECT, 0), reg_consts);
+    } else if (raw_ptr_get(raw_ptr_regs, arg0) != 0) {
+        raw_reg = arg0;
+    }
+    ssa_tag_state_set(tag_states, cur.dest, raw_reg, raw_const_has, raw_const, c_life.val, c_own.val, c_storage.val, SSA_TAG_BARRIER_CLEAN, SSA_TAG_SHAPE_OBJECT, 0);
+    return 1;
+}
+
+func ssa_tag_record_object_auto(cur: *SSAInstruction, info: *SSACallInfo, elem_size: u64, reg_consts: *Vec<*SSAOptKV>, raw_ptr_regs: *Vec<*SSAOptKV>, tag_states: *Vec<*SSAOptTagState>) -> u64 {
+    if (cur.dest == 0 || info == 0 || info.nargs < 7) { return 0; }
+    var c_escapes: SSAOptConstValue = ssa_call_arg_const(info, 1, reg_consts);
+    var c_addr: SSAOptConstValue = ssa_call_arg_const(info, 2, reg_consts);
+    var c_shared: SSAOptConstValue = ssa_call_arg_const(info, 3, reg_consts);
+    var c_pinned: SSAOptConstValue = ssa_call_arg_const(info, 4, reg_consts);
+    var c_immortal: SSAOptConstValue = ssa_call_arg_const(info, 5, reg_consts);
+    var c_arena: SSAOptConstValue = ssa_call_arg_const(info, 6, reg_consts);
+    if (c_escapes.has == 0 || c_addr.has == 0 || c_shared.has == 0 || c_pinned.has == 0 || c_immortal.has == 0 || c_arena.has == 0) { return 0; }
+
+    var life: u64 = SSA_TAG_LIFE_YOUNG;
+    var own: u64 = SSA_TAG_OWN_UNIQUE;
+    var storage: u64 = SSA_TAG_STORAGE_HEAP;
+    var barrier: u64 = SSA_TAG_BARRIER_CLEAN;
+    if (c_immortal.val != 0) {
+        life = SSA_TAG_LIFE_IMMORTAL; own = SSA_TAG_OWN_SHARED; storage = SSA_TAG_STORAGE_STATIC; barrier = SSA_TAG_BARRIER_SKIP;
+    } else if (c_pinned.val != 0) {
+        life = SSA_TAG_LIFE_PINNED; own = SSA_TAG_OWN_SHARED; storage = SSA_TAG_STORAGE_HEAP; barrier = SSA_TAG_BARRIER_DIRTY;
+    } else if (c_escapes.val != 0) {
+        life = SSA_TAG_LIFE_YOUNG; storage = SSA_TAG_STORAGE_HEAP; barrier = SSA_TAG_BARRIER_CLEAN;
+        if (c_shared.val != 0) { own = SSA_TAG_OWN_SHARED; }
+        else { own = SSA_TAG_OWN_ESCAPED; }
+    } else if (c_shared.val != 0) {
+        life = SSA_TAG_LIFE_YOUNG; own = SSA_TAG_OWN_SHARED; storage = SSA_TAG_STORAGE_HEAP; barrier = SSA_TAG_BARRIER_CLEAN;
+    } else if (c_arena.val != 0 || elem_size > 4096) {
+        if (elem_size <= 262144) {
+            life = SSA_TAG_LIFE_ARENA; own = SSA_TAG_OWN_BORROWED; storage = SSA_TAG_STORAGE_ARENA; barrier = SSA_TAG_BARRIER_CLEAN;
+        } else {
+            life = SSA_TAG_LIFE_YOUNG; own = SSA_TAG_OWN_OWNED; storage = SSA_TAG_STORAGE_HEAP; barrier = SSA_TAG_BARRIER_CLEAN;
+        }
+    } else if (c_addr.val == 0 && elem_size <= 4096) {
+        life = SSA_TAG_LIFE_BORROWED; own = SSA_TAG_OWN_STACK; storage = SSA_TAG_STORAGE_STACK; barrier = SSA_TAG_BARRIER_SKIP;
+    }
+
+    var raw_reg: u64 = 0;
+    var raw_const_has: u64 = 0;
+    var raw_const: u64 = 0;
+    var arg0: u64 = ssa_call_arg(info, 0);
+    var c_raw: SSAOptConstValue = reg_const_value(reg_consts, arg0);
+    if (c_raw.has != 0) {
+        raw_const_has = 1;
+        raw_const = c_raw.val;
+        opt_set_const(cur, ssa_tag_pack_const(raw_const, life, own, storage, barrier, SSA_TAG_SHAPE_OBJECT, 0), reg_consts);
+    } else if (raw_ptr_get(raw_ptr_regs, arg0) != 0) {
+        raw_reg = arg0;
+    }
+    ssa_tag_state_set(tag_states, cur.dest, raw_reg, raw_const_has, raw_const, life, own, storage, barrier, SSA_TAG_SHAPE_OBJECT, 0);
+    return 1;
+}
+
+func ssa_tag_record_slice_from_ptr(cur: *SSAInstruction, info: *SSACallInfo, reg_consts: *Vec<*SSAOptKV>, raw_ptr_regs: *Vec<*SSAOptKV>, tag_states: *Vec<*SSAOptTagState>) -> u64 {
+    if (cur.dest == 0 || info == 0 || info.nargs < 3) { return 0; }
+    var c_len: SSAOptConstValue = ssa_call_arg_const(info, 1, reg_consts);
+    var c_shape: SSAOptConstValue = ssa_call_arg_const(info, 2, reg_consts);
+    if (c_shape.has == 0) { return 0; }
+    var shape2: u64 = c_shape.val;
+    if (c_len.has != 0 && c_len.val == 0) { shape2 = SSA_TAG_SHAPE_EMPTY; }
+    var raw_reg: u64 = 0;
+    var arg0: u64 = ssa_call_arg(info, 0);
+    if (raw_ptr_get(raw_ptr_regs, arg0) != 0) { raw_reg = arg0; }
+    ssa_tag_state_set(tag_states, cur.dest, raw_reg, 0, 0, SSA_TAG_LIFE_BORROWED, SSA_TAG_OWN_BORROWED, SSA_TAG_STORAGE_HEAP, SSA_TAG_BARRIER_CLEAN, shape2, 0);
+    return 1;
+}
+
+func ssa_tag_record_slice_from_raw_tag(cur: *SSAInstruction, info: *SSACallInfo, reg_consts: *Vec<*SSAOptKV>, raw_ptr_regs: *Vec<*SSAOptKV>, tag_states: *Vec<*SSAOptTagState>) -> u64 {
+    if (cur.dest == 0 || info == 0 || info.nargs < 8) { return 0; }
+    var c_len: SSAOptConstValue = ssa_call_arg_const(info, 1, reg_consts);
+    var c_life: SSAOptConstValue = ssa_call_arg_const(info, 2, reg_consts);
+    var c_own: SSAOptConstValue = ssa_call_arg_const(info, 3, reg_consts);
+    var c_storage: SSAOptConstValue = ssa_call_arg_const(info, 4, reg_consts);
+    var c_barrier: SSAOptConstValue = ssa_call_arg_const(info, 5, reg_consts);
+    var c_shape: SSAOptConstValue = ssa_call_arg_const(info, 6, reg_consts);
+    var c_profiled: SSAOptConstValue = ssa_call_arg_const(info, 7, reg_consts);
+    if (c_life.has == 0 || c_own.has == 0 || c_storage.has == 0 || c_barrier.has == 0 || c_shape.has == 0 || c_profiled.has == 0) { return 0; }
+    var shape2: u64 = c_shape.val;
+    if (c_len.has != 0 && c_len.val == 0) { shape2 = SSA_TAG_SHAPE_EMPTY; }
+    var raw_reg: u64 = 0;
+    var arg0: u64 = ssa_call_arg(info, 0);
+    if (raw_ptr_get(raw_ptr_regs, arg0) != 0) { raw_reg = arg0; }
+    ssa_tag_state_set(tag_states, cur.dest, raw_reg, 0, 0, c_life.val, c_own.val, c_storage.val, c_barrier.val, shape2, c_profiled.val);
+    return 1;
+}
+
+func ssa_tag_fold_fastpath_call(cur: *SSAInstruction, name: []u8, info: *SSACallInfo, reg_consts: *Vec<*SSAOptKV>) -> u64 {
+    if (cur.dest == 0 || info == 0) { return 0; }
+    if (ssa_tag_name_eq(name, "std_mem__bpp_shape_is_vectorizable", 34) != 0 && info.nargs >= 1) {
+        var c0: SSAOptConstValue = ssa_call_arg_const(info, 0, reg_consts);
+        if (c0.has != 0) { return opt_set_const(cur, ssa_tag_shape_vectorizable(c0.val), reg_consts); }
+    }
+    if (ssa_tag_name_eq(name, "std_mem__bpp_vector_lanes_for_shape", 35) != 0 && info.nargs >= 2) {
+        var c_shape: SSAOptConstValue = ssa_call_arg_const(info, 0, reg_consts);
+        var c_elem: SSAOptConstValue = ssa_call_arg_const(info, 1, reg_consts);
+        if (c_shape.has != 0 && c_elem.has != 0) { return opt_set_const(cur, ssa_tag_vector_lanes(c_shape.val, c_elem.val), reg_consts); }
+    }
+    if (ssa_tag_name_eq(name, "std_mem__bpp_tag_len_class", 26) != 0 && info.nargs >= 1) {
+        var c_len: SSAOptConstValue = ssa_call_arg_const(info, 0, reg_consts);
+        if (c_len.has != 0) { return opt_set_const(cur, ssa_tag_len_class(c_len.val), reg_consts); }
+    }
+    if (ssa_tag_name_eq(name, "std_mem__bpp_fast_path_for_shape_len", 36) != 0 && info.nargs >= 5) {
+        var c_shape2: SSAOptConstValue = ssa_call_arg_const(info, 0, reg_consts);
+        var c_hot: SSAOptConstValue = ssa_call_arg_const(info, 1, reg_consts);
+        var c_profiled: SSAOptConstValue = ssa_call_arg_const(info, 2, reg_consts);
+        var c_elem2: SSAOptConstValue = ssa_call_arg_const(info, 3, reg_consts);
+        var c_len2: SSAOptConstValue = ssa_call_arg_const(info, 4, reg_consts);
+        if (c_shape2.has != 0 && c_hot.has != 0 && c_profiled.has != 0 && c_elem2.has != 0 && c_len2.has != 0) {
+            return opt_set_const(cur, ssa_tag_fast_path_for(c_shape2.val, c_hot.val, c_profiled.val, c_elem2.val, c_len2.val), reg_consts);
+        }
+    }
+    if (ssa_tag_name_eq(name, "std_mem__bpp_fast_path_for_shape", 32) != 0 && info.nargs >= 4) {
+        var c_shape3: SSAOptConstValue = ssa_call_arg_const(info, 0, reg_consts);
+        var c_hot2: SSAOptConstValue = ssa_call_arg_const(info, 1, reg_consts);
+        var c_profiled2: SSAOptConstValue = ssa_call_arg_const(info, 2, reg_consts);
+        var c_elem3: SSAOptConstValue = ssa_call_arg_const(info, 3, reg_consts);
+        if (c_shape3.has != 0 && c_hot2.has != 0 && c_profiled2.has != 0 && c_elem3.has != 0) {
+            var len: u64 = ssa_tag_vector_lanes(c_shape3.val, c_elem3.val);
+            return opt_set_const(cur, ssa_tag_fast_path_for(c_shape3.val, c_hot2.val, c_profiled2.val, c_elem3.val, len), reg_consts);
+        }
+    }
+    return 0;
+}
+
+func handle_tag_call(cur: *SSAInstruction, reg_consts: *Vec<*SSAOptKV>, raw_ptr_regs: *Vec<*SSAOptKV>, tag_states: *Vec<*SSAOptTagState>, summary: *SSAOptEscapeSummary) -> u64 {
+    if (op_of(cur) != SSA_OP_CALL) { return 0; }
+    var info: *SSACallInfo = (*SSACallInfo)operand_value(cur.src1);
+    if (info == 0) { return 0; }
+    var name: []u8 = info.name;
+    if (summary != 0) { summary.has_call = 1; }
+
+    if (ssa_tag_call_name_is_heap_alloc(name) != 0) {
+        if (cur.dest != 0) {
+            raw_ptr_set(raw_ptr_regs, cur.dest);
+            ssa_tag_state_clear(tag_states, cur.dest);
+        }
+        if (summary != 0) { summary.has_heap_alloc = 1; }
+        return 1;
+    }
+
+    if (ssa_tag_call_name_is_pack(name) != 0) {
+        if (summary != 0) { summary.has_tag_pack = 1; }
+        return ssa_tag_record_pack_result(cur, info, reg_consts, raw_ptr_regs, tag_states);
+    }
+
+    if (ssa_tag_call_name_is_object_from_raw(name) != 0) {
+        if (summary != 0) { summary.has_tag_pack = 1; summary.has_tagged_access = 1; }
+        return ssa_tag_record_object_from_raw(cur, info, reg_consts, raw_ptr_regs, tag_states);
+    }
+
+    if (ssa_tag_call_name_is_object_auto(name) != 0) {
+        if (summary != 0) { summary.has_tag_auto = 1; summary.has_tagged_access = 1; }
+        return ssa_tag_record_object_auto(cur, info, ssa_tag_object_auto_elem_size(name), reg_consts, raw_ptr_regs, tag_states);
+    }
+
+    if (ssa_tag_call_name_is_slice_from_ptr(name) != 0) {
+        if (summary != 0) { summary.has_tagged_access = 1; }
+        return ssa_tag_record_slice_from_ptr(cur, info, reg_consts, raw_ptr_regs, tag_states);
+    }
+
+    if (ssa_tag_call_name_is_slice_from_raw_tag(name) != 0) {
+        if (summary != 0) { summary.has_tagged_access = 1; }
+        return ssa_tag_record_slice_from_raw_tag(cur, info, reg_consts, raw_ptr_regs, tag_states);
+    }
+
+    if (ssa_tag_call_name_is_strip(name) != 0 && info.nargs >= 1 && cur.dest != 0) {
+        var arg0: u64 = ssa_call_arg(info, 0);
+        var c_arg0: SSAOptConstValue = reg_const_value(reg_consts, arg0);
+        if (c_arg0.has != 0) { return ssa_tag_try_const_from_raw(cur, c_arg0.val, reg_consts, tag_states); }
+        var state: *SSAOptTagState = ssa_tag_state_find(tag_states, arg0);
+        if (state != 0 && state.raw_const_has != 0) { return ssa_tag_try_const_from_raw(cur, state.raw_const, reg_consts, tag_states); }
+        if (state != 0 && state.raw_reg != 0 && raw_ptr_get(raw_ptr_regs, state.raw_reg) != 0) {
+            raw_ptr_set(raw_ptr_regs, cur.dest);
+            ssa_tag_state_clear(tag_states, cur.dest);
+            return opt_set_copy(cur, operand_reg(state.raw_reg), reg_consts);
+        }
+        if (raw_ptr_get(raw_ptr_regs, arg0) != 0) {
+            raw_ptr_set(raw_ptr_regs, cur.dest);
+            ssa_tag_state_clear(tag_states, cur.dest);
+            return opt_set_copy(cur, operand_reg(arg0), reg_consts);
+        }
+    }
+
+    if (info.nargs >= 1 && ssa_tag_fold_field_call(cur, name, ssa_call_arg(info, 0), reg_consts, tag_states) != 0) {
+        if (summary != 0) { summary.has_tagged_access = 1; }
+        return 1;
+    }
+    if (ssa_tag_fold_lifecycle_predicate(cur, name, info, reg_consts, tag_states) != 0) {
+        if (summary != 0) { summary.has_tagged_access = 1; }
+        return 1;
+    }
+    if (ssa_tag_name_eq(name, "std_mem__bpp_tag_gc_barrier_needed_raw", 38) != 0) {
+        if (summary != 0) { summary.has_tagged_access = 1; }
+        return ssa_tag_fold_gc_barrier_call(cur, info, reg_consts, tag_states);
+    }
+    if (ssa_tag_fold_fastpath_call(cur, name, info, reg_consts) != 0) {
+        if (summary != 0) { summary.has_tagged_access = 1; }
+        return 1;
+    }
+
+    if (cur.dest != 0) {
+        const_clear(reg_consts, cur.dest);
+        raw_ptr_clear(raw_ptr_regs, cur.dest);
+        ssa_tag_state_clear(tag_states, cur.dest);
+    }
+    return 1;
+}
+
+func run_block(b: *SSABlock, summary: *SSAOptEscapeSummary) -> u64 {
     var reg_consts: *Vec<*SSAOptKV> = new Vec<*SSAOptKV>{heap_alloc((32) * sizeof(*SSAOptKV)), 0, (32)};
     var var_consts: *Vec<*SSAOptKV> = new Vec<*SSAOptKV>{heap_alloc((32) * sizeof(*SSAOptKV)), 0, (32)};
     var raw_ptr_regs: *Vec<*SSAOptKV> = new Vec<*SSAOptKV>{heap_alloc((32) * sizeof(*SSAOptKV)), 0, (32)};
+    var tag_states: *Vec<*SSAOptTagState> = new Vec<*SSAOptTagState>{heap_alloc((32) * sizeof(*SSAOptTagState)), 0, (32)};
 
     var cur: *SSAInstruction = b.inst_head;
     while (cur != 0) {
@@ -684,11 +1415,23 @@ func run_block(b: *SSABlock) -> u64 {
 
         if (op == SSA_OP_CONST) {
             const_set(reg_consts, cur.dest, operand_value(cur.src1));
+            raw_ptr_clear(raw_ptr_regs, cur.dest);
+            ssa_tag_state_clear(tag_states, cur.dest);
             cur = cur.next;
             continue;
         }
 
-        if (handle_copy(cur, reg_consts, raw_ptr_regs) != 0) {
+        if (op == SSA_OP_LEA_LOCAL || op == SSA_OP_LEA_GLOBAL || op == SSA_OP_LEA_FUNC) {
+            if (cur.dest != 0) {
+                const_clear(reg_consts, cur.dest);
+                raw_ptr_set(raw_ptr_regs, cur.dest);
+                ssa_tag_state_clear(tag_states, cur.dest);
+            }
+            cur = cur.next;
+            continue;
+        }
+
+        if (handle_copy(cur, reg_consts, raw_ptr_regs, tag_states) != 0) {
             cur = cur.next;
             continue;
         }
@@ -698,12 +1441,17 @@ func run_block(b: *SSABlock) -> u64 {
             continue;
         }
 
-        if (handle_load(cur, reg_consts, var_consts, raw_ptr_regs) != 0) {
+        if (handle_load(cur, reg_consts, var_consts, raw_ptr_regs, tag_states) != 0) {
             cur = cur.next;
             continue;
         }
 
-        if (handle_foldable(cur, reg_consts, raw_ptr_regs) != 0) {
+        if (handle_foldable(cur, reg_consts, raw_ptr_regs, tag_states) != 0) {
+            cur = cur.next;
+            continue;
+        }
+
+        if (handle_tag_call(cur, reg_consts, raw_ptr_regs, tag_states, summary) != 0) {
             cur = cur.next;
             continue;
         }
@@ -711,6 +1459,7 @@ func run_block(b: *SSABlock) -> u64 {
         if (cur.dest != 0) {
             const_clear(reg_consts, cur.dest);
             raw_ptr_clear(raw_ptr_regs, cur.dest);
+            ssa_tag_state_clear(tag_states, cur.dest);
         }
 
         cur = cur.next;
@@ -718,6 +1467,49 @@ func run_block(b: *SSABlock) -> u64 {
 
     remove_nops(b);
     return 0;
+}
+
+func ssa_tag_summarize_call(summary: *SSAOptEscapeSummary, op: u64, info_ptr: u64) -> u64 {
+    if (summary == 0) { return 0; }
+    summary.has_call = 1;
+    if (op == SSA_OP_CALL_PTR) {
+        summary.has_indirect_call = 1;
+        return 0;
+    }
+    if (op != SSA_OP_CALL || info_ptr == 0) { return 0; }
+    var info: *SSACallInfo = (*SSACallInfo)info_ptr;
+    if (info == 0) { return 0; }
+    var name: []u8 = info.name;
+    if (ssa_tag_call_name_is_heap_alloc(name) != 0) { summary.has_heap_alloc = 1; }
+    if (ssa_tag_call_name_is_pack(name) != 0 || ssa_tag_call_name_is_object_from_raw(name) != 0) { summary.has_tag_pack = 1; }
+    if (ssa_tag_call_name_is_object_auto(name) != 0) { summary.has_tag_auto = 1; }
+    if (ssa_tag_name_has_prefix(name, "std_mem__bpp_tag_", 17) != 0 ||
+        ssa_tag_name_has_prefix(name, "std_mem__bpp_shape_", 19) != 0 ||
+        ssa_tag_name_has_prefix(name, "std_mem__bpp_fast_path_", 23) != 0 ||
+        ssa_tag_name_has_prefix(name, "std_mem__bpp_vector_", 20) != 0) {
+        summary.has_tagged_access = 1;
+    }
+    return 0;
+}
+
+func ssa_tag_analyze_function_escape(fn: *SSAFunction) -> *SSAOptEscapeSummary {
+    var summary: *SSAOptEscapeSummary = new SSAOptEscapeSummary{};
+    if (fn == 0) { return summary; }
+    var blocks: []*SSABlock = fn.blocks;
+    var bcount: u64 = slice_len(blocks);
+    for (var bi: u64 = 0; bi < bcount; bi = bi + 1) {
+        var block: *SSABlock = blocks[bi];
+        if (block == 0) { continue; }
+        var cur: *SSAInstruction = block.inst_head;
+        while (cur != 0) {
+            var op: u64 = op_of(cur);
+            if (op == SSA_OP_CALL || op == SSA_OP_CALL_PTR || op == SSA_OP_CALL_SLICE_STORE) {
+                ssa_tag_summarize_call(summary, op, operand_value(cur.src1));
+            }
+            cur = cur.next;
+        }
+    }
+    return summary;
 }
 
 func run(ctx: *SSAContext) -> u64 {
@@ -730,12 +1522,13 @@ func run(ctx: *SSAContext) -> u64 {
     var i: u64 = 0;
     for (i = 0; i < n; i = i + 1) {
         var fn: *SSAFunction = funcs[i];
+        var summary: *SSAOptEscapeSummary = ssa_tag_analyze_function_escape(fn);
 
         var blocks: []*SSABlock = fn.blocks;
         var bcount: u64 = slice_len(blocks);
         var bi: u64 = 0;
         for (bi = 0; bi < bcount; bi = bi + 1) {
-            run_block(blocks[bi]);
+            run_block(blocks[bi], summary);
         }
 
         dce_run(fn);

@@ -83,7 +83,21 @@ const BPP_FAST_PATH_SCALAR = 1;
 const BPP_FAST_PATH_UNROLLED = 2;
 const BPP_FAST_PATH_VECTOR = 3;
 
+const BPP_COLD_PATH_NONE = 0;
+const BPP_COLD_PATH_GUARD_MISS = 1;
+const BPP_COLD_PATH_BOUNDS = 2;
+const BPP_COLD_PATH_SCALAR = 3;
+
 const BPP_SHAPE_CACHE_HOT_HITS = 3;
+const BPP_TAG_TUNE_DEFAULT_VECTOR_MIN_LEN = 4;
+const BPP_TAG_TUNE_DEFAULT_UNROLL_MIN_LEN = 2;
+const BPP_TAG_TUNE_DEFAULT_MAX_LANES = 8;
+
+const BPP_TAG_LEN_EMPTY = 0;
+const BPP_TAG_LEN_TINY = 1;
+const BPP_TAG_LEN_SMALL = 2;
+const BPP_TAG_LEN_MEDIUM = 3;
+const BPP_TAG_LEN_LARGE = 4;
 
 const BPP_TAG_LIFECYCLE_SHIFT = 48;
 const BPP_TAG_OWNERSHIP_SHIFT = 51;
@@ -144,6 +158,10 @@ struct BppSliceProof {
 
 struct BppShapeCache {
     public shape: u64;
+    public elem_size: u64;
+    public len_class: u64;
+    public profiled: u64;
+    public hot: u64;
     public fast_path: u64;
     public hits: u64;
     public misses: u64;
@@ -156,6 +174,49 @@ struct BppVectorPlan {
     public unroll: u64;
     public shape: u64;
     public hot: u64;
+}
+
+struct BppTagFastGuard {
+    public shape: u64;
+    public elem_size: u64;
+    public len_class: u64;
+    public profiled: u64;
+    public hot: u64;
+    public epoch: u64;
+    public fast_path: u64;
+    public lanes: u64;
+}
+
+struct BppTaggedAccessPlan {
+    public shape: u64;
+    public elem_size: u64;
+    public len: u64;
+    public len_class: u64;
+    public profiled: u64;
+    public hot: u64;
+    public epoch: u64;
+    public fast_path: u64;
+    public lanes: u64;
+    public stable_bounds: u64;
+    public nonnull: u64;
+    public effect_safe: u64;
+    public vectorizable: u64;
+}
+
+struct BppHotPathPlan {
+    public fast_path: u64;
+    public cold_path: u64;
+    public epoch: u64;
+    public lanes: u64;
+    public deopt_reason: u64;
+}
+
+struct BppTagTuning {
+    public hot_threshold: u64;
+    public vector_min_len: u64;
+    public unroll_min_len: u64;
+    public cache_hot_hits: u64;
+    public max_lanes: u64;
 }
 
 func bpp_tag_strip(ptr: u64) -> u64 {
@@ -178,6 +239,30 @@ func bpp_tag_pack(ptr: u64, lifecycle: u64, ownership: u64, storage: u64, barrie
     out = out | ((shape & 15) << BPP_TAG_SHAPE_SHIFT);
     out = out | ((profiled & 1) << BPP_TAG_PROFILED_SHIFT);
     return out;
+}
+
+func bpp_heap_alloc_tagged(size: u64, lifecycle: u64, ownership: u64, storage: u64, barrier: u64, shape: u64, profiled: u64) -> u64 {
+    var ptr: u64 = heap_alloc(size);
+    if (ptr == 0) { return 0; }
+    return bpp_tag_pack(ptr, lifecycle, ownership, storage, barrier, shape, profiled);
+}
+
+func bpp_heap_alloc_with_policy(size: u64, policy: *BppEscapePolicy, shape: u64) -> u64 {
+    if (policy == 0) {
+        return bpp_heap_alloc_tagged(size, BPP_TAG_LIFE_YOUNG, BPP_TAG_OWN_OWNED, BPP_TAG_STORAGE_HEAP, BPP_TAG_BARRIER_CLEAN, shape, 0);
+    }
+    return bpp_heap_alloc_tagged(size, policy.lifecycle, policy.ownership, policy.storage, policy.barrier, shape, 0);
+}
+
+func bpp_heap_alloc_auto_tagged(size: u64, escapes: u64, address_taken: u64, shared: u64, pinned: u64, immortal: u64, arena_hint: u64, shape: u64) -> u64 {
+    var policy: BppEscapePolicy = bpp_escape_policy_for(size, escapes, address_taken, shared, pinned, immortal, arena_hint);
+    return bpp_heap_alloc_with_policy(size, &policy, shape);
+}
+
+func bpp_heap_tagged_free(ptr: u64) -> u64 {
+    if (ptr == 0) { return 0; }
+    if (bpp_tag_delete_allowed_raw(ptr) == 0) { return 0; }
+    return heap_free(ptr);
 }
 
 func bpp_tag_lifecycle_raw(ptr: u64) -> u64 {
@@ -589,12 +674,7 @@ func bpp_slice_proof_vector_plan(proof: *BppSliceProof, profile: *BppLoopProfile
     out.shape = proof.shape;
     if (profile != 0 && bpp_loop_profile_is_hot(profile) != 0) { out.hot = 1; }
     if (bpp_slice_proof_can_vectorize(proof) == 0 || out.hot == 0) { return out; }
-    out.fast_path = BPP_FAST_PATH_VECTOR;
-    if (elem_size == 8) { out.lanes = 4; out.unroll = 2; }
-    else if (elem_size == 4) { out.lanes = 8; out.unroll = 2; }
-    else if (elem_size == 2) { out.lanes = 16; out.unroll = 1; }
-    else if (elem_size == 1) { out.lanes = 32; out.unroll = 1; }
-    return out;
+    return bpp_vector_plan_for(proof.shape, elem_size, proof.len, 1, out.hot);
 }
 
 func bpp_tag_slice_subslice<T>(s: *BppTaggedSlice<T>, start: u64, len: u64) -> BppTaggedSlice<T> {
@@ -621,11 +701,72 @@ func bpp_vector_lanes_for_shape(shape: u64, elem_size: u64) -> u64 {
     return lanes;
 }
 
-func bpp_fast_path_for_shape(shape: u64, hot: u64, profiled: u64, elem_size: u64) -> u64 {
+func bpp_tag_len_class(len: u64) -> u64 {
+    if (len == 0) { return BPP_TAG_LEN_EMPTY; }
+    if (len < 4) { return BPP_TAG_LEN_TINY; }
+    if (len < 16) { return BPP_TAG_LEN_SMALL; }
+    if (len < 1024) { return BPP_TAG_LEN_MEDIUM; }
+    return BPP_TAG_LEN_LARGE;
+}
+
+func bpp_fast_path_for_shape_len(shape: u64, hot: u64, profiled: u64, elem_size: u64, len: u64) -> u64 {
+    if (len == 0) { return BPP_FAST_PATH_NONE; }
     if (bpp_shape_is_vectorizable(shape) == 0) { return BPP_FAST_PATH_SCALAR; }
     var lanes: u64 = bpp_vector_lanes_for_shape(shape, elem_size);
-    if (hot != 0 && profiled != 0 && lanes >= 2) { return BPP_FAST_PATH_VECTOR; }
-    if (lanes >= 2) { return BPP_FAST_PATH_UNROLLED; }
+    if (hot != 0 && profiled != 0 && lanes >= 2 && len >= lanes) { return BPP_FAST_PATH_VECTOR; }
+    if (len >= 2 && lanes >= 2) { return BPP_FAST_PATH_UNROLLED; }
+    return BPP_FAST_PATH_SCALAR;
+}
+
+func bpp_fast_path_for_shape(shape: u64, hot: u64, profiled: u64, elem_size: u64) -> u64 {
+    return bpp_fast_path_for_shape_len(shape, hot, profiled, elem_size, bpp_vector_lanes_for_shape(shape, elem_size));
+}
+
+func bpp_tag_tuning_default() -> BppTagTuning {
+    var out: BppTagTuning;
+    out.hot_threshold = BPP_LOOP_PROFILE_DEFAULT_HOT_THRESHOLD;
+    out.vector_min_len = BPP_TAG_TUNE_DEFAULT_VECTOR_MIN_LEN;
+    out.unroll_min_len = BPP_TAG_TUNE_DEFAULT_UNROLL_MIN_LEN;
+    out.cache_hot_hits = BPP_SHAPE_CACHE_HOT_HITS;
+    out.max_lanes = BPP_TAG_TUNE_DEFAULT_MAX_LANES;
+    return out;
+}
+
+func bpp_tag_tuning_from_benchmark(scalar_ticks: u64, vector_ticks: u64, samples: u64) -> BppTagTuning {
+    var out: BppTagTuning = bpp_tag_tuning_default();
+    if (samples == 0 || scalar_ticks == 0 || vector_ticks == 0) { return out; }
+    if (vector_ticks < scalar_ticks) {
+        out.hot_threshold = 64;
+        out.vector_min_len = 2;
+        out.unroll_min_len = 2;
+        out.cache_hot_hits = 2;
+    } else {
+        out.hot_threshold = 2048;
+        out.vector_min_len = 8;
+        out.unroll_min_len = 4;
+        out.cache_hot_hits = 5;
+    }
+    if (samples >= 1024 && vector_ticks * 2 < scalar_ticks) {
+        out.hot_threshold = 16;
+        out.vector_min_len = 2;
+        out.cache_hot_hits = 1;
+    }
+    return out;
+}
+
+func bpp_fast_path_for_shape_len_tuned(shape: u64, hot: u64, profiled: u64, elem_size: u64, len: u64, tuning: *BppTagTuning) -> u64 {
+    if (len == 0) { return BPP_FAST_PATH_NONE; }
+    if (bpp_shape_is_vectorizable(shape) == 0) { return BPP_FAST_PATH_SCALAR; }
+    var lanes: u64 = bpp_vector_lanes_for_shape(shape, elem_size);
+    var vector_min: u64 = BPP_TAG_TUNE_DEFAULT_VECTOR_MIN_LEN;
+    var unroll_min: u64 = BPP_TAG_TUNE_DEFAULT_UNROLL_MIN_LEN;
+    if (tuning != 0) {
+        if (tuning.max_lanes != 0 && lanes > tuning.max_lanes) { lanes = tuning.max_lanes; }
+        if (tuning.vector_min_len != 0) { vector_min = tuning.vector_min_len; }
+        if (tuning.unroll_min_len != 0) { unroll_min = tuning.unroll_min_len; }
+    }
+    if (hot != 0 && profiled != 0 && lanes >= 2 && len >= vector_min && len >= lanes) { return BPP_FAST_PATH_VECTOR; }
+    if (len >= unroll_min && lanes >= 2) { return BPP_FAST_PATH_UNROLLED; }
     return BPP_FAST_PATH_SCALAR;
 }
 
@@ -639,8 +780,168 @@ func bpp_vector_plan_for(shape: u64, elem_size: u64, len: u64, profiled: u64, ho
     if (len == 0) { return out; }
     out.lanes = bpp_vector_lanes_for_shape(shape, elem_size);
     out.unroll = out.lanes;
+    if (out.unroll > len) { out.unroll = len; }
     if (out.unroll < 2 && len >= 4) { out.unroll = 4; }
-    out.fast_path = bpp_fast_path_for_shape(shape, hot, profiled, elem_size);
+    out.fast_path = bpp_fast_path_for_shape_len(shape, hot, profiled, elem_size, len);
+    return out;
+}
+
+func bpp_vector_plan_for_tuned(shape: u64, elem_size: u64, len: u64, profiled: u64, hot: u64, tuning: *BppTagTuning) -> BppVectorPlan {
+    var out: BppVectorPlan = bpp_vector_plan_for(shape, elem_size, len, profiled, hot);
+    if (len == 0) { return out; }
+    if (tuning != 0 && tuning.max_lanes != 0 && out.lanes > tuning.max_lanes) {
+        out.lanes = tuning.max_lanes;
+    }
+    out.unroll = out.lanes;
+    if (out.unroll > len) { out.unroll = len; }
+    out.fast_path = bpp_fast_path_for_shape_len_tuned(shape, hot, profiled, elem_size, len, tuning);
+    return out;
+}
+
+func bpp_tag_fast_guard_empty() -> BppTagFastGuard {
+    var out: BppTagFastGuard;
+    out.shape = BPP_TAG_SHAPE_UNKNOWN;
+    out.elem_size = 0;
+    out.len_class = BPP_TAG_LEN_EMPTY;
+    out.profiled = 0;
+    out.hot = 0;
+    out.epoch = 0;
+    out.fast_path = BPP_FAST_PATH_NONE;
+    out.lanes = 1;
+    return out;
+}
+
+func bpp_tag_fast_guard_from_slice<T>(s: *BppTaggedSlice<T>, profile: *BppLoopProfile, epoch: u64) -> BppTagFastGuard {
+    var out: BppTagFastGuard = bpp_tag_fast_guard_empty();
+    if (s == 0) { return out; }
+    out.shape = bpp_tag_slice_shape<T>(s);
+    out.elem_size = sizeof(T);
+    out.len_class = bpp_tag_len_class(s.len);
+    out.profiled = bpp_tag_profiled_raw((u64)s.ptr);
+    out.hot = bpp_loop_profile_is_hot(profile);
+    out.epoch = epoch;
+    out.lanes = bpp_vector_lanes_for_shape(out.shape, out.elem_size);
+    out.fast_path = bpp_fast_path_for_shape_len(out.shape, out.hot, out.profiled, out.elem_size, s.len);
+    return out;
+}
+
+func bpp_tag_fast_guard_matches_slice<T>(guard: *BppTagFastGuard, s: *BppTaggedSlice<T>, profile: *BppLoopProfile, epoch: u64) -> u64 {
+    if (guard == 0 || s == 0) { return 0; }
+    if (guard.shape != bpp_tag_slice_shape<T>(s)) { return 0; }
+    if (guard.elem_size != sizeof(T)) { return 0; }
+    if (guard.len_class != bpp_tag_len_class(s.len)) { return 0; }
+    if (guard.profiled != bpp_tag_profiled_raw((u64)s.ptr)) { return 0; }
+    if (guard.hot != bpp_loop_profile_is_hot(profile)) { return 0; }
+    if (guard.epoch != epoch) { return 0; }
+    return 1;
+}
+
+func bpp_tag_access_plan_empty() -> BppTaggedAccessPlan {
+    var out: BppTaggedAccessPlan;
+    out.shape = BPP_TAG_SHAPE_UNKNOWN;
+    out.elem_size = 0;
+    out.len = 0;
+    out.len_class = BPP_TAG_LEN_EMPTY;
+    out.profiled = 0;
+    out.hot = 0;
+    out.epoch = 0;
+    out.fast_path = BPP_FAST_PATH_NONE;
+    out.lanes = 1;
+    out.stable_bounds = 0;
+    out.nonnull = 0;
+    out.effect_safe = 0;
+    out.vectorizable = 0;
+    return out;
+}
+
+func bpp_tag_access_plan_from_slice<T>(s: *BppTaggedSlice<T>, profile: *BppLoopProfile, epoch: u64) -> BppTaggedAccessPlan {
+    var out: BppTaggedAccessPlan = bpp_tag_access_plan_empty();
+    if (s == 0) { return out; }
+    out.shape = bpp_tag_slice_shape<T>(s);
+    out.elem_size = sizeof(T);
+    out.len = s.len;
+    out.len_class = bpp_tag_len_class(s.len);
+    out.profiled = bpp_tag_profiled_raw((u64)s.ptr);
+    out.hot = bpp_loop_profile_is_hot(profile);
+    out.epoch = epoch;
+    out.lanes = bpp_vector_lanes_for_shape(out.shape, out.elem_size);
+    out.stable_bounds = 1;
+    if (bpp_tag_strip((u64)s.ptr) != 0) { out.nonnull = 1; }
+    if (out.profiled != 0 || bpp_tag_ownership_raw((u64)s.ptr) == BPP_TAG_OWN_BORROWED) {
+        out.effect_safe = 1;
+    }
+    if (out.len != 0 && out.stable_bounds != 0 && out.nonnull != 0 && out.effect_safe != 0 && bpp_shape_is_vectorizable(out.shape) != 0) {
+        out.vectorizable = 1;
+    }
+    out.fast_path = bpp_fast_path_for_shape_len(out.shape, out.hot, out.profiled, out.elem_size, out.len);
+    if (out.vectorizable == 0 && out.fast_path == BPP_FAST_PATH_VECTOR) {
+        out.fast_path = BPP_FAST_PATH_SCALAR;
+    }
+    return out;
+}
+
+func bpp_tag_access_plan_matches_slice<T>(plan: *BppTaggedAccessPlan, s: *BppTaggedSlice<T>, profile: *BppLoopProfile, epoch: u64) -> u64 {
+    if (plan == 0 || s == 0) { return 0; }
+    if (plan.shape != bpp_tag_slice_shape<T>(s)) { return 0; }
+    if (plan.elem_size != sizeof(T)) { return 0; }
+    if (plan.len != s.len) { return 0; }
+    if (plan.len_class != bpp_tag_len_class(s.len)) { return 0; }
+    if (plan.profiled != bpp_tag_profiled_raw((u64)s.ptr)) { return 0; }
+    if (plan.hot != bpp_loop_profile_is_hot(profile)) { return 0; }
+    if (plan.epoch != epoch) { return 0; }
+    return 1;
+}
+
+func bpp_tag_access_plan_can_index(plan: *BppTaggedAccessPlan, index: u64) -> u64 {
+    if (plan == 0) { return 0; }
+    if (plan.stable_bounds == 0 || plan.nonnull == 0) { return 0; }
+    if (index < plan.len) { return 1; }
+    return 0;
+}
+
+func bpp_tag_access_plan_can_range(plan: *BppTaggedAccessPlan, start: u64, len: u64) -> u64 {
+    if (plan == 0) { return 0; }
+    if (plan.stable_bounds == 0 || plan.nonnull == 0) { return 0; }
+    if (start > plan.len) { return 0; }
+    if (len > plan.len - start) { return 0; }
+    return 1;
+}
+
+func bpp_tag_access_plan_hot_path(plan: *BppTaggedAccessPlan) -> u64 {
+    if (plan == 0) { return BPP_FAST_PATH_NONE; }
+    if (plan.fast_path == BPP_FAST_PATH_NONE) { return BPP_FAST_PATH_NONE; }
+    return plan.fast_path;
+}
+
+func bpp_tag_access_plan_cold_path<T>(plan: *BppTaggedAccessPlan, s: *BppTaggedSlice<T>, profile: *BppLoopProfile, epoch: u64, require_index: u64, index: u64) -> u64 {
+    if (plan == 0 || s == 0) { return BPP_COLD_PATH_GUARD_MISS; }
+    if (bpp_tag_access_plan_matches_slice<T>(plan, s, profile, epoch) == 0) { return BPP_COLD_PATH_GUARD_MISS; }
+    if (require_index != 0 && bpp_tag_access_plan_can_index(plan, index) == 0) { return BPP_COLD_PATH_BOUNDS; }
+    if (plan.fast_path == BPP_FAST_PATH_NONE) { return BPP_COLD_PATH_SCALAR; }
+    return BPP_COLD_PATH_NONE;
+}
+
+func bpp_hot_path_plan_from_access(plan: *BppTaggedAccessPlan, require_index: u64, index: u64) -> BppHotPathPlan {
+    var out: BppHotPathPlan;
+    out.fast_path = BPP_FAST_PATH_NONE;
+    out.cold_path = BPP_COLD_PATH_GUARD_MISS;
+    out.epoch = 0;
+    out.lanes = 1;
+    out.deopt_reason = BPP_COLD_PATH_GUARD_MISS;
+    if (plan == 0) { return out; }
+    out.fast_path = bpp_tag_access_plan_hot_path(plan);
+    out.epoch = plan.epoch;
+    out.lanes = plan.lanes;
+    out.cold_path = BPP_COLD_PATH_NONE;
+    out.deopt_reason = BPP_COLD_PATH_NONE;
+    if (require_index != 0 && bpp_tag_access_plan_can_index(plan, index) == 0) {
+        out.fast_path = BPP_FAST_PATH_NONE;
+        out.cold_path = BPP_COLD_PATH_BOUNDS;
+        out.deopt_reason = BPP_COLD_PATH_BOUNDS;
+    } else if (out.fast_path == BPP_FAST_PATH_NONE) {
+        out.cold_path = BPP_COLD_PATH_SCALAR;
+        out.deopt_reason = BPP_COLD_PATH_SCALAR;
+    }
     return out;
 }
 
@@ -1052,6 +1353,13 @@ func bpp_loop_profile_new(threshold: u64) -> BppLoopProfile {
     return out;
 }
 
+func bpp_loop_profile_new_tuned(tuning: *BppTagTuning) -> BppLoopProfile {
+    if (tuning == 0 || tuning.hot_threshold == 0) {
+        return bpp_loop_profile_new(0);
+    }
+    return bpp_loop_profile_new(tuning.hot_threshold);
+}
+
 func bpp_loop_profile_record(profile: *BppLoopProfile, iterations: u64, shape: u64) -> u64 {
     if (profile == 0) { return 0; }
     profile.iterations = profile.iterations + iterations;
@@ -1078,6 +1386,10 @@ func bpp_loop_profile_vector_candidate<T>(profile: *BppLoopProfile, s: *BppTagge
 func bpp_shape_cache_new(shape: u64) -> BppShapeCache {
     var out: BppShapeCache;
     out.shape = shape;
+    out.elem_size = 0;
+    out.len_class = BPP_TAG_LEN_EMPTY;
+    out.profiled = 0;
+    out.hot = 0;
     out.fast_path = BPP_FAST_PATH_NONE;
     out.hits = 0;
     out.misses = 0;
@@ -1099,13 +1411,38 @@ func bpp_shape_cache_probe(cache: *BppShapeCache, shape: u64, epoch: u64) -> u64
     return 0;
 }
 
-func bpp_shape_cache_select_fast_path(cache: *BppShapeCache, shape: u64, elem_size: u64, hot: u64, profiled: u64, epoch: u64) -> u64 {
-    if (cache == 0) { return bpp_fast_path_for_shape(shape, hot, profiled, elem_size); }
-    var hit: u64 = bpp_shape_cache_probe(cache, shape, epoch);
-    if (hit != 0 && cache.hits >= BPP_SHAPE_CACHE_HOT_HITS) {
-        cache.fast_path = bpp_fast_path_for_shape(shape, hot, profiled, elem_size);
+func bpp_shape_cache_probe_guard(cache: *BppShapeCache, shape: u64, elem_size: u64, len_class: u64, hot: u64, profiled: u64, epoch: u64) -> u64 {
+    if (cache == 0) { return 0; }
+    if (cache.shape == shape && cache.elem_size == elem_size && cache.len_class == len_class && cache.hot == hot && cache.profiled == profiled && cache.last_epoch == epoch) {
+        cache.hits = cache.hits + 1;
+        return 1;
+    }
+    cache.shape = shape;
+    cache.elem_size = elem_size;
+    cache.len_class = len_class;
+    cache.hot = hot;
+    cache.profiled = profiled;
+    cache.last_epoch = epoch;
+    cache.misses = cache.misses + 1;
+    cache.hits = 1;
+    cache.fast_path = BPP_FAST_PATH_NONE;
+    return 0;
+}
+
+func bpp_shape_cache_select_fast_path_len(cache: *BppShapeCache, shape: u64, elem_size: u64, len: u64, hot: u64, profiled: u64, epoch: u64) -> u64 {
+    var chosen: u64 = bpp_fast_path_for_shape_len(shape, hot, profiled, elem_size, len);
+    if (cache == 0) { return chosen; }
+    var hit: u64 = bpp_shape_cache_probe_guard(cache, shape, elem_size, bpp_tag_len_class(len), hot, profiled, epoch);
+    if (chosen == BPP_FAST_PATH_NONE) {
+        cache.fast_path = BPP_FAST_PATH_NONE;
+    } else if (hit != 0 && cache.hits >= BPP_SHAPE_CACHE_HOT_HITS) {
+        cache.fast_path = chosen;
     } else {
         cache.fast_path = BPP_FAST_PATH_SCALAR;
     }
     return cache.fast_path;
+}
+
+func bpp_shape_cache_select_fast_path(cache: *BppShapeCache, shape: u64, elem_size: u64, hot: u64, profiled: u64, epoch: u64) -> u64 {
+    return bpp_shape_cache_select_fast_path_len(cache, shape, elem_size, bpp_vector_lanes_for_shape(shape, elem_size), hot, profiled, epoch);
 }
