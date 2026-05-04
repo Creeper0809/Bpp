@@ -146,54 +146,86 @@ function(bpp_download_bootstrap_compiler OUT_VAR)
     endif()
 
     set(_tools_dir "${CMAKE_BINARY_DIR}/_tools")
-    set(_downloaded_path "${_tools_dir}/${_asset_name}")
-    set(_bootstrap_url "${BPP_BOOTSTRAP_BASE_URL}/${BPP_BOOTSTRAP_REPOSITORY}/releases/download/${BPP_BOOTSTRAP_RELEASE_TAG}/${_asset_name}")
 
-    if(NOT EXISTS "${_downloaded_path}")
-        file(MAKE_DIRECTORY "${_tools_dir}")
-        message(STATUS "Downloading BPP bootstrap compiler from ${_bootstrap_url}")
-
-        if(_asset_sha)
-            file(DOWNLOAD
-                "${_bootstrap_url}"
-                "${_downloaded_path}"
-                SHOW_PROGRESS
-                TLS_VERIFY ON
-                EXPECTED_HASH "SHA256=${_asset_sha}"
-                STATUS _download_status
-            )
-        else()
-            file(DOWNLOAD
-                "${_bootstrap_url}"
-                "${_downloaded_path}"
-                SHOW_PROGRESS
-                TLS_VERIFY ON
-                STATUS _download_status
-            )
-        endif()
-
-        list(GET _download_status 0 _download_code)
-        list(GET _download_status 1 _download_message)
-        if(NOT _download_code EQUAL 0)
-            file(REMOVE "${_downloaded_path}")
+    set(_release_candidates "${BPP_BOOTSTRAP_RELEASE_TAG}")
+    set(_asset_candidates "${_asset_name}")
+    if(NOT _asset_sha
+       AND BPP_BOOTSTRAP_RELEASE_TAG MATCHES "^bootstrap-v([0-9]+)$"
+       AND _asset_name MATCHES "^bpp-bootstrap-v([0-9]+)-")
+        set(_fallback_version "${CMAKE_MATCH_1}")
+        math(EXPR _fallback_version "${_fallback_version} - 1")
+        while(_fallback_version GREATER 0)
+            list(APPEND _release_candidates "bootstrap-v${_fallback_version}")
             if(WIN32)
-                message(STATUS "Windows bootstrap compiler asset is not available yet: ${_bootstrap_url}")
-                set(${OUT_VAR} "" PARENT_SCOPE)
-                return()
+                list(APPEND _asset_candidates "bpp-bootstrap-v${_fallback_version}-windows-x86_64.exe")
+            else()
+                list(APPEND _asset_candidates "bpp-bootstrap-v${_fallback_version}-linux-x86_64")
             endif()
-            message(FATAL_ERROR "Failed to download BPP bootstrap compiler: ${_download_message}")
+            math(EXPR _fallback_version "${_fallback_version} - 1")
+        endwhile()
+    endif()
+
+    list(LENGTH _release_candidates _candidate_count)
+    math(EXPR _candidate_last "${_candidate_count} - 1")
+    foreach(_candidate_index RANGE 0 ${_candidate_last})
+        list(GET _release_candidates ${_candidate_index} _candidate_release)
+        list(GET _asset_candidates ${_candidate_index} _candidate_asset)
+        set(_downloaded_path "${_tools_dir}/${_candidate_asset}")
+        set(_bootstrap_url "${BPP_BOOTSTRAP_BASE_URL}/${BPP_BOOTSTRAP_REPOSITORY}/releases/download/${_candidate_release}/${_candidate_asset}")
+
+        if(NOT EXISTS "${_downloaded_path}")
+            file(MAKE_DIRECTORY "${_tools_dir}")
+            message(STATUS "Downloading BPP bootstrap compiler from ${_bootstrap_url}")
+
+            if(_asset_sha AND _candidate_index EQUAL 0)
+                file(DOWNLOAD
+                    "${_bootstrap_url}"
+                    "${_downloaded_path}"
+                    SHOW_PROGRESS
+                    TLS_VERIFY ON
+                    EXPECTED_HASH "SHA256=${_asset_sha}"
+                    STATUS _download_status
+                )
+            else()
+                file(DOWNLOAD
+                    "${_bootstrap_url}"
+                    "${_downloaded_path}"
+                    SHOW_PROGRESS
+                    TLS_VERIFY ON
+                    STATUS _download_status
+                )
+            endif()
+
+            list(GET _download_status 0 _download_code)
+            list(GET _download_status 1 _download_message)
+            if(NOT _download_code EQUAL 0)
+                file(REMOVE "${_downloaded_path}")
+                message(STATUS "BPP bootstrap compiler asset is not available yet: ${_bootstrap_url} (${_download_message})")
+                continue()
+            endif()
         endif()
-    endif()
 
-    if(NOT WIN32)
-        file(CHMOD "${_downloaded_path}" PERMISSIONS
-            OWNER_READ OWNER_WRITE OWNER_EXECUTE
-            GROUP_READ GROUP_EXECUTE
-            WORLD_READ WORLD_EXECUTE
-        )
-    endif()
+        if(NOT WIN32)
+            file(CHMOD "${_downloaded_path}" PERMISSIONS
+                OWNER_READ OWNER_WRITE OWNER_EXECUTE
+                GROUP_READ GROUP_EXECUTE
+                WORLD_READ WORLD_EXECUTE
+            )
+        endif()
 
-    set(${OUT_VAR} "${_downloaded_path}" PARENT_SCOPE)
+        if(NOT _candidate_index EQUAL 0)
+            message(STATUS "Using previous BPP bootstrap compiler: ${_candidate_release}/${_candidate_asset}")
+        endif()
+        set(${OUT_VAR} "${_downloaded_path}" PARENT_SCOPE)
+        return()
+    endforeach()
+
+    if(WIN32)
+        message(STATUS "Windows bootstrap compiler asset is not available yet.")
+    else()
+        message(STATUS "Linux bootstrap compiler asset is not available yet.")
+    endif()
+    set(${OUT_VAR} "" PARENT_SCOPE)
 endfunction()
 
 function(bpp_resolve_bootstrap_compiler ROOT_DIR VERSION_HINT OUT_VAR)

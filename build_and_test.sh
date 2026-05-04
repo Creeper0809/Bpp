@@ -173,26 +173,20 @@ download_file() {
     return 127
 }
 
-download_bootstrap_compiler() {
-    if [ "${BPP_BOOTSTRAP_COMPILER:-1}" = "0" ]; then
-        return 1
-    fi
-
-    local base_url="${BPP_BOOTSTRAP_BASE_URL:-https://github.com}"
-    local repo="${BPP_BOOTSTRAP_REPOSITORY:-Creeper0809/Bpp}"
-    local release_tag="${BPP_BOOTSTRAP_RELEASE_TAG:-bootstrap-${VERSION}}"
-    local asset_name="${BPP_BOOTSTRAP_ASSET_LINUX:-bpp-bootstrap-${VERSION}-linux-x86_64}"
-    local asset_sha="${BPP_BOOTSTRAP_SHA256_LINUX:-}"
-    local tools_dir="$BUILD_DIR/_tools"
+try_download_bootstrap_compiler() {
+    local release_tag="$1"
+    local asset_name="$2"
+    local asset_sha="$3"
+    local tools_dir="$4"
     local download_path="$tools_dir/$asset_name"
-    local download_url="$base_url/$repo/releases/download/$release_tag/$asset_name"
+    local download_url="${BPP_BOOTSTRAP_BASE_URL:-https://github.com}/${BPP_BOOTSTRAP_REPOSITORY:-Creeper0809/Bpp}/releases/download/${release_tag}/${asset_name}"
 
     mkdir -p "$tools_dir"
     if [ ! -f "$download_path" ]; then
         echo "   [INFO] Downloading bootstrap compiler: $download_url" >&2
         if ! download_file "$download_url" "$download_path"; then
             rm -f "$download_path"
-            echo "   [WARN] Failed to download bootstrap compiler." >&2
+            echo "   [WARN] Failed to download bootstrap compiler: $download_url" >&2
             return 1
         fi
     fi
@@ -210,19 +204,63 @@ download_bootstrap_compiler() {
             local sha_path="$download_path.sha256"
             local sha_url="$download_url.sha256"
             if [ ! -f "$sha_path" ]; then
-                download_file "$sha_url" "$sha_path" >/dev/null 2>&1 || true
+                download_file "${sha_url}?cache_bust=$(date +%s)" "$sha_path" >/dev/null 2>&1 ||
+                    download_file "$sha_url" "$sha_path" >/dev/null 2>&1 || true
             fi
             if [ -f "$sha_path" ]; then
                 if ! (cd "$tools_dir" && sha256sum -c "$(basename "$sha_path")" >/dev/null 2>&1); then
-                    rm -f "$download_path"
-                    echo "   [WARN] Downloaded bootstrap checksum file did not validate." >&2
-                    return 1
+                    rm -f "$sha_path"
+                    echo "   [WARN] Downloaded bootstrap checksum file did not validate; continuing with smoke check." >&2
                 fi
             fi
         fi
     fi
 
     echo "$download_path"
+    return 0
+}
+
+download_bootstrap_compiler() {
+    if [ "${BPP_BOOTSTRAP_COMPILER:-1}" = "0" ]; then
+        return 1
+    fi
+
+    local release_tag="${BPP_BOOTSTRAP_RELEASE_TAG:-bootstrap-${VERSION}}"
+    local asset_name="${BPP_BOOTSTRAP_ASSET_LINUX:-bpp-bootstrap-${VERSION}-linux-x86_64}"
+    local asset_sha="${BPP_BOOTSTRAP_SHA256_LINUX:-}"
+    local tools_dir="$BUILD_DIR/_tools"
+
+    local downloaded=""
+    downloaded="$(try_download_bootstrap_compiler "$release_tag" "$asset_name" "$asset_sha" "$tools_dir" || true)"
+    if [ -n "$downloaded" ]; then
+        echo "$downloaded"
+        return 0
+    fi
+
+    if [ -n "${BPP_BOOTSTRAP_RELEASE_TAG+x}" ] ||
+       [ -n "${BPP_BOOTSTRAP_ASSET_LINUX+x}" ] ||
+       [ -n "$asset_sha" ]; then
+        return 1
+    fi
+
+    if [[ "$VERSION" =~ ^v([0-9]+)$ ]]; then
+        local ver="${BASH_REMATCH[1]}"
+        local prev=$((ver - 1))
+        while [ "$prev" -ge 1 ]; do
+            local fallback_version="v${prev}"
+            local fallback_release="bootstrap-${fallback_version}"
+            local fallback_asset="bpp-bootstrap-${fallback_version}-linux-x86_64"
+            downloaded="$(try_download_bootstrap_compiler "$fallback_release" "$fallback_asset" "" "$tools_dir" || true)"
+            if [ -n "$downloaded" ]; then
+                echo "   [INFO] Using previous bootstrap compiler: ${fallback_release}/${fallback_asset}" >&2
+                echo "$downloaded"
+                return 0
+            fi
+            prev=$((prev - 1))
+        done
+    fi
+
+    return 1
 }
 
 extract_numeric_version() {
