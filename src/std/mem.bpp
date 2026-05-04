@@ -1,6 +1,7 @@
 // mem.b - Memory utilities for v3.16
 
 import std.io;
+import std.str;
 
 func memset(dst: u64, value: u64, len: u64) -> u64 {
     var v: u64 = value & 255;
@@ -91,6 +92,9 @@ const BPP_TAG_BARRIER_SHIFT = 57;
 const BPP_TAG_SHAPE_SHIFT = 59;
 const BPP_TAG_PROFILED_SHIFT = 63;
 
+const BPP_TAG_BARRIER_CLEAR_MASK = 18014398509481983999;
+const BPP_TAG_BARRIER_DIRTY_BITS = 288230376151711744;
+
 packed struct BppObjectTag {
     public lifecycle: u3;
     public ownership: u3;
@@ -156,6 +160,13 @@ struct BppVectorPlan {
 
 func bpp_tag_strip(ptr: u64) -> u64 {
     return ptr & BPP_TAG_PTR_MASK;
+}
+
+func bpp_tag_layout_has_memory_state(layout: []u8) -> u64 {
+    if (layout.ptr == 0 || layout.len == 0) { return 0; }
+    if (str_eq(layout, slice("BppObjectTag", str_len("BppObjectTag"))) != 0) { return 1; }
+    if (str_eq(layout, slice("std_mem__BppObjectTag", str_len("std_mem__BppObjectTag"))) != 0) { return 1; }
+    return 0;
 }
 
 func bpp_tag_pack(ptr: u64, lifecycle: u64, ownership: u64, storage: u64, barrier: u64, shape: u64, profiled: u64) -> u64 {
@@ -273,7 +284,8 @@ func bpp_escape_policy_new(lifecycle: u64, ownership: u64, storage: u64, barrier
     if (ownership == BPP_TAG_OWN_BORROWED || ownership == BPP_TAG_OWN_WEAK || ownership == BPP_TAG_OWN_STACK) {
         out.delete_allowed = 0;
     }
-    if (storage == BPP_TAG_STORAGE_STACK || storage == BPP_TAG_STORAGE_ARENA || storage == BPP_TAG_STORAGE_STATIC) {
+    if (storage == BPP_TAG_STORAGE_STACK || storage == BPP_TAG_STORAGE_ARENA || storage == BPP_TAG_STORAGE_STATIC ||
+        storage == BPP_TAG_STORAGE_FOREIGN || storage == BPP_TAG_STORAGE_INLINE || storage == BPP_TAG_STORAGE_VECTOR) {
         out.delete_allowed = 0;
     }
 
@@ -344,6 +356,9 @@ func bpp_tag_delete_allowed_raw(ptr: u64) -> u64 {
     if (storage == BPP_TAG_STORAGE_STACK) { return 0; }
     if (storage == BPP_TAG_STORAGE_ARENA) { return 0; }
     if (storage == BPP_TAG_STORAGE_STATIC) { return 0; }
+    if (storage == BPP_TAG_STORAGE_FOREIGN) { return 0; }
+    if (storage == BPP_TAG_STORAGE_INLINE) { return 0; }
+    if (storage == BPP_TAG_STORAGE_VECTOR) { return 0; }
     return 1;
 }
 
@@ -391,7 +406,7 @@ func bpp_tag_can_skip_gc_barrier_raw(ptr: u64) -> u64 {
 
 func bpp_tag_mark_barrier_dirty_raw(ptr: u64) -> u64 {
     if (ptr == 0) { return 0; }
-    return bpp_tag_repack_lifecycle_barrier(ptr, bpp_tag_lifecycle_raw(ptr), BPP_TAG_BARRIER_DIRTY);
+    return (ptr & BPP_TAG_BARRIER_CLEAR_MASK) | BPP_TAG_BARRIER_DIRTY_BITS;
 }
 
 func bpp_tag_gc_barrier_needed_raw(parent: u64, child: u64) -> u64 {
@@ -528,6 +543,28 @@ func bpp_slice_proof_can_skip_bounds(proof: *BppSliceProof, index: u64) -> u64 {
     return 0;
 }
 
+func bpp_slice_proof_can_skip_range_bounds(proof: *BppSliceProof, start: u64, len: u64) -> u64 {
+    if (proof == 0) { return 0; }
+    if (proof.stable_bounds == 0 || proof.nonnull == 0) { return 0; }
+    if (start > proof.len) { return 0; }
+    if (len > proof.len - start) { return 0; }
+    return 1;
+}
+
+func bpp_slice_proof_contains_absolute_range(proof: *BppSliceProof, start: u64, end_index: u64) -> u64 {
+    if (proof == 0) { return 0; }
+    if (proof.stable_bounds == 0 || proof.nonnull == 0) { return 0; }
+    if (end_index < start) { return 0; }
+    if (start < proof.start) { return 0; }
+    if (end_index > proof.end_index) { return 0; }
+    return 1;
+}
+
+func bpp_slice_proof_element_ptr<T>(proof: *BppSliceProof, index: u64) -> *T {
+    if (bpp_slice_proof_can_skip_bounds(proof, index) == 0) { return (*T)0; }
+    return (*T)(proof.base + ((proof.start + index) * sizeof(T)));
+}
+
 func bpp_shape_is_vectorizable(shape: u64) -> u64 {
     if (shape == BPP_TAG_SHAPE_I64) { return 1; }
     if (shape == BPP_TAG_SHAPE_U64) { return 1; }
@@ -539,6 +576,25 @@ func bpp_shape_is_vectorizable(shape: u64) -> u64 {
 func bpp_slice_proof_can_vectorize(proof: *BppSliceProof) -> u64 {
     if (proof == 0 || proof.len == 0 || proof.stable_bounds == 0 || proof.effect_safe == 0) { return 0; }
     return bpp_shape_is_vectorizable(proof.shape);
+}
+
+func bpp_slice_proof_vector_plan(proof: *BppSliceProof, profile: *BppLoopProfile, elem_size: u64) -> BppVectorPlan {
+    var out: BppVectorPlan;
+    out.fast_path = BPP_FAST_PATH_SCALAR;
+    out.lanes = 1;
+    out.unroll = 1;
+    out.shape = BPP_TAG_SHAPE_UNKNOWN;
+    out.hot = 0;
+    if (proof == 0) { return out; }
+    out.shape = proof.shape;
+    if (profile != 0 && bpp_loop_profile_is_hot(profile) != 0) { out.hot = 1; }
+    if (bpp_slice_proof_can_vectorize(proof) == 0 || out.hot == 0) { return out; }
+    out.fast_path = BPP_FAST_PATH_VECTOR;
+    if (elem_size == 8) { out.lanes = 4; out.unroll = 2; }
+    else if (elem_size == 4) { out.lanes = 8; out.unroll = 2; }
+    else if (elem_size == 2) { out.lanes = 16; out.unroll = 1; }
+    else if (elem_size == 1) { out.lanes = 32; out.unroll = 1; }
+    return out;
 }
 
 func bpp_tag_slice_subslice<T>(s: *BppTaggedSlice<T>, start: u64, len: u64) -> BppTaggedSlice<T> {
