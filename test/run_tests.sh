@@ -141,6 +141,7 @@ LLVM_ARTIFACT_DIR_BASE="build/${VERSION}_llvm"
 TEST_FAST_IO=${TEST_FAST_IO:-0}
 TEST_SKIP_LLVM_BUILD=${TEST_SKIP_LLVM_BUILD:-0}
 TEST_QUIET=${TEST_QUIET:-0}
+TEST_PROGRESS=${TEST_PROGRESS:-1}
 KEEP_TEST_ARTIFACTS=${KEEP_TEST_ARTIFACTS:-1}
 TEST_JOBS=${TEST_JOBS:-0}
 TEST_PROFILE=${TEST_PROFILE:-full}
@@ -158,6 +159,11 @@ TEST_SKIP_LLVM_BUILD="$(echo "$TEST_SKIP_LLVM_BUILD" | tr '[:upper:]' '[:lower:]
 case "$TEST_SKIP_LLVM_BUILD" in
     1|true|yes) TEST_SKIP_LLVM_BUILD=1 ;;
     *) TEST_SKIP_LLVM_BUILD=0 ;;
+esac
+TEST_PROGRESS="$(echo "$TEST_PROGRESS" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+case "$TEST_PROGRESS" in
+    1|true|yes) TEST_PROGRESS=1 ;;
+    *) TEST_PROGRESS=0 ;;
 esac
 
 shm_available_kb() {
@@ -491,6 +497,7 @@ if [ "$TEST_QUIET" -eq 0 ]; then
     echo "[INFO] Runtime timeout: ${TEST_TIMEOUT_SEC}s"
     echo "[INFO] Stress runs: $STRESS_RUNS"
     echo "[INFO] Stability runs: $STABILITY_RUNS"
+    echo "[INFO] Progress: $TEST_PROGRESS"
     echo ""
 fi
 
@@ -509,11 +516,38 @@ mkdir -p "$LLVM_ARTIFACT_DIR"
 
 ACTIVE_JOBS=0
 
+print_progress_start() {
+    if [ "$TEST_PROGRESS" -eq 0 ]; then
+        return 0
+    fi
+
+    local runner="$1"
+    shift
+    local case_num="$1"
+    case "$runner" in
+        run_matrix_case)
+            local test_label="$4"
+            local mode="$5"
+            local opt="$6"
+            echo "[$case_num] RUN Testing $test_label ($mode $opt) active=$((ACTIVE_JOBS + 1))/$TEST_JOBS"
+            ;;
+        run_llvm_case)
+            local test_label="$4"
+            echo "[$case_num] RUN LLVM $test_label active=$((ACTIVE_JOBS + 1))/$TEST_JOBS"
+            ;;
+        run_ir_case)
+            local test_name="$3"
+            echo "[$case_num] RUN IR $test_name active=$((ACTIVE_JOBS + 1))/$TEST_JOBS"
+            ;;
+    esac
+}
+
 launch_job_with_limit() {
     while [ "$ACTIVE_JOBS" -ge "$TEST_JOBS" ]; do
         wait -n || true
         ACTIVE_JOBS=$((ACTIVE_JOBS - 1))
     done
+    print_progress_start "$@"
     "$@" &
     ACTIVE_JOBS=$((ACTIVE_JOBS + 1))
 }
