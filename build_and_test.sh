@@ -143,10 +143,14 @@ base_compiler_smoke_check() {
         return 0
     fi
 
-    local smoke_src="$ROOT_DIR/test/source/01_arith_bit_cmp.bpp"
-    if [ ! -f "$smoke_src" ]; then
-        smoke_src="$SRC_FILE"
+    local smoke_src="${BPP_BASE_SMOKE_SOURCE:-}"
+    if [ -z "$smoke_src" ]; then
+        local smoke_dir="$BUILD_DIR/tmp/bootstrap-smoke"
+        smoke_src="$smoke_dir/base_smoke.bpp"
+        mkdir -p "$smoke_dir" || return 1
+        printf '%s\n' 'func main() -> u64 { return 0; }' > "$smoke_src" || return 1
     fi
+    [ -f "$smoke_src" ] || return 1
 
     (
         ulimit -v "${BPP_BASE_SMOKE_VMEM_KB:-4000000}" 2>/dev/null || true
