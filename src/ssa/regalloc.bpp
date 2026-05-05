@@ -6,10 +6,14 @@
 import std.io;
 import std.util;
 import std.vec;
+import std.mem;
 import ssa.datastruct;
 import ssa.core;
 
 const SSA_REGALLOC_DEBUG = 0;
+const SSA_REGALLOC_RELEASE_SCRATCH = 0;
+const SSA_REGALLOC_USE_SCRATCH_ARENA = 1;
+const SSA_REGALLOC_MAP_IN_ARENA = 0;
 
 const SSA_PHYS_RAX = 1;
 const SSA_PHYS_RBX = 2;
@@ -35,14 +39,33 @@ func bits_len(nbits: u64) -> u64 {
     return words;
 }
 
-func bitset_new(nbits: u64) -> u64 {
+func bitset_new_scratch(nbits: u64, arena: *BppScratchArena) -> u64 {
     var words: u64 = bits_len(nbits);
-    var buf: u64 = heap_alloc(words * sizeof(u64));
+    var buf: u64 = 0;
+    if (arena != 0) {
+        buf = bpp_scratch_arena_alloc_zero(arena, words * sizeof(u64));
+    } else {
+        buf = heap_alloc(words * sizeof(u64));
+    }
     var buf_u64: *u64 = (*u64)buf;
     for (var i: u64 = 0; i < words; i++) {
         buf_u64[i] = 0;
     }
     return buf;
+}
+
+func bitset_new(nbits: u64) -> u64 {
+    return bitset_new_scratch(nbits, 0);
+}
+
+func bitset_free_array(arr: u64, count: u64) -> u64 {
+    if (arr == 0) { return 0; }
+    var arr_u64: *u64 = (*u64)arr;
+    for (var i: u64 = 0; i < count; i++) {
+        if (arr_u64[i] != 0) { free(arr_u64[i]); }
+    }
+    free(arr);
+    return 0;
 }
 
 func bitset_zero(buf: u64, nbits: u64) -> u64 {
@@ -254,7 +277,7 @@ func use_add_call_operands(use: u64, def: u64, info_ptr: u64, op: u64, max_reg: 
     return 0;
 }
 
-func build_use_def(fn: *SSAFunction, max_reg: u64, use_arr: u64, def_arr: u64) -> u64 {
+func build_use_def(fn: *SSAFunction, max_reg: u64, use_arr: u64, def_arr: u64, arena: *BppScratchArena) -> u64 {
     var blocks: []*SSABlock = fn.blocks;
     var n: u64 = slice_len(blocks);
     var use_arr_u64: *u64 = (*u64)use_arr;
@@ -262,8 +285,8 @@ func build_use_def(fn: *SSAFunction, max_reg: u64, use_arr: u64, def_arr: u64) -
     for (var i: u64 = 0; i < n; i++) {
         var b: *SSABlock = blocks[i];
 
-        var use: u64 = bitset_new(max_reg + 1);
-        var def: u64 = bitset_new(max_reg + 1);
+        var use: u64 = bitset_new_scratch(max_reg + 1, arena);
+        var def: u64 = bitset_new_scratch(max_reg + 1, arena);
 
         var cur: *SSAInstruction = b.inst_head;
         while (cur != 0) {
@@ -319,18 +342,18 @@ func build_use_def(fn: *SSAFunction, max_reg: u64, use_arr: u64, def_arr: u64) -
     return 0;
 }
 
-func liveness(fn: *SSAFunction, max_reg: u64, live_in: u64, live_out: u64) -> u64 {
+func liveness(fn: *SSAFunction, max_reg: u64, live_in: u64, live_out: u64, arena: *BppScratchArena) -> u64 {
     var n: u64 = slice_len(fn.blocks);
     var live_in_u64: *u64 = (*u64)live_in;
     var live_out_u64: *u64 = (*u64)live_out;
     for (var i: u64 = 0; i < n; i++) {
-        live_in_u64[i] = bitset_new(max_reg + 1);
-        live_out_u64[i] = bitset_new(max_reg + 1);
+        live_in_u64[i] = bitset_new_scratch(max_reg + 1, arena);
+        live_out_u64[i] = bitset_new_scratch(max_reg + 1, arena);
     }
 
-    var use_arr: u64 = heap_alloc(n * sizeof(u64));
-    var def_arr: u64 = heap_alloc(n * sizeof(u64));
-    build_use_def(fn, max_reg, use_arr, def_arr);
+    var use_arr: u64 = bpp_scratch_arena_alloc(arena, n * sizeof(u64));
+    var def_arr: u64 = bpp_scratch_arena_alloc(arena, n * sizeof(u64));
+    build_use_def(fn, max_reg, use_arr, def_arr, arena);
     var use_arr_u64: *u64 = (*u64)use_arr;
     var def_arr_u64: *u64 = (*u64)def_arr;
     var blocks: []*SSABlock = fn.blocks;
@@ -343,7 +366,7 @@ func liveness(fn: *SSAFunction, max_reg: u64, live_in: u64, live_out: u64) -> u6
     }
     var idx_cap: u64 = max_block_id + 1;
     var undef_idx: u64 = all_ones();
-    var idx_map: u64 = heap_alloc(idx_cap * sizeof(u64));
+    var idx_map: u64 = bpp_scratch_arena_alloc(arena, idx_cap * sizeof(u64));
     var idx_map_u64: *u64 = (*u64)idx_map;
     for (var fill: u64 = 0; fill < idx_cap; fill++) {
         idx_map_u64[fill] = undef_idx;
@@ -353,13 +376,13 @@ func liveness(fn: *SSAFunction, max_reg: u64, live_in: u64, live_out: u64) -> u6
         idx_map_u64[b1.id] = bi1;
     }
 
-    var tmp_out_arr: u64 = heap_alloc(n * sizeof(u64));
-    var tmp_in_arr: u64 = heap_alloc(n * sizeof(u64));
+    var tmp_out_arr: u64 = bpp_scratch_arena_alloc(arena, n * sizeof(u64));
+    var tmp_in_arr: u64 = bpp_scratch_arena_alloc(arena, n * sizeof(u64));
     var tmp_out_arr_u64: *u64 = (*u64)tmp_out_arr;
     var tmp_in_arr_u64: *u64 = (*u64)tmp_in_arr;
     for (var ti: u64 = 0; ti < n; ti++) {
-        tmp_out_arr_u64[ti] = bitset_new(max_reg + 1);
-        tmp_in_arr_u64[ti] = bitset_new(max_reg + 1);
+        tmp_out_arr_u64[ti] = bitset_new_scratch(max_reg + 1, arena);
+        tmp_in_arr_u64[ti] = bitset_new_scratch(max_reg + 1, arena);
     }
 
     var changed: u64 = 1;
@@ -411,6 +434,13 @@ func liveness(fn: *SSAFunction, max_reg: u64, live_in: u64, live_out: u64) -> u6
         }
     }
 
+    if (SSA_REGALLOC_RELEASE_SCRATCH != 0) {
+        bitset_free_array(use_arr, n);
+        bitset_free_array(def_arr, n);
+        bitset_free_array(tmp_out_arr, n);
+        bitset_free_array(tmp_in_arr, n);
+        free(idx_map);
+    }
     return 0;
 }
 
@@ -491,31 +521,33 @@ func live_mark_call_operands(live: u64, info_ptr: u64, op: u64, nregs: u64) -> u
     return 0;
 }
 
-func interference_build(fn: *SSAFunction, max_reg: u64) -> u64 {
+func interference_build(fn: *SSAFunction, max_reg: u64, arena: *BppScratchArena) -> u64 {
     var nregs: u64 = max_reg + 1;
-    var adj: u64 = heap_alloc(nregs * sizeof(u64));
+    var adj: u64 = bpp_scratch_arena_alloc(arena, nregs * sizeof(u64));
     var adj_u64: *u64 = (*u64)adj;
     for (var r: u64 = 0; r < nregs; r++) {
-        adj_u64[r] = bitset_new(nregs);
+        adj_u64[r] = bitset_new_scratch(nregs, arena);
     }
 
     var blocks: []*SSABlock = fn.blocks;
     var bcount: u64 = slice_len(blocks);
-    var live_in: u64 = heap_alloc(bcount * sizeof(u64));
-    var live_out: u64 = heap_alloc(bcount * sizeof(u64));
-    liveness(fn, max_reg, live_in, live_out);
+    var live_in: u64 = bpp_scratch_arena_alloc(arena, bcount * sizeof(u64));
+    var live_out: u64 = bpp_scratch_arena_alloc(arena, bcount * sizeof(u64));
+    liveness(fn, max_reg, live_in, live_out, arena);
     var live_in_u64: *u64 = (*u64)live_in;
     var live_out_u64: *u64 = (*u64)live_out;
 
     for (var bi: u64 = 0; bi < bcount; bi++) {
         var b: *SSABlock = blocks[bi];
-        var live: u64 = bitset_new(nregs);
+        var live_mark: BppScratchArenaMark;
+        bpp_scratch_arena_mark_into(arena, &live_mark);
+        var live: u64 = bitset_new_scratch(nregs, arena);
         bitset_copy(live, live_out_u64[bi], nregs);
 
-            var insts: *Vec<*SSAInstruction> = new Vec<*SSAInstruction>{heap_alloc((8) * sizeof(*SSAInstruction)), 0, (8)};
+        var insts: *Vec<*SSAInstruction> = vec_new_scratch<*SSAInstruction>(arena, 8);
         var cur: *SSAInstruction = b.inst_head;
         while (cur != 0) {
-            insts.push(cur);
+            insts.push_scratch(cur, arena);
             cur = cur.next;
         }
 
@@ -592,24 +624,34 @@ func interference_build(fn: *SSAFunction, max_reg: u64) -> u64 {
             }
         }
 
+        if (SSA_REGALLOC_RELEASE_SCRATCH != 0) {
+            insts.release_buffer();
+            free((u64)insts);
+            free(live);
+        }
+        bpp_scratch_arena_rewind(arena, &live_mark);
     }
 
+    if (SSA_REGALLOC_RELEASE_SCRATCH != 0) {
+        bitset_free_array(live_in, bcount);
+        bitset_free_array(live_out, bcount);
+    }
     return adj;
 }
 
-func color_fn(fn: *SSAFunction, k: u64) -> *Vec<u64> {
+func color_fn(fn: *SSAFunction, k: u64, arena: *BppScratchArena) -> *Vec<u64> {
     var max_reg: u64 = calc_max_reg(fn);
     if (max_reg == 0) { return 0; }
 
-    var adj: u64 = interference_build(fn, max_reg);
+    var adj: u64 = interference_build(fn, max_reg, arena);
     var adj_u64: *u64 = (*u64)adj;
-        var colors_vec: *Vec<u64> = new Vec<u64>{heap_alloc((max_reg + 1) * sizeof(u64)), 0, (max_reg + 1)};
+    var colors_vec: *Vec<u64> = vec_new_scratch<u64>(arena, max_reg + 1);
     for (var i: u64 = 0; i <= max_reg; i++) {
-        colors_vec.push(0);
+        colors_vec.push_scratch(0, arena);
     }
-    var used_vec: *Vec<u64> = new Vec<u64>{heap_alloc((k + 1) * sizeof(u64)), 0, (k + 1)};
+    var used_vec: *Vec<u64> = vec_new_scratch<u64>(arena, k + 1);
         for (var j: u64 = 0; j <= k; j++) {
-        used_vec.push(0);
+        used_vec.push_scratch(0, arena);
     }
 
     for (var r: u64 = 1; r <= max_reg; r++) {
@@ -638,6 +680,11 @@ func color_fn(fn: *SSAFunction, k: u64) -> *Vec<u64> {
         println("[DEBUG] color_fn: done", 36);
     }
 
+    if (SSA_REGALLOC_RELEASE_SCRATCH != 0) {
+        bitset_free_array(adj, max_reg + 1);
+        used_vec.release_buffer();
+        free((u64)used_vec);
+    }
     return colors_vec;
 }
 
@@ -655,7 +702,28 @@ func color_to_phys(color: u64) -> u64 {
     }
 }
 
-func map_fn(fn: *SSAFunction, k: u64) -> u64 {
+func regalloc_map_uses_arena(arena: *BppScratchArena) -> u64 {
+    if (arena != 0 && SSA_REGALLOC_MAP_IN_ARENA != 0) { return 1; }
+    return 0;
+}
+
+func regalloc_map_alloc(max_reg: u64, arena: *BppScratchArena) -> u64 {
+    var bytes: u64 = (max_reg + 1) * sizeof(u64);
+    if (regalloc_map_uses_arena(arena) != 0) {
+        return bpp_scratch_arena_alloc_zero(arena, bytes);
+    }
+    return heap_alloc(bytes);
+}
+
+func regalloc_map_free(map: u64, arena: *BppScratchArena) -> u64 {
+    if (map == 0) { return 0; }
+    if (regalloc_map_uses_arena(arena) == 0) {
+        free(map);
+    }
+    return 0;
+}
+
+func map_fn(fn: *SSAFunction, k: u64, arena: *BppScratchArena) -> u64 {
     var max_reg: u64 = calc_max_reg(fn);
     if (max_reg == 0) {
         fn.regalloc_failed = 0;
@@ -663,7 +731,7 @@ func map_fn(fn: *SSAFunction, k: u64) -> u64 {
         return 0;
     }
 
-    var colors: *Vec<u64> = color_fn(fn, k);
+    var colors: *Vec<u64> = color_fn(fn, k, arena);
     if (colors == 0) {
         fn.regalloc_failed = 1;
         fn.regalloc_done = 0;
@@ -672,7 +740,7 @@ func map_fn(fn: *SSAFunction, k: u64) -> u64 {
         return 0;
     }
 
-    var map: u64 = heap_alloc((max_reg + 1) * sizeof(u64));
+    var map: u64 = regalloc_map_alloc(max_reg, arena);
     var map_u64: *u64 = (*u64)map;
     for (var i: u64 = 0; i <= max_reg; i++) {
         map_u64[i] = 0;
@@ -694,6 +762,11 @@ func map_fn(fn: *SSAFunction, k: u64) -> u64 {
     }
 
     if (failed != 0) {
+        regalloc_map_free(map, arena);
+        if (SSA_REGALLOC_RELEASE_SCRATCH != 0) {
+            colors.release_buffer();
+            free((u64)colors);
+        }
         fn.regalloc_failed = 1;
         fn.regalloc_done = 0;
         fn.reg_map_data = 0;
@@ -705,6 +778,10 @@ func map_fn(fn: *SSAFunction, k: u64) -> u64 {
     fn.reg_map_len = max_reg + 1;
     fn.regalloc_failed = 0;
     fn.regalloc_done = 1;
+    if (SSA_REGALLOC_RELEASE_SCRATCH != 0) {
+        colors.release_buffer();
+        free((u64)colors);
+    }
     return map;
 }
 
@@ -719,9 +796,21 @@ func run(ctx: *SSAContext, k: u64) -> u64 {
             println("[DEBUG] regalloc_run", 26);
         }
         var fn: *SSAFunction = funcs[i];
-        map_fn(fn, k);
+        var arena: BppScratchArena;
+        var arena_ptr: *BppScratchArena = 0;
+        if (SSA_REGALLOC_USE_SCRATCH_ARENA != 0) {
+            bpp_scratch_arena_init(&arena, 0);
+            arena_ptr = &arena;
+        }
+        map_fn(fn, k, arena_ptr);
         if (fn.regalloc_failed == 0 && fn.regalloc_done != 0) {
             apply_fn(fn);
+            regalloc_map_free(fn.reg_map_data, arena_ptr);
+        }
+        fn.reg_map_data = 0;
+        fn.reg_map_len = 0;
+        if (SSA_REGALLOC_USE_SCRATCH_ARENA != 0) {
+            bpp_scratch_arena_reset(&arena);
         }
     }
     return 0;

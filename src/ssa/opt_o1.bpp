@@ -4,10 +4,13 @@ import std.io;
 import std.util;
 import std.vec;
 import std.str;
+import std.mem;
 import ssa.datastruct;
 import ssa.core;
 
 const SSA_O1_DEBUG = 0;
+const SSA_O1_RELEASE_SCRATCH = 0;
+const SSA_O1_USE_SCRATCH_ARENA = 1;
 const SSA_TAGGED_PTR_MASK = 281474976710655;
 const SSA_TAG_LIFECYCLE_SHIFT = 48;
 const SSA_TAG_OWNERSHIP_SHIFT = 51;
@@ -79,6 +82,8 @@ const SSA_TAG_SUMMARY_HAS_TAG_AUTO = 16;
 const SSA_TAG_SUMMARY_HAS_TAGGED_ACCESS = 32;
 const SSA_TAG_SUMMARY_HAS_FOLDED_TAGS = 64;
 
+var g_ssa_o1_scratch_arena: *BppScratchArena;
+
 struct SSAOptKV {
     public key: u64;
     public val: u64;
@@ -143,6 +148,27 @@ impl SSAOptFuncLookup {
     }
 }
 
+func ssa_o1_alloc_kv() -> *SSAOptKV {
+    if (g_ssa_o1_scratch_arena != 0) {
+        return (*SSAOptKV)bpp_scratch_arena_alloc_zero(g_ssa_o1_scratch_arena, sizeof(SSAOptKV));
+    }
+    return new SSAOptKV{};
+}
+
+func ssa_o1_alloc_summary() -> *SSAOptEscapeSummary {
+    if (g_ssa_o1_scratch_arena != 0) {
+        return (*SSAOptEscapeSummary)bpp_scratch_arena_alloc_zero(g_ssa_o1_scratch_arena, sizeof(SSAOptEscapeSummary));
+    }
+    return new SSAOptEscapeSummary{};
+}
+
+func ssa_o1_alloc_func_lookup() -> *SSAOptFuncLookup {
+    if (g_ssa_o1_scratch_arena != 0) {
+        return (*SSAOptFuncLookup)bpp_scratch_arena_alloc_zero(g_ssa_o1_scratch_arena, sizeof(SSAOptFuncLookup));
+    }
+    return new SSAOptFuncLookup{};
+}
+
 struct SSAOptTagState {
     public key: u64;
     public active: u64;
@@ -175,6 +201,13 @@ impl SSAOptTagState {
     }
 }
 
+func ssa_o1_alloc_tag_state() -> *SSAOptTagState {
+    if (g_ssa_o1_scratch_arena != 0) {
+        return (*SSAOptTagState)bpp_scratch_arena_alloc_zero(g_ssa_o1_scratch_arena, sizeof(SSAOptTagState));
+    }
+    return new SSAOptTagState{};
+}
+
 // ============================================
 // Const Propagation Helpers
 // ============================================
@@ -197,11 +230,11 @@ func kv_set(map: *Vec<*SSAOptKV>, key: u64, val: u64) -> u64 {
         entry.active = 1;
         return 0;
     }
-    var new_entry: *SSAOptKV = new SSAOptKV{};
+    var new_entry: *SSAOptKV = ssa_o1_alloc_kv();
     new_entry.key = key;
     new_entry.val = val;
     new_entry.active = 1;
-    map.push(new_entry);
+    map.push_scratch(new_entry, g_ssa_o1_scratch_arena);
     return 0;
 }
 
@@ -291,10 +324,10 @@ func ssa_tag_state_find(map: *Vec<*SSAOptTagState>, key: u64) -> *SSAOptTagState
 func ssa_tag_state_ensure(map: *Vec<*SSAOptTagState>, key: u64) -> *SSAOptTagState {
     var entry: *SSAOptTagState = ssa_tag_state_find(map, key);
     if (entry != 0) { return entry; }
-    var new_entry: *SSAOptTagState = new SSAOptTagState{};
+    var new_entry: *SSAOptTagState = ssa_o1_alloc_tag_state();
     new_entry.key = key;
     new_entry.active = 1;
-    map.push(new_entry);
+    map.push_scratch(new_entry, g_ssa_o1_scratch_arena);
     return new_entry;
 }
 
@@ -559,11 +592,11 @@ func use_inc(map: *Vec<*SSAOptKV>, key: u64) -> u64 {
         entry.val = entry.val + 1;
         return 0;
     }
-    var new_entry: *SSAOptKV = new SSAOptKV{};
+    var new_entry: *SSAOptKV = ssa_o1_alloc_kv();
     new_entry.key = key;
     new_entry.val = 1;
     new_entry.active = 1;
-    map.push(new_entry);
+    map.push_scratch(new_entry, g_ssa_o1_scratch_arena);
     return 0;
 }
 
@@ -607,7 +640,7 @@ func is_dce_pure(op: u64) -> u64 {
 }
 
 func collect_uses(fn: *SSAFunction) -> *Vec<*SSAOptKV> {
-    var uses: *Vec<*SSAOptKV> = new Vec<*SSAOptKV>{heap_alloc((64) * sizeof(*SSAOptKV)), 0, (64)};
+    var uses: *Vec<*SSAOptKV> = vec_new_scratch<*SSAOptKV>(g_ssa_o1_scratch_arena, 64);
     var blocks: []*SSABlock = fn.blocks;
     var bcount: u64 = slice_len(blocks);
 
@@ -1109,6 +1142,18 @@ func ssa_tag_call_name_is_strip(name: []u8) -> u64 {
 
 func ssa_tag_call_name_is_heap_alloc(name: []u8) -> u64 {
     return ssa_tag_name_eq(name, "std_io__heap_alloc", 18);
+}
+
+func ssa_tag_call_name_has_heap_allocation(name: []u8) -> u64 {
+    if (ssa_tag_call_name_is_heap_alloc(name) != 0) { return 1; }
+    if (ssa_tag_name_eq(name, "std_mem__bpp_heap_alloc_tagged", str_len("std_mem__bpp_heap_alloc_tagged")) != 0) { return 1; }
+    if (ssa_tag_name_eq(name, "std_mem__bpp_heap_alloc_auto_tagged", str_len("std_mem__bpp_heap_alloc_auto_tagged")) != 0) { return 1; }
+    if (ssa_tag_name_eq(name, "std_mem__bpp_heap_alloc_with_policy", str_len("std_mem__bpp_heap_alloc_with_policy")) != 0) { return 1; }
+    if (ssa_tag_name_eq(name, "std_mem__bpp_gc_alloc_tagged", str_len("std_mem__bpp_gc_alloc_tagged")) != 0) { return 1; }
+    if (ssa_tag_name_eq(name, "std_mem__bpp_gc_alloc_tagged_policy", str_len("std_mem__bpp_gc_alloc_tagged_policy")) != 0) { return 1; }
+    if (ssa_tag_name_eq(name, "std_mem__bpp_gc_alloc_raw", str_len("std_mem__bpp_gc_alloc_raw")) != 0) { return 1; }
+    if (ssa_tag_name_eq(name, "std_mem__bpp_gc_alloc_raw_rooted", str_len("std_mem__bpp_gc_alloc_raw_rooted")) != 0) { return 1; }
+    return 0;
 }
 
 func ssa_tag_call_name_is_object_auto(name: []u8) -> u64 {
@@ -1843,6 +1888,9 @@ func handle_tag_call(cur: *SSAInstruction, reg_consts: *Vec<*SSAOptKV>, raw_ptr_
         if (summary != 0) { summary.has_heap_alloc = 1; }
         return 1;
     }
+    if (summary != 0 && ssa_tag_call_name_has_heap_allocation(name) != 0) {
+        summary.has_heap_alloc = 1;
+    }
 
     if (ssa_tag_call_name_is_pack(name) != 0) {
         if (summary != 0) { summary.has_tag_pack = 1; }
@@ -1973,12 +2021,14 @@ func handle_tag_call(cur: *SSAInstruction, reg_consts: *Vec<*SSAOptKV>, raw_ptr_
 }
 
 func run_block(b: *SSABlock, summary: *SSAOptEscapeSummary) -> u64 {
-    var reg_consts: *Vec<*SSAOptKV> = new Vec<*SSAOptKV>{heap_alloc((32) * sizeof(*SSAOptKV)), 0, (32)};
-    var var_consts: *Vec<*SSAOptKV> = new Vec<*SSAOptKV>{heap_alloc((32) * sizeof(*SSAOptKV)), 0, (32)};
-    var raw_ptr_regs: *Vec<*SSAOptKV> = new Vec<*SSAOptKV>{heap_alloc((32) * sizeof(*SSAOptKV)), 0, (32)};
-    var tag_states: *Vec<*SSAOptTagState> = new Vec<*SSAOptTagState>{heap_alloc((32) * sizeof(*SSAOptTagState)), 0, (32)};
-    var local_addrs: *Vec<*SSAOptKV> = new Vec<*SSAOptKV>{heap_alloc((32) * sizeof(*SSAOptKV)), 0, (32)};
-    var local_mem: *Vec<*SSAOptKV> = new Vec<*SSAOptKV>{heap_alloc((32) * sizeof(*SSAOptKV)), 0, (32)};
+    var scratch_mark: BppScratchArenaMark;
+    bpp_scratch_arena_mark_into(g_ssa_o1_scratch_arena, &scratch_mark);
+    var reg_consts: *Vec<*SSAOptKV> = vec_new_scratch<*SSAOptKV>(g_ssa_o1_scratch_arena, 32);
+    var var_consts: *Vec<*SSAOptKV> = vec_new_scratch<*SSAOptKV>(g_ssa_o1_scratch_arena, 32);
+    var raw_ptr_regs: *Vec<*SSAOptKV> = vec_new_scratch<*SSAOptKV>(g_ssa_o1_scratch_arena, 32);
+    var tag_states: *Vec<*SSAOptTagState> = vec_new_scratch<*SSAOptTagState>(g_ssa_o1_scratch_arena, 32);
+    var local_addrs: *Vec<*SSAOptKV> = vec_new_scratch<*SSAOptKV>(g_ssa_o1_scratch_arena, 32);
+    var local_mem: *Vec<*SSAOptKV> = vec_new_scratch<*SSAOptKV>(g_ssa_o1_scratch_arena, 32);
 
     var cur: *SSAInstruction = b.inst_head;
     while (cur != 0) {
@@ -2099,12 +2149,27 @@ func run_block(b: *SSABlock, summary: *SSAOptEscapeSummary) -> u64 {
     }
 
     remove_nops(b);
+    if (SSA_O1_RELEASE_SCRATCH != 0) {
+        reg_consts.release_buffer();
+        var_consts.release_buffer();
+        raw_ptr_regs.release_buffer();
+        tag_states.release_buffer();
+        local_addrs.release_buffer();
+        local_mem.release_buffer();
+        free((u64)reg_consts);
+        free((u64)var_consts);
+        free((u64)raw_ptr_regs);
+        free((u64)tag_states);
+        free((u64)local_addrs);
+        free((u64)local_mem);
+    }
+    bpp_scratch_arena_rewind(g_ssa_o1_scratch_arena, &scratch_mark);
     return 0;
 }
 
 func ssa_tag_summarize_call_name(summary: *SSAOptEscapeSummary, name: []u8) -> u64 {
     if (summary == 0 || name.ptr == 0 || name.len == 0) { return 0; }
-    if (ssa_tag_call_name_is_heap_alloc(name) != 0) { summary.has_heap_alloc = 1; }
+    if (ssa_tag_call_name_has_heap_allocation(name) != 0) { summary.has_heap_alloc = 1; }
     if (ssa_tag_call_name_is_pack(name) != 0 || ssa_tag_call_name_is_object_from_raw(name) != 0) { summary.has_tag_pack = 1; }
     if (ssa_tag_call_name_is_object_auto(name) != 0) { summary.has_tag_auto = 1; }
     if (ssa_tag_name_has_prefix(name, "std_mem__bpp_tag_", 17) != 0 ||
@@ -2146,7 +2211,7 @@ func ssa_tag_summarize_call(summary: *SSAOptEscapeSummary, op: u64, info_ptr: u6
 }
 
 func ssa_tag_analyze_function_escape(fn: *SSAFunction) -> *SSAOptEscapeSummary {
-    var summary: *SSAOptEscapeSummary = new SSAOptEscapeSummary{};
+    var summary: *SSAOptEscapeSummary = ssa_o1_alloc_summary();
     if (fn == 0) { return summary; }
     var blocks: []*SSABlock = fn.blocks;
     var bcount: u64 = slice_len(blocks);
@@ -2199,11 +2264,11 @@ func ssa_tag_find_func_by_name_cached(ctx: *SSAContext, cache: *Vec<*SSAOptFuncL
     if (cached != 0) { return cached.fn; }
     var found: *SSAFunction = ssa_tag_find_func_by_name(ctx, name);
     if (cache != 0) {
-        var entry: *SSAOptFuncLookup = new SSAOptFuncLookup{};
+        var entry: *SSAOptFuncLookup = ssa_o1_alloc_func_lookup();
         entry.name = slice(name.ptr, name.len);
         entry.fn = found;
         entry.active = 1;
-        cache.push(entry);
+        cache.push_scratch(entry, g_ssa_o1_scratch_arena);
     }
     return found;
 }
@@ -2250,10 +2315,34 @@ func ssa_tag_reset_call_graph(ctx: *SSAContext) -> u64 {
     return 1;
 }
 
+func ssa_tag_release_call_graph(ctx: *SSAContext) -> u64 {
+    if (ctx == 0) { return 0; }
+    var funcs: []*SSAFunction = ctx.funcs;
+    var n: u64 = slice_len(funcs);
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var fn: *SSAFunction = funcs[i];
+        if (fn == 0) { continue; }
+        var callees_raw: *u64 = (*u64)&fn.tag_callees;
+        if (callees_raw[0] != 0) {
+            heap_free(callees_raw[0]);
+        }
+        fn.tag_callees = slice(0, 0);
+        fn.tag_callees_cap = 0;
+        fn.tag_call_graph_cached = 0;
+    }
+    return 1;
+}
+
 func ssa_tag_build_call_graph(ctx: *SSAContext) -> u64 {
     if (ctx == 0) { return 0; }
     ssa_tag_reset_call_graph(ctx);
-    var lookup_cache: *Vec<*SSAOptFuncLookup> = new Vec<*SSAOptFuncLookup>{heap_alloc((64) * sizeof(*SSAOptFuncLookup)), 0, (64)};
+    var lookup_arena: BppScratchArena;
+    var old_scratch: *BppScratchArena = g_ssa_o1_scratch_arena;
+    if (SSA_O1_USE_SCRATCH_ARENA != 0) {
+        bpp_scratch_arena_init(&lookup_arena, 0);
+        g_ssa_o1_scratch_arena = &lookup_arena;
+    }
+    var lookup_cache: *Vec<*SSAOptFuncLookup> = vec_new_scratch<*SSAOptFuncLookup>(g_ssa_o1_scratch_arena, 64);
     var funcs: []*SSAFunction = ctx.funcs;
     var n: u64 = slice_len(funcs);
     for (var i: u64 = 0; i < n; i = i + 1) {
@@ -2291,6 +2380,19 @@ func ssa_tag_build_call_graph(ctx: *SSAContext) -> u64 {
     for (var j: u64 = 0; j < n; j = j + 1) {
         var fn2: *SSAFunction = funcs[j];
         if (fn2 != 0) { fn2.tag_call_graph_cached = 1; }
+    }
+    if (SSA_O1_RELEASE_SCRATCH != 0) {
+        var cache_len: u64 = lookup_cache.len();
+        for (var ci: u64 = 0; ci < cache_len; ci = ci + 1) {
+            var entry_cached: *SSAOptFuncLookup = lookup_cache.get(ci);
+            if (entry_cached != 0) { free((u64)entry_cached); }
+        }
+        lookup_cache.release_buffer();
+        free((u64)lookup_cache);
+    }
+    if (SSA_O1_USE_SCRATCH_ARENA != 0) {
+        bpp_scratch_arena_reset(&lookup_arena);
+        g_ssa_o1_scratch_arena = old_scratch;
     }
     return 1;
 }
@@ -2378,6 +2480,9 @@ func ssa_tag_propagate_interprocedural(ctx: *SSAContext) -> u64 {
         fn2.tag_interproc_summary_bits = final_callee_bits;
         fn2.tag_interproc_callee_count = callee_count;
     }
+    if (SSA_O1_RELEASE_SCRATCH != 0) {
+        ssa_tag_release_call_graph(ctx);
+    }
     return 0;
 }
 
@@ -2390,6 +2495,13 @@ func run(ctx: *SSAContext) -> u64 {
     var n: u64 = slice_len(funcs);
     var i: u64 = 0;
     for (i = 0; i < n; i = i + 1) {
+        var arena: BppScratchArena;
+        if (SSA_O1_USE_SCRATCH_ARENA != 0) {
+            bpp_scratch_arena_init(&arena, 0);
+            g_ssa_o1_scratch_arena = &arena;
+        } else {
+            g_ssa_o1_scratch_arena = 0;
+        }
         var fn: *SSAFunction = funcs[i];
         var summary: *SSAOptEscapeSummary = ssa_tag_analyze_function_escape(fn);
 
@@ -2413,6 +2525,13 @@ func run(ctx: *SSAContext) -> u64 {
         fn.tag_profile_fold_count = summary.profile_fold_count;
         fn.tag_inline_cache_fold_count = summary.inline_cache_fold_count;
         fn.stack_new_sroa_scalar_count = summary.sroa_scalar_fold_count;
+        if (SSA_O1_RELEASE_SCRATCH != 0) {
+            free((u64)summary);
+        }
+        if (SSA_O1_USE_SCRATCH_ARENA != 0) {
+            bpp_scratch_arena_reset(&arena);
+            g_ssa_o1_scratch_arena = 0;
+        }
     }
 
     ssa_tag_propagate_interprocedural(ctx);

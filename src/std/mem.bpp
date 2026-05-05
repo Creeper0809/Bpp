@@ -17,6 +17,7 @@ func malloc(size: u64) -> u64 {
 }
 
 func free(ptr: u64) -> u64 {
+    bpp_gc_forget_live(ptr);
     return heap_free(ptr);
 }
 
@@ -25,16 +26,27 @@ func __bpp_delete_begin(ptr: u64) -> u64 {
 }
 
 func __bpp_delete_end(ptr: u64) -> u64 {
+    bpp_gc_forget_live(ptr);
     return heap_delete_end(ptr);
 }
 
 const BPP_TAG_PTR_MASK = 281474976710655;
-const BPP_TAG_HEAP_HEADER_SIZE = 40;
+const BPP_TAG_HEAP_HEADER_SIZE = 32;
 const BPP_TAG_HEAP_STATE_LIVE = 1;
 const BPP_TAG_HEAP_STATE_DROPPING = 2;
 const BPP_TAG_HEAP_STATE_FREED = 3;
 const BPP_TAG_ARENA_CHUNK_BYTES = 262144;
 const BPP_TAG_ARENA_CHUNK_HEADER_SIZE = 16;
+const BPP_SCRATCH_ARENA_DEFAULT_CHUNK_BYTES = 65536;
+const BPP_SCRATCH_ARENA_MIN_CHUNK_BYTES = 4096;
+const BPP_SCRATCH_ARENA_CHUNK_HEADER_SIZE = 16;
+const BPP_GC_DEFAULT_THRESHOLD_BYTES = 65536;
+const BPP_GC_META_LIVE = 1;
+const BPP_GC_META_MARK = 2;
+const BPP_GC_META_ROOTED = 4;
+const BPP_GC_META_GENERATION_SHIFT = 3;
+const BPP_GC_META_GENERATION_MASK = 255;
+const BPP_GC_META_SHAPE_SHIFT = 16;
 
 const BPP_TAG_LIFE_UNKNOWN = 0;
 const BPP_TAG_LIFE_YOUNG = 1;
@@ -240,6 +252,67 @@ struct BppTaggedAllocatorStats {
     public denied_frees: u64;
 }
 
+struct BppScratchArena {
+    public head: u64;
+    public cur: u64;
+    public end: u64;
+    public chunk_size: u64;
+    public chunks: u64;
+    public bytes_reserved: u64;
+    public bytes_used: u64;
+    public high_water: u64;
+}
+
+impl BppScratchArena {
+    public constructor() {
+        self.head = 0;
+        self.cur = 0;
+        self.end = 0;
+        self.chunk_size = BPP_SCRATCH_ARENA_DEFAULT_CHUNK_BYTES;
+        self.chunks = 0;
+        self.bytes_reserved = 0;
+        self.bytes_used = 0;
+        self.high_water = 0;
+    }
+}
+
+struct BppScratchArenaMark {
+    public head: u64;
+    public cur: u64;
+    public end: u64;
+    public chunks: u64;
+    public bytes_reserved: u64;
+    public bytes_used: u64;
+}
+
+impl BppScratchArenaMark {
+    public constructor() {
+        self.head = 0;
+        self.cur = 0;
+        self.end = 0;
+        self.chunks = 0;
+        self.bytes_reserved = 0;
+        self.bytes_used = 0;
+    }
+}
+
+struct BppGcEdge {
+    public child: u64;
+    public next: *BppGcEdge;
+}
+
+struct BppGcBlock {
+    public ptr: u64;
+    public meta: u64;
+    public edges: *BppGcEdge;
+    public next: *BppGcBlock;
+}
+
+struct BppGcRoot {
+    public ptr: u64;
+    public next: *BppGcRoot;
+}
+
 var g_bpp_tag_allocs: u64;
 var g_bpp_tag_heap_allocs: u64;
 var g_bpp_tag_arena_allocs: u64;
@@ -267,6 +340,21 @@ var g_bpp_tag_refcount_release_skipped: u64;
 var g_bpp_tag_gc_barrier_needed: u64;
 var g_bpp_tag_gc_barrier_skipped: u64;
 var g_bpp_tag_gc_barrier_dirty: u64;
+var g_bpp_gc_blocks: *BppGcBlock;
+var g_bpp_gc_roots: *BppGcRoot;
+var g_bpp_gc_allocs: u64;
+var g_bpp_gc_live: u64;
+var g_bpp_gc_frees: u64;
+var g_bpp_gc_collections: u64;
+var g_bpp_gc_auto_collections: u64;
+var g_bpp_gc_roots_count: u64;
+var g_bpp_gc_edges: u64;
+var g_bpp_gc_last_marked: u64;
+var g_bpp_gc_last_swept: u64;
+var g_bpp_gc_bytes_since_collect: u64;
+var g_bpp_gc_threshold: u64;
+var g_bpp_gc_auto_enabled: u64;
+var g_bpp_gc_promotions: u64;
 
 func bpp_tag_strip(ptr: u64) -> u64 {
     return ptr & BPP_TAG_PTR_MASK;
@@ -389,6 +477,117 @@ func bpp_tag_gc_barrier_needed_count() -> u64 { return g_bpp_tag_gc_barrier_need
 func bpp_tag_gc_barrier_skipped_count() -> u64 { return g_bpp_tag_gc_barrier_skipped; }
 func bpp_tag_gc_barrier_dirty_count() -> u64 { return g_bpp_tag_gc_barrier_dirty; }
 
+func bpp_scratch_arena_init(arena: *BppScratchArena, chunk_size: u64) -> u64 {
+    if (arena == 0) { return 0; }
+    arena.head = 0;
+    arena.cur = 0;
+    arena.end = 0;
+    if (chunk_size == 0) { chunk_size = BPP_SCRATCH_ARENA_DEFAULT_CHUNK_BYTES; }
+    if (chunk_size < BPP_SCRATCH_ARENA_MIN_CHUNK_BYTES) { chunk_size = BPP_SCRATCH_ARENA_MIN_CHUNK_BYTES; }
+    arena.chunk_size = heap_align8(chunk_size);
+    arena.chunks = 0;
+    arena.bytes_reserved = 0;
+    arena.bytes_used = 0;
+    arena.high_water = 0;
+    return 0;
+}
+
+func bpp_scratch_arena_alloc(arena: *BppScratchArena, size: u64) -> u64 {
+    if (size == 0) { return 0; }
+    if (arena == 0) { return heap_alloc(size); }
+    if (arena.chunk_size == 0) { bpp_scratch_arena_init(arena, 0); }
+
+    var aligned: u64 = heap_align8(size);
+    if (aligned == 0) { return 0; }
+    if (arena.cur == 0 || arena.cur + aligned > arena.end) {
+        var payload_size: u64 = arena.chunk_size;
+        if (aligned > payload_size) { payload_size = aligned; }
+        var chunk: u64 = heap_alloc(payload_size + BPP_SCRATCH_ARENA_CHUNK_HEADER_SIZE);
+        if (chunk == 0) { return 0; }
+        var meta: *u64 = (*u64)chunk;
+        meta[0] = arena.head;
+        meta[1] = payload_size;
+        arena.head = chunk;
+        arena.cur = chunk + BPP_SCRATCH_ARENA_CHUNK_HEADER_SIZE;
+        arena.end = arena.cur + payload_size;
+        arena.chunks = arena.chunks + 1;
+        arena.bytes_reserved = arena.bytes_reserved + payload_size;
+    }
+
+    var out: u64 = arena.cur;
+    arena.cur = arena.cur + aligned;
+    arena.bytes_used = arena.bytes_used + aligned;
+    if (arena.bytes_used > arena.high_water) { arena.high_water = arena.bytes_used; }
+    return out;
+}
+
+func bpp_scratch_arena_alloc_zero(arena: *BppScratchArena, size: u64) -> u64 {
+    var ptr: u64 = bpp_scratch_arena_alloc(arena, size);
+    if (ptr != 0) { memset(ptr, 0, size); }
+    return ptr;
+}
+
+func bpp_scratch_arena_mark_into(arena: *BppScratchArena, mark: *BppScratchArenaMark) -> u64 {
+    if (mark == 0) { return 0; }
+    mark.head = 0;
+    mark.cur = 0;
+    mark.end = 0;
+    mark.chunks = 0;
+    mark.bytes_reserved = 0;
+    mark.bytes_used = 0;
+    if (arena == 0) { return 0; }
+    mark.head = arena.head;
+    mark.cur = arena.cur;
+    mark.end = arena.end;
+    mark.chunks = arena.chunks;
+    mark.bytes_reserved = arena.bytes_reserved;
+    mark.bytes_used = arena.bytes_used;
+    return 0;
+}
+
+func bpp_scratch_arena_rewind(arena: *BppScratchArena, mark: *BppScratchArenaMark) -> u64 {
+    if (arena == 0 || mark == 0) { return 0; }
+    var cur: u64 = arena.head;
+    while (cur != 0 && cur != mark.head) {
+        var meta: *u64 = (*u64)cur;
+        var next: u64 = meta[0];
+        heap_free(cur);
+        cur = next;
+    }
+    arena.head = mark.head;
+    arena.cur = mark.cur;
+    arena.end = mark.end;
+    arena.chunks = mark.chunks;
+    arena.bytes_reserved = mark.bytes_reserved;
+    arena.bytes_used = mark.bytes_used;
+    return 0;
+}
+
+func bpp_scratch_arena_reset(arena: *BppScratchArena) -> u64 {
+    if (arena == 0) { return 0; }
+    var cur: u64 = arena.head;
+    while (cur != 0) {
+        var meta: *u64 = (*u64)cur;
+        var next: u64 = meta[0];
+        heap_free(cur);
+        cur = next;
+    }
+    arena.head = 0;
+    arena.cur = 0;
+    arena.end = 0;
+    arena.chunks = 0;
+    arena.bytes_reserved = 0;
+    arena.bytes_used = 0;
+    return 0;
+}
+
+func bpp_scratch_arena_release(arena: *BppScratchArena) -> u64 {
+    if (arena == 0) { return 0; }
+    bpp_scratch_arena_reset(arena);
+    arena.high_water = 0;
+    return 0;
+}
+
 func bpp_tag_arena_alloc_raw(size: u64) -> u64 {
     if (size == 0 || size > BPP_ESCAPE_ARENA_MAX_BYTES) { return 0; }
     var aligned: u64 = heap_align8(size);
@@ -445,10 +644,22 @@ func bpp_tag_arena_contains_raw(ptr: u64) -> u64 {
     return 0;
 }
 
+func bpp_heap_policy_uses_gc(lifecycle: u64, ownership: u64, barrier: u64) -> u64 {
+    if (ownership == BPP_TAG_OWN_SHARED || ownership == BPP_TAG_OWN_ESCAPED) { return 1; }
+    if (lifecycle == BPP_TAG_LIFE_PINNED || lifecycle == BPP_TAG_LIFE_OLD) { return 1; }
+    if (barrier == BPP_TAG_BARRIER_DIRTY) { return 1; }
+    return 0;
+}
+
 func bpp_heap_alloc_tagged(size: u64, lifecycle: u64, ownership: u64, storage: u64, barrier: u64, shape: u64, profiled: u64) -> u64 {
     if (storage != BPP_TAG_STORAGE_HEAP) {
         bpp_tag_allocator_record_denied_alloc(lifecycle, ownership, storage);
         return 0;
+    }
+    if (bpp_heap_policy_uses_gc(lifecycle, ownership, barrier) != 0) {
+        var gc_ptr: u64 = bpp_gc_alloc_tagged_policy(size, lifecycle, ownership, barrier, shape);
+        if (gc_ptr == 0 || profiled == 0) { return gc_ptr; }
+        return bpp_tag_repack_shape_profiled(gc_ptr, shape, profiled);
     }
     var ptr: u64 = heap_alloc(size);
     if (ptr == 0) { return 0; }
@@ -484,6 +695,10 @@ func bpp_heap_alloc_with_policy(size: u64, policy: *BppEscapePolicy, shape: u64)
     if (policy.storage == BPP_TAG_STORAGE_ARENA) {
         return bpp_arena_alloc_tagged(size, policy.lifecycle, policy.ownership, policy.barrier, shape, 0);
     }
+    if (policy.storage == BPP_TAG_STORAGE_HEAP &&
+        bpp_heap_policy_uses_gc(policy.lifecycle, policy.ownership, policy.barrier) != 0) {
+        return bpp_gc_alloc_tagged_policy(size, policy.lifecycle, policy.ownership, policy.barrier, shape);
+    }
     return bpp_heap_alloc_tagged(size, policy.lifecycle, policy.ownership, policy.storage, policy.barrier, shape, 0);
 }
 
@@ -505,8 +720,420 @@ func bpp_heap_tagged_free(ptr: u64) -> u64 {
     var allowed: u64 = bpp_tag_allocator_can_free_raw(ptr);
     bpp_tag_allocator_record_free(ptr, allowed);
     if (allowed == 0) { return 0; }
+    bpp_gc_forget_live(ptr);
     return heap_free(ptr);
 }
+
+func bpp_gc_init() -> u64 {
+    if (g_bpp_gc_threshold == 0) {
+        g_bpp_gc_threshold = BPP_GC_DEFAULT_THRESHOLD_BYTES;
+        g_bpp_gc_auto_enabled = 1;
+    }
+    return 0;
+}
+
+func bpp_gc_block_raw(block: *BppGcBlock) -> u64 {
+    if (block == 0) { return 0; }
+    return bpp_tag_strip(block.ptr);
+}
+
+func bpp_gc_block_is_live(block: *BppGcBlock) -> u64 {
+    if (block == 0) { return 0; }
+    if ((block.meta & BPP_GC_META_LIVE) != 0) { return 1; }
+    return 0;
+}
+
+func bpp_gc_block_is_marked(block: *BppGcBlock) -> u64 {
+    if (block == 0) { return 0; }
+    if ((block.meta & BPP_GC_META_MARK) != 0) { return 1; }
+    return 0;
+}
+
+func bpp_gc_block_is_rooted(block: *BppGcBlock) -> u64 {
+    if (block == 0) { return 0; }
+    if ((block.meta & BPP_GC_META_ROOTED) != 0) { return 1; }
+    return 0;
+}
+
+func bpp_gc_block_set_live(block: *BppGcBlock, live: u64) -> u64 {
+    if (block == 0) { return 0; }
+    if (live != 0) { block.meta = block.meta | BPP_GC_META_LIVE; }
+    else { block.meta = block.meta & (0 - (BPP_GC_META_LIVE + 1)); }
+    return 0;
+}
+
+func bpp_gc_block_set_mark(block: *BppGcBlock, mark: u64) -> u64 {
+    if (block == 0) { return 0; }
+    if (mark != 0) { block.meta = block.meta | BPP_GC_META_MARK; }
+    else { block.meta = block.meta & (0 - (BPP_GC_META_MARK + 1)); }
+    return 0;
+}
+
+func bpp_gc_block_set_rooted(block: *BppGcBlock, rooted: u64) -> u64 {
+    if (block == 0) { return 0; }
+    if (rooted != 0) { block.meta = block.meta | BPP_GC_META_ROOTED; }
+    else { block.meta = block.meta & (0 - (BPP_GC_META_ROOTED + 1)); }
+    return 0;
+}
+
+func bpp_gc_block_generation(block: *BppGcBlock) -> u64 {
+    if (block == 0) { return 0; }
+    return (block.meta >> BPP_GC_META_GENERATION_SHIFT) & BPP_GC_META_GENERATION_MASK;
+}
+
+func bpp_gc_block_set_generation(block: *BppGcBlock, generation: u64) -> u64 {
+    if (block == 0) { return 0; }
+    var gen_bits: u64 = BPP_GC_META_GENERATION_MASK << BPP_GC_META_GENERATION_SHIFT;
+    var clear_mask: u64 = 0 - (gen_bits + 1);
+    block.meta = block.meta & clear_mask;
+    block.meta = block.meta | ((generation & BPP_GC_META_GENERATION_MASK) << BPP_GC_META_GENERATION_SHIFT);
+    return 0;
+}
+
+func bpp_gc_block_make_meta(shape: u64) -> u64 {
+    return BPP_GC_META_LIVE | (1 << BPP_GC_META_GENERATION_SHIFT) | ((shape & 15) << BPP_GC_META_SHAPE_SHIFT);
+}
+
+func bpp_gc_find_block(ptr: u64) -> *BppGcBlock {
+    var raw: u64 = bpp_tag_strip(ptr);
+    if (raw == 0) { return (*BppGcBlock)0; }
+    var cur: *BppGcBlock = g_bpp_gc_blocks;
+    while (cur != 0) {
+        if (bpp_gc_block_is_live(cur) != 0 && bpp_gc_block_raw(cur) == raw) { return cur; }
+        cur = cur.next;
+    }
+    return (*BppGcBlock)0;
+}
+
+func bpp_gc_is_live(ptr: u64) -> u64 {
+    if (bpp_gc_find_block(ptr) == 0) { return 0; }
+    return 1;
+}
+
+func bpp_gc_is_marked(ptr: u64) -> u64 {
+    var block: *BppGcBlock = bpp_gc_find_block(ptr);
+    if (block == 0) { return 0; }
+    return bpp_gc_block_is_marked(block);
+}
+
+func bpp_gc_root_remove(ptr: u64) -> u64 {
+    var raw: u64 = bpp_tag_strip(ptr);
+    if (raw == 0) { return 0; }
+    var block: *BppGcBlock = bpp_gc_find_block(raw);
+    if (block != 0 && bpp_gc_block_is_rooted(block) != 0) {
+        bpp_gc_block_set_rooted(block, 0);
+        if (g_bpp_gc_roots_count > 0) { g_bpp_gc_roots_count = g_bpp_gc_roots_count - 1; }
+        return 1;
+    }
+    var prev: *BppGcRoot = (*BppGcRoot)0;
+    var cur: *BppGcRoot = g_bpp_gc_roots;
+    while (cur != 0) {
+        var next_root: *BppGcRoot = cur.next;
+        if (bpp_tag_strip(cur.ptr) == raw) {
+            if (prev == 0) {
+                g_bpp_gc_roots = next_root;
+            } else {
+                prev.next = next_root;
+            }
+            if (g_bpp_gc_roots_count > 0) { g_bpp_gc_roots_count = g_bpp_gc_roots_count - 1; }
+            heap_free((u64)cur);
+            return 1;
+        }
+        prev = cur;
+        cur = next_root;
+    }
+    return 0;
+}
+
+func bpp_gc_forget_live(ptr: u64) -> u64 {
+    var block: *BppGcBlock = bpp_gc_find_block(ptr);
+    if (block == 0) { return 0; }
+    bpp_gc_root_remove(ptr);
+    bpp_gc_block_set_live(block, 0);
+    bpp_gc_block_set_mark(block, 0);
+    if (g_bpp_gc_live > 0) { g_bpp_gc_live = g_bpp_gc_live - 1; }
+    return 1;
+}
+
+func bpp_gc_register_block(ptr: u64, size: u64, shape: u64) -> u64 {
+    if (ptr == 0) { return 0; }
+    var node: *BppGcBlock = (*BppGcBlock)heap_alloc(sizeof(BppGcBlock));
+    if (node == 0) { return 0; }
+    node.ptr = ptr;
+    node.meta = bpp_gc_block_make_meta(shape);
+    node.edges = (*BppGcEdge)0;
+    node.next = g_bpp_gc_blocks;
+    g_bpp_gc_blocks = node;
+    g_bpp_gc_allocs = g_bpp_gc_allocs + 1;
+    g_bpp_gc_live = g_bpp_gc_live + 1;
+    return ptr;
+}
+
+func bpp_gc_auto_collect_before_alloc(size: u64) -> u64 {
+    bpp_gc_init();
+    if (g_bpp_gc_auto_enabled == 0) { return 0; }
+    if (g_bpp_gc_threshold == 0) { return 0; }
+    if (g_bpp_gc_live == 0) { return 0; }
+    if (g_bpp_gc_bytes_since_collect + size <= g_bpp_gc_threshold) { return 0; }
+    g_bpp_gc_auto_collections = g_bpp_gc_auto_collections + 1;
+    bpp_gc_collect();
+    return 1;
+}
+
+func bpp_gc_alloc_tagged_policy(size: u64, lifecycle: u64, ownership: u64, barrier: u64, shape: u64) -> u64 {
+    if (size == 0) { return 0; }
+    bpp_gc_auto_collect_before_alloc(size);
+    var raw: u64 = heap_alloc(size);
+    if (raw == 0) { return 0; }
+    var tagged_ptr: u64 = bpp_tag_pack(raw, lifecycle, ownership, BPP_TAG_STORAGE_HEAP, barrier, shape, 0);
+    if (bpp_gc_register_block(tagged_ptr, size, shape) == 0) {
+        heap_free(raw);
+        return 0;
+    }
+    bpp_tag_allocator_record_alloc(lifecycle, ownership, BPP_TAG_STORAGE_HEAP);
+    g_bpp_gc_bytes_since_collect = g_bpp_gc_bytes_since_collect + size;
+    return tagged_ptr;
+}
+
+func bpp_gc_alloc_tagged(size: u64, shape: u64) -> u64 {
+    return bpp_gc_alloc_tagged_policy(size, BPP_TAG_LIFE_YOUNG, BPP_TAG_OWN_SHARED, BPP_TAG_BARRIER_CLEAN, shape);
+}
+
+func bpp_gc_alloc_raw(size: u64, shape: u64) -> u64 {
+    if (size == 0) { return 0; }
+    bpp_gc_init();
+    bpp_gc_auto_collect_before_alloc(size);
+    var raw: u64 = heap_alloc(size);
+    if (raw == 0) { return 0; }
+    var tagged_meta: u64 = bpp_tag_pack(raw, BPP_TAG_LIFE_YOUNG, BPP_TAG_OWN_SHARED, BPP_TAG_STORAGE_HEAP, BPP_TAG_BARRIER_CLEAN, shape, 0);
+    if (bpp_gc_register_block(tagged_meta, size, shape) == 0) {
+        heap_free(raw);
+        return 0;
+    }
+    bpp_tag_allocator_record_alloc(BPP_TAG_LIFE_YOUNG, BPP_TAG_OWN_SHARED, BPP_TAG_STORAGE_HEAP);
+    g_bpp_gc_bytes_since_collect = g_bpp_gc_bytes_since_collect + size;
+    return raw;
+}
+
+func bpp_gc_alloc_raw_rooted(size: u64, shape: u64) -> u64 {
+    var raw: u64 = bpp_gc_alloc_raw(size, shape);
+    if (raw != 0) { bpp_gc_root_push(raw); }
+    return raw;
+}
+
+func bpp_gc_root_push(ptr: u64) -> u64 {
+    if (ptr == 0) { return 0; }
+    var block: *BppGcBlock = bpp_gc_find_block(ptr);
+    if (block != 0) {
+        if (bpp_gc_block_is_rooted(block) == 0) {
+            bpp_gc_block_set_rooted(block, 1);
+            g_bpp_gc_roots_count = g_bpp_gc_roots_count + 1;
+        }
+        return 1;
+    }
+    var root: *BppGcRoot = (*BppGcRoot)heap_alloc(sizeof(BppGcRoot));
+    if (root == 0) { return 0; }
+    root.ptr = ptr;
+    root.next = g_bpp_gc_roots;
+    g_bpp_gc_roots = root;
+    g_bpp_gc_roots_count = g_bpp_gc_roots_count + 1;
+    return 1;
+}
+
+func bpp_gc_root_pop() -> u64 {
+    var root: *BppGcRoot = g_bpp_gc_roots;
+    if (root != 0) {
+        g_bpp_gc_roots = root.next;
+        if (g_bpp_gc_roots_count > 0) { g_bpp_gc_roots_count = g_bpp_gc_roots_count - 1; }
+        heap_free((u64)root);
+        return 1;
+    }
+    var block: *BppGcBlock = g_bpp_gc_blocks;
+    while (block != 0) {
+        if (bpp_gc_block_is_live(block) != 0 && bpp_gc_block_is_rooted(block) != 0) {
+            bpp_gc_block_set_rooted(block, 0);
+            if (g_bpp_gc_roots_count > 0) { g_bpp_gc_roots_count = g_bpp_gc_roots_count - 1; }
+            return 1;
+        }
+        block = block.next;
+    }
+    return 0;
+}
+
+func bpp_gc_root_count() -> u64 { return g_bpp_gc_roots_count; }
+
+func bpp_gc_record_edge(parent: u64, child: u64) -> u64 {
+    if (parent == 0 || child == 0) { return 0; }
+    var parent_block: *BppGcBlock = bpp_gc_find_block(parent);
+    var child_block: *BppGcBlock = bpp_gc_find_block(child);
+    if (parent_block == 0 || child_block == 0) { return 0; }
+    var child_raw: u64 = bpp_gc_block_raw(child_block);
+    var edge: *BppGcEdge = parent_block.edges;
+    while (edge != 0) {
+        if (bpp_tag_strip(edge.child) == child_raw) { return 0; }
+        edge = edge.next;
+    }
+    var new_edge: *BppGcEdge = (*BppGcEdge)heap_alloc(sizeof(BppGcEdge));
+    if (new_edge == 0) { return 0; }
+    new_edge.child = child_block.ptr;
+    new_edge.next = parent_block.edges;
+    parent_block.edges = new_edge;
+    g_bpp_gc_edges = g_bpp_gc_edges + 1;
+    return 1;
+}
+
+func bpp_gc_mark_block(block: *BppGcBlock) -> u64 {
+    if (block == 0) { return 0; }
+    if (bpp_gc_block_is_live(block) == 0) { return 0; }
+    if (bpp_gc_block_is_marked(block) != 0) { return 0; }
+    bpp_gc_block_set_mark(block, 1);
+    g_bpp_gc_last_marked = g_bpp_gc_last_marked + 1;
+    var edge: *BppGcEdge = block.edges;
+    while (edge != 0) {
+        bpp_gc_mark(edge.child);
+        edge = edge.next;
+    }
+    return 1;
+}
+
+func bpp_gc_mark(ptr: u64) -> u64 {
+    return bpp_gc_mark_block(bpp_gc_find_block(ptr));
+}
+
+func bpp_gc_promote_survivor(block: *BppGcBlock) -> u64 {
+    if (block == 0 || bpp_gc_block_is_live(block) == 0) { return 0; }
+    var generation: u64 = bpp_gc_block_generation(block) + 1;
+    bpp_gc_block_set_generation(block, generation);
+    if (generation < 2) { return 0; }
+    if (bpp_tag_lifecycle_raw(block.ptr) != BPP_TAG_LIFE_YOUNG) { return 0; }
+    block.ptr = bpp_tag_repack_lifecycle_barrier(block.ptr, BPP_TAG_LIFE_OLD, bpp_tag_barrier_raw(block.ptr));
+    g_bpp_gc_promotions = g_bpp_gc_promotions + 1;
+    return 1;
+}
+
+func bpp_gc_collect() -> u64 {
+    bpp_gc_init();
+    g_bpp_gc_collections = g_bpp_gc_collections + 1;
+    g_bpp_gc_last_marked = 0;
+    g_bpp_gc_last_swept = 0;
+
+    var cur: *BppGcBlock = g_bpp_gc_blocks;
+    while (cur != 0) {
+        if (bpp_gc_block_is_live(cur) != 0) { bpp_gc_block_set_mark(cur, 0); }
+        cur = cur.next;
+    }
+
+    var root: *BppGcRoot = g_bpp_gc_roots;
+    while (root != 0) {
+        bpp_gc_mark(root.ptr);
+        root = root.next;
+    }
+
+    cur = g_bpp_gc_blocks;
+    while (cur != 0) {
+        if (bpp_gc_block_is_live(cur) != 0 && bpp_gc_block_is_rooted(cur) != 0) {
+            bpp_gc_mark_block(cur);
+        }
+        cur = cur.next;
+    }
+
+    cur = g_bpp_gc_blocks;
+    while (cur != 0) {
+        if (bpp_gc_block_is_live(cur) != 0) {
+            if (bpp_gc_block_is_marked(cur) != 0) {
+                bpp_gc_promote_survivor(cur);
+            } else {
+                var lifecycle: u64 = bpp_tag_lifecycle_raw(cur.ptr);
+                if (lifecycle != BPP_TAG_LIFE_PINNED && lifecycle != BPP_TAG_LIFE_IMMORTAL) {
+                    var raw: u64 = bpp_gc_block_raw(cur);
+                    if (raw != 0 && bpp_tag_heap_is_live_raw(raw) != 0) {
+                        heap_free(raw);
+                    }
+                    bpp_gc_block_set_live(cur, 0);
+                    if (g_bpp_gc_live > 0) { g_bpp_gc_live = g_bpp_gc_live - 1; }
+                    g_bpp_gc_frees = g_bpp_gc_frees + 1;
+                    g_bpp_gc_last_swept = g_bpp_gc_last_swept + 1;
+                    bpp_tag_allocator_record_free(cur.ptr, 1);
+                }
+            }
+        }
+        cur = cur.next;
+    }
+
+    g_bpp_gc_bytes_since_collect = 0;
+    return g_bpp_gc_last_swept;
+}
+
+func bpp_gc_set_auto(enabled: u64, threshold: u64) -> u64 {
+    bpp_gc_init();
+    g_bpp_gc_auto_enabled = enabled;
+    if (threshold != 0) { g_bpp_gc_threshold = threshold; }
+    return 0;
+}
+
+func bpp_gc_set_threshold(threshold: u64) -> u64 {
+    if (threshold == 0) {
+        g_bpp_gc_threshold = BPP_GC_DEFAULT_THRESHOLD_BYTES;
+    } else {
+        g_bpp_gc_threshold = threshold;
+    }
+    return g_bpp_gc_threshold;
+}
+
+func bpp_gc_reset() -> u64 {
+    var cur: *BppGcBlock = g_bpp_gc_blocks;
+    while (cur != 0) {
+        var next_block: *BppGcBlock = cur.next;
+        var edge: *BppGcEdge = cur.edges;
+        while (edge != 0) {
+            var next_edge: *BppGcEdge = edge.next;
+            heap_free((u64)edge);
+            edge = next_edge;
+        }
+        var raw: u64 = bpp_gc_block_raw(cur);
+        if (bpp_gc_block_is_live(cur) != 0 && raw != 0 && bpp_tag_heap_is_live_raw(raw) != 0) {
+            heap_free(raw);
+        }
+        heap_free((u64)cur);
+        cur = next_block;
+    }
+
+    var root: *BppGcRoot = g_bpp_gc_roots;
+    while (root != 0) {
+        var next_root: *BppGcRoot = root.next;
+        heap_free((u64)root);
+        root = next_root;
+    }
+
+    g_bpp_gc_blocks = (*BppGcBlock)0;
+    g_bpp_gc_roots = (*BppGcRoot)0;
+    g_bpp_gc_allocs = 0;
+    g_bpp_gc_live = 0;
+    g_bpp_gc_frees = 0;
+    g_bpp_gc_collections = 0;
+    g_bpp_gc_auto_collections = 0;
+    g_bpp_gc_roots_count = 0;
+    g_bpp_gc_edges = 0;
+    g_bpp_gc_last_marked = 0;
+    g_bpp_gc_last_swept = 0;
+    g_bpp_gc_bytes_since_collect = 0;
+    g_bpp_gc_threshold = BPP_GC_DEFAULT_THRESHOLD_BYTES;
+    g_bpp_gc_auto_enabled = 1;
+    g_bpp_gc_promotions = 0;
+    return 0;
+}
+
+func bpp_gc_alloc_count() -> u64 { return g_bpp_gc_allocs; }
+func bpp_gc_live_count() -> u64 { return g_bpp_gc_live; }
+func bpp_gc_free_count() -> u64 { return g_bpp_gc_frees; }
+func bpp_gc_collect_count() -> u64 { return g_bpp_gc_collections; }
+func bpp_gc_auto_collect_count() -> u64 { return g_bpp_gc_auto_collections; }
+func bpp_gc_edge_count() -> u64 { return g_bpp_gc_edges; }
+func bpp_gc_last_marked_count() -> u64 { return g_bpp_gc_last_marked; }
+func bpp_gc_last_swept_count() -> u64 { return g_bpp_gc_last_swept; }
+func bpp_gc_promotion_count() -> u64 { return g_bpp_gc_promotions; }
+func bpp_gc_bytes_since_collect() -> u64 { return g_bpp_gc_bytes_since_collect; }
+func bpp_gc_threshold() -> u64 { bpp_gc_init(); return g_bpp_gc_threshold; }
 
 func bpp_tag_lifecycle_raw(ptr: u64) -> u64 {
     return (ptr >> BPP_TAG_LIFECYCLE_SHIFT) & 7;
@@ -777,6 +1404,7 @@ func bpp_heap_tagged_delete_end(ptr: u64) -> u64 {
     var allowed: u64 = bpp_tag_allocator_can_delete_end_raw(ptr);
     bpp_tag_allocator_record_free(ptr, allowed);
     if (allowed == 0) { return 0; }
+    bpp_gc_forget_live(ptr);
     return heap_delete_end(ptr);
 }
 
@@ -854,6 +1482,7 @@ func bpp_tag_write_barrier_raw(parent: u64, child: u64) -> u64 {
 }
 
 func bpp_tag_write_barrier_runtime_raw(parent: u64, child: u64) -> u64 {
+    bpp_gc_record_edge(parent, child);
     if (bpp_tag_gc_barrier_needed_raw(parent, child) == 0) {
         g_bpp_tag_gc_barrier_skipped = g_bpp_tag_gc_barrier_skipped + 1;
         return parent;

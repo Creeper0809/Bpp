@@ -8,6 +8,16 @@ var heap_brk: u64;
 var heap_reserved_end: u64;
 var heap_base: u64;
 var heap_free_head: u64;
+var heap_bin_8: u64;
+var heap_bin_16: u64;
+var heap_bin_32: u64;
+var heap_bin_64: u64;
+var heap_bin_128: u64;
+var heap_bin_256: u64;
+var heap_bin_512: u64;
+var heap_bin_1024: u64;
+var heap_bin_2048: u64;
+var heap_bin_4096: u64;
 var g_out_fd: u64;
 var g_out_buf: u64;
 var g_out_buf_len: u64;
@@ -24,11 +34,15 @@ const IO_OUT_BUFFER_CAP = 4096;
 const HEAP_ALIGN = 8;
 const HEAP_PTR_MASK = 281474976710655;
 const HEAP_ALLOC_MAGIC = 4774451407313060417;
-const HEAP_ALLOC_HEADER_SIZE = 40;
+const HEAP_ALLOC_HEADER_SIZE = 32;
 const HEAP_ALLOC_MIN_SPLIT = 8;
+const HEAP_SMALL_MAX_SIZE = 4096;
+const HEAP_GROW_MIN_BYTES = 1048576;
 const HEAP_BLOCK_LIVE = 1;
 const HEAP_BLOCK_DROPPING = 2;
 const HEAP_BLOCK_FREED = 3;
+const HEAP_BLOCK_META_STATE_MASK = 255;
+const HEAP_BLOCK_META_GENERATION_SHIFT = 8;
 
 func sys_brk(addr: u64) -> u64 { return os_sys_brk(addr); }
 func sys_write(fd: u64, buf: u64, count: u64) -> u64 { return os_sys_write(fd, buf, count); }
@@ -306,6 +320,55 @@ func heap_strip_tags(ptr: u64) -> u64 {
     return ptr & HEAP_PTR_MASK;
 }
 
+func heap_size_class_for(size: u64) -> u64 {
+    if (size == 0) { return 0; }
+    if (size <= 8) { return 8; }
+    if (size <= 16) { return 16; }
+    if (size <= 32) { return 32; }
+    if (size <= 64) { return 64; }
+    if (size <= 128) { return 128; }
+    if (size <= 256) { return 256; }
+    if (size <= 512) { return 512; }
+    if (size <= 1024) { return 1024; }
+    if (size <= 2048) { return 2048; }
+    if (size <= HEAP_SMALL_MAX_SIZE) { return HEAP_SMALL_MAX_SIZE; }
+    return 0;
+}
+
+func heap_size_is_class(size: u64) -> u64 {
+    if (size == 8 || size == 16 || size == 32 || size == 64 || size == 128) { return 1; }
+    if (size == 256 || size == 512 || size == 1024 || size == 2048 || size == HEAP_SMALL_MAX_SIZE) { return 1; }
+    return 0;
+}
+
+func heap_bin_head_get(class_size: u64) -> u64 {
+    if (class_size == 8) { return heap_bin_8; }
+    if (class_size == 16) { return heap_bin_16; }
+    if (class_size == 32) { return heap_bin_32; }
+    if (class_size == 64) { return heap_bin_64; }
+    if (class_size == 128) { return heap_bin_128; }
+    if (class_size == 256) { return heap_bin_256; }
+    if (class_size == 512) { return heap_bin_512; }
+    if (class_size == 1024) { return heap_bin_1024; }
+    if (class_size == 2048) { return heap_bin_2048; }
+    if (class_size == HEAP_SMALL_MAX_SIZE) { return heap_bin_4096; }
+    return 0;
+}
+
+func heap_bin_head_set(class_size: u64, head: u64) -> u64 {
+    if (class_size == 8) { heap_bin_8 = head; return 1; }
+    if (class_size == 16) { heap_bin_16 = head; return 1; }
+    if (class_size == 32) { heap_bin_32 = head; return 1; }
+    if (class_size == 64) { heap_bin_64 = head; return 1; }
+    if (class_size == 128) { heap_bin_128 = head; return 1; }
+    if (class_size == 256) { heap_bin_256 = head; return 1; }
+    if (class_size == 512) { heap_bin_512 = head; return 1; }
+    if (class_size == 1024) { heap_bin_1024 = head; return 1; }
+    if (class_size == 2048) { heap_bin_2048 = head; return 1; }
+    if (class_size == HEAP_SMALL_MAX_SIZE) { heap_bin_4096 = head; return 1; }
+    return 0;
+}
+
 func heap_block_get_magic(block: u64) -> u64 {
     var p: *u64 = (*u64)block;
     return p[0];
@@ -341,23 +404,25 @@ func heap_block_set_next(block: u64, next: u64) -> u64 {
 
 func heap_block_get_state(block: u64) -> u64 {
     var p: *u64 = (*u64)block;
-    return p[3];
+    return p[3] & HEAP_BLOCK_META_STATE_MASK;
 }
 
 func heap_block_set_state(block: u64, state: u64) -> u64 {
     var p: *u64 = (*u64)block;
-    p[3] = state;
+    var generation_bits: u64 = p[3] & (0 - (HEAP_BLOCK_META_STATE_MASK + 1));
+    p[3] = generation_bits | (state & HEAP_BLOCK_META_STATE_MASK);
     return 0;
 }
 
 func heap_block_get_generation(block: u64) -> u64 {
     var p: *u64 = (*u64)block;
-    return p[4];
+    return p[3] >> HEAP_BLOCK_META_GENERATION_SHIFT;
 }
 
 func heap_block_set_generation(block: u64, generation: u64) -> u64 {
     var p: *u64 = (*u64)block;
-    p[4] = generation;
+    var state_bits: u64 = p[3] & HEAP_BLOCK_META_STATE_MASK;
+    p[3] = state_bits | (generation << HEAP_BLOCK_META_GENERATION_SHIFT);
     return 0;
 }
 
@@ -403,12 +468,52 @@ func heap_free_list_coalesce_adjacent() -> u64 {
     return 0;
 }
 
+func heap_bin_push(block: u64) -> u64 {
+    if (block == 0) { return 0; }
+    var size: u64 = heap_block_get_size(block);
+    if (heap_size_is_class(size) == 0) { return 0; }
+    var head: u64 = heap_bin_head_get(size);
+    heap_block_set_next(block, head);
+    heap_bin_head_set(size, block);
+    return 1;
+}
+
+func heap_bin_pop(class_size: u64) -> u64 {
+    if (heap_size_is_class(class_size) == 0) { return 0; }
+    var head: u64 = heap_bin_head_get(class_size);
+    if (head == 0) { return 0; }
+    var next: u64 = heap_block_get_next(head);
+    heap_bin_head_set(class_size, next);
+    heap_block_set_next(head, 0);
+    heap_block_set_state(head, HEAP_BLOCK_LIVE);
+    heap_block_set_generation(head, heap_block_get_generation(head) + 1);
+    return head + HEAP_ALLOC_HEADER_SIZE;
+}
+
+func heap_free_bin_count(class_size: u64) -> u64 {
+    var count: u64 = 0;
+    var cur: u64 = heap_bin_head_get(class_size);
+    while (cur != 0) {
+        count = count + 1;
+        cur = heap_block_get_next(cur);
+    }
+    return count;
+}
+
 func heap_free_list_insert(block: u64) -> u64 {
     if (block == 0) { return 0; }
     if (heap_free_head == 0 || block < heap_free_head) {
         heap_block_set_next(block, heap_free_head);
         heap_free_head = block;
-        heap_free_list_coalesce_adjacent();
+        var next_head: u64 = heap_block_get_next(block);
+        if (next_head != 0) {
+            var block_end: u64 = block + HEAP_ALLOC_HEADER_SIZE + heap_block_get_size(block);
+            if (block_end == next_head) {
+                var merged_head_size: u64 = heap_block_get_size(block) + HEAP_ALLOC_HEADER_SIZE + heap_block_get_size(next_head);
+                heap_block_set_size(block, merged_head_size);
+                heap_block_set_next(block, heap_block_get_next(next_head));
+            }
+        }
         return 0;
     }
 
@@ -421,8 +526,31 @@ func heap_free_list_insert(block: u64) -> u64 {
 
     heap_block_set_next(block, cur);
     heap_block_set_next(prev, block);
-    heap_free_list_coalesce_adjacent();
+    if (cur != 0) {
+        var block_end2: u64 = block + HEAP_ALLOC_HEADER_SIZE + heap_block_get_size(block);
+        if (block_end2 == cur) {
+            var merged_size2: u64 = heap_block_get_size(block) + HEAP_ALLOC_HEADER_SIZE + heap_block_get_size(cur);
+            heap_block_set_size(block, merged_size2);
+            heap_block_set_next(block, heap_block_get_next(cur));
+        }
+    }
+    var prev_end: u64 = prev + HEAP_ALLOC_HEADER_SIZE + heap_block_get_size(prev);
+    if (prev_end == block) {
+        var merged_size3: u64 = heap_block_get_size(prev) + HEAP_ALLOC_HEADER_SIZE + heap_block_get_size(block);
+        heap_block_set_size(prev, merged_size3);
+        heap_block_set_next(prev, heap_block_get_next(block));
+    }
     return 0;
+}
+
+func heap_ensure_init() -> u64 {
+    if (heap_inited != 0) { return 1; }
+    var cur_brk: u64 = os_sys_brk(0);
+    heap_base = cur_brk;
+    heap_brk = cur_brk;
+    heap_reserved_end = cur_brk;
+    heap_inited = 1;
+    return 1;
 }
 
 func heap_try_alloc_from_free_list(aligned_size: u64) -> u64 {
@@ -455,22 +583,8 @@ func heap_try_alloc_from_free_list(aligned_size: u64) -> u64 {
     return 0;
 }
 
-func heap_alloc(size: u64) -> u64 {
-    if (size == 0) {
-        return 0;
-    }
-
-    var aligned_size: u64 = heap_align8(size);
-    var reused: u64 = heap_try_alloc_from_free_list(aligned_size);
-    if (reused != 0) { return reused; }
-
-    if (heap_inited == 0) {
-        var cur_brk: u64 = os_sys_brk(0);
-        heap_base = cur_brk;
-        heap_brk = cur_brk;
-        heap_reserved_end = cur_brk;
-        heap_inited = 1;
-    }
+func heap_alloc_new_block(aligned_size: u64) -> u64 {
+    heap_ensure_init();
 
     var aligned_brk: u64 = heap_align8(heap_brk);
     var total_size: u64 = aligned_size + HEAP_ALLOC_HEADER_SIZE;
@@ -479,7 +593,7 @@ func heap_alloc(size: u64) -> u64 {
     var new_brk: u64 = p + total_size;
     if (new_brk > heap_reserved_end) {
         var grow: u64 = total_size;
-        if (grow < 1048576) { grow = 1048576; } // Reserve 1 MiB chunks.
+        if (grow < HEAP_GROW_MIN_BYTES) { grow = HEAP_GROW_MIN_BYTES; }
         var target_end: u64 = new_brk + grow;
         var res: u64 = os_sys_brk(target_end);
         if (res < target_end) {
@@ -493,6 +607,26 @@ func heap_alloc(size: u64) -> u64 {
     return p + HEAP_ALLOC_HEADER_SIZE;
 }
 
+func heap_alloc(size: u64) -> u64 {
+    if (size == 0) {
+        return 0;
+    }
+
+    var aligned_size: u64 = heap_align8(size);
+    var class_size: u64 = heap_size_class_for(aligned_size);
+    if (class_size != 0) { aligned_size = class_size; }
+
+    if (class_size != 0) {
+        var bin_reused: u64 = heap_bin_pop(class_size);
+        if (bin_reused != 0) { return bin_reused; }
+    }
+
+    var reused: u64 = heap_try_alloc_from_free_list(aligned_size);
+    if (reused != 0) { return reused; }
+
+    return heap_alloc_new_block(aligned_size);
+}
+
 func heap_free(ptr: u64) -> u64 {
     ptr = heap_strip_tags(ptr);
     if (ptr == 0) { return 0; }
@@ -501,7 +635,6 @@ func heap_free(ptr: u64) -> u64 {
 
     var block: u64 = ptr - HEAP_ALLOC_HEADER_SIZE;
     if (heap_block_is_valid(block) == 0) { return 0; }
-    if (heap_free_list_contains(block) != 0) { return 0; }
 
     var state: u64 = heap_block_get_state(block);
     if (state != HEAP_BLOCK_LIVE && state != HEAP_BLOCK_DROPPING) { return 0; }
@@ -511,8 +644,19 @@ func heap_free(ptr: u64) -> u64 {
 
     heap_block_set_state(block, HEAP_BLOCK_FREED);
     heap_block_set_generation(block, heap_block_get_generation(block) + 1);
+    if (heap_bin_push(block) != 0) { return 0; }
     heap_free_list_insert(block);
     return 0;
+}
+
+func heap_block_payload_size_raw(ptr: u64) -> u64 {
+    ptr = heap_strip_tags(ptr);
+    if (ptr == 0) { return 0; }
+    if (heap_inited == 0) { return 0; }
+    if (ptr < HEAP_ALLOC_HEADER_SIZE) { return 0; }
+    var block: u64 = ptr - HEAP_ALLOC_HEADER_SIZE;
+    if (heap_block_is_valid(block) == 0) { return 0; }
+    return heap_block_get_size(block);
 }
 
 func heap_delete_begin(ptr: u64) -> u64 {
