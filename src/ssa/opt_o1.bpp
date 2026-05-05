@@ -71,6 +71,14 @@ const SSA_TAG_HAS_SHAPE = 16;
 const SSA_TAG_HAS_PROFILED = 32;
 const SSA_TAG_HAS_ALL = 63;
 
+const SSA_TAG_SUMMARY_HAS_CALL = 1;
+const SSA_TAG_SUMMARY_HAS_INDIRECT_CALL = 2;
+const SSA_TAG_SUMMARY_HAS_HEAP_ALLOC = 4;
+const SSA_TAG_SUMMARY_HAS_TAG_PACK = 8;
+const SSA_TAG_SUMMARY_HAS_TAG_AUTO = 16;
+const SSA_TAG_SUMMARY_HAS_TAGGED_ACCESS = 32;
+const SSA_TAG_SUMMARY_HAS_FOLDED_TAGS = 64;
+
 struct SSAOptKV {
     public key: u64;
     public val: u64;
@@ -92,6 +100,11 @@ struct SSAOptEscapeSummary {
     public has_tag_pack: u64;
     public has_tag_auto: u64;
     public has_tagged_access: u64;
+    public fold_count: u64;
+    public pack_count: u64;
+    public predicate_fold_count: u64;
+    public raw_elision_count: u64;
+    public hot_path_fold_count: u64;
 }
 
 impl SSAOptEscapeSummary {
@@ -102,6 +115,11 @@ impl SSAOptEscapeSummary {
         self.has_tag_pack = 0;
         self.has_tag_auto = 0;
         self.has_tagged_access = 0;
+        self.fold_count = 0;
+        self.pack_count = 0;
+        self.predicate_fold_count = 0;
+        self.raw_elision_count = 0;
+        self.hot_path_fold_count = 0;
     }
 }
 
@@ -218,6 +236,24 @@ func ssa_tag_name_eq(name: []u8, lit: u64, len: u64) -> u64 {
 func ssa_tag_name_has_prefix(name: []u8, lit: u64, len: u64) -> u64 {
     if (name.ptr == 0 || name.len < len) { return 0; }
     return str_eq(slice(name.ptr, len), slice(lit, len));
+}
+
+func ssa_tag_summary_bits(summary: *SSAOptEscapeSummary) -> u64 {
+    if (summary == 0) { return 0; }
+    var bits: u64 = 0;
+    if (summary.has_call != 0) { bits = bits | SSA_TAG_SUMMARY_HAS_CALL; }
+    if (summary.has_indirect_call != 0) { bits = bits | SSA_TAG_SUMMARY_HAS_INDIRECT_CALL; }
+    if (summary.has_heap_alloc != 0) { bits = bits | SSA_TAG_SUMMARY_HAS_HEAP_ALLOC; }
+    if (summary.has_tag_pack != 0) { bits = bits | SSA_TAG_SUMMARY_HAS_TAG_PACK; }
+    if (summary.has_tag_auto != 0) { bits = bits | SSA_TAG_SUMMARY_HAS_TAG_AUTO; }
+    if (summary.has_tagged_access != 0) { bits = bits | SSA_TAG_SUMMARY_HAS_TAGGED_ACCESS; }
+    if (summary.fold_count != 0) { bits = bits | SSA_TAG_SUMMARY_HAS_FOLDED_TAGS; }
+    return bits;
+}
+
+func ssa_tag_summary_record_fold(summary: *SSAOptEscapeSummary) -> u64 {
+    if (summary != 0) { summary.fold_count = summary.fold_count + 1; }
+    return 0;
 }
 
 func ssa_tag_state_find(map: *Vec<*SSAOptTagState>, key: u64) -> *SSAOptTagState {
@@ -821,6 +857,34 @@ struct SSAOptConstValue {
     public val: u64;
 }
 
+struct SSAOptTagFields {
+    public has: u64;
+    public raw_reg: u64;
+    public raw_const_has: u64;
+    public raw_const: u64;
+    public lifecycle: u64;
+    public ownership: u64;
+    public storage: u64;
+    public barrier: u64;
+    public shape: u64;
+    public profiled: u64;
+}
+
+impl SSAOptTagFields {
+    public constructor() {
+        self.has = 0;
+        self.raw_reg = 0;
+        self.raw_const_has = 0;
+        self.raw_const = 0;
+        self.lifecycle = 0;
+        self.ownership = 0;
+        self.storage = 0;
+        self.barrier = 0;
+        self.shape = 0;
+        self.profiled = 0;
+    }
+}
+
 func operand_const_value(reg_consts: *Vec<*SSAOptKV>, opr: u64) -> SSAOptConstValue {
     var result: SSAOptConstValue;
     result.has = 0;
@@ -858,6 +922,46 @@ func ssa_call_arg(info: *SSACallInfo, idx: u64) -> u64 {
 
 func ssa_call_arg_const(info: *SSACallInfo, idx: u64, reg_consts: *Vec<*SSAOptKV>) -> SSAOptConstValue {
     return reg_const_value(reg_consts, ssa_call_arg(info, idx));
+}
+
+func ssa_tag_fields_from_arg(arg: u64, reg_consts: *Vec<*SSAOptKV>, tag_states: *Vec<*SSAOptTagState>) -> SSAOptTagFields {
+    var out: SSAOptTagFields;
+    out.has = 0;
+    out.raw_reg = 0;
+    out.raw_const_has = 0;
+    out.raw_const = 0;
+    out.lifecycle = 0;
+    out.ownership = 0;
+    out.storage = 0;
+    out.barrier = 0;
+    out.shape = 0;
+    out.profiled = 0;
+    var c: SSAOptConstValue = reg_const_value(reg_consts, arg);
+    if (c.has != 0) {
+        out.has = 1;
+        out.raw_const_has = 1;
+        out.raw_const = c.val & SSA_TAGGED_PTR_MASK;
+        out.lifecycle = ssa_tag_lifecycle_const(c.val);
+        out.ownership = ssa_tag_ownership_const(c.val);
+        out.storage = ssa_tag_storage_const(c.val);
+        out.barrier = ssa_tag_barrier_const(c.val);
+        out.shape = ssa_tag_shape_const(c.val);
+        out.profiled = ssa_tag_profiled_const(c.val);
+        return out;
+    }
+    var state: *SSAOptTagState = ssa_tag_state_find(tag_states, arg);
+    if (state == 0 || (state.has_bits & SSA_TAG_HAS_ALL) != SSA_TAG_HAS_ALL) { return out; }
+    out.has = 1;
+    out.raw_reg = state.raw_reg;
+    out.raw_const_has = state.raw_const_has;
+    out.raw_const = state.raw_const;
+    out.lifecycle = state.lifecycle;
+    out.ownership = state.ownership;
+    out.storage = state.storage;
+    out.barrier = state.barrier;
+    out.shape = state.shape;
+    out.profiled = state.profiled;
+    return out;
 }
 
 func ssa_tag_call_name_is_pack(name: []u8) -> u64 {
@@ -1137,6 +1241,16 @@ func ssa_tag_fold_gc_barrier_call(cur: *SSAInstruction, info: *SSACallInfo, reg_
     if (cur.dest == 0 || info == 0 || info.nargs < 2) { return 0; }
     var parent_reg: u64 = ssa_call_arg(info, 0);
     var child_reg: u64 = ssa_call_arg(info, 1);
+    var parent_fields: SSAOptTagFields = ssa_tag_fields_from_arg(parent_reg, reg_consts, tag_states);
+    var child_fields: SSAOptTagFields = ssa_tag_fields_from_arg(child_reg, reg_consts, tag_states);
+    if (parent_fields.has != 0 && child_fields.has != 0) {
+        if (ssa_tag_skip_barrier_fields(parent_fields.lifecycle, parent_fields.storage, parent_fields.barrier) != 0) {
+            return opt_set_const(cur, 0, reg_consts);
+        }
+        if (child_fields.lifecycle == SSA_TAG_LIFE_IMMORTAL) { return opt_set_const(cur, 0, reg_consts); }
+        if (child_fields.storage == SSA_TAG_STORAGE_STATIC) { return opt_set_const(cur, 0, reg_consts); }
+        return opt_set_const(cur, 1, reg_consts);
+    }
     var parent_state: *SSAOptTagState = ssa_tag_state_find(tag_states, parent_reg);
     var child_state: *SSAOptTagState = ssa_tag_state_find(tag_states, child_reg);
     if (parent_state == 0 || child_state == 0) { return 0; }
@@ -1148,6 +1262,99 @@ func ssa_tag_fold_gc_barrier_call(cur: *SSAInstruction, info: *SSACallInfo, reg_
     if (child_state.lifecycle == SSA_TAG_LIFE_IMMORTAL) { return opt_set_const(cur, 0, reg_consts); }
     if (child_state.storage == SSA_TAG_STORAGE_STATIC) { return opt_set_const(cur, 0, reg_consts); }
     return opt_set_const(cur, 1, reg_consts);
+}
+
+func ssa_tag_mark_barrier_dirty_const(ptr: u64) -> u64 {
+    if (ptr == 0) { return 0; }
+    return ssa_tag_pack_const(ptr, ssa_tag_lifecycle_const(ptr), ssa_tag_ownership_const(ptr), ssa_tag_storage_const(ptr), SSA_TAG_BARRIER_DIRTY, ssa_tag_shape_const(ptr), ssa_tag_profiled_const(ptr));
+}
+
+func ssa_tag_fold_repack_call(cur: *SSAInstruction, name: []u8, info: *SSACallInfo, reg_consts: *Vec<*SSAOptKV>, tag_states: *Vec<*SSAOptTagState>) -> u64 {
+    if (cur.dest == 0 || info == 0 || info.nargs < 3) { return 0; }
+    var arg0: u64 = ssa_call_arg(info, 0);
+    var fields: SSAOptTagFields = ssa_tag_fields_from_arg(arg0, reg_consts, tag_states);
+    if (fields.has == 0) { return 0; }
+
+    if (ssa_tag_name_eq(name, "std_mem__bpp_tag_repack_lifecycle_barrier", 41) != 0) {
+        var c_life: SSAOptConstValue = ssa_call_arg_const(info, 1, reg_consts);
+        var c_barrier: SSAOptConstValue = ssa_call_arg_const(info, 2, reg_consts);
+        if (c_life.has == 0 || c_barrier.has == 0) { return 0; }
+        if (fields.raw_const_has != 0) {
+            opt_set_const(cur, ssa_tag_pack_const(fields.raw_const, c_life.val, fields.ownership, fields.storage, c_barrier.val, fields.shape, fields.profiled), reg_consts);
+        } else {
+            const_clear(reg_consts, cur.dest);
+        }
+        ssa_tag_state_set(tag_states, cur.dest, fields.raw_reg, fields.raw_const_has, fields.raw_const, c_life.val, fields.ownership, fields.storage, c_barrier.val, fields.shape, fields.profiled);
+        return 1;
+    }
+
+    if (ssa_tag_name_eq(name, "std_mem__bpp_tag_repack_shape_profiled", 38) != 0) {
+        var c_shape: SSAOptConstValue = ssa_call_arg_const(info, 1, reg_consts);
+        var c_profiled: SSAOptConstValue = ssa_call_arg_const(info, 2, reg_consts);
+        if (c_shape.has == 0 || c_profiled.has == 0) { return 0; }
+        if (fields.raw_const_has != 0) {
+            opt_set_const(cur, ssa_tag_pack_const(fields.raw_const, fields.lifecycle, fields.ownership, fields.storage, fields.barrier, c_shape.val, c_profiled.val), reg_consts);
+        } else {
+            const_clear(reg_consts, cur.dest);
+        }
+        ssa_tag_state_set(tag_states, cur.dest, fields.raw_reg, fields.raw_const_has, fields.raw_const, fields.lifecycle, fields.ownership, fields.storage, fields.barrier, c_shape.val, c_profiled.val);
+        return 1;
+    }
+
+    return 0;
+}
+
+func ssa_tag_fold_mark_barrier_dirty_call(cur: *SSAInstruction, info: *SSACallInfo, reg_consts: *Vec<*SSAOptKV>, tag_states: *Vec<*SSAOptTagState>) -> u64 {
+    if (cur.dest == 0 || info == 0 || info.nargs < 1) { return 0; }
+    var arg0: u64 = ssa_call_arg(info, 0);
+    var fields: SSAOptTagFields = ssa_tag_fields_from_arg(arg0, reg_consts, tag_states);
+    if (fields.has == 0) { return 0; }
+    if (fields.raw_const_has != 0) {
+        opt_set_const(cur, ssa_tag_pack_const(fields.raw_const, fields.lifecycle, fields.ownership, fields.storage, SSA_TAG_BARRIER_DIRTY, fields.shape, fields.profiled), reg_consts);
+    } else {
+        const_clear(reg_consts, cur.dest);
+    }
+    ssa_tag_state_set(tag_states, cur.dest, fields.raw_reg, fields.raw_const_has, fields.raw_const, fields.lifecycle, fields.ownership, fields.storage, SSA_TAG_BARRIER_DIRTY, fields.shape, fields.profiled);
+    return 1;
+}
+
+func ssa_tag_barrier_needed_fields(parent: SSAOptTagFields, child: SSAOptTagFields) -> u64 {
+    if (parent.has == 0 || child.has == 0) { return 0; }
+    if (ssa_tag_skip_barrier_fields(parent.lifecycle, parent.storage, parent.barrier) != 0) { return 0; }
+    if (child.lifecycle == SSA_TAG_LIFE_IMMORTAL) { return 0; }
+    if (child.storage == SSA_TAG_STORAGE_STATIC) { return 0; }
+    return 1;
+}
+
+func ssa_tag_fold_write_barrier_call(cur: *SSAInstruction, info: *SSACallInfo, reg_consts: *Vec<*SSAOptKV>, raw_ptr_regs: *Vec<*SSAOptKV>, tag_states: *Vec<*SSAOptTagState>) -> u64 {
+    if (cur.dest == 0 || info == 0 || info.nargs < 2) { return 0; }
+    var parent_reg: u64 = ssa_call_arg(info, 0);
+    var child_reg: u64 = ssa_call_arg(info, 1);
+    var parent: SSAOptTagFields = ssa_tag_fields_from_arg(parent_reg, reg_consts, tag_states);
+    var child: SSAOptTagFields = ssa_tag_fields_from_arg(child_reg, reg_consts, tag_states);
+    if (parent.has == 0 || child.has == 0) { return 0; }
+
+    if (ssa_tag_barrier_needed_fields(parent, child) == 0) {
+        var c_parent: SSAOptConstValue = reg_const_value(reg_consts, parent_reg);
+        if (c_parent.has != 0) {
+            opt_set_const(cur, c_parent.val, reg_consts);
+        } else {
+            opt_set_copy(cur, operand_reg(parent_reg), reg_consts);
+        }
+        if (raw_ptr_get(raw_ptr_regs, parent_reg) != 0) { raw_ptr_set(raw_ptr_regs, cur.dest); }
+        else { raw_ptr_clear(raw_ptr_regs, cur.dest); }
+        ssa_tag_state_copy(tag_states, cur.dest, parent_reg);
+        return 1;
+    }
+
+    if (parent.raw_const_has != 0) {
+        opt_set_const(cur, ssa_tag_mark_barrier_dirty_const(ssa_tag_pack_const(parent.raw_const, parent.lifecycle, parent.ownership, parent.storage, parent.barrier, parent.shape, parent.profiled)), reg_consts);
+    } else {
+        const_clear(reg_consts, cur.dest);
+    }
+    raw_ptr_clear(raw_ptr_regs, cur.dest);
+    ssa_tag_state_set(tag_states, cur.dest, parent.raw_reg, parent.raw_const_has, parent.raw_const, parent.lifecycle, parent.ownership, parent.storage, SSA_TAG_BARRIER_DIRTY, parent.shape, parent.profiled);
+    return 1;
 }
 
 func ssa_tag_record_pack_result(cur: *SSAInstruction, info: *SSACallInfo, reg_consts: *Vec<*SSAOptKV>, raw_ptr_regs: *Vec<*SSAOptKV>, tag_states: *Vec<*SSAOptTagState>) -> u64 {
@@ -1337,61 +1544,103 @@ func handle_tag_call(cur: *SSAInstruction, reg_consts: *Vec<*SSAOptKV>, raw_ptr_
 
     if (ssa_tag_call_name_is_pack(name) != 0) {
         if (summary != 0) { summary.has_tag_pack = 1; }
-        return ssa_tag_record_pack_result(cur, info, reg_consts, raw_ptr_regs, tag_states);
+        var did_pack: u64 = ssa_tag_record_pack_result(cur, info, reg_consts, raw_ptr_regs, tag_states);
+        if (did_pack != 0 && summary != 0) { summary.pack_count = summary.pack_count + 1; }
+        return did_pack;
     }
 
     if (ssa_tag_call_name_is_object_from_raw(name) != 0) {
         if (summary != 0) { summary.has_tag_pack = 1; summary.has_tagged_access = 1; }
-        return ssa_tag_record_object_from_raw(cur, info, reg_consts, raw_ptr_regs, tag_states);
+        var did_obj_raw: u64 = ssa_tag_record_object_from_raw(cur, info, reg_consts, raw_ptr_regs, tag_states);
+        if (did_obj_raw != 0 && summary != 0) { summary.pack_count = summary.pack_count + 1; }
+        return did_obj_raw;
     }
 
     if (ssa_tag_call_name_is_object_auto(name) != 0) {
         if (summary != 0) { summary.has_tag_auto = 1; summary.has_tagged_access = 1; }
-        return ssa_tag_record_object_auto(cur, info, ssa_tag_object_auto_elem_size(name), reg_consts, raw_ptr_regs, tag_states);
+        var did_obj_auto: u64 = ssa_tag_record_object_auto(cur, info, ssa_tag_object_auto_elem_size(name), reg_consts, raw_ptr_regs, tag_states);
+        if (did_obj_auto != 0 && summary != 0) { summary.pack_count = summary.pack_count + 1; }
+        return did_obj_auto;
     }
 
     if (ssa_tag_call_name_is_slice_from_ptr(name) != 0) {
         if (summary != 0) { summary.has_tagged_access = 1; }
-        return ssa_tag_record_slice_from_ptr(cur, info, reg_consts, raw_ptr_regs, tag_states);
+        var did_slice_ptr: u64 = ssa_tag_record_slice_from_ptr(cur, info, reg_consts, raw_ptr_regs, tag_states);
+        if (did_slice_ptr != 0 && summary != 0) { summary.pack_count = summary.pack_count + 1; }
+        return did_slice_ptr;
     }
 
     if (ssa_tag_call_name_is_slice_from_raw_tag(name) != 0) {
         if (summary != 0) { summary.has_tagged_access = 1; }
-        return ssa_tag_record_slice_from_raw_tag(cur, info, reg_consts, raw_ptr_regs, tag_states);
+        var did_slice_raw: u64 = ssa_tag_record_slice_from_raw_tag(cur, info, reg_consts, raw_ptr_regs, tag_states);
+        if (did_slice_raw != 0 && summary != 0) { summary.pack_count = summary.pack_count + 1; }
+        return did_slice_raw;
     }
 
     if (ssa_tag_call_name_is_strip(name) != 0 && info.nargs >= 1 && cur.dest != 0) {
         var arg0: u64 = ssa_call_arg(info, 0);
         var c_arg0: SSAOptConstValue = reg_const_value(reg_consts, arg0);
-        if (c_arg0.has != 0) { return ssa_tag_try_const_from_raw(cur, c_arg0.val, reg_consts, tag_states); }
+        if (c_arg0.has != 0) {
+            var did_strip_const: u64 = ssa_tag_try_const_from_raw(cur, c_arg0.val, reg_consts, tag_states);
+            if (did_strip_const != 0 && summary != 0) { ssa_tag_summary_record_fold(summary); summary.raw_elision_count = summary.raw_elision_count + 1; }
+            return did_strip_const;
+        }
         var state: *SSAOptTagState = ssa_tag_state_find(tag_states, arg0);
-        if (state != 0 && state.raw_const_has != 0) { return ssa_tag_try_const_from_raw(cur, state.raw_const, reg_consts, tag_states); }
+        if (state != 0 && state.raw_const_has != 0) {
+            var did_strip_state_const: u64 = ssa_tag_try_const_from_raw(cur, state.raw_const, reg_consts, tag_states);
+            if (did_strip_state_const != 0 && summary != 0) { ssa_tag_summary_record_fold(summary); summary.raw_elision_count = summary.raw_elision_count + 1; }
+            return did_strip_state_const;
+        }
         if (state != 0 && state.raw_reg != 0 && raw_ptr_get(raw_ptr_regs, state.raw_reg) != 0) {
             raw_ptr_set(raw_ptr_regs, cur.dest);
             ssa_tag_state_clear(tag_states, cur.dest);
-            return opt_set_copy(cur, operand_reg(state.raw_reg), reg_consts);
+            var did_strip_copy: u64 = opt_set_copy(cur, operand_reg(state.raw_reg), reg_consts);
+            if (did_strip_copy != 0 && summary != 0) { ssa_tag_summary_record_fold(summary); summary.raw_elision_count = summary.raw_elision_count + 1; }
+            return did_strip_copy;
         }
         if (raw_ptr_get(raw_ptr_regs, arg0) != 0) {
             raw_ptr_set(raw_ptr_regs, cur.dest);
             ssa_tag_state_clear(tag_states, cur.dest);
-            return opt_set_copy(cur, operand_reg(arg0), reg_consts);
+            var did_strip_raw_copy: u64 = opt_set_copy(cur, operand_reg(arg0), reg_consts);
+            if (did_strip_raw_copy != 0 && summary != 0) { ssa_tag_summary_record_fold(summary); summary.raw_elision_count = summary.raw_elision_count + 1; }
+            return did_strip_raw_copy;
         }
     }
 
     if (info.nargs >= 1 && ssa_tag_fold_field_call(cur, name, ssa_call_arg(info, 0), reg_consts, tag_states) != 0) {
-        if (summary != 0) { summary.has_tagged_access = 1; }
+        if (summary != 0) { summary.has_tagged_access = 1; ssa_tag_summary_record_fold(summary); summary.predicate_fold_count = summary.predicate_fold_count + 1; }
         return 1;
     }
     if (ssa_tag_fold_lifecycle_predicate(cur, name, info, reg_consts, tag_states) != 0) {
-        if (summary != 0) { summary.has_tagged_access = 1; }
+        if (summary != 0) { summary.has_tagged_access = 1; ssa_tag_summary_record_fold(summary); summary.predicate_fold_count = summary.predicate_fold_count + 1; }
         return 1;
     }
     if (ssa_tag_name_eq(name, "std_mem__bpp_tag_gc_barrier_needed_raw", 38) != 0) {
         if (summary != 0) { summary.has_tagged_access = 1; }
-        return ssa_tag_fold_gc_barrier_call(cur, info, reg_consts, tag_states);
+        var did_gc: u64 = ssa_tag_fold_gc_barrier_call(cur, info, reg_consts, tag_states);
+        if (did_gc != 0 && summary != 0) { ssa_tag_summary_record_fold(summary); summary.predicate_fold_count = summary.predicate_fold_count + 1; }
+        return did_gc;
+    }
+    if (ssa_tag_name_eq(name, "std_mem__bpp_tag_repack_lifecycle_barrier", 41) != 0 || ssa_tag_name_eq(name, "std_mem__bpp_tag_repack_shape_profiled", 38) != 0) {
+        if (summary != 0) { summary.has_tagged_access = 1; }
+        var did_repack: u64 = ssa_tag_fold_repack_call(cur, name, info, reg_consts, tag_states);
+        if (did_repack != 0 && summary != 0) { summary.pack_count = summary.pack_count + 1; }
+        return did_repack;
+    }
+    if (ssa_tag_name_eq(name, "std_mem__bpp_tag_mark_barrier_dirty_raw", 39) != 0) {
+        if (summary != 0) { summary.has_tagged_access = 1; }
+        var did_dirty: u64 = ssa_tag_fold_mark_barrier_dirty_call(cur, info, reg_consts, tag_states);
+        if (did_dirty != 0 && summary != 0) { ssa_tag_summary_record_fold(summary); summary.predicate_fold_count = summary.predicate_fold_count + 1; }
+        return did_dirty;
+    }
+    if (ssa_tag_name_eq(name, "std_mem__bpp_tag_write_barrier_raw", 34) != 0) {
+        if (summary != 0) { summary.has_tagged_access = 1; }
+        var did_write_barrier: u64 = ssa_tag_fold_write_barrier_call(cur, info, reg_consts, raw_ptr_regs, tag_states);
+        if (did_write_barrier != 0 && summary != 0) { ssa_tag_summary_record_fold(summary); summary.predicate_fold_count = summary.predicate_fold_count + 1; }
+        return did_write_barrier;
     }
     if (ssa_tag_fold_fastpath_call(cur, name, info, reg_consts) != 0) {
-        if (summary != 0) { summary.has_tagged_access = 1; }
+        if (summary != 0) { summary.has_tagged_access = 1; ssa_tag_summary_record_fold(summary); summary.hot_path_fold_count = summary.hot_path_fold_count + 1; }
         return 1;
     }
 
@@ -1512,6 +1761,85 @@ func ssa_tag_analyze_function_escape(fn: *SSAFunction) -> *SSAOptEscapeSummary {
     return summary;
 }
 
+func ssa_tag_func_name_eq(fn: *SSAFunction, name: []u8) -> u64 {
+    if (fn == 0 || fn.name.ptr == 0 || name.ptr == 0) { return 0; }
+    if (fn.name.len != name.len) { return 0; }
+    return str_eq(fn.name, slice(name.ptr, name.len));
+}
+
+func ssa_tag_find_func_by_name(ctx: *SSAContext, name: []u8) -> *SSAFunction {
+    if (ctx == 0 || name.ptr == 0 || name.len == 0) { return 0; }
+    var funcs: []*SSAFunction = ctx.funcs;
+    var n: u64 = slice_len(funcs);
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var fn: *SSAFunction = funcs[i];
+        if (ssa_tag_func_name_eq(fn, name) != 0) { return fn; }
+    }
+    return 0;
+}
+
+func ssa_tag_callee_summary_bits(ctx: *SSAContext, fn: *SSAFunction, callee_count_out: *u64) -> u64 {
+    if (callee_count_out != 0) { *callee_count_out = 0; }
+    if (ctx == 0 || fn == 0) { return 0; }
+    var bits: u64 = 0;
+    var count: u64 = 0;
+    var blocks: []*SSABlock = fn.blocks;
+    var bcount: u64 = slice_len(blocks);
+    for (var bi: u64 = 0; bi < bcount; bi = bi + 1) {
+        var block: *SSABlock = blocks[bi];
+        if (block == 0) { continue; }
+        var cur: *SSAInstruction = block.inst_head;
+        while (cur != 0) {
+            if (op_of(cur) == SSA_OP_CALL) {
+                var info: *SSACallInfo = (*SSACallInfo)operand_value(cur.src1);
+                if (info != 0) {
+                    var callee: *SSAFunction = ssa_tag_find_func_by_name(ctx, info.name);
+                    if (callee != 0 && callee != fn && callee.tag_summary_bits != 0) {
+                        bits = bits | callee.tag_summary_bits;
+                        count = count + 1;
+                    }
+                }
+            }
+            cur = cur.next;
+        }
+    }
+    if (callee_count_out != 0) { *callee_count_out = count; }
+    return bits;
+}
+
+func ssa_tag_propagate_interprocedural(ctx: *SSAContext) -> u64 {
+    if (ctx == 0) { return 0; }
+    var funcs: []*SSAFunction = ctx.funcs;
+    var n: u64 = slice_len(funcs);
+    var changed: u64 = 1;
+    var round: u64 = 0;
+    while (changed != 0 && round < n) {
+        changed = 0;
+        for (var i: u64 = 0; i < n; i = i + 1) {
+            var fn: *SSAFunction = funcs[i];
+            if (fn == 0) { continue; }
+            var ignored: u64 = 0;
+            var callee_bits: u64 = ssa_tag_callee_summary_bits(ctx, fn, &ignored);
+            var merged: u64 = fn.tag_summary_bits | callee_bits;
+            if (merged != fn.tag_summary_bits) {
+                fn.tag_summary_bits = merged;
+                changed = 1;
+            }
+        }
+        round = round + 1;
+    }
+
+    for (var j: u64 = 0; j < n; j = j + 1) {
+        var fn2: *SSAFunction = funcs[j];
+        if (fn2 == 0) { continue; }
+        var callee_count: u64 = 0;
+        var final_callee_bits: u64 = ssa_tag_callee_summary_bits(ctx, fn2, &callee_count);
+        fn2.tag_interproc_summary_bits = final_callee_bits;
+        fn2.tag_interproc_callee_count = callee_count;
+    }
+    return 0;
+}
+
 func run(ctx: *SSAContext) -> u64 {
     push_trace("run", "ssa_opt_o1.b", __LINE__);
     defer pop_trace();
@@ -1532,7 +1860,18 @@ func run(ctx: *SSAContext) -> u64 {
         }
 
         dce_run(fn);
+        fn.tag_direct_summary_bits = ssa_tag_summary_bits(summary);
+        fn.tag_summary_bits = fn.tag_direct_summary_bits;
+        fn.tag_interproc_summary_bits = 0;
+        fn.tag_interproc_callee_count = 0;
+        fn.tag_fold_count = summary.fold_count;
+        fn.tag_pack_count = summary.pack_count;
+        fn.tag_predicate_fold_count = summary.predicate_fold_count;
+        fn.tag_raw_elision_count = summary.raw_elision_count;
+        fn.tag_hot_path_fold_count = summary.hot_path_fold_count;
     }
+
+    ssa_tag_propagate_interprocedural(ctx);
 
     if (SSA_O1_DEBUG != 0) {
         println("[DEBUG] opt_o1_run: done", 32);
