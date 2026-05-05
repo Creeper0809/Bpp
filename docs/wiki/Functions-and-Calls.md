@@ -93,13 +93,15 @@ var out2: u64 = obj.instance_add(1, 2);
 - static/direct 호출은 named 인자 지원 경로가 있습니다.
 - instance method 호출도 named/default 인자를 지원합니다.
 
-## Constraints (v11)
+## Constraints
 
 - variadic parameter는 마지막에만 허용됩니다.
 - variadic parameter에 default 값은 금지됩니다.
 - default parameter 뒤에 non-default parameter가 오면 오류입니다.
 - by-ref lambda capture(`&x`)는 현재 함수 파라미터에 대해서만 허용됩니다.
 - 로컬 변수에 대한 by-ref capture는 컴파일 오류입니다.
+- LLVM build subset은 direct call, call pointer, primitive/narrow signature, small/large
+  struct return, slice param/return을 fixture로 고정합니다.
 
 ### Invalid Examples
 
@@ -125,3 +127,6 @@ var f: u64 = func [&x] () -> u64 { x + 1 };
 - public API 함수는 default/named를 과도하게 섞지 말고 명시 호출을 우선합니다.
 - variadic은 최소화하고 명시적 오버로드(또는 helper 함수)로 분리합니다.
 - 람다를 API 경계로 넘길 때는 함수 타입 시그니처를 명시해 회귀를 줄입니다.
+- ABI가 중요한 함수는 `45_llvm_build_runtime_fixture_bundle_success`와
+  `46_llvm_build_abi_only_bundle_success` 같은 LLVM fixture에 작은 재현을 추가하는
+  편이 안전합니다.

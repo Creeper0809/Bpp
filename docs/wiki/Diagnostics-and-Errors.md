@@ -31,11 +31,26 @@
 - `test/source/*_fail*.bpp` 케이스는 의도적으로 실패해야 정상입니다.
 - 진단 메시지 포함 여부까지 CI에서 검증합니다.
 
-## Constraints (v11)
+## Constraints
 
 - 일부 경로는 아직 panic 기반 종료를 사용합니다.
 - 진단 정밀도는 parser/semantic 분기마다 편차가 있습니다.
 - 메시지 wording이 버전별로 바뀔 수 있으므로 테스트 substring은 핵심 문구 중심으로 유지해야 합니다.
+
+## Contract Diagnostics
+
+최근 contract/complexity 경로는 일반 타입 오류보다 더 많은 context를 출력하려고
+합니다.
+
+- contract surface: 함수 이름, module ownership, public/generated surface kind
+- contract family: complexity, decorator, property, entry, prelude, condition,
+  effects, ownership, memory, concurrency, ABI, execution
+- complexity rank: declared/budget time·space와 SSA summary rank
+- origin: raw annotation text, related declaration site, generated wrapper/original chain
+
+LLVM handoff 쪽 오류는 `graph -> envelope -> LLVM adapter` 단계 중 어느 carrier에서
+metadata가 사라졌는지를 먼저 확인해야 합니다. 실행 결과가 맞아도 metadata
+expectation이 깨지면 contract preservation 관점에서는 회귀입니다.
 
 ## Cautions
 

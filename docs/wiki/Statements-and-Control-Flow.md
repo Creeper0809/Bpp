@@ -103,13 +103,17 @@ match (1) {
 }
 ```
 
-## Constraints (v11)
+## Constraints
 
 - `try`는 `catch` 또는 `finally` 중 하나 이상이 필수입니다.
 - `throw`는 try 밖에서도 파싱/의미 분석이 허용됩니다.
 - `match expression`은 기본적으로 `default` arm이 필요하지만, enum exhaustive인 경우 생략할 수 있습니다.
 - `match expression`의 각 arm은 반환 타입을 일관되게 만족해야 합니다.
 - `case _`와 명시 값을 동일 arm에 혼합할 수 없습니다.
+- `do-while`과 ternary operator는 core runtime suite에서 고정되어 있습니다.
+- SSA phi/parallel-copy 문제는 루프/분기 의미와 직접 관련되며
+  `test/source/43_language_feature_runtime_bundle_success.bpp`의 parallel-copy phi
+  케이스로 회귀를 잡습니다.
 
 ## Cautions
 

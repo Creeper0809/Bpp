@@ -105,6 +105,9 @@ struct SSAOptEscapeSummary {
     public predicate_fold_count: u64;
     public raw_elision_count: u64;
     public hot_path_fold_count: u64;
+    public profile_fold_count: u64;
+    public inline_cache_fold_count: u64;
+    public sroa_scalar_fold_count: u64;
 }
 
 impl SSAOptEscapeSummary {
@@ -120,6 +123,23 @@ impl SSAOptEscapeSummary {
         self.predicate_fold_count = 0;
         self.raw_elision_count = 0;
         self.hot_path_fold_count = 0;
+        self.profile_fold_count = 0;
+        self.inline_cache_fold_count = 0;
+        self.sroa_scalar_fold_count = 0;
+    }
+}
+
+struct SSAOptFuncLookup {
+    public name: []u8;
+    public fn: *SSAFunction;
+    public active: u64;
+}
+
+impl SSAOptFuncLookup {
+    public constructor() {
+        self.name = slice(0, 0);
+        self.fn = 0;
+        self.active = 0;
     }
 }
 
@@ -408,6 +428,121 @@ func ssa_tag_fast_path_for(shape: u64, hot: u64, profiled: u64, elem_size: u64, 
     if (hot != 0 && profiled != 0 && lanes >= 2 && len >= lanes) { return SSA_TAG_FAST_PATH_VECTOR; }
     if (len >= 2 && lanes >= 2) { return SSA_TAG_FAST_PATH_UNROLLED; }
     return SSA_TAG_FAST_PATH_SCALAR;
+}
+
+func ssa_tag_profile_hot_from_threshold(iterations: u64, threshold: u64) -> u64 {
+    var limit: u64 = threshold;
+    if (limit == 0) { limit = 1024; }
+    if (iterations >= limit) { return 1; }
+    return 0;
+}
+
+func ssa_tag_fast_path_for_tuned(shape: u64, profiled: u64, elem_size: u64, len: u64, iterations: u64, hot_threshold: u64, vector_min_len: u64, unroll_min_len: u64, max_lanes: u64) -> u64 {
+    if (len == 0) { return SSA_TAG_FAST_PATH_NONE; }
+    if (ssa_tag_shape_vectorizable(shape) == 0) { return SSA_TAG_FAST_PATH_SCALAR; }
+    var lanes: u64 = ssa_tag_vector_lanes(shape, elem_size);
+    if (max_lanes != 0 && lanes > max_lanes) { lanes = max_lanes; }
+    var vector_min: u64 = vector_min_len;
+    var unroll_min: u64 = unroll_min_len;
+    if (vector_min == 0) { vector_min = 4; }
+    if (unroll_min == 0) { unroll_min = 2; }
+    var hot: u64 = ssa_tag_profile_hot_from_threshold(iterations, hot_threshold);
+    if (hot != 0 && profiled != 0 && lanes >= 2 && len >= vector_min && len >= lanes) { return SSA_TAG_FAST_PATH_VECTOR; }
+    if (len >= unroll_min && lanes >= 2) { return SSA_TAG_FAST_PATH_UNROLLED; }
+    return SSA_TAG_FAST_PATH_SCALAR;
+}
+
+func ssa_tag_inline_cache_fast_path(shape: u64, profiled: u64, elem_size: u64, len: u64, iterations: u64, hot_threshold: u64, cache_hits: u64, cache_hot_hits: u64, vector_min_len: u64, unroll_min_len: u64, max_lanes: u64) -> u64 {
+    var chosen: u64 = ssa_tag_fast_path_for_tuned(shape, profiled, elem_size, len, iterations, hot_threshold, vector_min_len, unroll_min_len, max_lanes);
+    if (chosen == SSA_TAG_FAST_PATH_NONE) { return SSA_TAG_FAST_PATH_NONE; }
+    var needed_hits: u64 = cache_hot_hits;
+    if (needed_hits == 0) { needed_hits = 3; }
+    if (cache_hits >= needed_hits) { return chosen; }
+    return SSA_TAG_FAST_PATH_SCALAR;
+}
+
+func ssa_local_decode_offset(enc: u64) -> i64 {
+    var bias: u64 = 4611686018427387904;
+    return (i64)enc - (i64)bias;
+}
+
+func ssa_local_encode_offset(off: i64) -> u64 {
+    var bias: u64 = 4611686018427387904;
+    return (u64)(off + (i64)bias);
+}
+
+func ssa_sroa_mem_key(offset_enc: u64, size: u64) -> u64 {
+    return offset_enc ^ ((size & 15) << 56);
+}
+
+func ssa_sroa_local_addr_get(local_addrs: *Vec<*SSAOptKV>, reg: u64, out_offset_enc: *u64) -> u64 {
+    if (local_addrs == 0 || reg == 0 || out_offset_enc == 0) { return 0; }
+    var entry: *SSAOptKV = kv_find(local_addrs, reg);
+    if (entry == 0) { return 0; }
+    *out_offset_enc = entry.val;
+    return 1;
+}
+
+func ssa_sroa_local_addr_set(local_addrs: *Vec<*SSAOptKV>, reg: u64, offset_enc: u64) -> u64 {
+    if (local_addrs == 0 || reg == 0) { return 0; }
+    return kv_set(local_addrs, reg, offset_enc);
+}
+
+func ssa_sroa_local_addr_clear(local_addrs: *Vec<*SSAOptKV>, reg: u64) -> u64 {
+    if (local_addrs == 0 || reg == 0) { return 0; }
+    return kv_clear(local_addrs, reg);
+}
+
+func ssa_sroa_mem_clear_all(local_mem: *Vec<*SSAOptKV>) -> u64 {
+    if (local_mem == 0) { return 0; }
+    var n: u64 = local_mem.len();
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var entry: *SSAOptKV = local_mem.get(i);
+        if (entry != 0) { entry.active = 0; }
+    }
+    return 0;
+}
+
+func ssa_sroa_ranges_overlap(a_offset_enc: u64, a_size: u64, b_offset_enc: u64, b_size: u64) -> u64 {
+    if (a_size == 0 || b_size == 0) { return 0; }
+    var a0: i64 = ssa_local_decode_offset(a_offset_enc);
+    var b0: i64 = ssa_local_decode_offset(b_offset_enc);
+    var a1: i64 = a0 + (i64)a_size;
+    var b1: i64 = b0 + (i64)b_size;
+    if (a0 < b1 && b0 < a1) { return 1; }
+    return 0;
+}
+
+func ssa_sroa_mem_clear_overlap_size(local_mem: *Vec<*SSAOptKV>, write_offset_enc: u64, write_size: u64, entry: *SSAOptKV, entry_size: u64) -> u64 {
+    if (entry == 0 || entry.active == 0 || entry_size == 0) { return 0; }
+    var entry_offset_enc: u64 = entry.key ^ ((entry_size & 15) << 56);
+    if (ssa_sroa_mem_key(entry_offset_enc, entry_size) != entry.key) { return 0; }
+    if (ssa_sroa_ranges_overlap(write_offset_enc, write_size, entry_offset_enc, entry_size) != 0) {
+        entry.active = 0;
+    }
+    return 0;
+}
+
+func ssa_sroa_mem_clear_overlap(local_mem: *Vec<*SSAOptKV>, write_offset_enc: u64, write_size: u64) -> u64 {
+    if (local_mem == 0 || write_size == 0) { return 0; }
+    var n: u64 = local_mem.len();
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var entry: *SSAOptKV = local_mem.get(i);
+        if (entry == 0 || entry.active == 0) { continue; }
+        ssa_sroa_mem_clear_overlap_size(local_mem, write_offset_enc, write_size, entry, 1);
+        ssa_sroa_mem_clear_overlap_size(local_mem, write_offset_enc, write_size, entry, 2);
+        ssa_sroa_mem_clear_overlap_size(local_mem, write_offset_enc, write_size, entry, 4);
+        ssa_sroa_mem_clear_overlap_size(local_mem, write_offset_enc, write_size, entry, 8);
+    }
+    return 0;
+}
+
+func ssa_sroa_mem_size_for_op(op: u64) -> u64 {
+    if (op == SSA_OP_LOAD8 || op == SSA_OP_STORE8) { return 1; }
+    if (op == SSA_OP_LOAD16 || op == SSA_OP_STORE16) { return 2; }
+    if (op == SSA_OP_LOAD32 || op == SSA_OP_STORE32) { return 4; }
+    if (op == SSA_OP_LOAD64 || op == SSA_OP_STORE64) { return 8; }
+    return 0;
 }
 
 // ============================================
@@ -980,6 +1115,10 @@ func ssa_tag_call_name_is_object_auto(name: []u8) -> u64 {
     return ssa_tag_name_has_prefix(name, "std_mem__bpp_tag_object_auto__G__T_", 35);
 }
 
+func ssa_tag_call_name_is_stack_alloc_auto_from_raw(name: []u8) -> u64 {
+    return ssa_tag_name_eq(name, "std_mem__bpp_stack_alloc_auto_tagged_from_raw", 45);
+}
+
 func ssa_tag_call_name_is_object_from_raw(name: []u8) -> u64 {
     return ssa_tag_name_has_prefix(name, "std_mem__bpp_tag_object_from_raw__G__T_", 39);
 }
@@ -1090,6 +1229,78 @@ func handle_load(cur: *SSAInstruction, reg_consts: *Vec<*SSAOptKV>, var_consts: 
     raw_ptr_clear(raw_ptr_regs, cur.dest);
     ssa_tag_state_clear(tag_states, cur.dest);
     return 1;
+}
+
+func handle_sroa_local_addr_add(cur: *SSAInstruction, reg_consts: *Vec<*SSAOptKV>, local_addrs: *Vec<*SSAOptKV>) -> u64 {
+    if (op_of(cur) != SSA_OP_ADD || cur.dest == 0 || local_addrs == 0) { return 0; }
+    var offset_enc: u64 = 0;
+    var add_const: SSAOptConstValue;
+    add_const.has = 0;
+    add_const.val = 0;
+    if (operand_is_const(cur.src1) == 0 && ssa_sroa_local_addr_get(local_addrs, operand_value(cur.src1), &offset_enc) != 0) {
+        add_const = operand_const_value(reg_consts, cur.src2);
+    } else if (operand_is_const(cur.src2) == 0 && ssa_sroa_local_addr_get(local_addrs, operand_value(cur.src2), &offset_enc) != 0) {
+        add_const = operand_const_value(reg_consts, cur.src1);
+    } else {
+        return 0;
+    }
+    if (add_const.has == 0) { return 0; }
+    var next_off: i64 = ssa_local_decode_offset(offset_enc) + (i64)add_const.val;
+    ssa_sroa_local_addr_set(local_addrs, cur.dest, ssa_local_encode_offset(next_off));
+    return 1;
+}
+
+func handle_sroa_memory(cur: *SSAInstruction, reg_consts: *Vec<*SSAOptKV>, raw_ptr_regs: *Vec<*SSAOptKV>, tag_states: *Vec<*SSAOptTagState>, local_addrs: *Vec<*SSAOptKV>, local_mem: *Vec<*SSAOptKV>, summary: *SSAOptEscapeSummary) -> u64 {
+    var op: u64 = op_of(cur);
+    var size: u64 = ssa_sroa_mem_size_for_op(op);
+    if (size == 0) { return 0; }
+    var offset_enc: u64 = 0;
+    var has_local_addr: u64 = 0;
+    if (cur.src1 != 0 && operand_is_const(cur.src1) == 0) {
+        has_local_addr = ssa_sroa_local_addr_get(local_addrs, operand_value(cur.src1), &offset_enc);
+    }
+
+    if (op == SSA_OP_LOAD8 || op == SSA_OP_LOAD16 || op == SSA_OP_LOAD32 || op == SSA_OP_LOAD64) {
+        if (has_local_addr != 0) {
+            var entry: *SSAOptKV = kv_find(local_mem, ssa_sroa_mem_key(offset_enc, size));
+            if (entry != 0 && cur.dest != 0) {
+                opt_set_const(cur, entry.val, reg_consts);
+                raw_ptr_clear(raw_ptr_regs, cur.dest);
+                ssa_tag_state_clear(tag_states, cur.dest);
+                ssa_sroa_local_addr_clear(local_addrs, cur.dest);
+                if (summary != 0) { summary.sroa_scalar_fold_count = summary.sroa_scalar_fold_count + 1; }
+                return 1;
+            }
+        }
+        if (cur.dest != 0) {
+            const_clear(reg_consts, cur.dest);
+            raw_ptr_clear(raw_ptr_regs, cur.dest);
+            ssa_tag_state_clear(tag_states, cur.dest);
+            ssa_sroa_local_addr_clear(local_addrs, cur.dest);
+        }
+        return 1;
+    }
+
+    if (op == SSA_OP_STORE8 || op == SSA_OP_STORE16 || op == SSA_OP_STORE32 || op == SSA_OP_STORE64) {
+        if (has_local_addr != 0) {
+            ssa_sroa_mem_clear_overlap(local_mem, offset_enc, size);
+        } else {
+            ssa_sroa_mem_clear_all(local_mem);
+        }
+        if (has_local_addr != 0 && cur.src2 != 0) {
+            var value: SSAOptConstValue = operand_const_value(reg_consts, cur.src2);
+            if (value.has != 0) {
+                var mask: u64 = 0 - 1;
+                if (size == 1) { mask = 255; }
+                else if (size == 2) { mask = 65535; }
+                else if (size == 4) { mask = 4294967295; }
+                kv_set(local_mem, ssa_sroa_mem_key(offset_enc, size), value.val & mask);
+            }
+        }
+        return 1;
+    }
+
+    return 0;
 }
 
 func handle_tagged_ptr_mask(cur: *SSAInstruction, reg_consts: *Vec<*SSAOptKV>, raw_ptr_regs: *Vec<*SSAOptKV>) -> u64 {
@@ -1455,6 +1666,60 @@ func ssa_tag_record_object_auto(cur: *SSAInstruction, info: *SSACallInfo, elem_s
     return 1;
 }
 
+func ssa_tag_record_stack_alloc_auto_from_raw(cur: *SSAInstruction, info: *SSACallInfo, reg_consts: *Vec<*SSAOptKV>, raw_ptr_regs: *Vec<*SSAOptKV>, tag_states: *Vec<*SSAOptTagState>) -> u64 {
+    if (cur.dest == 0 || info == 0 || info.nargs < 9) { return 0; }
+    var c_size: SSAOptConstValue = ssa_call_arg_const(info, 1, reg_consts);
+    var c_escapes: SSAOptConstValue = ssa_call_arg_const(info, 2, reg_consts);
+    var c_addr: SSAOptConstValue = ssa_call_arg_const(info, 3, reg_consts);
+    var c_shared: SSAOptConstValue = ssa_call_arg_const(info, 4, reg_consts);
+    var c_pinned: SSAOptConstValue = ssa_call_arg_const(info, 5, reg_consts);
+    var c_immortal: SSAOptConstValue = ssa_call_arg_const(info, 6, reg_consts);
+    var c_arena: SSAOptConstValue = ssa_call_arg_const(info, 7, reg_consts);
+    var c_shape: SSAOptConstValue = ssa_call_arg_const(info, 8, reg_consts);
+    if (c_size.has == 0 || c_escapes.has == 0 || c_addr.has == 0 || c_shared.has == 0 || c_pinned.has == 0 || c_immortal.has == 0 || c_arena.has == 0 || c_shape.has == 0) { return 0; }
+
+    var life: u64 = SSA_TAG_LIFE_YOUNG;
+    var own: u64 = SSA_TAG_OWN_UNIQUE;
+    var storage: u64 = SSA_TAG_STORAGE_HEAP;
+    var barrier: u64 = SSA_TAG_BARRIER_CLEAN;
+    if (c_immortal.val != 0) {
+        life = SSA_TAG_LIFE_IMMORTAL; own = SSA_TAG_OWN_SHARED; storage = SSA_TAG_STORAGE_STATIC; barrier = SSA_TAG_BARRIER_SKIP;
+    } else if (c_pinned.val != 0) {
+        life = SSA_TAG_LIFE_PINNED; own = SSA_TAG_OWN_SHARED; storage = SSA_TAG_STORAGE_HEAP; barrier = SSA_TAG_BARRIER_DIRTY;
+    } else if (c_escapes.val != 0) {
+        life = SSA_TAG_LIFE_YOUNG; storage = SSA_TAG_STORAGE_HEAP; barrier = SSA_TAG_BARRIER_CLEAN;
+        if (c_shared.val != 0) { own = SSA_TAG_OWN_SHARED; }
+        else { own = SSA_TAG_OWN_ESCAPED; }
+    } else if (c_shared.val != 0) {
+        life = SSA_TAG_LIFE_YOUNG; own = SSA_TAG_OWN_SHARED; storage = SSA_TAG_STORAGE_HEAP; barrier = SSA_TAG_BARRIER_CLEAN;
+    } else if (c_arena.val != 0 || c_size.val > 4096) {
+        if (c_size.val <= 262144) {
+            life = SSA_TAG_LIFE_ARENA; own = SSA_TAG_OWN_BORROWED; storage = SSA_TAG_STORAGE_ARENA; barrier = SSA_TAG_BARRIER_CLEAN;
+        } else {
+            life = SSA_TAG_LIFE_YOUNG; own = SSA_TAG_OWN_OWNED; storage = SSA_TAG_STORAGE_HEAP; barrier = SSA_TAG_BARRIER_CLEAN;
+        }
+    } else if (c_addr.val == 0 && c_size.val <= 4096) {
+        life = SSA_TAG_LIFE_BORROWED; own = SSA_TAG_OWN_STACK; storage = SSA_TAG_STORAGE_STACK; barrier = SSA_TAG_BARRIER_SKIP;
+    }
+
+    var raw_reg: u64 = 0;
+    var raw_const_has: u64 = 0;
+    var raw_const: u64 = 0;
+    if (storage == SSA_TAG_STORAGE_STACK) {
+        var arg0: u64 = ssa_call_arg(info, 0);
+        var c_raw: SSAOptConstValue = reg_const_value(reg_consts, arg0);
+        if (c_raw.has != 0) {
+            raw_const_has = 1;
+            raw_const = c_raw.val;
+            opt_set_const(cur, ssa_tag_pack_const(raw_const, life, own, storage, barrier, c_shape.val, 0), reg_consts);
+        } else if (raw_ptr_get(raw_ptr_regs, arg0) != 0) {
+            raw_reg = arg0;
+        }
+    }
+    ssa_tag_state_set(tag_states, cur.dest, raw_reg, raw_const_has, raw_const, life, own, storage, barrier, c_shape.val, 0);
+    return 1;
+}
+
 func ssa_tag_record_slice_from_ptr(cur: *SSAInstruction, info: *SSACallInfo, reg_consts: *Vec<*SSAOptKV>, raw_ptr_regs: *Vec<*SSAOptKV>, tag_states: *Vec<*SSAOptTagState>) -> u64 {
     if (cur.dest == 0 || info == 0 || info.nargs < 3) { return 0; }
     var c_len: SSAOptConstValue = ssa_call_arg_const(info, 1, reg_consts);
@@ -1523,6 +1788,43 @@ func ssa_tag_fold_fastpath_call(cur: *SSAInstruction, name: []u8, info: *SSACall
             return opt_set_const(cur, ssa_tag_fast_path_for(c_shape3.val, c_hot2.val, c_profiled2.val, c_elem3.val, len), reg_consts);
         }
     }
+    if (ssa_tag_name_eq(name, "std_mem__bpp_profile_hot_from_threshold", str_len("std_mem__bpp_profile_hot_from_threshold")) != 0 && info.nargs >= 2) {
+        var c_iterations: SSAOptConstValue = ssa_call_arg_const(info, 0, reg_consts);
+        var c_threshold: SSAOptConstValue = ssa_call_arg_const(info, 1, reg_consts);
+        if (c_iterations.has != 0 && c_threshold.has != 0) {
+            return opt_set_const(cur, ssa_tag_profile_hot_from_threshold(c_iterations.val, c_threshold.val), reg_consts);
+        }
+    }
+    if (ssa_tag_name_eq(name, "std_mem__bpp_profile_fast_path_for_shape_len", str_len("std_mem__bpp_profile_fast_path_for_shape_len")) != 0 && info.nargs >= 9) {
+        var c_p_shape: SSAOptConstValue = ssa_call_arg_const(info, 0, reg_consts);
+        var c_p_profiled: SSAOptConstValue = ssa_call_arg_const(info, 1, reg_consts);
+        var c_p_elem: SSAOptConstValue = ssa_call_arg_const(info, 2, reg_consts);
+        var c_p_len: SSAOptConstValue = ssa_call_arg_const(info, 3, reg_consts);
+        var c_p_iters: SSAOptConstValue = ssa_call_arg_const(info, 4, reg_consts);
+        var c_p_hot_threshold: SSAOptConstValue = ssa_call_arg_const(info, 5, reg_consts);
+        var c_p_vector_min: SSAOptConstValue = ssa_call_arg_const(info, 6, reg_consts);
+        var c_p_unroll_min: SSAOptConstValue = ssa_call_arg_const(info, 7, reg_consts);
+        var c_p_max_lanes: SSAOptConstValue = ssa_call_arg_const(info, 8, reg_consts);
+        if (c_p_shape.has != 0 && c_p_profiled.has != 0 && c_p_elem.has != 0 && c_p_len.has != 0 && c_p_iters.has != 0 && c_p_hot_threshold.has != 0 && c_p_vector_min.has != 0 && c_p_unroll_min.has != 0 && c_p_max_lanes.has != 0) {
+            return opt_set_const(cur, ssa_tag_fast_path_for_tuned(c_p_shape.val, c_p_profiled.val, c_p_elem.val, c_p_len.val, c_p_iters.val, c_p_hot_threshold.val, c_p_vector_min.val, c_p_unroll_min.val, c_p_max_lanes.val), reg_consts);
+        }
+    }
+    if (ssa_tag_name_eq(name, "std_mem__bpp_shape_inline_cache_fast_path", str_len("std_mem__bpp_shape_inline_cache_fast_path")) != 0 && info.nargs >= 11) {
+        var c_i_shape: SSAOptConstValue = ssa_call_arg_const(info, 0, reg_consts);
+        var c_i_profiled: SSAOptConstValue = ssa_call_arg_const(info, 1, reg_consts);
+        var c_i_elem: SSAOptConstValue = ssa_call_arg_const(info, 2, reg_consts);
+        var c_i_len: SSAOptConstValue = ssa_call_arg_const(info, 3, reg_consts);
+        var c_i_iters: SSAOptConstValue = ssa_call_arg_const(info, 4, reg_consts);
+        var c_i_hot_threshold: SSAOptConstValue = ssa_call_arg_const(info, 5, reg_consts);
+        var c_i_hits: SSAOptConstValue = ssa_call_arg_const(info, 6, reg_consts);
+        var c_i_hot_hits: SSAOptConstValue = ssa_call_arg_const(info, 7, reg_consts);
+        var c_i_vector_min: SSAOptConstValue = ssa_call_arg_const(info, 8, reg_consts);
+        var c_i_unroll_min: SSAOptConstValue = ssa_call_arg_const(info, 9, reg_consts);
+        var c_i_max_lanes: SSAOptConstValue = ssa_call_arg_const(info, 10, reg_consts);
+        if (c_i_shape.has != 0 && c_i_profiled.has != 0 && c_i_elem.has != 0 && c_i_len.has != 0 && c_i_iters.has != 0 && c_i_hot_threshold.has != 0 && c_i_hits.has != 0 && c_i_hot_hits.has != 0 && c_i_vector_min.has != 0 && c_i_unroll_min.has != 0 && c_i_max_lanes.has != 0) {
+            return opt_set_const(cur, ssa_tag_inline_cache_fast_path(c_i_shape.val, c_i_profiled.val, c_i_elem.val, c_i_len.val, c_i_iters.val, c_i_hot_threshold.val, c_i_hits.val, c_i_hot_hits.val, c_i_vector_min.val, c_i_unroll_min.val, c_i_max_lanes.val), reg_consts);
+        }
+    }
     return 0;
 }
 
@@ -1561,6 +1863,13 @@ func handle_tag_call(cur: *SSAInstruction, reg_consts: *Vec<*SSAOptKV>, raw_ptr_
         var did_obj_auto: u64 = ssa_tag_record_object_auto(cur, info, ssa_tag_object_auto_elem_size(name), reg_consts, raw_ptr_regs, tag_states);
         if (did_obj_auto != 0 && summary != 0) { summary.pack_count = summary.pack_count + 1; }
         return did_obj_auto;
+    }
+
+    if (ssa_tag_call_name_is_stack_alloc_auto_from_raw(name) != 0) {
+        if (summary != 0) { summary.has_tag_auto = 1; summary.has_tagged_access = 1; }
+        var did_stack_auto: u64 = ssa_tag_record_stack_alloc_auto_from_raw(cur, info, reg_consts, raw_ptr_regs, tag_states);
+        if (did_stack_auto != 0 && summary != 0) { summary.pack_count = summary.pack_count + 1; }
+        return did_stack_auto;
     }
 
     if (ssa_tag_call_name_is_slice_from_ptr(name) != 0) {
@@ -1640,7 +1949,18 @@ func handle_tag_call(cur: *SSAInstruction, reg_consts: *Vec<*SSAOptKV>, raw_ptr_
         return did_write_barrier;
     }
     if (ssa_tag_fold_fastpath_call(cur, name, info, reg_consts) != 0) {
-        if (summary != 0) { summary.has_tagged_access = 1; ssa_tag_summary_record_fold(summary); summary.hot_path_fold_count = summary.hot_path_fold_count + 1; }
+        if (summary != 0) {
+            summary.has_tagged_access = 1;
+            ssa_tag_summary_record_fold(summary);
+            summary.hot_path_fold_count = summary.hot_path_fold_count + 1;
+            if (ssa_tag_name_eq(name, "std_mem__bpp_profile_hot_from_threshold", str_len("std_mem__bpp_profile_hot_from_threshold")) != 0 ||
+                ssa_tag_name_eq(name, "std_mem__bpp_profile_fast_path_for_shape_len", str_len("std_mem__bpp_profile_fast_path_for_shape_len")) != 0) {
+                summary.profile_fold_count = summary.profile_fold_count + 1;
+            }
+            if (ssa_tag_name_eq(name, "std_mem__bpp_shape_inline_cache_fast_path", str_len("std_mem__bpp_shape_inline_cache_fast_path")) != 0) {
+                summary.inline_cache_fold_count = summary.inline_cache_fold_count + 1;
+            }
+        }
         return 1;
     }
 
@@ -1657,6 +1977,8 @@ func run_block(b: *SSABlock, summary: *SSAOptEscapeSummary) -> u64 {
     var var_consts: *Vec<*SSAOptKV> = new Vec<*SSAOptKV>{heap_alloc((32) * sizeof(*SSAOptKV)), 0, (32)};
     var raw_ptr_regs: *Vec<*SSAOptKV> = new Vec<*SSAOptKV>{heap_alloc((32) * sizeof(*SSAOptKV)), 0, (32)};
     var tag_states: *Vec<*SSAOptTagState> = new Vec<*SSAOptTagState>{heap_alloc((32) * sizeof(*SSAOptTagState)), 0, (32)};
+    var local_addrs: *Vec<*SSAOptKV> = new Vec<*SSAOptKV>{heap_alloc((32) * sizeof(*SSAOptKV)), 0, (32)};
+    var local_mem: *Vec<*SSAOptKV> = new Vec<*SSAOptKV>{heap_alloc((32) * sizeof(*SSAOptKV)), 0, (32)};
 
     var cur: *SSAInstruction = b.inst_head;
     while (cur != 0) {
@@ -1666,21 +1988,44 @@ func run_block(b: *SSABlock, summary: *SSAOptEscapeSummary) -> u64 {
             const_set(reg_consts, cur.dest, operand_value(cur.src1));
             raw_ptr_clear(raw_ptr_regs, cur.dest);
             ssa_tag_state_clear(tag_states, cur.dest);
+            ssa_sroa_local_addr_clear(local_addrs, cur.dest);
             cur = cur.next;
             continue;
         }
 
-        if (op == SSA_OP_LEA_LOCAL || op == SSA_OP_LEA_GLOBAL || op == SSA_OP_LEA_FUNC) {
+        if (op == SSA_OP_LEA_LOCAL) {
+            if (cur.dest != 0 && operand_is_const(cur.src1) != 0) {
+                const_clear(reg_consts, cur.dest);
+                raw_ptr_set(raw_ptr_regs, cur.dest);
+                ssa_tag_state_clear(tag_states, cur.dest);
+                ssa_sroa_local_addr_set(local_addrs, cur.dest, operand_value(cur.src1));
+            }
+            cur = cur.next;
+            continue;
+        }
+
+        if (op == SSA_OP_LEA_GLOBAL || op == SSA_OP_LEA_FUNC) {
             if (cur.dest != 0) {
                 const_clear(reg_consts, cur.dest);
                 raw_ptr_set(raw_ptr_regs, cur.dest);
                 ssa_tag_state_clear(tag_states, cur.dest);
+                ssa_sroa_local_addr_clear(local_addrs, cur.dest);
             }
             cur = cur.next;
             continue;
         }
 
         if (handle_copy(cur, reg_consts, raw_ptr_regs, tag_states) != 0) {
+            if (cur.dest != 0 && op_of(cur) == SSA_OP_COPY && operand_is_const(cur.src1) == 0) {
+                var copied_offset: u64 = 0;
+                if (ssa_sroa_local_addr_get(local_addrs, operand_value(cur.src1), &copied_offset) != 0) {
+                    ssa_sroa_local_addr_set(local_addrs, cur.dest, copied_offset);
+                } else {
+                    ssa_sroa_local_addr_clear(local_addrs, cur.dest);
+                }
+            } else if (cur.dest != 0) {
+                ssa_sroa_local_addr_clear(local_addrs, cur.dest);
+            }
             cur = cur.next;
             continue;
         }
@@ -1691,16 +2036,54 @@ func run_block(b: *SSABlock, summary: *SSAOptEscapeSummary) -> u64 {
         }
 
         if (handle_load(cur, reg_consts, var_consts, raw_ptr_regs, tag_states) != 0) {
+            if (cur.dest != 0) { ssa_sroa_local_addr_clear(local_addrs, cur.dest); }
+            cur = cur.next;
+            continue;
+        }
+
+        if (handle_sroa_memory(cur, reg_consts, raw_ptr_regs, tag_states, local_addrs, local_mem, summary) != 0) {
+            cur = cur.next;
+            continue;
+        }
+
+        if (handle_sroa_local_addr_add(cur, reg_consts, local_addrs) != 0) {
+            const_clear(reg_consts, cur.dest);
+            raw_ptr_set(raw_ptr_regs, cur.dest);
+            ssa_tag_state_clear(tag_states, cur.dest);
+            cur = cur.next;
+            continue;
+        }
+
+        if (op == SSA_OP_ASM) {
+            ssa_sroa_mem_clear_all(local_mem);
+            ssa_sroa_mem_clear_all(var_consts);
+            cur = cur.next;
+            continue;
+        }
+
+        if (op == SSA_OP_CALL_PTR || op == SSA_OP_CALL_SLICE_STORE) {
+            ssa_sroa_mem_clear_all(local_mem);
+            ssa_sroa_mem_clear_all(var_consts);
+            if (cur.dest != 0) {
+                const_clear(reg_consts, cur.dest);
+                raw_ptr_clear(raw_ptr_regs, cur.dest);
+                ssa_tag_state_clear(tag_states, cur.dest);
+                ssa_sroa_local_addr_clear(local_addrs, cur.dest);
+            }
             cur = cur.next;
             continue;
         }
 
         if (handle_foldable(cur, reg_consts, raw_ptr_regs, tag_states) != 0) {
+            if (cur.dest != 0) { ssa_sroa_local_addr_clear(local_addrs, cur.dest); }
             cur = cur.next;
             continue;
         }
 
         if (handle_tag_call(cur, reg_consts, raw_ptr_regs, tag_states, summary) != 0) {
+            ssa_sroa_mem_clear_all(local_mem);
+            ssa_sroa_mem_clear_all(var_consts);
+            if (cur.dest != 0) { ssa_sroa_local_addr_clear(local_addrs, cur.dest); }
             cur = cur.next;
             continue;
         }
@@ -1709,12 +2092,28 @@ func run_block(b: *SSABlock, summary: *SSAOptEscapeSummary) -> u64 {
             const_clear(reg_consts, cur.dest);
             raw_ptr_clear(raw_ptr_regs, cur.dest);
             ssa_tag_state_clear(tag_states, cur.dest);
+            ssa_sroa_local_addr_clear(local_addrs, cur.dest);
         }
 
         cur = cur.next;
     }
 
     remove_nops(b);
+    return 0;
+}
+
+func ssa_tag_summarize_call_name(summary: *SSAOptEscapeSummary, name: []u8) -> u64 {
+    if (summary == 0 || name.ptr == 0 || name.len == 0) { return 0; }
+    if (ssa_tag_call_name_is_heap_alloc(name) != 0) { summary.has_heap_alloc = 1; }
+    if (ssa_tag_call_name_is_pack(name) != 0 || ssa_tag_call_name_is_object_from_raw(name) != 0) { summary.has_tag_pack = 1; }
+    if (ssa_tag_call_name_is_object_auto(name) != 0) { summary.has_tag_auto = 1; }
+    if (ssa_tag_name_has_prefix(name, "std_mem__bpp_tag_", 17) != 0 ||
+        ssa_tag_name_has_prefix(name, "std_mem__bpp_shape_", 19) != 0 ||
+        ssa_tag_name_has_prefix(name, "std_mem__bpp_fast_path_", 23) != 0 ||
+        ssa_tag_name_has_prefix(name, "std_mem__bpp_profile_", str_len("std_mem__bpp_profile_")) != 0 ||
+        ssa_tag_name_has_prefix(name, "std_mem__bpp_vector_", 20) != 0) {
+        summary.has_tagged_access = 1;
+    }
     return 0;
 }
 
@@ -1725,18 +2124,23 @@ func ssa_tag_summarize_call(summary: *SSAOptEscapeSummary, op: u64, info_ptr: u6
         summary.has_indirect_call = 1;
         return 0;
     }
-    if (op != SSA_OP_CALL || info_ptr == 0) { return 0; }
-    var info: *SSACallInfo = (*SSACallInfo)info_ptr;
-    if (info == 0) { return 0; }
-    var name: []u8 = info.name;
-    if (ssa_tag_call_name_is_heap_alloc(name) != 0) { summary.has_heap_alloc = 1; }
-    if (ssa_tag_call_name_is_pack(name) != 0 || ssa_tag_call_name_is_object_from_raw(name) != 0) { summary.has_tag_pack = 1; }
-    if (ssa_tag_call_name_is_object_auto(name) != 0) { summary.has_tag_auto = 1; }
-    if (ssa_tag_name_has_prefix(name, "std_mem__bpp_tag_", 17) != 0 ||
-        ssa_tag_name_has_prefix(name, "std_mem__bpp_shape_", 19) != 0 ||
-        ssa_tag_name_has_prefix(name, "std_mem__bpp_fast_path_", 23) != 0 ||
-        ssa_tag_name_has_prefix(name, "std_mem__bpp_vector_", 20) != 0) {
-        summary.has_tagged_access = 1;
+    if (info_ptr == 0) { return 0; }
+    if (op == SSA_OP_CALL) {
+        var info: *SSACallInfo = (*SSACallInfo)info_ptr;
+        if (info == 0) { return 0; }
+        return ssa_tag_summarize_call_name(summary, info.name);
+    }
+    if (op == SSA_OP_CALL_SLICE_STORE) {
+        var slice_info: *SSACallSliceStoreInfo = (*SSACallSliceStoreInfo)info_ptr;
+        if (slice_info == 0) { return 0; }
+        if (slice_info.is_ptr == 0) {
+            return ssa_tag_summarize_call_name(summary, slice_info.name);
+        }
+        if (slice_info.is_ptr > 1) {
+            var call_info: *SSACallInfo = (*SSACallInfo)info_ptr;
+            if (call_info != 0) { return ssa_tag_summarize_call_name(summary, call_info.name); }
+        }
+        summary.has_indirect_call = 1;
     }
     return 0;
 }
@@ -1778,11 +2182,138 @@ func ssa_tag_find_func_by_name(ctx: *SSAContext, name: []u8) -> *SSAFunction {
     return 0;
 }
 
+func ssa_tag_func_lookup_find(cache: *Vec<*SSAOptFuncLookup>, name: []u8) -> *SSAOptFuncLookup {
+    if (cache == 0 || name.ptr == 0 || name.len == 0) { return 0; }
+    var n: u64 = cache.len();
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var entry: *SSAOptFuncLookup = cache.get(i);
+        if (entry == 0 || entry.active == 0 || entry.name.ptr == 0 || entry.name.len != name.len) { continue; }
+        if (str_eq(entry.name, slice(name.ptr, name.len)) != 0) { return entry; }
+    }
+    return 0;
+}
+
+func ssa_tag_find_func_by_name_cached(ctx: *SSAContext, cache: *Vec<*SSAOptFuncLookup>, name: []u8) -> *SSAFunction {
+    if (ctx == 0 || name.ptr == 0 || name.len == 0) { return 0; }
+    var cached: *SSAOptFuncLookup = ssa_tag_func_lookup_find(cache, name);
+    if (cached != 0) { return cached.fn; }
+    var found: *SSAFunction = ssa_tag_find_func_by_name(ctx, name);
+    if (cache != 0) {
+        var entry: *SSAOptFuncLookup = new SSAOptFuncLookup{};
+        entry.name = slice(name.ptr, name.len);
+        entry.fn = found;
+        entry.active = 1;
+        cache.push(entry);
+    }
+    return found;
+}
+
+func ssa_tag_func_has_callee(fn: *SSAFunction, callee: *SSAFunction) -> u64 {
+    if (fn == 0 || callee == 0) { return 0; }
+    var callees: []*SSAFunction = fn.tag_callees;
+    var n: u64 = slice_len(callees);
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        if (callees[i] == callee) { return 1; }
+    }
+    return 0;
+}
+
+func ssa_tag_record_direct_call_edge(ctx: *SSAContext, cache: *Vec<*SSAOptFuncLookup>, fn: *SSAFunction, name: []u8) -> u64 {
+    if (ctx == 0 || fn == 0) { return 0; }
+    fn.tag_callsite_count = fn.tag_callsite_count + 1;
+    if (name.ptr == 0 || name.len == 0) { return 0; }
+    var callee: *SSAFunction = ssa_tag_find_func_by_name_cached(ctx, cache, name);
+    if (callee == 0 || callee == fn) { return 0; }
+    if (ssa_tag_func_has_callee(fn, callee) != 0) { return 0; }
+    push_item<*SSAFunction>(&fn.tag_callees, &fn.tag_callees_cap, callee, 4);
+    return 1;
+}
+
+func ssa_tag_record_indirect_callsite(fn: *SSAFunction) -> u64 {
+    if (fn == 0) { return 0; }
+    fn.tag_callsite_count = fn.tag_callsite_count + 1;
+    return 1;
+}
+
+func ssa_tag_reset_call_graph(ctx: *SSAContext) -> u64 {
+    if (ctx == 0) { return 0; }
+    var funcs: []*SSAFunction = ctx.funcs;
+    var n: u64 = slice_len(funcs);
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var fn: *SSAFunction = funcs[i];
+        if (fn == 0) { continue; }
+        fn.tag_callees = slice(0, 0);
+        fn.tag_callees_cap = 0;
+        fn.tag_callsite_count = 0;
+        fn.tag_call_graph_cached = 0;
+    }
+    return 1;
+}
+
+func ssa_tag_build_call_graph(ctx: *SSAContext) -> u64 {
+    if (ctx == 0) { return 0; }
+    ssa_tag_reset_call_graph(ctx);
+    var lookup_cache: *Vec<*SSAOptFuncLookup> = new Vec<*SSAOptFuncLookup>{heap_alloc((64) * sizeof(*SSAOptFuncLookup)), 0, (64)};
+    var funcs: []*SSAFunction = ctx.funcs;
+    var n: u64 = slice_len(funcs);
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var fn: *SSAFunction = funcs[i];
+        if (fn == 0) { continue; }
+        var blocks: []*SSABlock = fn.blocks;
+        var bcount: u64 = slice_len(blocks);
+        for (var bi: u64 = 0; bi < bcount; bi = bi + 1) {
+            var block: *SSABlock = blocks[bi];
+            if (block == 0) { continue; }
+            var cur: *SSAInstruction = block.inst_head;
+            while (cur != 0) {
+                var op: u64 = op_of(cur);
+                if (op == SSA_OP_CALL) {
+                    var info: *SSACallInfo = (*SSACallInfo)operand_value(cur.src1);
+                    if (info != 0) { ssa_tag_record_direct_call_edge(ctx, lookup_cache, fn, info.name); }
+                } else if (op == SSA_OP_CALL_SLICE_STORE) {
+                    var slice_info: *SSACallSliceStoreInfo = (*SSACallSliceStoreInfo)operand_value(cur.src1);
+                    if (slice_info != 0 && slice_info.is_ptr == 0) {
+                        ssa_tag_record_direct_call_edge(ctx, lookup_cache, fn, slice_info.name);
+                    } else if (slice_info != 0 && slice_info.is_ptr > 1) {
+                        var call_info: *SSACallInfo = (*SSACallInfo)operand_value(cur.src1);
+                        if (call_info != 0) { ssa_tag_record_direct_call_edge(ctx, lookup_cache, fn, call_info.name); }
+                    } else {
+                        ssa_tag_record_indirect_callsite(fn);
+                    }
+                } else if (op == SSA_OP_CALL_PTR) {
+                    ssa_tag_record_indirect_callsite(fn);
+                }
+                cur = cur.next;
+            }
+        }
+    }
+
+    for (var j: u64 = 0; j < n; j = j + 1) {
+        var fn2: *SSAFunction = funcs[j];
+        if (fn2 != 0) { fn2.tag_call_graph_cached = 1; }
+    }
+    return 1;
+}
+
 func ssa_tag_callee_summary_bits(ctx: *SSAContext, fn: *SSAFunction, callee_count_out: *u64) -> u64 {
     if (callee_count_out != 0) { *callee_count_out = 0; }
     if (ctx == 0 || fn == 0) { return 0; }
     var bits: u64 = 0;
     var count: u64 = 0;
+    if (fn.tag_call_graph_cached != 0) {
+        var callees_cached: []*SSAFunction = fn.tag_callees;
+        var cached_count: u64 = slice_len(callees_cached);
+        for (var ci: u64 = 0; ci < cached_count; ci = ci + 1) {
+            var cached_callee: *SSAFunction = callees_cached[ci];
+            if (cached_callee == 0 || cached_callee == fn) { continue; }
+            if (cached_callee.tag_summary_bits != 0) {
+                bits = bits | cached_callee.tag_summary_bits;
+                count = count + 1;
+            }
+        }
+        if (callee_count_out != 0) { *callee_count_out = count; }
+        return bits;
+    }
     var blocks: []*SSABlock = fn.blocks;
     var bcount: u64 = slice_len(blocks);
     for (var bi: u64 = 0; bi < bcount; bi = bi + 1) {
@@ -1799,6 +2330,15 @@ func ssa_tag_callee_summary_bits(ctx: *SSAContext, fn: *SSAFunction, callee_coun
                         count = count + 1;
                     }
                 }
+            } else if (op_of(cur) == SSA_OP_CALL_SLICE_STORE) {
+                var slice_info: *SSACallSliceStoreInfo = (*SSACallSliceStoreInfo)operand_value(cur.src1);
+                if (slice_info != 0 && slice_info.is_ptr == 0) {
+                    var callee_slice: *SSAFunction = ssa_tag_find_func_by_name(ctx, slice_info.name);
+                    if (callee_slice != 0 && callee_slice != fn && callee_slice.tag_summary_bits != 0) {
+                        bits = bits | callee_slice.tag_summary_bits;
+                        count = count + 1;
+                    }
+                }
             }
             cur = cur.next;
         }
@@ -1809,6 +2349,7 @@ func ssa_tag_callee_summary_bits(ctx: *SSAContext, fn: *SSAFunction, callee_coun
 
 func ssa_tag_propagate_interprocedural(ctx: *SSAContext) -> u64 {
     if (ctx == 0) { return 0; }
+    ssa_tag_build_call_graph(ctx);
     var funcs: []*SSAFunction = ctx.funcs;
     var n: u64 = slice_len(funcs);
     var changed: u64 = 1;
@@ -1869,6 +2410,9 @@ func run(ctx: *SSAContext) -> u64 {
         fn.tag_predicate_fold_count = summary.predicate_fold_count;
         fn.tag_raw_elision_count = summary.raw_elision_count;
         fn.tag_hot_path_fold_count = summary.hot_path_fold_count;
+        fn.tag_profile_fold_count = summary.profile_fold_count;
+        fn.tag_inline_cache_fold_count = summary.inline_cache_fold_count;
+        fn.stack_new_sroa_scalar_count = summary.sroa_scalar_fold_count;
     }
 
     ssa_tag_propagate_interprocedural(ctx);

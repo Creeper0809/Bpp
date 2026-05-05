@@ -1,6 +1,6 @@
 # Language Scope
 
-이 문서는 Bpp v11이 어떤 문제를 해결하려는 언어/컴파일러인지, 그리고 실제 적용 범위를 설명합니다.
+이 문서는 현재 Bpp가 어떤 문제를 해결하려는 언어/컴파일러인지, 그리고 실제 적용 범위를 설명합니다.
 
 ## Why It Exists
 
@@ -19,9 +19,10 @@
 - 같은 개념에는 가능하면 하나의 대표 표면 문법을 둡니다.
   - 예: 분기 계열은 `match`를 중심으로 이해합니다.
 - 표면 문법은 다음 세 계층으로 나누어 이해하는 것이 가장 정확합니다.
-  - core language
-  - compiler-known prelude
-  - annotation layer
+  - core language: 값, 포인터, 구조체, 제어 흐름, `new`/`delete`
+  - compiler-known prelude: `number`, `string`, `input<T>()`, 출력 sugar
+  - annotation/contract layer: entry, override, decorator, complexity, contract families
+  - optimization metadata layer: tagged metadata, stack-new, LLVM handoff metadata
 - property hook은 더 이상 annotation layer에 속하지 않으며, core language의 member access 규칙으로 다룹니다.
 - annotation layer는 현재 다음 두 역할을 가집니다.
   - decorator: 선언을 감싸는 변환
@@ -36,7 +37,25 @@
   - `src`에서 parser/compiler/codegen 계층을 분리해 수정
   - `test/source` 케이스로 동작과 진단을 검증
 
-## Constraints (v11)
+## Current Scope
+
+현재 구현은 Linux x86-64를 주 개발/검증 경로로 삼고, Windows x86-64는 toolchain과
+runner plumbing을 단계적으로 복구하는 중입니다. 언어 기능은 non-SSA, SSA,
+LLVM prototype 경로가 서로 겹쳐 있으므로 "파싱된다"와 "모든 backend에서 완전한
+production codegen이 된다"를 구분해야 합니다.
+
+가장 안정적으로 고정된 기능 범위는 다음 번들에 들어 있습니다.
+
+- core runtime: arithmetic/control-flow/pointer/slice/asm/defer/literal
+- struct ABI: layout/method/access/property/operator/slice field
+- container/module: Vec/HashMap/module import/generic/vtable
+- language feature: constructor/destructor, Option/Result `?`, inheritance, trait,
+  complexity/symbolic annotation, implicit conversion, match, stack-new metadata
+- number: bigint/real/complex/exact tower/bitwise
+- tagged metadata: object/slice tag, proof, vector lowering, fast path
+- LLVM build: call/branch/loop/ABI/string/global/contract family metadata
+
+## Constraints
 
 - 일부 고급 문법은 완전 일반화보다 안정성 중심으로 제한되어 있습니다.
 - 파서에서 허용하는 문법이라도 의미 분석(pass) 단계에서 금지될 수 있습니다.
@@ -46,6 +65,9 @@
   - decorator는 wrapper generation 같은 선언 변환을 담당합니다.
   - metadata는 complexity/constraints 같은 분석 정보를 담당합니다.
 - 진단 메시지는 phase tag, 핵심 메시지, note/help를 포함하는 방향으로 정리되고 있지만, 아직 일부 경로에는 편차가 남아 있습니다.
+- LLVM build 경로는 빠르게 넓어지고 있지만 아직 "모든 Bpp 프로그램을 LLVM으로
+  완전 컴파일하는 backend"가 아니라, reachable subset을 실제 build/run하는
+  prototype입니다.
 
 ## Cautions
 
@@ -77,3 +99,4 @@
 - [Diagnostics and Errors](Diagnostics-and-Errors)
 - [Object Construction](Object-Construction)
 - [Testing and CI](Testing-and-CI)
+- [Runtime and LLVM Bundles](Runtime-and-LLVM-Bundles)

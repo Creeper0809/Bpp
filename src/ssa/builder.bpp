@@ -28,6 +28,7 @@ import ssa.codegen;
 
 const SSA_BUILDER_DEBUG = 0;
 const TAGGED_PTR_MASK = 281474976710655;
+const SSA_STACK_NEW_MAX_BYTES = 4096;
 
 // Simple pointer+length pair for name lookups and metadata.
 struct PtrLen {
@@ -645,6 +646,13 @@ struct BuilderCtx {
     public func_ptr_map: *HashMap<u64, *PtrLen>;    // hashmap: name -> [func_name_ptr, func_name_len]
     public closure_handle_map: *HashMap<u64, u64>;  // hashmap: name -> 1 if tagged lambda closure handle
     public addr_taken_map: *HashMap<u64, u64>;  // hashmap: name -> 1
+    public stack_new_candidate_map: *HashMap<u64, u64>; // hashmap: local pointer name -> 1
+    public stack_new_unsafe_map: *HashMap<u64, u64>;    // hashmap: local pointer name -> 1
+    public stack_new_delete_count_map: *HashMap<u64, u64>; // hashmap: local pointer name -> delete count
+    public stack_new_deleted_map: *HashMap<u64, u64>;   // hashmap: local pointer name -> already deleted in lexical scan
+    public stack_new_offset_map: *HashMap<u64, u64>;    // hashmap: local pointer name -> object stack offset
+    public stack_new_loop_depth: u64;
+    public stack_new_disabled: u64;
     public defer_stack: *Vec<*AstNode>;
     public defer_markers: *Vec<u64>;
     public defer_loop_markers: *Vec<u64>;
@@ -669,6 +677,13 @@ impl BuilderCtx {
         self.func_ptr_map = 0;
         self.closure_handle_map = 0;
         self.addr_taken_map = 0;
+        self.stack_new_candidate_map = 0;
+        self.stack_new_unsafe_map = 0;
+        self.stack_new_delete_count_map = 0;
+        self.stack_new_deleted_map = 0;
+        self.stack_new_offset_map = 0;
+        self.stack_new_loop_depth = 0;
+        self.stack_new_disabled = 0;
         self.defer_stack = 0;
         self.defer_markers = 0;
         self.defer_loop_markers = 0;
@@ -735,6 +750,18 @@ func reset_func(ctx: *BuilderCtx) -> u64 {
     ctx.closure_handle_map.ensure_capacity(16);
     ctx.addr_taken_map = new HashMap<u64, u64>{0, 0, 0};
     ctx.addr_taken_map.ensure_capacity(16);
+    ctx.stack_new_candidate_map = new HashMap<u64, u64>{0, 0, 0};
+    ctx.stack_new_candidate_map.ensure_capacity(16);
+    ctx.stack_new_unsafe_map = new HashMap<u64, u64>{0, 0, 0};
+    ctx.stack_new_unsafe_map.ensure_capacity(16);
+    ctx.stack_new_delete_count_map = new HashMap<u64, u64>{0, 0, 0};
+    ctx.stack_new_delete_count_map.ensure_capacity(16);
+    ctx.stack_new_deleted_map = new HashMap<u64, u64>{0, 0, 0};
+    ctx.stack_new_deleted_map.ensure_capacity(16);
+    ctx.stack_new_offset_map = new HashMap<u64, u64>{0, 0, 0};
+    ctx.stack_new_offset_map.ensure_capacity(16);
+    ctx.stack_new_loop_depth = 0;
+    ctx.stack_new_disabled = 0;
     ctx.defer_stack = new Vec<*AstNode>{heap_alloc((16) * sizeof(*AstNode)), 0, (16)};
     ctx.defer_markers = new Vec<u64>{heap_alloc((16) * sizeof(u64)), 0, (16)};
     ctx.defer_loop_markers = new Vec<u64>{heap_alloc((8) * sizeof(u64)), 0, (8)};
@@ -767,6 +794,892 @@ func mark_addr_taken(ctx: *BuilderCtx, name: []u8) -> u64 {
 func is_addr_taken(ctx: *BuilderCtx, name: []u8) -> u64 {
     if (ctx.addr_taken_map == 0) { return 0; }
     return ctx.addr_taken_map.get(slice(name.ptr, name.len));
+}
+
+func stack_new_unwrap_new_expr(expr: *AstNode) -> *AstNew {
+    if (expr == 0) { return 0; }
+    var kind: u64 = ast_kind(expr);
+    if (kind == AST_NEW) { return (*AstNew)expr; }
+    if (kind == AST_CAST) {
+        var cs: *AstCast = (*AstCast)expr;
+        return stack_new_unwrap_new_expr(cs.expr);
+    }
+    return 0;
+}
+
+func stack_new_alloc_size(nw: *AstNew) -> u64 {
+    if (nw == 0 || nw.array_len_is_param != 0) { return 0; }
+    if (nw.type_kind == TYPE_ARRAY) {
+        var elem_size: u64 = 0;
+        if (nw.elem_typeinfo != 0) {
+            elem_size = sizeof_type_ex(nw.elem_typeinfo);
+        } else {
+            elem_size = layout_type_sizeof(nw.elem_type_kind, nw.elem_ptr_depth, nw.struct_name);
+        }
+        return elem_size * nw.array_len;
+    }
+    if (nw.type_kind == TYPE_SLICE) { return 16; }
+    return layout_type_sizeof(nw.type_kind, nw.ptr_depth, nw.struct_name);
+}
+
+func stack_new_tag_layout_has_memory_state(layout: []u8) -> u64 {
+    if (layout.ptr == 0 || layout.len == 0) { return 0; }
+    if (str_eq(layout, slice("BppObjectTag", str_len("BppObjectTag"))) != 0) { return 1; }
+    if (str_eq(layout, slice("std_mem__BppObjectTag", str_len("std_mem__BppObjectTag"))) != 0) { return 1; }
+    return 0;
+}
+
+func stack_new_decl_tag_layout(vd: *AstVarDecl, nw: *AstNew) -> []u8 {
+    if (vd != 0 && vd.is_tagged != 0 && vd.tag_layout.ptr != 0) { return vd.tag_layout; }
+    if (nw != 0 && nw.is_tagged != 0 && nw.tag_layout.ptr != 0) { return nw.tag_layout; }
+    return slice(0, 0);
+}
+
+func stack_new_decl_uses_memory_state_tag(vd: *AstVarDecl, nw: *AstNew) -> u64 {
+    if (vd == 0 || nw == 0) { return 0; }
+    if (vd.is_tagged == 0 && nw.is_tagged == 0) { return 0; }
+    return stack_new_tag_layout_has_memory_state(stack_new_decl_tag_layout(vd, nw));
+}
+
+func stack_new_decl_is_candidate(vd: *AstVarDecl) -> u64 {
+    if (vd == 0 || vd.init_expr == 0) { return 0; }
+    if (vd.ptr_depth == 0) { return 0; }
+    var nw: *AstNew = stack_new_unwrap_new_expr(vd.init_expr);
+    if (nw == 0) { return 0; }
+    if ((vd.is_tagged != 0 || nw.is_tagged != 0) && stack_new_decl_uses_memory_state_tag(vd, nw) == 0) { return 0; }
+    if (nw.ctor_args_vec != 0 && nw.type_kind != TYPE_STRUCT) { return 0; }
+    var size: u64 = stack_new_alloc_size(nw);
+    if (size == 0 || size > SSA_STACK_NEW_MAX_BYTES) { return 0; }
+    return 1;
+}
+
+func stack_new_mark_candidate(ctx: *BuilderCtx, name: []u8) -> u64 {
+    if (ctx == 0 || name.ptr == 0 || name.len == 0) { return 0; }
+    if (ctx.stack_new_candidate_map == 0) {
+        ctx.stack_new_candidate_map = new HashMap<u64, u64>{0, 0, 0};
+        ctx.stack_new_candidate_map.ensure_capacity(16);
+    }
+    ctx.stack_new_candidate_map.put(slice(name.ptr, name.len), 1);
+    return 1;
+}
+
+func stack_new_is_candidate_name(ctx: *BuilderCtx, name: []u8) -> u64 {
+    if (ctx == 0 || ctx.stack_new_candidate_map == 0 || name.ptr == 0 || name.len == 0) { return 0; }
+    return ctx.stack_new_candidate_map.get(slice(name.ptr, name.len));
+}
+
+func stack_new_mark_unsafe_name(ctx: *BuilderCtx, name: []u8) -> u64 {
+    if (ctx == 0 || name.ptr == 0 || name.len == 0) { return 0; }
+    if (stack_new_is_candidate_name(ctx, name) == 0) { return 0; }
+    if (ctx.stack_new_unsafe_map == 0) {
+        ctx.stack_new_unsafe_map = new HashMap<u64, u64>{0, 0, 0};
+        ctx.stack_new_unsafe_map.ensure_capacity(16);
+    }
+    ctx.stack_new_unsafe_map.put(slice(name.ptr, name.len), 1);
+    return 1;
+}
+
+func stack_new_record_delete_name(ctx: *BuilderCtx, name: []u8) -> u64 {
+    if (ctx == 0 || name.ptr == 0 || name.len == 0) { return 0; }
+    if (stack_new_is_candidate_name(ctx, name) == 0) { return 0; }
+    if (ctx.stack_new_delete_count_map == 0) {
+        ctx.stack_new_delete_count_map = new HashMap<u64, u64>{0, 0, 0};
+        ctx.stack_new_delete_count_map.ensure_capacity(16);
+    }
+    var old_count: u64 = ctx.stack_new_delete_count_map.get(slice(name.ptr, name.len));
+    ctx.stack_new_delete_count_map.put(slice(name.ptr, name.len), old_count + 1);
+    return 1;
+}
+
+func stack_new_mark_deleted_name(ctx: *BuilderCtx, name: []u8) -> u64 {
+    if (ctx == 0 || name.ptr == 0 || name.len == 0) { return 0; }
+    if (stack_new_is_candidate_name(ctx, name) == 0) { return 0; }
+    if (ctx.stack_new_deleted_map == 0) {
+        ctx.stack_new_deleted_map = new HashMap<u64, u64>{0, 0, 0};
+        ctx.stack_new_deleted_map.ensure_capacity(16);
+    }
+    ctx.stack_new_deleted_map.put(slice(name.ptr, name.len), 1);
+    return 1;
+}
+
+func stack_new_is_deleted_name(ctx: *BuilderCtx, name: []u8) -> u64 {
+    if (ctx == 0 || ctx.stack_new_deleted_map == 0 || name.ptr == 0 || name.len == 0) { return 0; }
+    return ctx.stack_new_deleted_map.get(slice(name.ptr, name.len));
+}
+
+func stack_new_note_use_name(ctx: *BuilderCtx, name: []u8, safe_object_use: u64) -> u64 {
+    if (ctx == 0 || name.ptr == 0 || name.len == 0) { return 0; }
+    if (stack_new_is_candidate_name(ctx, name) == 0) { return 0; }
+    if (stack_new_is_deleted_name(ctx, name) != 0) {
+        stack_new_mark_unsafe_name(ctx, name);
+        return 0;
+    }
+    if (safe_object_use == 0) { stack_new_mark_unsafe_name(ctx, name); }
+    return 0;
+}
+
+func stack_new_is_safe_name(ctx: *BuilderCtx, name: []u8) -> u64 {
+    if (ctx == 0 || ctx.stack_new_disabled != 0) { return 0; }
+    if (stack_new_is_candidate_name(ctx, name) == 0) { return 0; }
+    if (ctx.stack_new_unsafe_map != 0 && ctx.stack_new_unsafe_map.get(slice(name.ptr, name.len)) != 0) { return 0; }
+    if (ctx.stack_new_delete_count_map != 0 && ctx.stack_new_delete_count_map.get(slice(name.ptr, name.len)) > 1) { return 0; }
+    return 1;
+}
+
+func stack_new_set_offset(ctx: *BuilderCtx, name: []u8, offset: u64) -> u64 {
+    if (ctx == 0 || name.ptr == 0 || name.len == 0 || offset == 0) { return 0; }
+    if (ctx.stack_new_offset_map == 0) {
+        ctx.stack_new_offset_map = new HashMap<u64, u64>{0, 0, 0};
+        ctx.stack_new_offset_map.ensure_capacity(16);
+    }
+    ctx.stack_new_offset_map.put(slice(name.ptr, name.len), offset);
+    return 1;
+}
+
+func stack_new_get_offset(ctx: *BuilderCtx, name: []u8) -> u64 {
+    if (ctx == 0 || ctx.stack_new_offset_map == 0 || name.ptr == 0 || name.len == 0) { return 0; }
+    return ctx.stack_new_offset_map.get(slice(name.ptr, name.len));
+}
+
+func stack_new_expr_offset(ctx: *BuilderCtx, expr: *AstNode) -> u64 {
+    if (ctx == 0 || expr == 0) { return 0; }
+    if (ast_kind(expr) == AST_CAST) {
+        var cs: *AstCast = (*AstCast)expr;
+        return stack_new_expr_offset(ctx, cs.expr);
+    }
+    if (ast_kind(expr) != AST_IDENT) { return 0; }
+    var idn: *AstIdent = (*AstIdent)expr;
+    return stack_new_get_offset(ctx, idn.name);
+}
+
+func stack_new_note_sroa_field(ctx: *BuilderCtx) -> u64 {
+    if (ctx != 0 && ctx.cur_func != 0) {
+        ctx.cur_func.stack_new_sroa_field_count = ctx.cur_func.stack_new_sroa_field_count + 1;
+    }
+    return 0;
+}
+
+func stack_new_delete_expr_offset(ctx: *BuilderCtx, expr: *AstNode) -> u64 {
+    if (expr == 0 || ast_kind(expr) != AST_IDENT) { return 0; }
+    var idn: *AstIdent = (*AstIdent)expr;
+    return stack_new_get_offset(ctx, idn.name);
+}
+
+func stack_new_expr_candidate_ident(ctx: *BuilderCtx, expr: *AstNode) -> *NameInfo {
+    if (ctx == 0 || expr == 0) { return 0; }
+    if (ast_kind(expr) == AST_CAST) {
+        var cs: *AstCast = (*AstCast)expr;
+        return stack_new_expr_candidate_ident(ctx, cs.expr);
+    }
+    if (ast_kind(expr) != AST_IDENT) { return 0; }
+    var idn: *AstIdent = (*AstIdent)expr;
+    if (stack_new_is_candidate_name(ctx, idn.name) == 0) { return 0; }
+    return new NameInfo{idn.name.ptr, idn.name.len};
+}
+
+func stack_new_expr_is_named_ident(expr: *AstNode, name: []u8) -> u64 {
+    if (expr == 0 || name.ptr == 0 || name.len == 0) { return 0; }
+    if (ast_kind(expr) == AST_CAST) {
+        var cs: *AstCast = (*AstCast)expr;
+        return stack_new_expr_is_named_ident(cs.expr, name);
+    }
+    if (ast_kind(expr) != AST_IDENT) { return 0; }
+    var idn: *AstIdent = (*AstIdent)expr;
+    return str_eq(idn.name, name);
+}
+
+func stack_new_call_is_tag_metadata_read(call: *AstCall) -> u64 {
+    if (call == 0) { return 0; }
+    var resolved_name: *PtrLen = resolve_symbol_name(call.name);
+    var name: []u8 = call.name;
+    if (resolved_name != 0 && resolved_name.ptr != 0 && resolved_name.len != 0) {
+        name = slice(resolved_name.ptr, resolved_name.len);
+    }
+    if (str_eq(name, slice("bpp_tag_lifecycle_raw", str_len("bpp_tag_lifecycle_raw"))) != 0) { return 1; }
+    if (str_eq(name, slice("bpp_tag_ownership_raw", str_len("bpp_tag_ownership_raw"))) != 0) { return 1; }
+    if (str_eq(name, slice("bpp_tag_storage_raw", str_len("bpp_tag_storage_raw"))) != 0) { return 1; }
+    if (str_eq(name, slice("bpp_tag_barrier_raw", str_len("bpp_tag_barrier_raw"))) != 0) { return 1; }
+    if (str_eq(name, slice("bpp_tag_shape_raw", str_len("bpp_tag_shape_raw"))) != 0) { return 1; }
+    if (str_eq(name, slice("bpp_tag_profiled_raw", str_len("bpp_tag_profiled_raw"))) != 0) { return 1; }
+    if (str_eq(name, slice("std_mem__bpp_tag_lifecycle_raw", str_len("std_mem__bpp_tag_lifecycle_raw"))) != 0) { return 1; }
+    if (str_eq(name, slice("std_mem__bpp_tag_ownership_raw", str_len("std_mem__bpp_tag_ownership_raw"))) != 0) { return 1; }
+    if (str_eq(name, slice("std_mem__bpp_tag_storage_raw", str_len("std_mem__bpp_tag_storage_raw"))) != 0) { return 1; }
+    if (str_eq(name, slice("std_mem__bpp_tag_barrier_raw", str_len("std_mem__bpp_tag_barrier_raw"))) != 0) { return 1; }
+    if (str_eq(name, slice("std_mem__bpp_tag_shape_raw", str_len("std_mem__bpp_tag_shape_raw"))) != 0) { return 1; }
+    if (str_eq(name, slice("std_mem__bpp_tag_profiled_raw", str_len("std_mem__bpp_tag_profiled_raw"))) != 0) { return 1; }
+    return 0;
+}
+
+func scan_stack_new_tag_metadata_args(ctx: *BuilderCtx, args: *Vec<*AstNode>) -> u64 {
+    if (args == 0) { return 0; }
+    var n: u64 = args.len();
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var candidate: *NameInfo = stack_new_expr_candidate_ident(ctx, args.get(i));
+        if (candidate != 0) {
+            stack_new_note_use_name(ctx, slice(candidate.ptr, candidate.len), 1);
+        } else {
+            scan_stack_new_escapes_expr(ctx, args.get(i), 0);
+        }
+    }
+    return 0;
+}
+
+func stack_new_param_bit(param_index: u64) -> u64 {
+    if (param_index >= 63) { return 0; }
+    return 1 << param_index;
+}
+
+func stack_new_fn_noescape_summary_build(fn: *AstFunc, depth: u64) -> u64 {
+    if (fn == 0 || fn.body == 0 || fn.params_vec == 0 || depth > 4) { return 0; }
+    if (fn.stack_noescape_summary_state == 2) { return 1; }
+    if (fn.stack_noescape_summary_state == 1) { return 0; }
+
+    fn.stack_noescape_summary_state = 1;
+    fn.stack_noescape_param_bits = 0;
+
+    var n: u64 = fn.params_vec.len();
+    if (n > 63) { n = 63; }
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var param: *Param = fn.params_vec.get(i);
+        if (param == 0 || param.ptr_depth == 0 || param.name.ptr == 0 || param.name.len == 0) { continue; }
+        if (stack_new_scan_param_stmt_unsafe(fn.body, param.name, depth + 1) == 0) {
+            fn.stack_noescape_param_bits = fn.stack_noescape_param_bits | stack_new_param_bit(i);
+        }
+    }
+
+    fn.stack_noescape_summary_state = 2;
+    return 1;
+}
+
+func stack_new_param_call_arg_noescape(call: *AstCall, arg_index: u64, depth: u64) -> u64 {
+    if (call == 0 || depth > 3) { return 0; }
+    var resolved_name: *PtrLen = resolve_symbol_name(call.name);
+    var fn_call: *AstFunc = find_callable_func_any(call.name, slice(resolved_name.ptr, resolved_name.len));
+    return stack_new_fn_param_noescape(fn_call, arg_index, depth + 1);
+}
+
+func stack_new_scan_param_expr_vec_unsafe(exprs: *Vec<*AstNode>, name: []u8, depth: u64) -> u64 {
+    if (exprs == 0) { return 0; }
+    var n: u64 = exprs.len();
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        if (stack_new_scan_param_expr_unsafe(exprs.get(i), name, 0, depth) != 0) { return 1; }
+    }
+    return 0;
+}
+
+func stack_new_scan_param_call_args_unsafe(call: *AstCall, name: []u8, depth: u64) -> u64 {
+    if (call == 0 || call.args_vec == 0) { return 0; }
+    var n: u64 = call.args_vec.len();
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var arg: *AstNode = call.args_vec.get(i);
+        if (stack_new_expr_is_named_ident(arg, name) != 0) {
+            if (stack_new_param_call_arg_noescape(call, i, depth) == 0) { return 1; }
+        } else if (stack_new_scan_param_expr_unsafe(arg, name, 0, depth) != 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+func stack_new_scan_param_assign_target_unsafe(target: *AstNode, name: []u8, depth: u64) -> u64 {
+    if (target == 0) { return 0; }
+    var kind: u64 = ast_kind(target);
+    var nref: AstNodeTagRef;
+    nref.node = target;
+    match (kind) {
+        case AST_IDENT:
+            var idn: *AstIdent = nref.ident;
+            if (str_eq(idn.name, name) != 0) { return 1; }
+            return 0;
+        case AST_MEMBER_ACCESS:
+        case AST_SAFE_MEMBER_ACCESS:
+            var ma: *AstMemberAccess = nref.member_access;
+            return stack_new_scan_param_expr_unsafe(ma.object, name, 1, depth);
+        case AST_DEREF:
+            var dr: *AstDeref = nref.deref;
+            return stack_new_scan_param_expr_unsafe(dr.operand, name, 1, depth);
+        case AST_DEREF8:
+            var dr8: *AstDeref8 = nref.deref8;
+            return stack_new_scan_param_expr_unsafe(dr8.operand, name, 1, depth);
+        case AST_INDEX:
+        case AST_SAFE_INDEX:
+            var ix: *AstIndex = nref.index_expr;
+            if (stack_new_scan_param_expr_unsafe(ix.base, name, 1, depth) != 0) { return 1; }
+            return stack_new_scan_param_expr_unsafe(ix.index, name, 0, depth);
+    }
+    return stack_new_scan_param_expr_unsafe(target, name, 0, depth);
+}
+
+func stack_new_scan_param_expr_unsafe(expr: *AstNode, name: []u8, safe_object_use: u64, depth: u64) -> u64 {
+    if (expr == 0) { return 0; }
+    var kind: u64 = ast_kind(expr);
+    var nref: AstNodeTagRef;
+    nref.node = expr;
+    match (kind) {
+        case AST_IDENT:
+            var idn: *AstIdent = nref.ident;
+            if (str_eq(idn.name, name) != 0 && safe_object_use == 0) { return 1; }
+            return 0;
+        case AST_BINARY:
+            var bin: *AstBinary = nref.binary;
+            if (stack_new_scan_param_expr_unsafe(bin.left, name, 0, depth) != 0) { return 1; }
+            return stack_new_scan_param_expr_unsafe(bin.right, name, 0, depth);
+        case AST_TERNARY:
+            var tern: *AstTernary = nref.ternary_expr;
+            if (stack_new_scan_param_expr_unsafe(tern.cond, name, 0, depth) != 0) { return 1; }
+            if (stack_new_scan_param_expr_unsafe(tern.then_expr, name, 0, depth) != 0) { return 1; }
+            return stack_new_scan_param_expr_unsafe(tern.else_expr, name, 0, depth);
+        case AST_UNARY:
+            var un: *AstUnary = nref.unary;
+            return stack_new_scan_param_expr_unsafe(un.operand, name, 0, depth);
+        case AST_TRY:
+            var tr: *AstTry = nref.try_expr;
+            return stack_new_scan_param_expr_unsafe(tr.operand, name, 0, depth);
+        case AST_CAST:
+            var cs: *AstCast = nref.cast_expr;
+            return stack_new_scan_param_expr_unsafe(cs.expr, name, safe_object_use, depth);
+        case AST_ADDR_OF:
+            var ao: *AstAddrOf = nref.addr_of;
+            return stack_new_scan_param_expr_unsafe(ao.operand, name, 0, depth);
+        case AST_DEREF:
+            var dr: *AstDeref = nref.deref;
+            return stack_new_scan_param_expr_unsafe(dr.operand, name, 1, depth);
+        case AST_DEREF8:
+            var dr8: *AstDeref8 = nref.deref8;
+            return stack_new_scan_param_expr_unsafe(dr8.operand, name, 1, depth);
+        case AST_INDEX:
+        case AST_SAFE_INDEX:
+            var ix: *AstIndex = nref.index_expr;
+            if (stack_new_scan_param_expr_unsafe(ix.base, name, 1, depth) != 0) { return 1; }
+            return stack_new_scan_param_expr_unsafe(ix.index, name, 0, depth);
+        case AST_MEMBER_ACCESS:
+        case AST_SAFE_MEMBER_ACCESS:
+            var ma: *AstMemberAccess = nref.member_access;
+            return stack_new_scan_param_expr_unsafe(ma.object, name, 1, depth);
+        case AST_CALL:
+            return stack_new_scan_param_call_args_unsafe(nref.call, name, depth);
+        case AST_GENERIC_CALL:
+            var gcall: *AstGenericCall = nref.generic_call;
+            return stack_new_scan_param_expr_vec_unsafe(gcall.args_vec, name, depth);
+        case AST_STATIC_GENERIC_CALL:
+            var sgc: *AstStaticGenericCall = nref.static_generic_call;
+            return stack_new_scan_param_expr_vec_unsafe(sgc.args_vec, name, depth);
+        case AST_METHOD_CALL:
+        case AST_SAFE_METHOD_CALL:
+            var mc: *AstMethodCall = nref.method_call;
+            if (stack_new_scan_param_expr_unsafe(mc.receiver, name, 0, depth) != 0) { return 1; }
+            return stack_new_scan_param_expr_vec_unsafe(mc.args_vec, name, depth);
+        case AST_CALL_PTR:
+            var cp: *AstCallPtr = nref.call_ptr;
+            if (stack_new_scan_param_expr_unsafe(cp.callee, name, 0, depth) != 0) { return 1; }
+            return stack_new_scan_param_expr_vec_unsafe(cp.args_vec, name, depth);
+        case AST_SLICE:
+            var sl: *AstSlice = nref.slice_expr;
+            if (stack_new_scan_param_expr_unsafe(sl.ptr_expr, name, 0, depth) != 0) { return 1; }
+            return stack_new_scan_param_expr_unsafe(sl.len_expr, name, 0, depth);
+        case AST_STRUCT_LITERAL:
+            var st: *AstStructLiteral = nref.struct_lit;
+            return stack_new_scan_param_expr_vec_unsafe(st.values_vec, name, depth);
+        case AST_GENERIC_STRUCT_LITERAL:
+            var gst: *AstGenericStructLiteral = nref.generic_struct_lit;
+            return stack_new_scan_param_expr_vec_unsafe(gst.values_vec, name, depth);
+        case AST_NEW:
+            var nw: *AstNew = nref.new_expr;
+            if (stack_new_scan_param_expr_unsafe(nw.literal_expr, name, 0, depth) != 0) { return 1; }
+            return stack_new_scan_param_expr_vec_unsafe(nw.ctor_args_vec, name, depth);
+    }
+    return 0;
+}
+
+func stack_new_scan_param_stmt_unsafe(stmt: *AstNode, name: []u8, depth: u64) -> u64 {
+    if (stmt == 0) { return 0; }
+    var kind: u64 = ast_kind(stmt);
+    var nref: AstNodeTagRef;
+    nref.node = stmt;
+    match (kind) {
+        case AST_VAR_DECL:
+            var vd: *AstVarDecl = nref.var_decl;
+            return stack_new_scan_param_expr_unsafe(vd.init_expr, name, 0, depth);
+        case AST_CONST_DECL:
+            var cd: *AstConstDecl = nref.const_decl;
+            return stack_new_scan_param_expr_unsafe((*AstNode)cd.value, name, 0, depth);
+        case AST_ASSIGN:
+            var asn: *AstAssign = nref.assign_stmt;
+            if (stack_new_scan_param_assign_target_unsafe(asn.target, name, depth) != 0) { return 1; }
+            return stack_new_scan_param_expr_unsafe(asn.value, name, 0, depth);
+        case AST_EXPR_STMT:
+            var es: *AstExprStmt = nref.expr_stmt;
+            return stack_new_scan_param_expr_unsafe(es.expr, name, 0, depth);
+        case AST_DEFER:
+            var df: *AstDefer = nref.defer_stmt;
+            return stack_new_scan_param_stmt_unsafe(df.stmt, name, depth);
+        case AST_DELETE:
+            var dl: *AstDelete = nref.delete_stmt;
+            if (stack_new_expr_is_named_ident(dl.expr, name) != 0) { return 1; }
+            return stack_new_scan_param_expr_unsafe(dl.expr, name, 0, depth);
+        case AST_RETURN:
+            var ret: *AstReturn = nref.ret_stmt;
+            return stack_new_scan_param_expr_unsafe(ret.expr, name, 0, depth);
+        case AST_IF:
+            var ifs: *AstIf = nref.if_stmt;
+            if (stack_new_scan_param_expr_unsafe(ifs.cond, name, 0, depth) != 0) { return 1; }
+            if (stack_new_scan_param_stmt_unsafe(ifs.then_block, name, depth) != 0) { return 1; }
+            return stack_new_scan_param_stmt_unsafe(ifs.else_block, name, depth);
+        case AST_WHILE:
+            var wl: *AstWhile = nref.while_stmt;
+            if (stack_new_scan_param_expr_unsafe(wl.cond, name, 0, depth) != 0) { return 1; }
+            return stack_new_scan_param_stmt_unsafe(wl.body, name, depth);
+        case AST_FOR:
+            var fr: *AstFor = nref.for_stmt;
+            if (stack_new_scan_param_stmt_unsafe(fr.init, name, depth) != 0) { return 1; }
+            if (stack_new_scan_param_expr_unsafe(fr.cond, name, 0, depth) != 0) { return 1; }
+            if (stack_new_scan_param_expr_unsafe(fr.update, name, 0, depth) != 0) { return 1; }
+            return stack_new_scan_param_stmt_unsafe(fr.body, name, depth);
+        case AST_DO_WHILE:
+            var dw: *AstDoWhile = nref.do_while_stmt;
+            if (stack_new_scan_param_stmt_unsafe(dw.body, name, depth) != 0) { return 1; }
+            return stack_new_scan_param_expr_unsafe(dw.cond, name, 0, depth);
+        case AST_SWITCH:
+        case AST_MATCH:
+            var sw: *AstSwitch = nref.switch_stmt;
+            if (stack_new_scan_param_expr_unsafe(sw.expr, name, 0, depth) != 0) { return 1; }
+            if (sw.cases_vec == 0) { return 0; }
+            var cn: u64 = sw.cases_vec.len();
+            for (var ci: u64 = 0; ci < cn; ci = ci + 1) {
+                if (stack_new_scan_param_stmt_unsafe(sw.cases_vec.get(ci), name, depth) != 0) { return 1; }
+            }
+            return 0;
+        case AST_CASE:
+            var cs: *AstCase = nref.case_stmt;
+            if (stack_new_scan_param_expr_unsafe(cs.value, name, 0, depth) != 0) { return 1; }
+            return stack_new_scan_param_stmt_unsafe(cs.body, name, depth);
+        case AST_BLOCK:
+            var blk: *AstBlock = nref.block_stmt;
+            if (blk.stmts_vec == 0) { return 0; }
+            var n: u64 = blk.stmts_vec.len();
+            for (var i: u64 = 0; i < n; i = i + 1) {
+                if (stack_new_scan_param_stmt_unsafe(blk.stmts_vec.get(i), name, depth) != 0) { return 1; }
+            }
+            return 0;
+        case AST_TRY_STMT:
+            var ts: *AstTryStmt = (*AstTryStmt)stmt;
+            if (stack_new_scan_param_stmt_unsafe(ts.try_block, name, depth) != 0) { return 1; }
+            if (stack_new_scan_param_stmt_unsafe(ts.catch_block, name, depth) != 0) { return 1; }
+            return stack_new_scan_param_stmt_unsafe(ts.finally_block, name, depth);
+        case AST_THROW_STMT:
+            var th: *AstThrowStmt = (*AstThrowStmt)stmt;
+            return stack_new_scan_param_expr_unsafe(th.expr, name, 0, depth);
+    }
+    return 0;
+}
+
+func stack_new_fn_param_noescape(fn: *AstFunc, param_index: u64, depth: u64) -> u64 {
+    if (fn == 0 || fn.body == 0 || fn.params_vec == 0 || depth > 4) { return 0; }
+    if (param_index >= fn.params_vec.len()) { return 0; }
+    var param: *Param = fn.params_vec.get(param_index);
+    if (param == 0 || param.ptr_depth == 0 || param.name.ptr == 0 || param.name.len == 0) { return 0; }
+    if (param_index < 63) {
+        if (fn.stack_noescape_summary_state != 2) {
+            if (stack_new_fn_noescape_summary_build(fn, depth) == 0) { return 0; }
+        }
+        if ((fn.stack_noescape_param_bits & stack_new_param_bit(param_index)) != 0) { return 1; }
+        return 0;
+    }
+    if (stack_new_scan_param_stmt_unsafe(fn.body, param.name, depth) != 0) { return 0; }
+    return 1;
+}
+
+func scan_stack_new_arg_with_callee(ctx: *BuilderCtx, arg: *AstNode, fn: *AstFunc, param_index: u64) -> u64 {
+    var candidate: *NameInfo = stack_new_expr_candidate_ident(ctx, arg);
+    if (candidate != 0) {
+        if (stack_new_fn_param_noescape(fn, param_index, 0) != 0) {
+            stack_new_note_use_name(ctx, slice(candidate.ptr, candidate.len), 1);
+            if (ctx != 0 && ctx.cur_func != 0) {
+                ctx.cur_func.stack_new_noescape_callsite_count = ctx.cur_func.stack_new_noescape_callsite_count + 1;
+            }
+        } else {
+            stack_new_mark_unsafe_name(ctx, slice(candidate.ptr, candidate.len));
+        }
+        return 0;
+    }
+    scan_stack_new_escapes_expr(ctx, arg, 0);
+    return 0;
+}
+
+func scan_stack_new_call_args_with_callee(ctx: *BuilderCtx, args: *Vec<*AstNode>, fn: *AstFunc, param_start: u64) -> u64 {
+    if (args == 0) { return 0; }
+    var n: u64 = args.len();
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        scan_stack_new_arg_with_callee(ctx, args.get(i), fn, param_start + i);
+    }
+    return 0;
+}
+
+func stack_new_resolve_direct_call(call: *AstCall) -> *AstFunc {
+    if (call == 0) { return 0; }
+    var resolved_name: *PtrLen = resolve_symbol_name(call.name);
+    return find_callable_func_any(call.name, slice(resolved_name.ptr, resolved_name.len));
+}
+
+func stack_new_resolve_method_call(ctx: *BuilderCtx, mc: *AstMethodCall) -> *AstFunc {
+    if (ctx == 0 || mc == 0 || mc.receiver == 0) { return 0; }
+    var recv_ti: *TypeInfo = get_expr_type_with_symtab(mc.receiver, ctx.symtab);
+    if (recv_ti == 0 || recv_ti.type_kind != TYPE_STRUCT) { return 0; }
+    var owner_ptr: u64 = u8_slice_ptr(recv_ti.struct_name);
+    var owner_len: u64 = u8_slice_len(recv_ti.struct_name);
+    if ((owner_ptr == 0 || owner_len == 0) && recv_ti.struct_def != 0) {
+        owner_ptr = u8_slice_ptr(recv_ti.struct_def.name);
+        owner_len = u8_slice_len(recv_ti.struct_def.name);
+    }
+    if (owner_ptr == 0 || owner_len == 0) { return 0; }
+    var nargs: u64 = 0;
+    if (mc.args_vec != 0) { nargs = mc.args_vec.len(); }
+    var arg_types: *Vec<*TypeInfo> = builder_collect_arg_types_for_method_resolution(mc.args_vec, ctx.symtab);
+    var resolved_method: CompilerMethodResolveResult = sym_resolve_method_overload_with_count_fallback(slice(owner_ptr, owner_len), mc.method, arg_types, nargs);
+    if (resolved_method.found != 0 && resolved_method.fn != 0) { return resolved_method.fn; }
+    var recv_def: *AstStructDef = recv_ti.struct_def;
+    if (recv_def == 0) { recv_def = get_struct_def(slice(owner_ptr, owner_len)); }
+    if (recv_def != 0) { return find_method_func_in_hierarchy_with_arg_count(recv_def, mc.method, nargs); }
+    return 0;
+}
+
+func scan_stack_new_candidates_expr_vec(ctx: *BuilderCtx, exprs: *Vec<*AstNode>) -> u64 {
+    if (exprs == 0) { return 0; }
+    var n: u64 = exprs.len();
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var expr: *AstNode = exprs.get(i);
+        if (expr != 0 && ast_kind(expr) == AST_NEW) {
+            var nw: *AstNew = (*AstNew)expr;
+            scan_stack_new_candidates_expr_vec(ctx, nw.ctor_args_vec);
+            if (nw.literal_expr != 0 && ast_kind(nw.literal_expr) == AST_STRUCT_LITERAL) {
+                var lit: *AstStructLiteral = (*AstStructLiteral)nw.literal_expr;
+                scan_stack_new_candidates_expr_vec(ctx, lit.values_vec);
+            }
+        }
+    }
+    return 0;
+}
+
+func scan_stack_new_candidates_stmt(ctx: *BuilderCtx, stmt: u64) -> u64 {
+    if (ctx == 0 || stmt == 0) { return 0; }
+    var kind: u64 = ast_kind(stmt);
+    var nref: AstNodeTagRef;
+    nref.node = (*AstNode)stmt;
+    match (kind) {
+        case AST_VAR_DECL:
+            var vd: *AstVarDecl = nref.var_decl;
+            if (stack_new_decl_is_candidate(vd) != 0) { stack_new_mark_candidate(ctx, vd.name); }
+            return 0;
+        case AST_DEFER:
+            var df: *AstDefer = nref.defer_stmt;
+            return scan_stack_new_candidates_stmt(ctx, df.stmt);
+        case AST_IF:
+            var ifs: *AstIf = nref.if_stmt;
+            scan_stack_new_candidates_stmt(ctx, ifs.then_block);
+            scan_stack_new_candidates_stmt(ctx, ifs.else_block);
+            return 0;
+        case AST_WHILE:
+            var wl: *AstWhile = nref.while_stmt;
+            return scan_stack_new_candidates_stmt(ctx, wl.body);
+        case AST_FOR:
+            var fr: *AstFor = nref.for_stmt;
+            scan_stack_new_candidates_stmt(ctx, fr.init);
+            scan_stack_new_candidates_stmt(ctx, fr.body);
+            return 0;
+        case AST_DO_WHILE:
+            var dw: *AstDoWhile = nref.do_while_stmt;
+            return scan_stack_new_candidates_stmt(ctx, dw.body);
+        case AST_SWITCH:
+        case AST_MATCH:
+            var sw: *AstSwitch = nref.switch_stmt;
+            if (sw.cases_vec == 0) { return 0; }
+            var cn: u64 = sw.cases_vec.len();
+            for (var ci: u64 = 0; ci < cn; ci = ci + 1) {
+                scan_stack_new_candidates_stmt(ctx, sw.cases_vec.get(ci));
+            }
+            return 0;
+        case AST_CASE:
+            var cs: *AstCase = nref.case_stmt;
+            return scan_stack_new_candidates_stmt(ctx, cs.body);
+        case AST_BLOCK:
+            var blk: *AstBlock = nref.block_stmt;
+            if (blk.stmts_vec == 0) { return 0; }
+            var n: u64 = blk.stmts_vec.len();
+            for (var i: u64 = 0; i < n; i = i + 1) {
+                scan_stack_new_candidates_stmt(ctx, blk.stmts_vec.get(i));
+            }
+            return 0;
+        case AST_TRY_STMT:
+            var ts: *AstTryStmt = (*AstTryStmt)stmt;
+            scan_stack_new_candidates_stmt(ctx, ts.try_block);
+            scan_stack_new_candidates_stmt(ctx, ts.catch_block);
+            scan_stack_new_candidates_stmt(ctx, ts.finally_block);
+            return 0;
+    }
+    return 0;
+}
+
+func scan_stack_new_escapes_expr_vec(ctx: *BuilderCtx, exprs: *Vec<*AstNode>) -> u64 {
+    if (exprs == 0) { return 0; }
+    var n: u64 = exprs.len();
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        scan_stack_new_escapes_expr(ctx, exprs.get(i), 0);
+    }
+    return 0;
+}
+
+func scan_stack_new_assign_target(ctx: *BuilderCtx, target: *AstNode) -> u64 {
+    if (target == 0) { return 0; }
+    var kind: u64 = ast_kind(target);
+    var nref: AstNodeTagRef;
+    nref.node = target;
+    match (kind) {
+        case AST_IDENT:
+            var idn: *AstIdent = nref.ident;
+            stack_new_mark_unsafe_name(ctx, idn.name);
+            return 0;
+        case AST_MEMBER_ACCESS:
+        case AST_SAFE_MEMBER_ACCESS:
+            var ma: *AstMemberAccess = nref.member_access;
+            scan_stack_new_escapes_expr(ctx, ma.object, 1);
+            return 0;
+        case AST_DEREF:
+            var dr: *AstDeref = nref.deref;
+            scan_stack_new_escapes_expr(ctx, dr.operand, 1);
+            return 0;
+        case AST_DEREF8:
+            var dr8: *AstDeref8 = nref.deref8;
+            scan_stack_new_escapes_expr(ctx, dr8.operand, 1);
+            return 0;
+        case AST_INDEX:
+        case AST_SAFE_INDEX:
+            var ix: *AstIndex = nref.index_expr;
+            scan_stack_new_escapes_expr(ctx, ix.base, 1);
+            scan_stack_new_escapes_expr(ctx, ix.index, 0);
+            return 0;
+    }
+    scan_stack_new_escapes_expr(ctx, target, 0);
+    return 0;
+}
+
+func scan_stack_new_escapes_expr(ctx: *BuilderCtx, expr: *AstNode, safe_object_use: u64) -> u64 {
+    if (ctx == 0 || expr == 0) { return 0; }
+    var kind: u64 = ast_kind(expr);
+    var nref: AstNodeTagRef;
+    nref.node = expr;
+    match (kind) {
+        case AST_IDENT:
+            var idn: *AstIdent = nref.ident;
+            stack_new_note_use_name(ctx, idn.name, safe_object_use);
+            return 0;
+        case AST_BINARY:
+            var bin: *AstBinary = nref.binary;
+            scan_stack_new_escapes_expr(ctx, bin.left, 0);
+            scan_stack_new_escapes_expr(ctx, bin.right, 0);
+            return 0;
+        case AST_TERNARY:
+            var tern: *AstTernary = nref.ternary_expr;
+            scan_stack_new_escapes_expr(ctx, tern.cond, 0);
+            scan_stack_new_escapes_expr(ctx, tern.then_expr, 0);
+            scan_stack_new_escapes_expr(ctx, tern.else_expr, 0);
+            return 0;
+        case AST_UNARY:
+            var un: *AstUnary = nref.unary;
+            scan_stack_new_escapes_expr(ctx, un.operand, 0);
+            return 0;
+        case AST_TRY:
+            var tr: *AstTry = nref.try_expr;
+            scan_stack_new_escapes_expr(ctx, tr.operand, 0);
+            return 0;
+        case AST_CAST:
+            var cs: *AstCast = nref.cast_expr;
+            scan_stack_new_escapes_expr(ctx, cs.expr, safe_object_use);
+            return 0;
+        case AST_ADDR_OF:
+            var ao: *AstAddrOf = nref.addr_of;
+            scan_stack_new_escapes_expr(ctx, ao.operand, 0);
+            return 0;
+        case AST_DEREF:
+            var dr: *AstDeref = nref.deref;
+            scan_stack_new_escapes_expr(ctx, dr.operand, 1);
+            return 0;
+        case AST_DEREF8:
+            var dr8: *AstDeref8 = nref.deref8;
+            scan_stack_new_escapes_expr(ctx, dr8.operand, 1);
+            return 0;
+        case AST_INDEX:
+        case AST_SAFE_INDEX:
+            var ix: *AstIndex = nref.index_expr;
+            scan_stack_new_escapes_expr(ctx, ix.base, 1);
+            scan_stack_new_escapes_expr(ctx, ix.index, 0);
+            return 0;
+        case AST_MEMBER_ACCESS:
+        case AST_SAFE_MEMBER_ACCESS:
+            var ma: *AstMemberAccess = nref.member_access;
+            scan_stack_new_escapes_expr(ctx, ma.object, 1);
+            return 0;
+        case AST_CALL:
+            var call: *AstCall = nref.call;
+            if (stack_new_call_is_tag_metadata_read(call) != 0) {
+                scan_stack_new_tag_metadata_args(ctx, call.args_vec);
+                return 0;
+            }
+            scan_stack_new_call_args_with_callee(ctx, call.args_vec, stack_new_resolve_direct_call(call), 0);
+            return 0;
+        case AST_GENERIC_CALL:
+            var gcall: *AstGenericCall = nref.generic_call;
+            scan_stack_new_escapes_expr_vec(ctx, gcall.args_vec);
+            return 0;
+        case AST_STATIC_GENERIC_CALL:
+            var sgc: *AstStaticGenericCall = nref.static_generic_call;
+            scan_stack_new_escapes_expr_vec(ctx, sgc.args_vec);
+            return 0;
+        case AST_METHOD_CALL:
+        case AST_SAFE_METHOD_CALL:
+            var mc: *AstMethodCall = nref.method_call;
+            var method_fn: *AstFunc = stack_new_resolve_method_call(ctx, mc);
+            scan_stack_new_arg_with_callee(ctx, mc.receiver, method_fn, 0);
+            scan_stack_new_call_args_with_callee(ctx, mc.args_vec, method_fn, 1);
+            return 0;
+        case AST_CALL_PTR:
+            var cp: *AstCallPtr = nref.call_ptr;
+            scan_stack_new_escapes_expr(ctx, cp.callee, 0);
+            scan_stack_new_escapes_expr_vec(ctx, cp.args_vec);
+            return 0;
+        case AST_SLICE:
+            var sl: *AstSlice = nref.slice_expr;
+            scan_stack_new_escapes_expr(ctx, sl.ptr_expr, 0);
+            scan_stack_new_escapes_expr(ctx, sl.len_expr, 0);
+            return 0;
+        case AST_STRUCT_LITERAL:
+            var st: *AstStructLiteral = nref.struct_lit;
+            scan_stack_new_escapes_expr_vec(ctx, st.values_vec);
+            return 0;
+        case AST_GENERIC_STRUCT_LITERAL:
+            var gst: *AstGenericStructLiteral = nref.generic_struct_lit;
+            scan_stack_new_escapes_expr_vec(ctx, gst.values_vec);
+            return 0;
+        case AST_NEW:
+            var nw: *AstNew = nref.new_expr;
+            if (nw.literal_expr != 0) { scan_stack_new_escapes_expr(ctx, nw.literal_expr, 0); }
+            scan_stack_new_escapes_expr_vec(ctx, nw.ctor_args_vec);
+            return 0;
+    }
+    return 0;
+}
+
+func scan_stack_new_escapes_stmt(ctx: *BuilderCtx, stmt: u64) -> u64 {
+    if (ctx == 0 || stmt == 0) { return 0; }
+    var kind: u64 = ast_kind(stmt);
+    var nref: AstNodeTagRef;
+    nref.node = (*AstNode)stmt;
+    match (kind) {
+        case AST_VAR_DECL:
+            var vd: *AstVarDecl = nref.var_decl;
+            var nw: *AstNew = stack_new_unwrap_new_expr(vd.init_expr);
+            if (stack_new_is_candidate_name(ctx, vd.name) != 0 && nw != 0) {
+                if (nw.literal_expr != 0) { scan_stack_new_escapes_expr(ctx, nw.literal_expr, 0); }
+                scan_stack_new_escapes_expr_vec(ctx, nw.ctor_args_vec);
+            } else {
+                scan_stack_new_escapes_expr(ctx, vd.init_expr, 0);
+            }
+            return 0;
+        case AST_CONST_DECL:
+            return 0;
+        case AST_ASSIGN:
+            var asn: *AstAssign = nref.assign_stmt;
+            scan_stack_new_assign_target(ctx, asn.target);
+            scan_stack_new_escapes_expr(ctx, asn.value, 0);
+            return 0;
+        case AST_EXPR_STMT:
+            var es: *AstExprStmt = nref.expr_stmt;
+            scan_stack_new_escapes_expr(ctx, es.expr, 0);
+            return 0;
+        case AST_DEFER:
+            var df: *AstDefer = nref.defer_stmt;
+            scan_stack_new_escapes_stmt(ctx, df.stmt);
+            return 0;
+        case AST_DELETE:
+            var dl: *AstDelete = nref.delete_stmt;
+            if (dl.expr != 0 && ast_kind(dl.expr) == AST_IDENT) {
+                var idn: *AstIdent = (*AstIdent)dl.expr;
+                if (ctx.stack_new_loop_depth != 0 || stack_new_is_deleted_name(ctx, idn.name) != 0) {
+                    stack_new_mark_unsafe_name(ctx, idn.name);
+                }
+                stack_new_record_delete_name(ctx, idn.name);
+                stack_new_mark_deleted_name(ctx, idn.name);
+            } else {
+                scan_stack_new_escapes_expr(ctx, dl.expr, 0);
+            }
+            return 0;
+        case AST_RETURN:
+            var ret: *AstReturn = nref.ret_stmt;
+            scan_stack_new_escapes_expr(ctx, ret.expr, 0);
+            return 0;
+        case AST_IF:
+            var ifs: *AstIf = nref.if_stmt;
+            scan_stack_new_escapes_expr(ctx, ifs.cond, 0);
+            scan_stack_new_escapes_stmt(ctx, ifs.then_block);
+            scan_stack_new_escapes_stmt(ctx, ifs.else_block);
+            return 0;
+        case AST_WHILE:
+            var wl: *AstWhile = nref.while_stmt;
+            scan_stack_new_escapes_expr(ctx, wl.cond, 0);
+            ctx.stack_new_loop_depth = ctx.stack_new_loop_depth + 1;
+            scan_stack_new_escapes_stmt(ctx, wl.body);
+            ctx.stack_new_loop_depth = ctx.stack_new_loop_depth - 1;
+            return 0;
+        case AST_FOR:
+            var fr: *AstFor = nref.for_stmt;
+            scan_stack_new_escapes_stmt(ctx, fr.init);
+            scan_stack_new_escapes_expr(ctx, fr.cond, 0);
+            scan_stack_new_escapes_expr(ctx, fr.update, 0);
+            ctx.stack_new_loop_depth = ctx.stack_new_loop_depth + 1;
+            scan_stack_new_escapes_stmt(ctx, fr.body);
+            ctx.stack_new_loop_depth = ctx.stack_new_loop_depth - 1;
+            return 0;
+        case AST_DO_WHILE:
+            var dw: *AstDoWhile = nref.do_while_stmt;
+            ctx.stack_new_loop_depth = ctx.stack_new_loop_depth + 1;
+            scan_stack_new_escapes_stmt(ctx, dw.body);
+            ctx.stack_new_loop_depth = ctx.stack_new_loop_depth - 1;
+            scan_stack_new_escapes_expr(ctx, dw.cond, 0);
+            return 0;
+        case AST_SWITCH:
+        case AST_MATCH:
+            var sw: *AstSwitch = nref.switch_stmt;
+            scan_stack_new_escapes_expr(ctx, sw.expr, 0);
+            if (sw.cases_vec == 0) { return 0; }
+            var cn: u64 = sw.cases_vec.len();
+            for (var ci: u64 = 0; ci < cn; ci = ci + 1) {
+                scan_stack_new_escapes_stmt(ctx, sw.cases_vec.get(ci));
+            }
+            return 0;
+        case AST_CASE:
+            var cs: *AstCase = nref.case_stmt;
+            scan_stack_new_escapes_expr(ctx, cs.value, 0);
+            scan_stack_new_escapes_stmt(ctx, cs.body);
+            return 0;
+        case AST_BLOCK:
+            var blk: *AstBlock = nref.block_stmt;
+            if (blk.stmts_vec == 0) { return 0; }
+            var n: u64 = blk.stmts_vec.len();
+            for (var i: u64 = 0; i < n; i = i + 1) {
+                scan_stack_new_escapes_stmt(ctx, blk.stmts_vec.get(i));
+            }
+            return 0;
+        case AST_TRY_STMT:
+            var ts: *AstTryStmt = (*AstTryStmt)stmt;
+            scan_stack_new_escapes_stmt(ctx, ts.try_block);
+            scan_stack_new_escapes_stmt(ctx, ts.catch_block);
+            scan_stack_new_escapes_stmt(ctx, ts.finally_block);
+            return 0;
+        case AST_THROW_STMT:
+            var th: *AstThrowStmt = (*AstThrowStmt)stmt;
+            scan_stack_new_escapes_expr(ctx, th.expr, 0);
+            return 0;
+    }
+    return 0;
 }
 
 func scan_addr_taken_expr_vec(ctx: *BuilderCtx, exprs: *Vec<*AstNode>) -> u64 {
@@ -2424,6 +3337,33 @@ func make_args3(v0: u64, v1: u64, v2: u64) -> *Vec<u64> {
     return args;
 }
 
+func make_args8(v0: u64, v1: u64, v2: u64, v3: u64, v4: u64, v5: u64, v6: u64, v7: u64) -> *Vec<u64> {
+    var args: *Vec<u64> = new Vec<u64>{heap_alloc((8) * sizeof(u64)), 0, (8)};
+    args.push(v0);
+    args.push(v1);
+    args.push(v2);
+    args.push(v3);
+    args.push(v4);
+    args.push(v5);
+    args.push(v6);
+    args.push(v7);
+    return args;
+}
+
+func make_args9(v0: u64, v1: u64, v2: u64, v3: u64, v4: u64, v5: u64, v6: u64, v7: u64, v8: u64) -> *Vec<u64> {
+    var args: *Vec<u64> = new Vec<u64>{heap_alloc((9) * sizeof(u64)), 0, (9)};
+    args.push(v0);
+    args.push(v1);
+    args.push(v2);
+    args.push(v3);
+    args.push(v4);
+    args.push(v5);
+    args.push(v6);
+    args.push(v7);
+    args.push(v8);
+    return args;
+}
+
 func call_ret_meta(ctx: *BuilderCtx, node: u64, default_type: u64, default_ptr_depth: u64) -> BuilderCallRetMeta {
     var meta: BuilderCallRetMeta;
     meta.ret_type = default_type;
@@ -3611,8 +4551,15 @@ func member_resolve_addr_and_field(ctx: *BuilderCtx, node: u64, assign_mode: u64
         return 0;
     }
     var base_addr: u64 = 0;
+    var stack_new_field_base: u64 = 0;
     if (ti.ptr_depth > 0) {
-        base_addr = build_expr(ctx, obj);
+        var stack_new_obj_offset: u64 = stack_new_expr_offset(ctx, (*AstNode)obj);
+        if (stack_new_obj_offset != 0) {
+            base_addr = new_lea_local(ctx, stack_new_obj_offset);
+            stack_new_field_base = 1;
+        } else {
+            base_addr = build_expr(ctx, obj);
+        }
     } else {
         base_addr = lvalue_addr(ctx, obj);
     }
@@ -3640,6 +4587,7 @@ func member_resolve_addr_and_field(ctx: *BuilderCtx, node: u64, assign_mode: u64
     var field_desc: *FieldDesc = 0;
     var found: u64 = struct_find_field_desc_scoped(struct_def, m.parent, m.member, &field_offset, &field_desc);
     if (found == 0) { return 1; }
+    if (stack_new_field_base != 0) { stack_new_note_sroa_field(ctx); }
     if (field_desc != 0 && check_field_access(field_desc) == 0) {
         member_diag_access_denied(struct_def.name, m.member, field_desc.access, 0);
         return 0;
@@ -3664,6 +4612,11 @@ func lvalue_addr_member(ctx: *BuilderCtx, node: u64) -> u64 {
 
 func lvalue_addr_deref(ctx: *BuilderCtx, node: u64) -> u64 {
     var d: *AstDeref = (*AstDeref)node;
+    var stack_new_obj_offset: u64 = stack_new_expr_offset(ctx, d.operand);
+    if (stack_new_obj_offset != 0) {
+        stack_new_note_sroa_field(ctx);
+        return new_lea_local(ctx, stack_new_obj_offset);
+    }
     var addr_reg: u64 = build_expr(ctx, d.operand);
     var op_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)d.operand, ctx.symtab);
     if (op_ti != 0 && op_ti.is_tagged == 1) {
@@ -4196,6 +5149,113 @@ func build_try_expr(ctx: *BuilderCtx, node: u64) -> u64 {
     return try_load_value_or_panic(ctx, value_addr, value_size);
 }
 
+func emit_memset_zero_at_addr(ctx: *BuilderCtx, base_addr: u64, size: u64) -> u64 {
+    var memset_ptr: u64 = (u64)"memset";
+    var memset_len: u64 = 6;
+    var memset_res: *NameInfo = resolve_name(slice(memset_ptr, memset_len));
+    if (memset_res != 0) {
+        memset_ptr = memset_res.ptr;
+        memset_len = memset_res.len;
+    }
+    var zero_reg: u64 = build_const(ctx, 0);
+    var size_reg: u64 = build_const(ctx, size);
+    var memset_args: *Vec<u64> = make_args3(base_addr, zero_reg, size_reg);
+    emit_call_name_raw(ctx, slice(memset_ptr, memset_len), memset_args, 0, 0, TYPE_I64, 0, 0);
+    return 0;
+}
+
+func expr_new_init_at_addr(ctx: *BuilderCtx, nw: *AstNew, base_addr: u64, size: u64) -> u64 {
+    if (nw == 0 || base_addr == 0) { return 0; }
+    emit_memset_zero_at_addr(ctx, base_addr, size);
+
+    if (nw.type_kind == TYPE_STRUCT) {
+        emit_trait_vptr_init_at_addr(ctx, base_addr, nw.struct_name);
+    }
+
+    if (nw.literal_expr != 0) {
+        if (ast_kind(nw.literal_expr) == AST_STRUCT_LITERAL) {
+            var lit_new: *AstStructLiteral = (*AstStructLiteral)nw.literal_expr;
+            struct_literal_init(ctx, lit_new.struct_def, lit_new.values_vec, base_addr);
+        }
+    }
+
+    if (nw.ctor_args_vec != 0) {
+        if (nw.type_kind != TYPE_STRUCT) {
+            emit_stderr("[ERROR] new constructor call requires struct type\n");
+            diag_error("SSA build error");
+        }
+        if (u8_slice_ptr(nw.struct_name) == 0 || u8_slice_len(nw.struct_name) == 0) {
+            emit_stderr("[ERROR] new constructor target struct missing metadata in SSA\n");
+            diag_error("SSA build error");
+            return 0;
+        }
+        var args: *Vec<*AstNode> = nw.ctor_args_vec;
+        var ctor_resolved: CompilerMethodResolveResult = resolve_constructor_call(nw.struct_name, args, ctx.symtab, slice("new", 3));
+        if (ctor_resolved.found == 0 || ctor_resolved.fn == 0) {
+            return 0;
+        }
+        var arg_regs: *Vec<u64> = make_call_arg_regs_nodes(ctx, args, call_prefix_one(base_addr));
+        emit_call_name_raw(ctx, ctor_resolved.fn.name, arg_regs, 0, 0, TYPE_VOID, 0, 0);
+    }
+
+    return 0;
+}
+
+func builder_tag_shape_for_new(nw: *AstNew) -> u64 {
+    if (nw == 0) { return 0; }
+    if (nw.type_kind == TYPE_STRUCT) { return 6; }
+    if (nw.type_kind == TYPE_ARRAY || nw.type_kind == TYPE_SLICE) { return 15; }
+    if (nw.type_kind == TYPE_I64) { return 2; }
+    if (nw.type_kind == TYPE_U64) { return 3; }
+    if (nw.type_kind == TYPE_F64) { return 4; }
+    if (nw.ptr_depth != 0) { return 8; }
+    return 7;
+}
+
+func builder_emit_named_u64_call(ctx: *BuilderCtx, name: []u8, args: *Vec<u64>) -> u64 {
+    var name_ptr: u64 = name.ptr;
+    var name_len: u64 = name.len;
+    var resolved: *NameInfo = resolve_name(slice(name_ptr, name_len));
+    if (resolved != 0) {
+        name_ptr = resolved.ptr;
+        name_len = resolved.len;
+    }
+    var out_reg: u64 = new_reg(ctx);
+    emit_call_name_raw(ctx, slice(name_ptr, name_len), args, out_reg, 0, TYPE_I64, 0, 0);
+    return out_reg;
+}
+
+func builder_emit_heap_tagged_policy_new(ctx: *BuilderCtx, nw: *AstNew, size: u64, escapes: u64, address_taken: u64, shared: u64, pinned: u64, immortal: u64, arena_hint: u64) -> u64 {
+    var size_reg: u64 = build_const(ctx, size);
+    var escapes_reg: u64 = build_const(ctx, escapes);
+    var address_taken_reg: u64 = build_const(ctx, address_taken);
+    var shared_reg: u64 = build_const(ctx, shared);
+    var pinned_reg: u64 = build_const(ctx, pinned);
+    var immortal_reg: u64 = build_const(ctx, immortal);
+    var arena_hint_reg: u64 = build_const(ctx, arena_hint);
+    var shape_reg: u64 = build_const(ctx, builder_tag_shape_for_new(nw));
+    var args: *Vec<u64> = make_args8(size_reg, escapes_reg, address_taken_reg, shared_reg, pinned_reg, immortal_reg, arena_hint_reg, shape_reg);
+    var tagged_reg: u64 = builder_emit_named_u64_call(ctx, slice("bpp_heap_alloc_auto_tagged", str_len("bpp_heap_alloc_auto_tagged")), args);
+    var raw_reg: u64 = mask_tagged_ptr(ctx, tagged_reg);
+    expr_new_init_at_addr(ctx, nw, raw_reg, size);
+    if (ctx != 0 && ctx.cur_func != 0) {
+        ctx.cur_func.stack_new_tag_policy_count = ctx.cur_func.stack_new_tag_policy_count + 1;
+    }
+    return tagged_reg;
+}
+
+func builder_emit_stack_tagged_policy_from_raw(ctx: *BuilderCtx, nw: *AstNew, raw_reg: u64, size: u64) -> u64 {
+    var size_reg: u64 = build_const(ctx, size);
+    var no_reg: u64 = build_const(ctx, 0);
+    var shape_reg: u64 = build_const(ctx, builder_tag_shape_for_new(nw));
+    var args: *Vec<u64> = make_args9(raw_reg, size_reg, no_reg, no_reg, no_reg, no_reg, no_reg, no_reg, shape_reg);
+    var tagged_reg: u64 = builder_emit_named_u64_call(ctx, slice("bpp_stack_alloc_auto_tagged_from_raw", str_len("bpp_stack_alloc_auto_tagged_from_raw")), args);
+    if (ctx != 0 && ctx.cur_func != 0) {
+        ctx.cur_func.stack_new_tag_policy_count = ctx.cur_func.stack_new_tag_policy_count + 1;
+    }
+    return tagged_reg;
+}
+
 func expr_new(ctx: *BuilderCtx, node: u64) -> u64 {
     var nw: *AstNew = (*AstNew)node;
     if (nw.array_len_is_param != 0) {
@@ -4203,19 +5263,9 @@ func expr_new(ctx: *BuilderCtx, node: u64) -> u64 {
         diag_error("SSA build error");
     }
 
-    var size: u64 = 0;
-    if (nw.type_kind == TYPE_ARRAY) {
-        var elem_size: u64 = 0;
-        if (nw.elem_typeinfo != 0) {
-            elem_size = sizeof_type_ex(nw.elem_typeinfo);
-        } else {
-            elem_size = layout_type_sizeof(nw.elem_type_kind, nw.elem_ptr_depth, nw.struct_name);
-        }
-        size = elem_size * nw.array_len;
-    } else if (nw.type_kind == TYPE_SLICE) {
-        size = 16;
-    } else {
-        size = layout_type_sizeof(nw.type_kind, nw.ptr_depth, nw.struct_name);
+    var size: u64 = stack_new_alloc_size(nw);
+    if (nw.is_tagged != 0 && stack_new_tag_layout_has_memory_state(nw.tag_layout) != 0) {
+        return builder_emit_heap_tagged_policy_new(ctx, nw, size, 1, 1, 0, 0, 0, 0);
     }
 
     var malloc_ptr: u64 = (u64)"malloc";
@@ -4231,46 +5281,7 @@ func expr_new(ctx: *BuilderCtx, node: u64) -> u64 {
     var heap_reg: u64 = new_reg(ctx);
     emit_call_name_raw(ctx, slice(malloc_ptr, malloc_len), malloc_args, heap_reg, 0, TYPE_I64, 0, 0);
 
-    var memset_ptr: u64 = (u64)"memset";
-    var memset_len: u64 = 6;
-    var memset_res: *NameInfo = resolve_name(slice(memset_ptr, memset_len));
-    if (memset_res != 0) {
-        memset_ptr = memset_res.ptr;
-        memset_len = memset_res.len;
-    }
-    var zero_reg: u64 = build_const(ctx, 0);
-    var memset_args: *Vec<u64> = make_args3(heap_reg, zero_reg, size_reg);
-    emit_call_name_raw(ctx, slice(memset_ptr, memset_len), memset_args, 0, 0, TYPE_I64, 0, 0);
-
-    if (nw.type_kind == TYPE_STRUCT) {
-        emit_trait_vptr_init_at_addr(ctx, heap_reg, nw.struct_name);
-    }
-
-    if (nw.literal_expr != 0) {
-        if (ast_kind(nw.literal_expr) == AST_STRUCT_LITERAL) {
-            var lit_new: *AstStructLiteral = (*AstStructLiteral)nw.literal_expr;
-            struct_literal_init(ctx, lit_new.struct_def, lit_new.values_vec, heap_reg);
-        }
-    }
-
-    if (nw.ctor_args_vec != 0) {
-        if (nw.type_kind != TYPE_STRUCT) {
-            emit_stderr("[ERROR] new constructor call requires struct type\n");
-            diag_error("SSA build error");
-        }
-        if (u8_slice_ptr(nw.struct_name) == 0 || u8_slice_len(nw.struct_name) == 0) {
-            emit_stderr("[ERROR] new constructor target struct missing metadata in SSA\n");
-            diag_error("SSA build error");
-            return heap_reg;
-        }
-        var args: *Vec<*AstNode> = nw.ctor_args_vec;
-        var ctor_resolved: CompilerMethodResolveResult = resolve_constructor_call(nw.struct_name, args, ctx.symtab, slice("new", 3));
-        if (ctor_resolved.found == 0 || ctor_resolved.fn == 0) {
-            return heap_reg;
-        }
-        var arg_regs: *Vec<u64> = make_call_arg_regs_nodes(ctx, args, call_prefix_one(heap_reg));
-        emit_call_name_raw(ctx, ctor_resolved.fn.name, arg_regs, 0, 0, TYPE_VOID, 0, 0);
-    }
+    expr_new_init_at_addr(ctx, nw, heap_reg, size);
 
     return heap_reg;
 }
@@ -6333,6 +7344,69 @@ func store_struct_call_result_to_addr(ctx: *BuilderCtx, value_expr: u64, struct_
     return 1;
 }
 
+func stmt_var_decl_try_stack_new(ctx: *BuilderCtx, vd: *AstVarDecl, var_id: u64) -> u64 {
+    if (ctx == 0 || vd == 0 || vd.init_expr == 0 || var_id == 0) { return 0; }
+    if (stack_new_is_safe_name(ctx, vd.name) == 0) { return 0; }
+
+    var nw: *AstNew = stack_new_unwrap_new_expr(vd.init_expr);
+    if (nw == 0) { return 0; }
+    var size: u64 = stack_new_alloc_size(nw);
+    if (size == 0 || size > SSA_STACK_NEW_MAX_BYTES) { return 0; }
+
+    var obj_offset: u64 = symtab_add(ctx.symtab, slice(0, 0), nw.type_kind, nw.ptr_depth, size);
+    if (obj_offset == 0) { return 0; }
+    var obj_addr: u64 = new_lea_local(ctx, obj_offset);
+    expr_new_init_at_addr(ctx, nw, obj_addr, size);
+
+    var ptr_reg: u64 = obj_addr;
+    if (stack_new_decl_uses_memory_state_tag(vd, nw) != 0) {
+        ptr_reg = builder_emit_stack_tagged_policy_from_raw(ctx, nw, obj_addr, size);
+    }
+
+    var st_ptr: *SSAInstruction = create_inst(ctx.ssa_ctx, SSA_OP_STORE, 0, operand_const(var_id), operand_reg(ptr_reg));
+    append_inst(ctx.cur_block, st_ptr);
+
+    var var_offset: u64 = symtab_find(ctx.symtab, vd.name);
+    if (var_offset != 0) {
+        var var_addr: u64 = new_lea_local(ctx, var_offset);
+        store_by_size(ctx, var_addr, ptr_reg, 8);
+    }
+
+    stack_new_set_offset(ctx, vd.name, obj_offset);
+    if (ctx.cur_func != 0) {
+        ctx.cur_func.stack_new_lower_count = ctx.cur_func.stack_new_lower_count + 1;
+    }
+    return 1;
+}
+
+func stmt_var_decl_try_tagged_new_policy(ctx: *BuilderCtx, vd: *AstVarDecl, var_id: u64) -> u64 {
+    if (ctx == 0 || vd == 0 || vd.init_expr == 0 || var_id == 0) { return 0; }
+    if (vd.is_tagged == 0 || stack_new_tag_layout_has_memory_state(vd.tag_layout) == 0) { return 0; }
+    var nw: *AstNew = stack_new_unwrap_new_expr(vd.init_expr);
+    if (nw == 0) { return 0; }
+    var size: u64 = stack_new_alloc_size(nw);
+    if (size == 0) { return 0; }
+
+    var escapes: u64 = 1;
+    var address_taken: u64 = 1;
+    if (stack_new_is_candidate_name(ctx, vd.name) != 0 && stack_new_is_safe_name(ctx, vd.name) != 0) {
+        escapes = 0;
+        address_taken = is_addr_taken(ctx, vd.name);
+    }
+    var arena_hint: u64 = 0;
+    if (size > SSA_STACK_NEW_MAX_BYTES && escapes == 0) { arena_hint = 1; }
+    var ptr_reg: u64 = builder_emit_heap_tagged_policy_new(ctx, nw, size, escapes, address_taken, 0, 0, 0, arena_hint);
+    var st_ptr: *SSAInstruction = create_inst(ctx.ssa_ctx, SSA_OP_STORE, 0, operand_const(var_id), operand_reg(ptr_reg));
+    append_inst(ctx.cur_block, st_ptr);
+
+    var var_offset: u64 = symtab_find(ctx.symtab, vd.name);
+    if (var_offset != 0) {
+        var var_addr: u64 = new_lea_local(ctx, var_offset);
+        store_by_size(ctx, var_addr, ptr_reg, 8);
+    }
+    return 1;
+}
+
 func stmt_var_decl(ctx: *BuilderCtx, node: u64) -> u64 {
     var vd: *AstVarDecl = (*AstVarDecl)node;
     var var_id: u64 = get_var_id(ctx, vd.name);
@@ -6354,6 +7428,8 @@ func stmt_var_decl(ctx: *BuilderCtx, node: u64) -> u64 {
         var init_kind: u64 = ast_kind(vd.init_expr);
         track_func_ptr_from_addr_of_ident(ctx, vd.name, vd.init_expr);
         closure_track_from_expr(ctx, vd.name, vd.init_expr);
+        if (stmt_var_decl_try_stack_new(ctx, vd, var_id) != 0) { return 0; }
+        if (stmt_var_decl_try_tagged_new_policy(ctx, vd, var_id) != 0) { return 0; }
         if (vd.number_storage_kind != 0) {
             var storage_offset: u64 = symtab_find(ctx.symtab, vd.name);
             var storage_addr: u64 = new_lea_local(ctx, storage_offset);
@@ -7146,6 +8222,62 @@ func builder_delete_uses_bpp_object_tag(ti: *TypeInfo) -> u64 {
     return builder_tag_layout_has_memory_state_capability(ti.tag_layout);
 }
 
+func stmt_delete_stack_new(ctx: *BuilderCtx, dl: *AstDelete, ptr_reg: u64, ti: *TypeInfo, end_bb: *SSABlock) -> u64 {
+    if (ctx == 0 || dl == 0 || end_bb == 0) { return 0; }
+    var stack_off: u64 = stack_new_delete_expr_offset(ctx, dl.expr);
+    if (stack_off == 0) { return 0; }
+    var object_reg: u64 = ptr_reg;
+    if (ti != 0 && ti.is_tagged != 0) {
+        object_reg = new_lea_local(ctx, stack_off);
+    }
+
+    if (ti != 0 && ti.type_kind == TYPE_STRUCT && ti.ptr_depth > 0) {
+        var method_ptr: u64 = (u64)"destructor";
+        var method_len: u64 = 10;
+        var name_info: *NameInfo = build_method_name(ti.struct_name, slice(method_ptr, method_len));
+
+        var resolved_ptr: u64 = name_info.ptr;
+        var resolved_len: u64 = name_info.len;
+        var resolved: *NameInfo = resolve_name(slice(name_info.ptr, name_info.len));
+        if (resolved != 0) {
+            resolved_ptr = resolved.ptr;
+            resolved_len = resolved.len;
+        }
+
+        var has_dtor: u64 = 0;
+        if (sym_func_exists(slice(name_info.ptr, name_info.len)) != 0) {
+            has_dtor = 1;
+        } else if (resolved != 0 && sym_func_exists(slice(resolved_ptr, resolved_len)) != 0) {
+            has_dtor = 1;
+        }
+
+        if (has_dtor != 0) {
+            var dtor_args: *Vec<u64> = make_args1(object_reg);
+            emit_call_name_raw(ctx, slice(resolved_ptr, resolved_len), dtor_args, 0, 0, TYPE_VOID, 0, 0);
+        }
+    }
+
+    if (dl.expr != 0 && ast_kind(dl.expr) == AST_IDENT) {
+        var idn: *AstIdent = (*AstIdent)dl.expr;
+        var var_id: u64 = get_var_id(ctx, idn.name);
+        var zero_reg: u64 = build_const(ctx, 0);
+        var st_ptr: *SSAInstruction = create_inst(ctx.ssa_ctx, SSA_OP_STORE, 0, operand_const(var_id), operand_reg(zero_reg));
+        append_inst(ctx.cur_block, st_ptr);
+
+        var var_offset: u64 = symtab_find(ctx.symtab, idn.name);
+        if (var_offset != 0) {
+            var var_addr: u64 = new_lea_local(ctx, var_offset);
+            store_by_size(ctx, var_addr, zero_reg, 8);
+        }
+    }
+
+    var jmp_ptr: *SSAInstruction = create_inst(ctx.ssa_ctx, SSA_OP_JMP, 0, operand_const(end_bb.id), 0);
+    append_inst(ctx.cur_block, jmp_ptr);
+    connect_blocks(ctx.cur_block, end_bb);
+    ctx.cur_block = end_bb;
+    return 1;
+}
+
 func stmt_delete(ctx: *BuilderCtx, node: u64) -> u64 {
     var dl: *AstDelete = (*AstDelete)node;
     if (dl == 0 || dl.expr == 0) { return 0; }
@@ -7185,6 +8317,10 @@ func stmt_delete(ctx: *BuilderCtx, node: u64) -> u64 {
     if (closure_handle_delete == 0 && ti != 0 && ti.ptr_depth == 0) {
         emit_stderr("[ERROR] delete expects pointer type or lambda closure handle\n");
         diag_error("SSA build error");
+    }
+
+    if (closure_handle_delete == 0 && stmt_delete_stack_new(ctx, dl, ptr_reg, ti, end_bb) != 0) {
+        return 0;
     }
 
     if (closure_handle_delete != 0) {

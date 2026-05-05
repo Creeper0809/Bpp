@@ -95,5 +95,5 @@ bash test/run_regression.sh
 
 ```powershell
 # Windows
-.\test\run_tests.ps1 -CompilerPath .\bin\v11_stage1.exe
+.\test\run_tests.ps1 -CompilerPath .\bin\stage1.exe
 ```
