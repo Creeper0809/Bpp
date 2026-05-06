@@ -352,6 +352,7 @@ func emit_return_struct_from_addr_reg(ctx: *BuilderCtx, addr_reg: u64, struct_si
         if (hi_reg != 0) { ret_src2 = operand_reg(hi_reg); }
         else { ret_src2 = operand_reg(build_const(ctx, 0)); }
     }
+    builder_gc_cleanup_root_slots(ctx);
     var ret_ptr: *SSAInstruction = create_inst(ctx.ssa_ctx, SSA_OP_RET, 0, operand_reg(lo_reg), ret_src2);
     append_inst(ctx.cur_block, ret_ptr);
     return 0;
@@ -663,6 +664,7 @@ struct BuilderCtx {
     public debug_mode: u64;
     public build_failed: u64;
     public defer_emit_mode: u64;
+    public gc_auto_root_slot_count: u64;
 }
 
 impl BuilderCtx {
@@ -694,6 +696,7 @@ impl BuilderCtx {
         self.debug_mode = 0;
         self.build_failed = 0;
         self.defer_emit_mode = 0;
+        self.gc_auto_root_slot_count = 0;
     }
 }
 
@@ -779,6 +782,7 @@ func reset_func(ctx: *BuilderCtx) -> u64 {
     sym_reg_alias_reset();
     ctx.build_failed = 0;
     ctx.defer_emit_mode = 0;
+    ctx.gc_auto_root_slot_count = 0;
     return 0;
 }
 
@@ -838,7 +842,8 @@ func stack_new_decl_tag_layout(vd: *AstVarDecl, nw: *AstNew) -> []u8 {
 func stack_new_decl_uses_memory_state_tag(vd: *AstVarDecl, nw: *AstNew) -> u64 {
     if (vd == 0 || nw == 0) { return 0; }
     if (vd.is_tagged == 0 && nw.is_tagged == 0) { return 0; }
-    return stack_new_tag_layout_has_memory_state(stack_new_decl_tag_layout(vd, nw));
+    var layout: []u8 = stack_new_decl_tag_layout(vd, nw);
+    return stack_new_tag_layout_has_memory_state(layout);
 }
 
 func stack_new_decl_is_candidate(vd: *AstVarDecl) -> u64 {
@@ -965,7 +970,7 @@ func stack_new_delete_expr_offset(ctx: *BuilderCtx, expr: *AstNode) -> u64 {
     return stack_new_get_offset(ctx, idn.name);
 }
 
-func stack_new_expr_candidate_ident(ctx: *BuilderCtx, expr: *AstNode) -> *NameInfo {
+func stack_new_expr_candidate_ident(ctx: *BuilderCtx, expr: *AstNode) -> *AstIdent {
     if (ctx == 0 || expr == 0) { return 0; }
     if (ast_kind(expr) == AST_CAST) {
         var cs: *AstCast = (*AstCast)expr;
@@ -974,7 +979,7 @@ func stack_new_expr_candidate_ident(ctx: *BuilderCtx, expr: *AstNode) -> *NameIn
     if (ast_kind(expr) != AST_IDENT) { return 0; }
     var idn: *AstIdent = (*AstIdent)expr;
     if (stack_new_is_candidate_name(ctx, idn.name) == 0) { return 0; }
-    return new NameInfo{idn.name.ptr, idn.name.len};
+    return idn;
 }
 
 func stack_new_expr_is_named_ident(expr: *AstNode, name: []u8) -> u64 {
@@ -988,6 +993,11 @@ func stack_new_expr_is_named_ident(expr: *AstNode, name: []u8) -> u64 {
     return str_eq(idn.name, name);
 }
 
+func stack_new_name_has_suffix(name: []u8, suffix: u64, suffix_len: u64) -> u64 {
+    if (name.ptr == 0 || suffix == 0 || suffix_len == 0 || name.len < suffix_len) { return 0; }
+    return str_eq(slice(name.ptr + name.len - suffix_len, suffix_len), slice(suffix, suffix_len));
+}
+
 func stack_new_call_is_tag_metadata_read(call: *AstCall) -> u64 {
     if (call == 0) { return 0; }
     var resolved_name: *PtrLen = resolve_symbol_name(call.name);
@@ -995,6 +1005,12 @@ func stack_new_call_is_tag_metadata_read(call: *AstCall) -> u64 {
     if (resolved_name != 0 && resolved_name.ptr != 0 && resolved_name.len != 0) {
         name = slice(resolved_name.ptr, resolved_name.len);
     }
+    if (stack_new_name_has_suffix(name, (u64)"bpp_tag_lifecycle_raw", str_len("bpp_tag_lifecycle_raw")) != 0) { return 1; }
+    if (stack_new_name_has_suffix(name, (u64)"bpp_tag_ownership_raw", str_len("bpp_tag_ownership_raw")) != 0) { return 1; }
+    if (stack_new_name_has_suffix(name, (u64)"bpp_tag_storage_raw", str_len("bpp_tag_storage_raw")) != 0) { return 1; }
+    if (stack_new_name_has_suffix(name, (u64)"bpp_tag_barrier_raw", str_len("bpp_tag_barrier_raw")) != 0) { return 1; }
+    if (stack_new_name_has_suffix(name, (u64)"bpp_tag_shape_raw", str_len("bpp_tag_shape_raw")) != 0) { return 1; }
+    if (stack_new_name_has_suffix(name, (u64)"bpp_tag_profiled_raw", str_len("bpp_tag_profiled_raw")) != 0) { return 1; }
     if (str_eq(name, slice("bpp_tag_lifecycle_raw", str_len("bpp_tag_lifecycle_raw"))) != 0) { return 1; }
     if (str_eq(name, slice("bpp_tag_ownership_raw", str_len("bpp_tag_ownership_raw"))) != 0) { return 1; }
     if (str_eq(name, slice("bpp_tag_storage_raw", str_len("bpp_tag_storage_raw"))) != 0) { return 1; }
@@ -1014,9 +1030,10 @@ func scan_stack_new_tag_metadata_args(ctx: *BuilderCtx, args: *Vec<*AstNode>) ->
     if (args == 0) { return 0; }
     var n: u64 = args.len();
     for (var i: u64 = 0; i < n; i = i + 1) {
-        var candidate: *NameInfo = stack_new_expr_candidate_ident(ctx, args.get(i));
+        var candidate: *AstIdent = stack_new_expr_candidate_ident(ctx, args.get(i));
         if (candidate != 0) {
-            stack_new_note_use_name(ctx, slice(candidate.ptr, candidate.len), 1);
+            var candidate_name: []u8 = candidate.name;
+            stack_new_note_use_name(ctx, candidate_name, 1);
         } else {
             scan_stack_new_escapes_expr(ctx, args.get(i), 0);
         }
@@ -1041,7 +1058,7 @@ func stack_new_fn_noescape_summary_build(fn: *AstFunc, depth: u64) -> u64 {
     if (n > 63) { n = 63; }
     for (var i: u64 = 0; i < n; i = i + 1) {
         var param: *Param = fn.params_vec.get(i);
-        if (param == 0 || param.ptr_depth == 0 || param.name.ptr == 0 || param.name.len == 0) { continue; }
+        if (param == 0 || (param.ptr_depth == 0 && param.is_tagged == 0) || param.name.ptr == 0 || param.name.len == 0) { continue; }
         if (stack_new_scan_param_stmt_unsafe(fn.body, param.name, depth + 1) == 0) {
             fn.stack_noescape_param_bits = fn.stack_noescape_param_bits | stack_new_param_bit(i);
         }
@@ -1053,8 +1070,14 @@ func stack_new_fn_noescape_summary_build(fn: *AstFunc, depth: u64) -> u64 {
 
 func stack_new_param_call_arg_noescape(call: *AstCall, arg_index: u64, depth: u64) -> u64 {
     if (call == 0 || depth > 3) { return 0; }
-    var resolved_name: *PtrLen = resolve_symbol_name(call.name);
-    var fn_call: *AstFunc = find_callable_func_any(call.name, slice(resolved_name.ptr, resolved_name.len));
+    var resolved_ptr: u64 = call.name.ptr;
+    var resolved_len: u64 = call.name.len;
+    var resolved_name: *NameInfo = resolve_name(call.name);
+    if (resolved_name != 0) {
+        resolved_ptr = resolved_name.ptr;
+        resolved_len = resolved_name.len;
+    }
+    var fn_call: *AstFunc = find_callable_func_any(call.name, slice(resolved_ptr, resolved_len));
     return stack_new_fn_param_noescape(fn_call, arg_index, depth + 1);
 }
 
@@ -1277,7 +1300,7 @@ func stack_new_fn_param_noescape(fn: *AstFunc, param_index: u64, depth: u64) -> 
     if (fn == 0 || fn.body == 0 || fn.params_vec == 0 || depth > 4) { return 0; }
     if (param_index >= fn.params_vec.len()) { return 0; }
     var param: *Param = fn.params_vec.get(param_index);
-    if (param == 0 || param.ptr_depth == 0 || param.name.ptr == 0 || param.name.len == 0) { return 0; }
+    if (param == 0 || (param.ptr_depth == 0 && param.is_tagged == 0) || param.name.ptr == 0 || param.name.len == 0) { return 0; }
     if (param_index < 63) {
         if (fn.stack_noescape_summary_state != 2) {
             if (stack_new_fn_noescape_summary_build(fn, depth) == 0) { return 0; }
@@ -1290,15 +1313,16 @@ func stack_new_fn_param_noescape(fn: *AstFunc, param_index: u64, depth: u64) -> 
 }
 
 func scan_stack_new_arg_with_callee(ctx: *BuilderCtx, arg: *AstNode, fn: *AstFunc, param_index: u64) -> u64 {
-    var candidate: *NameInfo = stack_new_expr_candidate_ident(ctx, arg);
+    var candidate: *AstIdent = stack_new_expr_candidate_ident(ctx, arg);
     if (candidate != 0) {
+        var candidate_name: []u8 = candidate.name;
         if (stack_new_fn_param_noescape(fn, param_index, 0) != 0) {
-            stack_new_note_use_name(ctx, slice(candidate.ptr, candidate.len), 1);
+            stack_new_note_use_name(ctx, candidate_name, 1);
             if (ctx != 0 && ctx.cur_func != 0) {
                 ctx.cur_func.stack_new_noescape_callsite_count = ctx.cur_func.stack_new_noescape_callsite_count + 1;
             }
         } else {
-            stack_new_mark_unsafe_name(ctx, slice(candidate.ptr, candidate.len));
+            stack_new_mark_unsafe_name(ctx, candidate_name);
         }
         return 0;
     }
@@ -1317,8 +1341,14 @@ func scan_stack_new_call_args_with_callee(ctx: *BuilderCtx, args: *Vec<*AstNode>
 
 func stack_new_resolve_direct_call(call: *AstCall) -> *AstFunc {
     if (call == 0) { return 0; }
-    var resolved_name: *PtrLen = resolve_symbol_name(call.name);
-    return find_callable_func_any(call.name, slice(resolved_name.ptr, resolved_name.len));
+    var resolved_ptr: u64 = call.name.ptr;
+    var resolved_len: u64 = call.name.len;
+    var resolved_name: *NameInfo = resolve_name(call.name);
+    if (resolved_name != 0) {
+        resolved_ptr = resolved_name.ptr;
+        resolved_len = resolved_name.len;
+    }
+    return find_callable_func_any(call.name, slice(resolved_ptr, resolved_len));
 }
 
 func stack_new_resolve_method_call(ctx: *BuilderCtx, mc: *AstMethodCall) -> *AstFunc {
@@ -5082,6 +5112,7 @@ func try_emit_failure_return(ctx: *BuilderCtx, tmp_addr: u64, ret_struct_name: [
     if (ret_struct_size > 16) {
         if (ctx.sret_addr_reg == 0) { return 0; }
         struct_copy(ctx, ctx.sret_addr_reg, tmp_addr, ret_struct_size);
+        builder_gc_cleanup_root_slots(ctx);
         var ret_ptr: *SSAInstruction = create_inst(ctx.ssa_ctx, SSA_OP_RET, 0, 0, 0);
         append_inst(ctx.cur_block, ret_ptr);
         return 0;
@@ -5225,7 +5256,102 @@ func builder_emit_named_u64_call(ctx: *BuilderCtx, name: []u8, args: *Vec<u64>) 
     return out_reg;
 }
 
-func builder_emit_heap_tagged_policy_new(ctx: *BuilderCtx, nw: *AstNew, size: u64, escapes: u64, address_taken: u64, shared: u64, pinned: u64, immortal: u64, arena_hint: u64) -> u64 {
+func builder_gc_type_is_root_slot_candidate(ti: *TypeInfo) -> u64 {
+    if (ti == 0) { return 0; }
+    if (ti.ptr_depth > 0) { return 1; }
+    return 0;
+}
+
+func builder_gc_name_has_prefix(name: []u8, prefix: u64, prefix_len: u64) -> u64 {
+    if (name.ptr == 0 || name.len < prefix_len || prefix == 0 || prefix_len == 0) { return 0; }
+    if (str_eq(slice(name.ptr, prefix_len), slice(prefix, prefix_len)) != 0) { return 1; }
+    return 0;
+}
+
+func builder_gc_auto_slots_disabled(ctx: *BuilderCtx) -> u64 {
+    if (ctx == 0 || ctx.cur_func == 0) { return 0; }
+    var name: []u8 = ctx.cur_func.name;
+    if (builder_gc_name_has_prefix(name, (u64)"std_", str_len("std_")) != 0) { return 1; }
+    if (builder_gc_name_has_prefix(name, (u64)"std.", str_len("std.")) != 0) { return 1; }
+    if (builder_gc_name_has_prefix(name, (u64)"std_mem__", str_len("std_mem__")) != 0) { return 1; }
+    if (builder_gc_name_has_prefix(name, (u64)"std_mem.", str_len("std_mem.")) != 0) { return 1; }
+    if (builder_gc_name_has_prefix(name, (u64)"bpp_gc_", str_len("bpp_gc_")) != 0) { return 1; }
+    if (builder_gc_name_has_prefix(name, (u64)"bpp_tag_", str_len("bpp_tag_")) != 0) { return 1; }
+    if (builder_gc_name_has_prefix(name, (u64)"__bpp_", str_len("__bpp_")) != 0) { return 1; }
+    if (builder_gc_name_has_prefix(name, (u64)"emitter_", str_len("emitter_")) != 0) { return 1; }
+    if (builder_gc_name_has_prefix(name, (u64)"emitter.", str_len("emitter.")) != 0) { return 1; }
+    if (builder_gc_name_has_prefix(name, (u64)"ssa_", str_len("ssa_")) != 0) { return 1; }
+    if (builder_gc_name_has_prefix(name, (u64)"ssa.", str_len("ssa.")) != 0) { return 1; }
+    if (builder_gc_name_has_prefix(name, (u64)"compiler_", str_len("compiler_")) != 0) { return 1; }
+    if (builder_gc_name_has_prefix(name, (u64)"compiler.", str_len("compiler.")) != 0) { return 1; }
+    if (builder_gc_name_has_prefix(name, (u64)"llvm_", str_len("llvm_")) != 0) { return 1; }
+    if (builder_gc_name_has_prefix(name, (u64)"llvm.", str_len("llvm.")) != 0) { return 1; }
+    if (builder_gc_name_has_prefix(name, (u64)"parser_", str_len("parser_")) != 0) { return 1; }
+    if (builder_gc_name_has_prefix(name, (u64)"parser.", str_len("parser.")) != 0) { return 1; }
+    if (builder_gc_name_has_prefix(name, (u64)"lexer_", str_len("lexer_")) != 0) { return 1; }
+    if (builder_gc_name_has_prefix(name, (u64)"lexer.", str_len("lexer.")) != 0) { return 1; }
+    if (builder_gc_name_has_prefix(name, (u64)"codegen__", str_len("codegen__")) != 0) { return 1; }
+    if (builder_gc_name_has_prefix(name, (u64)"codegen.", str_len("codegen.")) != 0) { return 1; }
+    return 0;
+}
+
+func builder_gc_root_slot_addr_local(ctx: *BuilderCtx, name: []u8) -> u64 {
+    if (ctx == 0 || ctx.symtab == 0 || name.ptr == 0 || name.len == 0) { return 0; }
+    var offset: u64 = symtab_find(ctx.symtab, name);
+    if (offset == 0) { return 0; }
+    return new_lea_local(ctx, offset);
+}
+
+func builder_gc_root_slot_push_addr(ctx: *BuilderCtx, addr: u64) -> u64 {
+    if (ctx == 0 || addr == 0) { return 0; }
+    if (builder_gc_auto_slots_disabled(ctx) != 0) { return 0; }
+    var args: *Vec<u64> = make_args1(addr);
+    builder_emit_named_u64_call(ctx, slice("bpp_gc_root_slot_push", str_len("bpp_gc_root_slot_push")), args);
+    ctx.gc_auto_root_slot_count = ctx.gc_auto_root_slot_count + 1;
+    return 1;
+}
+
+func builder_gc_root_slot_remove_addr(ctx: *BuilderCtx, addr: u64) -> u64 {
+    if (ctx == 0 || addr == 0) { return 0; }
+    if (builder_gc_auto_slots_disabled(ctx) != 0) { return 0; }
+    var args: *Vec<u64> = make_args1(addr);
+    builder_emit_named_u64_call(ctx, slice("bpp_gc_root_slot_remove", str_len("bpp_gc_root_slot_remove")), args);
+    return 1;
+}
+
+func builder_gc_root_slot_push_local(ctx: *BuilderCtx, name: []u8) -> u64 {
+    return builder_gc_root_slot_push_addr(ctx, builder_gc_root_slot_addr_local(ctx, name));
+}
+
+func builder_gc_root_slot_remove_local(ctx: *BuilderCtx, name: []u8) -> u64 {
+    return builder_gc_root_slot_remove_addr(ctx, builder_gc_root_slot_addr_local(ctx, name));
+}
+
+func builder_gc_root_slot_refresh_local(ctx: *BuilderCtx, name: []u8) -> u64 {
+    var addr: u64 = builder_gc_root_slot_addr_local(ctx, name);
+    if (addr == 0) { return 0; }
+    builder_gc_root_slot_remove_addr(ctx, addr);
+    builder_gc_root_slot_push_addr(ctx, addr);
+    return 1;
+}
+
+func builder_gc_cleanup_root_slots(ctx: *BuilderCtx) -> u64 {
+    if (ctx == 0 || ctx.symtab == 0 || ctx.symtab.count == 0) { return 0; }
+    if (ctx.gc_auto_root_slot_count == 0) { return 0; }
+    if (builder_gc_auto_slots_disabled(ctx) != 0) { return 0; }
+    var count: u64 = ctx.symtab.count;
+    for (var i: u64 = 0; i < count; i = i + 1) {
+        var ti: *TypeInfo = ctx.symtab.types_vec.get(i);
+        if (builder_gc_type_is_root_slot_candidate(ti) == 0) { continue; }
+        var offset: u64 = ctx.symtab.offsets_vec.get(i);
+        if (offset == 0) { continue; }
+        var addr: u64 = new_lea_local(ctx, offset);
+        builder_gc_root_slot_remove_addr(ctx, addr);
+    }
+    return 0;
+}
+
+func builder_emit_heap_tagged_policy_alloc(ctx: *BuilderCtx, nw: *AstNew, size: u64, escapes: u64, address_taken: u64, shared: u64, pinned: u64, immortal: u64, arena_hint: u64) -> u64 {
     var size_reg: u64 = build_const(ctx, size);
     var escapes_reg: u64 = build_const(ctx, escapes);
     var address_taken_reg: u64 = build_const(ctx, address_taken);
@@ -5236,11 +5362,16 @@ func builder_emit_heap_tagged_policy_new(ctx: *BuilderCtx, nw: *AstNew, size: u6
     var shape_reg: u64 = build_const(ctx, builder_tag_shape_for_new(nw));
     var args: *Vec<u64> = make_args8(size_reg, escapes_reg, address_taken_reg, shared_reg, pinned_reg, immortal_reg, arena_hint_reg, shape_reg);
     var tagged_reg: u64 = builder_emit_named_u64_call(ctx, slice("bpp_heap_alloc_auto_tagged", str_len("bpp_heap_alloc_auto_tagged")), args);
-    var raw_reg: u64 = mask_tagged_ptr(ctx, tagged_reg);
-    expr_new_init_at_addr(ctx, nw, raw_reg, size);
     if (ctx != 0 && ctx.cur_func != 0) {
         ctx.cur_func.stack_new_tag_policy_count = ctx.cur_func.stack_new_tag_policy_count + 1;
     }
+    return tagged_reg;
+}
+
+func builder_emit_heap_tagged_policy_new(ctx: *BuilderCtx, nw: *AstNew, size: u64, escapes: u64, address_taken: u64, shared: u64, pinned: u64, immortal: u64, arena_hint: u64) -> u64 {
+    var tagged_reg: u64 = builder_emit_heap_tagged_policy_alloc(ctx, nw, size, escapes, address_taken, shared, pinned, immortal, arena_hint);
+    var raw_reg: u64 = mask_tagged_ptr(ctx, tagged_reg);
+    expr_new_init_at_addr(ctx, nw, raw_reg, size);
     return tagged_reg;
 }
 
@@ -5292,6 +5423,10 @@ func expr_ident(ctx: *BuilderCtx, node: u64) -> u64 {
             if (typeinfo_number_storage_is_specialized(var_ti) != 0) {
                 var raw_reg: u64 = load_number_storage_raw(ctx, offset, var_ti.number_storage_kind);
                 return builder_box_integer_kind_to_number_value(ctx, raw_reg, var_ti.number_storage_kind);
+            }
+            if (builder_gc_auto_slots_disabled(ctx) == 0 && builder_gc_type_is_root_slot_candidate(var_ti) != 0) {
+                var ptr_addr: u64 = new_lea_local(ctx, offset);
+                return load_by_size(ctx, ptr_addr, 8);
             }
         }
         if (is_addr_taken(ctx, idn.name) != 0) {
@@ -7103,6 +7238,7 @@ func emit_return_slice_from_call(ctx: *BuilderCtx, expr: u64) -> u64 {
     } else {
         emit_call_ptr(ctx, (*AstCallPtr)expr, ptr_reg, len_reg);
     }
+    builder_gc_cleanup_root_slots(ctx);
     var ret_ptr: *SSAInstruction = create_inst(ctx.ssa_ctx, SSA_OP_RET, 0, operand_reg(ptr_reg), operand_reg(len_reg));
     append_inst(ctx.cur_block, ret_ptr);
     return 0;
@@ -7122,6 +7258,7 @@ func emit_return_struct_from_call(ctx: *BuilderCtx, expr: u64, struct_size: u64)
     }
     var ret_src2: u64 = 0;
     if (hi_reg != 0) { ret_src2 = operand_reg(hi_reg); }
+    builder_gc_cleanup_root_slots(ctx);
     var ret_ptr: *SSAInstruction = create_inst(ctx.ssa_ctx, SSA_OP_RET, 0, operand_reg(lo_reg), ret_src2);
     append_inst(ctx.cur_block, ret_ptr);
     return 0;
@@ -7136,6 +7273,7 @@ func emit_return_struct_from_addr(ctx: *BuilderCtx, expr: u64, struct_size: u64)
             var zero_hi: u64 = build_const(ctx, 0);
             value_ret_src2 = operand_reg(zero_hi);
         }
+        builder_gc_cleanup_root_slots(ctx);
         var value_ret: *SSAInstruction = create_inst(ctx.ssa_ctx, SSA_OP_RET, 0, operand_reg(value_reg), value_ret_src2);
         append_inst(ctx.cur_block, value_ret);
         return 0;
@@ -7168,6 +7306,7 @@ func emit_return_struct_from_addr(ctx: *BuilderCtx, expr: u64, struct_size: u64)
             ret_src2 = operand_reg(zero_reg);
         }
     }
+    builder_gc_cleanup_root_slots(ctx);
     var ret_ptr2: *SSAInstruction = create_inst(ctx.ssa_ctx, SSA_OP_RET, 0, operand_reg(lo_reg), ret_src2);
     append_inst(ctx.cur_block, ret_ptr2);
     return 0;
@@ -7205,6 +7344,7 @@ func struct_literal_eval_value_or_zero(ctx: *BuilderCtx, values: *Vec<*AstNode>,
 
 func emit_return_zero_value(ctx: *BuilderCtx) -> u64 {
     var zero_reg: u64 = build_const(ctx, 0);
+    builder_gc_cleanup_root_slots(ctx);
     var ret_ptr: *SSAInstruction = create_inst(ctx.ssa_ctx, SSA_OP_RET, 0, operand_reg(zero_reg), 0);
     append_inst(ctx.cur_block, ret_ptr);
     return 0;
@@ -7387,7 +7527,8 @@ func stmt_var_decl_try_tagged_new_policy(ctx: *BuilderCtx, vd: *AstVarDecl, var_
     }
     var arena_hint: u64 = 0;
     if (size > SSA_STACK_NEW_MAX_BYTES && escapes == 0) { arena_hint = 1; }
-    var ptr_reg: u64 = builder_emit_heap_tagged_policy_new(ctx, nw, size, escapes, address_taken, 0, 0, 0, arena_hint);
+    var ptr_reg: u64 = builder_emit_heap_tagged_policy_alloc(ctx, nw, size, escapes, address_taken, 0, 0, 0, arena_hint);
+    var init_reg: u64 = mask_tagged_ptr(ctx, ptr_reg);
     var st_ptr: *SSAInstruction = create_inst(ctx.ssa_ctx, SSA_OP_STORE, 0, operand_const(var_id), operand_reg(ptr_reg));
     append_inst(ctx.cur_block, st_ptr);
 
@@ -7395,7 +7536,41 @@ func stmt_var_decl_try_tagged_new_policy(ctx: *BuilderCtx, vd: *AstVarDecl, var_
     if (var_offset != 0) {
         var var_addr: u64 = new_lea_local(ctx, var_offset);
         store_by_size(ctx, var_addr, ptr_reg, 8);
+        builder_gc_root_slot_push_addr(ctx, var_addr);
     }
+    expr_new_init_at_addr(ctx, nw, init_reg, size);
+    return 1;
+}
+
+func stmt_var_decl_try_gc_rooted_new_slot(ctx: *BuilderCtx, vd: *AstVarDecl, var_id: u64) -> u64 {
+    if (ctx == 0 || vd == 0 || vd.init_expr == 0 || var_id == 0) { return 0; }
+    if (builder_gc_auto_slots_disabled(ctx) != 0) { return 0; }
+    if (vd.ptr_depth == 0) { return 0; }
+    var nw: *AstNew = stack_new_unwrap_new_expr(vd.init_expr);
+    if (nw == 0) { return 0; }
+    if (vd.is_tagged != 0 || nw.is_tagged != 0) { return 0; }
+    var size: u64 = stack_new_alloc_size(nw);
+    if (size == 0) { return 0; }
+
+    var ptr_reg: u64 = 0;
+    var init_reg: u64 = 0;
+    var size_reg: u64 = build_const(ctx, size);
+    var shape_reg: u64 = build_const(ctx, builder_tag_shape_for_new(nw));
+    var raw_args: *Vec<u64> = make_args2(size_reg, shape_reg);
+    ptr_reg = builder_emit_named_u64_call(ctx, slice("bpp_gc_alloc_raw", str_len("bpp_gc_alloc_raw")), raw_args);
+    init_reg = ptr_reg;
+
+    var st_ptr: *SSAInstruction = create_inst(ctx.ssa_ctx, SSA_OP_STORE, 0, operand_const(var_id), operand_reg(ptr_reg));
+    append_inst(ctx.cur_block, st_ptr);
+
+    var var_offset: u64 = symtab_find(ctx.symtab, vd.name);
+    if (var_offset != 0) {
+        var var_addr: u64 = new_lea_local(ctx, var_offset);
+        store_by_size(ctx, var_addr, ptr_reg, 8);
+        builder_gc_root_slot_push_addr(ctx, var_addr);
+    }
+
+    expr_new_init_at_addr(ctx, nw, init_reg, size);
     return 1;
 }
 
@@ -7421,6 +7596,7 @@ func stmt_var_decl(ctx: *BuilderCtx, node: u64) -> u64 {
         track_func_ptr_from_addr_of_ident(ctx, vd.name, vd.init_expr);
         closure_track_from_expr(ctx, vd.name, vd.init_expr);
         if (stmt_var_decl_try_stack_new(ctx, vd, var_id) != 0) { return 0; }
+        if (stmt_var_decl_try_gc_rooted_new_slot(ctx, vd, var_id) != 0) { return 0; }
         if (stmt_var_decl_try_tagged_new_policy(ctx, vd, var_id) != 0) { return 0; }
         if (vd.number_storage_kind != 0) {
             var storage_offset: u64 = symtab_find(ctx.symtab, vd.name);
@@ -7570,12 +7746,23 @@ func stmt_var_decl(ctx: *BuilderCtx, node: u64) -> u64 {
                 }
                 if (size_at == 0) { size_at = 8; }
                 store_by_size(ctx, base_addr3, val_reg2, size_at);
+                if (vd.ptr_depth > 0) {
+                    builder_gc_root_slot_refresh_local(ctx, vd.name);
+                }
                 return 0;
             }
         }
         var val_reg: u64 = build_expr(ctx, vd.init_expr);
         var st_ptr: *SSAInstruction = create_inst(ctx.ssa_ctx, SSA_OP_STORE, 0, operand_const(var_id), operand_reg(val_reg));
         append_inst(ctx.cur_block, st_ptr);
+        if (vd.ptr_depth > 0) {
+            var ptr_offset: u64 = symtab_find(ctx.symtab, vd.name);
+            if (ptr_offset != 0) {
+                var ptr_addr: u64 = new_lea_local(ctx, ptr_offset);
+                store_by_size(ctx, ptr_addr, val_reg, 8);
+                builder_gc_root_slot_push_addr(ctx, ptr_addr);
+            }
+        }
     }
     return 0;
 }
@@ -7596,6 +7783,24 @@ func assign_addr_taken_ident(ctx: *BuilderCtx, asn: *AstAssign) -> u64 {
     var value_reg: u64 = build_expr(ctx, asn.value);
     var size_bytes: u64 = type_size_from_expr(ctx, asn.target);
     store_by_size(ctx, target_addr, value_reg, size_bytes);
+    if (builder_gc_type_is_root_slot_candidate(ti_at) != 0) {
+        builder_gc_root_slot_refresh_local(ctx, idn_tgt.name);
+    }
+    return 1;
+}
+
+func assign_gc_member_edge_slot_after_store(ctx: *BuilderCtx, target: u64, target_addr: u64) -> u64 {
+    if (ctx == 0 || target == 0 || target_addr == 0) { return 0; }
+    if (ast_kind(target) != AST_MEMBER_ACCESS) { return 0; }
+    var m: *AstMemberAccess = (*AstMemberAccess)target;
+    if (m.object == 0 || ast_kind((u64)m.object) != AST_IDENT) { return 0; }
+    var target_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)target, ctx.symtab);
+    if (builder_gc_type_is_root_slot_candidate(target_ti) == 0) { return 0; }
+    var object_ti: *TypeInfo = get_expr_type_with_symtab(m.object, ctx.symtab);
+    if (object_ti == 0 || object_ti.ptr_depth == 0) { return 0; }
+    var parent_reg: u64 = build_expr(ctx, (u64)m.object);
+    var args: *Vec<u64> = make_args2(parent_reg, target_addr);
+    builder_emit_named_u64_call(ctx, slice("bpp_tag_write_barrier_runtime_slot", str_len("bpp_tag_write_barrier_runtime_slot")), args);
     return 1;
 }
 
@@ -7840,6 +8045,13 @@ func stmt_assign(ctx: *BuilderCtx, node: u64) -> u64 {
         var var_id3: u64 = get_var_id(ctx, idn2.name);
         var st_ptr3: *SSAInstruction = create_inst(ctx.ssa_ctx, SSA_OP_STORE, 0, operand_const(var_id3), operand_reg(val_reg3));
         append_inst(ctx.cur_block, st_ptr3);
+        var ident_ti: *TypeInfo = symtab_get_type(ctx.symtab, idn2.name);
+        if (builder_gc_type_is_root_slot_candidate(ident_ti) != 0) {
+            builder_gc_root_slot_remove_local(ctx, idn2.name);
+            var ident_addr: u64 = new_lea_local(ctx, target_offset);
+            store_by_size(ctx, ident_addr, val_reg3, 8);
+            builder_gc_root_slot_push_addr(ctx, ident_addr);
+        }
         return 0;
     }
 
@@ -7850,6 +8062,7 @@ func stmt_assign(ctx: *BuilderCtx, node: u64) -> u64 {
         size4 = type_size_from_expr(ctx, asn.target);
     }
     store_by_size(ctx, target_addr, val_reg3, size4);
+    assign_gc_member_edge_slot_after_store(ctx, asn.target, target_addr);
     return 0;
 }
 
@@ -7873,6 +8086,7 @@ func emit_return_slice_value(ctx: *BuilderCtx, expr: u64) -> u64 {
                     ptr_reg = build_expr(ctx, slice_node.ptr_expr);
                 }
                 var len_reg: u64 = build_expr(ctx, slice_node.len_expr);
+                builder_gc_cleanup_root_slots(ctx);
                 var ret_ptr_heap: *SSAInstruction = create_inst(ctx.ssa_ctx, SSA_OP_RET_SLICE_HEAP, elem_size, operand_reg(ptr_reg), operand_reg(len_reg));
                 append_inst(ctx.cur_block, ret_ptr_heap);
                 var ptr_is_reg: u64 = 1;
@@ -7895,12 +8109,14 @@ func emit_return_slice_value(ctx: *BuilderCtx, expr: u64) -> u64 {
     var slice_regs: *SliceRegs = slice_regs(ctx, expr);
     var ptr_reg2: u64 = slice_regs.ptr_reg;
     var len_reg2: u64 = slice_regs.len_reg;
+    builder_gc_cleanup_root_slots(ctx);
     var ret_ptr: *SSAInstruction = create_inst(ctx.ssa_ctx, SSA_OP_RET, 0, operand_reg(ptr_reg2), operand_reg(len_reg2));
     append_inst(ctx.cur_block, ret_ptr);
     return 0;
 }
 
 func emit_return_void_inst(ctx: *BuilderCtx) -> u64 {
+    builder_gc_cleanup_root_slots(ctx);
     var ret_ptr: *SSAInstruction = create_inst(ctx.ssa_ctx, SSA_OP_RET, 0, 0, 0);
     append_inst(ctx.cur_block, ret_ptr);
     return 0;
@@ -8079,13 +8295,57 @@ func stmt_return_emit_struct(ctx: *BuilderCtx, expr: u64, struct_name0: []u8, re
     return emit_return_struct_from_addr(ctx, expr, struct_size);
 }
 
+func stmt_return_expr_uses_local_closure_handle(ctx: *BuilderCtx, expr: u64) -> u64 {
+    if (ctx == 0 || expr == 0) { return 0; }
+    var kind: u64 = ast_kind(expr);
+    var ref: AstNodeTagRef;
+    ref.node = expr;
+    if (kind == AST_CALL) {
+        var call_expr: *AstCall = ref.call;
+        if (call_expr != 0 && is_closure_handle(ctx, call_expr.name) != 0) { return 1; }
+        return 0;
+    }
+    if (kind == AST_CALL_PTR) {
+        var cp_expr: *AstCallPtr = ref.call_ptr;
+        if (cp_expr != 0 && closure_expr_is_lambda_handle(ctx, (u64)cp_expr.callee) != 0) { return 1; }
+    }
+    return 0;
+}
+
 func stmt_return(ctx: *BuilderCtx, node: u64) -> u64 {
     var ret: *AstReturn = (*AstReturn)node;
-    defer_emit_for_return(ctx);
     if (ret.expr == 0) {
+        defer_emit_for_return(ctx);
         emit_return_void_inst(ctx);
         return 0;
     }
+
+    var ret_type: u64 = ret_type_current();
+    var ret_ptr_depth: u64 = ret_ptr_depth_current();
+    var ret_struct_name: []u8 = ret_struct_name_current();
+
+    if (stmt_return_expr_uses_local_closure_handle(ctx, ret.expr) != 0) {
+        if (ssa_return_validate_expr(ctx, ret.expr) == 0) {
+            return 0;
+        }
+        var closure_ret_ti: *TypeInfo = get_expr_type_with_symtab(ret.expr, ctx.symtab);
+        var closure_returns_plain_word: u64 = 1;
+        if (ret_type == TYPE_SLICE && ret_ptr_depth == 0) { closure_returns_plain_word = 0; }
+        if (ret_type == TYPE_STRUCT && ret_ptr_depth == 0) { closure_returns_plain_word = 0; }
+        if (closure_ret_ti != 0 && closure_ret_ti.ptr_depth == 0 && (closure_ret_ti.type_kind == TYPE_SLICE || closure_ret_ti.type_kind == TYPE_STRUCT)) {
+            closure_returns_plain_word = 0;
+        }
+        if (closure_returns_plain_word != 0) {
+            var closure_ret_reg: u64 = build_expr(ctx, ret.expr);
+            defer_emit_for_return(ctx);
+            builder_gc_cleanup_root_slots(ctx);
+            var closure_ret_inst: *SSAInstruction = create_inst(ctx.ssa_ctx, SSA_OP_RET, 0, operand_reg(closure_ret_reg), 0);
+            append_inst(ctx.cur_block, closure_ret_inst);
+            return 0;
+        }
+    }
+
+    defer_emit_for_return(ctx);
 
     if (stmt_return_try_struct_literal(ctx, ret.expr) != 0) {
         return 0;
@@ -8095,9 +8355,6 @@ func stmt_return(ctx: *BuilderCtx, node: u64) -> u64 {
         return 0;
     }
 
-    var ret_type: u64 = ret_type_current();
-    var ret_ptr_depth: u64 = ret_ptr_depth_current();
-    var ret_struct_name: []u8 = ret_struct_name_current();
     if (ssa_return_validate_expr(ctx, ret.expr) == 0) {
         return 0;
     }
@@ -8117,6 +8374,7 @@ func stmt_return(ctx: *BuilderCtx, node: u64) -> u64 {
     }
 
     var val_reg4: u64 = build_expr(ctx, ret.expr);
+    builder_gc_cleanup_root_slots(ctx);
     var ret_ptr: *SSAInstruction = create_inst(ctx.ssa_ctx, SSA_OP_RET, 0, operand_reg(val_reg4), 0);
     append_inst(ctx.cur_block, ret_ptr);
     return 0;
@@ -8309,6 +8567,11 @@ func stmt_delete(ctx: *BuilderCtx, node: u64) -> u64 {
     if (closure_handle_delete == 0 && ti != 0 && ti.ptr_depth == 0) {
         emit_stderr("[ERROR] delete expects pointer type or lambda closure handle\n");
         diag_error("SSA build error");
+    }
+
+    if (dl.expr != 0 && ast_kind(dl.expr) == AST_IDENT) {
+        var delete_idn: *AstIdent = (*AstIdent)dl.expr;
+        builder_gc_root_slot_remove_local(ctx, delete_idn.name);
     }
 
     if (closure_handle_delete == 0 && stmt_delete_stack_new(ctx, dl, ptr_reg, ti, end_bb) != 0) {
