@@ -289,19 +289,23 @@ DoD:
 ### 9. Tagged Pointer 최적화 확장
 
 - [x] O1 roadmap pass에서 block/phi tag state, MemorySSA alias, lifecycle, shape, hot path 후보를 `tag2` 카운터와 LLVM 메타데이터로 노출한다.
-- [ ] tag state를 block/phi 경계로 전파한다.
-- [ ] tagged pointer 기반 alias analysis를 MemorySSA와 연결한다.
-- [ ] lifecycle tag로 free/barrier/refcount 제거를 더 공격적으로 수행한다.
-- [ ] shape tag로 devirtualization과 container fast path를 선택한다.
-- [ ] profile/hot tag로 hot path specialization을 선택한다.
-- [ ] tag metadata verifier를 만든다.
-- [ ] tag state invalidation 규칙을 call/memory effect와 연결한다.
-- [ ] tagged slice/vector loop specialization을 loop optimizer와 연결한다.
+- [x] tag state를 block/phi 경계로 전파한다.
+- [x] tagged pointer 기반 alias analysis를 MemorySSA와 연결한다.
+- [x] lifecycle tag로 free/barrier/refcount 제거를 더 공격적으로 수행한다.
+- [x] shape tag로 devirtualization과 container fast path를 선택한다.
+- [x] profile/hot tag로 hot path specialization을 선택한다.
+- [x] tag metadata verifier를 만든다.
+- [x] tag state invalidation 규칙을 call/memory effect와 연결한다.
+- [x] tagged slice/vector loop specialization을 loop optimizer와 연결한다.
+
+구현 메모: tag2 pass는 phi가 있는 block 경계, tagged/profile/shape 호출, 간접 호출 invalidation 지점을 따로 검증한다.
+MemorySSA가 만든 tagged noalias 증명과 loop2 후보를 tag2 카운터로 연결하고, lifecycle/refcount/barrier/shape/profile fast path는
+기존 tag fold 경로와 tag2 metadata에서 함께 확인한다. verifier는 tag 관련 직접 호출의 최소 인자 수를 검사해 잘못된 metadata를 O1 검증 오류로 드러낸다.
 
 DoD:
-- [ ] tagged metadata bundle에 phi/block 경계 케이스 추가
-- [ ] O1 LLVM dump에서 tagged alias/shape metadata 확인
-- [ ] fast 전체 회귀 통과
+- [x] tagged metadata bundle에 phi/block 경계 케이스 추가
+- [x] O1 LLVM dump에서 tagged alias/shape metadata 확인
+- [x] fast 전체 회귀 통과
 
 ### 10. Number 전용 IR lowering
 
