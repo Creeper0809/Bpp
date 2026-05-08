@@ -97,6 +97,11 @@ const BPP_GC_META_ROOTED = 4;
 const BPP_GC_META_GENERATION_SHIFT = 3;
 const BPP_GC_META_GENERATION_MASK = 255;
 const BPP_GC_META_SHAPE_SHIFT = 16;
+const BPP_GC_BLOCK_INDEX_BUCKETS = 8192;
+const BPP_GC_EDGE_TRACKING_DISABLED = 1;
+const BPP_GC_EDGE_TRACKING_ENABLED = 2;
+const BPP_GC_ROOT_SLOT_TRACKING_DISABLED = 1;
+const BPP_GC_ROOT_SLOT_TRACKING_ENABLED = 2;
 
 const BPP_TAG_LIFE_UNKNOWN = 0;
 const BPP_TAG_LIFE_YOUNG = 1;
@@ -364,6 +369,7 @@ struct BppGcBlock {
     public edges: *BppGcEdge;
     public edge_slots: *BppGcEdgeSlot;
     public next: *BppGcBlock;
+    public index_next: *BppGcBlock;
 }
 
 struct BppGcRoot {
@@ -404,6 +410,8 @@ var g_bpp_tag_gc_barrier_needed: u64;
 var g_bpp_tag_gc_barrier_skipped: u64;
 var g_bpp_tag_gc_barrier_dirty: u64;
 var g_bpp_gc_blocks: *BppGcBlock;
+var g_bpp_gc_block_index: *u64;
+var g_bpp_gc_block_index_buckets: u64;
 var g_bpp_gc_roots: *BppGcRoot;
 var g_bpp_gc_root_slots: *BppGcRootSlot;
 var g_bpp_gc_allocs: u64;
@@ -430,6 +438,8 @@ var g_bpp_gc_edge_slots: u64;
 var g_bpp_gc_moved: u64;
 var g_bpp_gc_bytes_moved: u64;
 var g_bpp_gc_compaction_blocked_untracked: u64;
+var g_bpp_gc_edge_tracking_state: u64;
+var g_bpp_gc_root_slot_tracking_state: u64;
 
 func bpp_tag_strip(ptr: u64) -> u64 {
     return ptr & BPP_TAG_PTR_MASK;
@@ -904,9 +914,80 @@ func bpp_gc_block_make_meta_policy(shape: u64, lifecycle: u64) -> u64 {
     return BPP_GC_META_LIVE | (bpp_gc_generation_for_lifecycle(lifecycle) << BPP_GC_META_GENERATION_SHIFT) | ((shape & 15) << BPP_GC_META_SHAPE_SHIFT);
 }
 
+func bpp_gc_block_index_hash(raw: u64) -> u64 {
+    var h: u64 = raw >> 3;
+    h = h ^ (raw >> 17);
+    h = h ^ (raw >> 31);
+    return h;
+}
+
+func bpp_gc_block_index_ensure() -> u64 {
+    if (g_bpp_gc_block_index != 0 && g_bpp_gc_block_index_buckets != 0) { return 1; }
+    var bytes: u64 = BPP_GC_BLOCK_INDEX_BUCKETS * sizeof(u64);
+    var table: *u64 = (*u64)heap_alloc(bytes);
+    if (table == 0) { return 0; }
+    memset((u64)table, 0, bytes);
+    g_bpp_gc_block_index = table;
+    g_bpp_gc_block_index_buckets = BPP_GC_BLOCK_INDEX_BUCKETS;
+    return 1;
+}
+
+func bpp_gc_block_index_bucket(raw: u64) -> u64 {
+    if (g_bpp_gc_block_index_buckets == 0) { return 0; }
+    return bpp_gc_block_index_hash(raw) % g_bpp_gc_block_index_buckets;
+}
+
+func bpp_gc_block_index_insert(block: *BppGcBlock) -> u64 {
+    if (block == 0) { return 0; }
+    var raw: u64 = bpp_gc_block_raw(block);
+    if (raw == 0) { return 0; }
+    if (bpp_gc_block_index_ensure() == 0) { return 0; }
+    var bucket: u64 = bpp_gc_block_index_bucket(raw);
+    block.index_next = (*BppGcBlock)g_bpp_gc_block_index[bucket];
+    g_bpp_gc_block_index[bucket] = (u64)block;
+    return 1;
+}
+
+func bpp_gc_block_index_find(raw: u64) -> *BppGcBlock {
+    if (raw == 0 || g_bpp_gc_block_index == 0 || g_bpp_gc_block_index_buckets == 0) { return (*BppGcBlock)0; }
+    var bucket: u64 = bpp_gc_block_index_bucket(raw);
+    var cur: *BppGcBlock = (*BppGcBlock)g_bpp_gc_block_index[bucket];
+    while (cur != 0) {
+        if (bpp_gc_block_is_live(cur) != 0 && bpp_gc_block_raw(cur) == raw) { return cur; }
+        cur = cur.index_next;
+    }
+    return (*BppGcBlock)0;
+}
+
+func bpp_gc_block_index_remove_raw(block: *BppGcBlock, raw: u64) -> u64 {
+    if (block == 0 || raw == 0 || g_bpp_gc_block_index == 0 || g_bpp_gc_block_index_buckets == 0) { return 0; }
+    var bucket: u64 = bpp_gc_block_index_bucket(raw);
+    var prev: *BppGcBlock = (*BppGcBlock)0;
+    var cur: *BppGcBlock = (*BppGcBlock)g_bpp_gc_block_index[bucket];
+    while (cur != 0) {
+        var next_block: *BppGcBlock = cur.index_next;
+        if (cur == block) {
+            if (prev == 0) { g_bpp_gc_block_index[bucket] = (u64)next_block; }
+            else { prev.index_next = next_block; }
+            block.index_next = (*BppGcBlock)0;
+            return 1;
+        }
+        prev = cur;
+        cur = next_block;
+    }
+    return 0;
+}
+
+func bpp_gc_block_index_remove(block: *BppGcBlock) -> u64 {
+    if (block == 0) { return 0; }
+    return bpp_gc_block_index_remove_raw(block, bpp_gc_block_raw(block));
+}
+
 func bpp_gc_find_block(ptr: u64) -> *BppGcBlock {
     var raw: u64 = bpp_tag_strip(ptr);
     if (raw == 0) { return (*BppGcBlock)0; }
+    var indexed: *BppGcBlock = bpp_gc_block_index_find(raw);
+    if (indexed != 0) { return indexed; }
     var cur: *BppGcBlock = g_bpp_gc_blocks;
     while (cur != 0) {
         if (bpp_gc_block_is_live(cur) != 0 && bpp_gc_block_raw(cur) == raw) { return cur; }
@@ -960,6 +1041,7 @@ func bpp_gc_forget_live(ptr: u64) -> u64 {
     if (block == 0) { return 0; }
     bpp_gc_root_remove(ptr);
     bpp_gc_forget_live_generation(bpp_tag_lifecycle_raw(block.ptr), bpp_gc_block_generation(block));
+    bpp_gc_block_index_remove(block);
     bpp_gc_block_set_live(block, 0);
     bpp_gc_block_set_mark(block, 0);
     if (g_bpp_gc_live > 0) { g_bpp_gc_live = g_bpp_gc_live - 1; }
@@ -981,7 +1063,9 @@ func bpp_gc_register_block_policy(ptr: u64, size: u64, shape: u64, lifecycle: u6
     node.edges = (*BppGcEdge)0;
     node.edge_slots = (*BppGcEdgeSlot)0;
     node.next = g_bpp_gc_blocks;
+    node.index_next = (*BppGcBlock)0;
     g_bpp_gc_blocks = node;
+    bpp_gc_block_index_insert(node);
     g_bpp_gc_allocs = g_bpp_gc_allocs + 1;
     g_bpp_gc_live = g_bpp_gc_live + 1;
     bpp_gc_record_live_generation(lifecycle, bpp_gc_block_generation(node));
@@ -1036,7 +1120,17 @@ func bpp_gc_alloc_raw(size: u64, shape: u64) -> u64 {
 
 func bpp_gc_alloc_raw_rooted(size: u64, shape: u64) -> u64 {
     var raw: u64 = bpp_gc_alloc_raw(size, shape);
-    if (raw != 0) { bpp_gc_root_push(raw); }
+    if (raw != 0) {
+        var block: *BppGcBlock = g_bpp_gc_blocks;
+        if (block != 0 && bpp_gc_block_raw(block) == raw) {
+            if (bpp_gc_block_is_rooted(block) == 0) {
+                bpp_gc_block_set_rooted(block, 1);
+                g_bpp_gc_roots_count = g_bpp_gc_roots_count + 1;
+            }
+        } else {
+            bpp_gc_root_push(raw);
+        }
+    }
     return raw;
 }
 
@@ -1082,6 +1176,7 @@ func bpp_gc_root_pop() -> u64 {
 func bpp_gc_root_count() -> u64 { return g_bpp_gc_roots_count; }
 
 func bpp_gc_root_slot_push(slot: *u64) -> u64 {
+    if (bpp_gc_root_slot_tracking_enabled() == 0) { return 0; }
     if (slot == 0) { return 0; }
     if (slot[0] == 0) { return 0; }
     if (bpp_gc_find_block(slot[0]) == 0) { return 0; }
@@ -1100,6 +1195,7 @@ func bpp_gc_root_slot_push(slot: *u64) -> u64 {
 }
 
 func bpp_gc_root_slot_pop() -> u64 {
+    if (bpp_gc_root_slot_tracking_enabled() == 0) { return 0; }
     var root: *BppGcRootSlot = g_bpp_gc_root_slots;
     if (root == 0) { return 0; }
     g_bpp_gc_root_slots = root.next;
@@ -1109,6 +1205,7 @@ func bpp_gc_root_slot_pop() -> u64 {
 }
 
 func bpp_gc_root_slot_remove(slot: *u64) -> u64 {
+    if (bpp_gc_root_slot_tracking_enabled() == 0) { return 0; }
     if (slot == 0) { return 0; }
     var prev: *BppGcRootSlot = (*BppGcRootSlot)0;
     var cur: *BppGcRootSlot = g_bpp_gc_root_slots;
@@ -1130,6 +1227,7 @@ func bpp_gc_root_slot_remove(slot: *u64) -> u64 {
 func bpp_gc_root_slot_count() -> u64 { return g_bpp_gc_root_slots_count; }
 
 func bpp_gc_record_edge(parent: u64, child: u64) -> u64 {
+    if (bpp_gc_edge_tracking_enabled() == 0) { return 0; }
     if (parent == 0 || child == 0) { return 0; }
     var parent_block: *BppGcBlock = bpp_gc_find_block(parent);
     var child_block: *BppGcBlock = bpp_gc_find_block(child);
@@ -1150,6 +1248,7 @@ func bpp_gc_record_edge(parent: u64, child: u64) -> u64 {
 }
 
 func bpp_gc_record_edge_slot(parent: u64, child_slot: *u64) -> u64 {
+    if (bpp_gc_edge_tracking_enabled() == 0) { return 0; }
     if (parent == 0 || child_slot == 0) { return 0; }
     if (child_slot[0] == 0) { return 0; }
     var parent_block: *BppGcBlock = bpp_gc_find_block(parent);
@@ -1252,6 +1351,7 @@ func bpp_gc_collect() -> u64 {
                         heap_free(raw);
                     }
                     bpp_gc_forget_live_generation(lifecycle, bpp_gc_block_generation(cur));
+                    bpp_gc_block_index_remove(cur);
                     bpp_gc_block_set_live(cur, 0);
                     if (g_bpp_gc_live > 0) { g_bpp_gc_live = g_bpp_gc_live - 1; }
                     g_bpp_gc_frees = g_bpp_gc_frees + 1;
@@ -1272,6 +1372,34 @@ func bpp_gc_set_auto(enabled: u64, threshold: u64) -> u64 {
     g_bpp_gc_auto_enabled = enabled;
     if (threshold != 0) { g_bpp_gc_threshold = threshold; }
     return 0;
+}
+
+func bpp_gc_set_edge_tracking(enabled: u64) -> u64 {
+    if (enabled == 0) {
+        g_bpp_gc_edge_tracking_state = BPP_GC_EDGE_TRACKING_DISABLED;
+    } else {
+        g_bpp_gc_edge_tracking_state = BPP_GC_EDGE_TRACKING_ENABLED;
+    }
+    return 0;
+}
+
+func bpp_gc_edge_tracking_enabled() -> u64 {
+    if (g_bpp_gc_edge_tracking_state == BPP_GC_EDGE_TRACKING_DISABLED) { return 0; }
+    return 1;
+}
+
+func bpp_gc_set_root_slot_tracking(enabled: u64) -> u64 {
+    if (enabled == 0) {
+        g_bpp_gc_root_slot_tracking_state = BPP_GC_ROOT_SLOT_TRACKING_DISABLED;
+    } else {
+        g_bpp_gc_root_slot_tracking_state = BPP_GC_ROOT_SLOT_TRACKING_ENABLED;
+    }
+    return 0;
+}
+
+func bpp_gc_root_slot_tracking_enabled() -> u64 {
+    if (g_bpp_gc_root_slot_tracking_state == BPP_GC_ROOT_SLOT_TRACKING_DISABLED) { return 0; }
+    return 1;
 }
 
 func bpp_gc_set_threshold(threshold: u64) -> u64 {
@@ -1471,7 +1599,9 @@ func bpp_gc_move_block(block: *BppGcBlock) -> u64 {
     bpp_gc_update_slots_for_moved_block(old_raw, new_block_ptr);
     bpp_gc_update_legacy_edges_for_moved_block(old_raw, new_block_ptr);
     block.forwarding = new_block_ptr;
+    bpp_gc_block_index_remove_raw(block, old_raw);
     block.ptr = new_block_ptr;
+    bpp_gc_block_index_insert(block);
     heap_free(old_raw);
     g_bpp_gc_moved = g_bpp_gc_moved + 1;
     g_bpp_gc_bytes_moved = g_bpp_gc_bytes_moved + block.size;
@@ -1543,7 +1673,13 @@ func bpp_gc_reset() -> u64 {
         root_slot = next_root_slot;
     }
 
+    if (g_bpp_gc_block_index != 0) {
+        heap_free((u64)g_bpp_gc_block_index);
+    }
+
     g_bpp_gc_blocks = (*BppGcBlock)0;
+    g_bpp_gc_block_index = (*u64)0;
+    g_bpp_gc_block_index_buckets = 0;
     g_bpp_gc_roots = (*BppGcRoot)0;
     g_bpp_gc_root_slots = (*BppGcRootSlot)0;
     g_bpp_gc_allocs = 0;
@@ -1570,6 +1706,8 @@ func bpp_gc_reset() -> u64 {
     g_bpp_gc_moved = 0;
     g_bpp_gc_bytes_moved = 0;
     g_bpp_gc_compaction_blocked_untracked = 0;
+    g_bpp_gc_edge_tracking_state = BPP_GC_EDGE_TRACKING_ENABLED;
+    g_bpp_gc_root_slot_tracking_state = BPP_GC_ROOT_SLOT_TRACKING_ENABLED;
     return 0;
 }
 

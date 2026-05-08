@@ -5262,6 +5262,27 @@ func builder_gc_type_is_root_slot_candidate(ti: *TypeInfo) -> u64 {
     return 0;
 }
 
+func builder_gc_call_is_raw_strip(name: []u8) -> u64 {
+    if (name.ptr == 0 || name.len == 0) { return 0; }
+    if (str_eq(name, slice("bpp_tag_strip", str_len("bpp_tag_strip"))) != 0) { return 1; }
+    if (str_eq(name, slice("std_mem__bpp_tag_strip", str_len("std_mem__bpp_tag_strip"))) != 0) { return 1; }
+    return 0;
+}
+
+func builder_gc_init_is_raw_strip(init: u64) -> u64 {
+    if (init == 0) { return 0; }
+    var k: u64 = ast_kind(init);
+    if (k == AST_CAST) {
+        var cast: *AstCast = (*AstCast)init;
+        return builder_gc_init_is_raw_strip((u64)cast.expr);
+    }
+    if (k == AST_CALL) {
+        var call: *AstCall = (*AstCall)init;
+        if (builder_gc_call_is_raw_strip(call.name) != 0) { return 1; }
+    }
+    return 0;
+}
+
 func builder_gc_name_has_prefix(name: []u8, prefix: u64, prefix_len: u64) -> u64 {
     if (name.ptr == 0 || name.len < prefix_len || prefix == 0 || prefix_len == 0) { return 0; }
     if (str_eq(slice(name.ptr, prefix_len), slice(prefix, prefix_len)) != 0) { return 1; }
@@ -5401,8 +5422,14 @@ func expr_new(ctx: *BuilderCtx, node: u64) -> u64 {
 
     var size_reg: u64 = build_const(ctx, size);
     var shape_reg: u64 = build_const(ctx, builder_tag_shape_for_new(nw));
-    var raw_args: *Vec<u64> = make_args2(size_reg, shape_reg);
-    var heap_reg: u64 = builder_emit_named_u64_call(ctx, slice("bpp_gc_alloc_raw_rooted", str_len("bpp_gc_alloc_raw_rooted")), raw_args);
+    var heap_reg: u64 = 0;
+    if (builder_gc_auto_slots_disabled(ctx) != 0) {
+        var heap_args: *Vec<u64> = make_args1(size_reg);
+        heap_reg = builder_emit_named_u64_call(ctx, slice("heap_alloc", str_len("heap_alloc")), heap_args);
+    } else {
+        var raw_args: *Vec<u64> = make_args2(size_reg, shape_reg);
+        heap_reg = builder_emit_named_u64_call(ctx, slice("bpp_gc_alloc_raw_rooted", str_len("bpp_gc_alloc_raw_rooted")), raw_args);
+    }
 
     expr_new_init_at_addr(ctx, nw, heap_reg, size);
 
@@ -7746,7 +7773,7 @@ func stmt_var_decl(ctx: *BuilderCtx, node: u64) -> u64 {
                 }
                 if (size_at == 0) { size_at = 8; }
                 store_by_size(ctx, base_addr3, val_reg2, size_at);
-                if (vd.ptr_depth > 0) {
+                if (vd.ptr_depth > 0 && builder_gc_init_is_raw_strip(vd.init_expr) == 0) {
                     builder_gc_root_slot_refresh_local(ctx, vd.name);
                 }
                 return 0;
@@ -7760,7 +7787,9 @@ func stmt_var_decl(ctx: *BuilderCtx, node: u64) -> u64 {
             if (ptr_offset != 0) {
                 var ptr_addr: u64 = new_lea_local(ctx, ptr_offset);
                 store_by_size(ctx, ptr_addr, val_reg, 8);
-                builder_gc_root_slot_push_addr(ctx, ptr_addr);
+                if (builder_gc_init_is_raw_strip(vd.init_expr) == 0) {
+                    builder_gc_root_slot_push_addr(ctx, ptr_addr);
+                }
             }
         }
     }
@@ -7828,6 +7857,8 @@ func assign_try_packed_member(ctx: *BuilderCtx, asn: *AstAssign) -> u64 {
                     var var_id_tag: u64 = get_var_id(ctx, idn_tag.name);
                     var st_ptr_tag: *SSAInstruction = create_inst(ctx.ssa_ctx, SSA_OP_STORE, 0, operand_const(var_id_tag), operand_reg(merged));
                     append_inst(ctx.cur_block, st_ptr_tag);
+                    var tag_addr: u64 = new_lea_local(ctx, tag_offset);
+                    store_by_size(ctx, tag_addr, merged, 8);
                     return 1;
                 }
             }
