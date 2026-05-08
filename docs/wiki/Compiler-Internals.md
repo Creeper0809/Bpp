@@ -49,6 +49,9 @@
 - metadata 단계: 최적화나 backend 전환 중 사라지면 안 되는 feature marker를
   `Expect llvm metadata contains`로 고정
 
+최적화 작업의 상세 TODO는 [Compiler Optimization TODO](../compiler_optimization_todo.md)에서
+별도로 추적합니다.
+
 ## 5. 디버깅 팁
 
 - 특정 패스 전후 AST/시그니처 변화를 확인
