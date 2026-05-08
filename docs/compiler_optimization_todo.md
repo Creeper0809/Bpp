@@ -331,15 +331,20 @@ DoD:
 ### 11. PGO와 벤치마크 기반 튜닝
 
 - [x] O1 roadmap pass에서 benchmark report, inline/bigint/allocator/vector threshold 후보를 `pgo` 카운터와 LLVM 메타데이터로 노출한다.
-- [ ] microbenchmark runner를 만든다.
-- [ ] compile-time optimization report를 만든다.
-- [ ] inlining threshold를 벤치마크 기반으로 조정한다.
-- [ ] bigint 곱셈/나눗셈 threshold를 벤치마크 기반으로 조정한다.
-- [ ] allocator threshold를 벤치마크 기반으로 조정한다.
-- [ ] vector/unroll threshold를 벤치마크 기반으로 조정한다.
-- [ ] CI에서 성능 회귀를 기록하는 별도 job을 만든다.
-- [ ] 빠른 CI와 full benchmark CI를 분리한다.
+- [x] microbenchmark runner를 만든다.
+- [x] compile-time optimization report를 만든다.
+- [x] inlining threshold를 벤치마크 기반으로 조정한다.
+- [x] bigint 곱셈/나눗셈 threshold를 벤치마크 기반으로 조정한다.
+- [x] allocator threshold를 벤치마크 기반으로 조정한다.
+- [x] vector/unroll threshold를 벤치마크 기반으로 조정한다.
+- [x] CI에서 성능 회귀를 기록하는 별도 job을 만든다.
+- [x] 빠른 CI와 full benchmark CI를 분리한다.
+
+구현 메모: `bench/run_microbench.sh`는 후보/기준 컴파일러를 같은 benchmark 입력, 같은 backend, 같은 opt level로 실행하고
+`bench_report.tsv`, `optimization_report.tsv`, `comparison_report.tsv`를 만든다. threshold 값은
+`bench/optimization_thresholds.tsv`에 기록하고 실행 때 결과 디렉터리로 복사해 benchmark 결과와 함께 남긴다.
+GitHub Actions는 기본 fast CI와 수동 `full_benchmarks=true`로 켜는 별도 `performance` job을 분리한다.
 
 DoD:
-- [ ] 같은 입력, 같은 backend, 같은 opt level 기준으로 전후 성능 비교 가능
-- [ ] threshold 변경이 문서와 benchmark 결과에 함께 기록됨
+- [x] 같은 입력, 같은 backend, 같은 opt level 기준으로 전후 성능 비교 가능
+- [x] threshold 변경이 문서와 benchmark 결과에 함께 기록됨
