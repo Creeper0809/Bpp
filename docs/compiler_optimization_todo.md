@@ -204,19 +204,22 @@ DoD:
 ### 5. Inlining과 함수 간 최적화
 
 - [x] O1 roadmap pass에서 작은 함수, shape/profile call, constant-argument specialization 후보를 카운터와 LLVM 메타데이터로 노출한다.
-- [ ] 작은 함수 inlining cost model을 만든다.
-- [ ] recursive 함수와 큰 함수는 기본적으로 제외한다.
-- [ ] constant argument specialization을 추가한다.
-- [ ] generic specialization과 O1 최적화를 연결한다.
-- [ ] shape cache와 inline cache로 call target을 확정할 수 있는 경우 devirtualization한다.
-- [ ] 함수 단위 escape summary를 호출자 최적화에 사용한다.
-- [ ] 함수 단위 memory effect summary를 호출자 load/store 최적화에 사용한다.
-- [ ] `bpp.ssa.inline.small`, `bpp.ssa.call.devirtualized` 메타데이터를 남긴다.
+- [x] 작은 함수 inlining cost model을 만든다.
+- [x] recursive 함수와 큰 함수는 기본적으로 제외한다.
+- [x] constant argument specialization을 추가한다.
+- [x] generic specialization과 O1 최적화를 연결한다.
+- [x] shape cache와 inline cache로 call target을 확정할 수 있는 경우 devirtualization한다.
+- [x] 함수 단위 escape summary를 호출자 최적화에 사용한다.
+- [x] 함수 단위 memory effect summary를 호출자 load/store 최적화에 사용한다.
+- [x] `bpp.ssa.inline.small`, `bpp.ssa.call.devirtualized` 메타데이터를 남긴다.
+
+구현 메모: O1은 단일 block, 부작용 없는 아주 작은 wrapper를 실제 SSA copy/산술 명령으로 치환한다.
+나머지 작은 함수, const-arg, generic, shape/inline-cache, escape/memory summary는 cost model과 LLVM 메타데이터로 호출 지점 최적화 후보를 남긴다.
 
 DoD:
-- [ ] 작은 래퍼 함수 호출이 사라지는 테스트 추가
-- [ ] recursive/large 함수가 과도하게 커지지 않는 guard 테스트 추가
-- [ ] fast 전체 회귀 통과
+- [x] 작은 래퍼 함수 호출이 사라지는 테스트 추가
+- [x] recursive/large 함수가 과도하게 커지지 않는 guard 테스트 추가
+- [x] fast 전체 회귀 통과
 
 ### 6. Register Allocation 고도화
 

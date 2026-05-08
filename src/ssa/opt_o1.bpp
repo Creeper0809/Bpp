@@ -82,6 +82,9 @@ const SSA_TAG_SUMMARY_HAS_TAG_AUTO = 16;
 const SSA_TAG_SUMMARY_HAS_TAGGED_ACCESS = 32;
 const SSA_TAG_SUMMARY_HAS_FOLDED_TAGS = 64;
 
+const SSA_O1_INLINE_SMALL_INST_LIMIT = 18;
+const SSA_O1_INLINE_TRIVIAL_INST_LIMIT = 8;
+
 const SSA_O1_SCCP_UNKNOWN = 0;
 const SSA_O1_SCCP_CONST = 1;
 const SSA_O1_SCCP_OVERDEFINED = 2;
@@ -4288,6 +4291,158 @@ func ssa_o1_call_const_arg_count(info: *SSACallInfo) -> u64 {
     return count;
 }
 
+func ssa_o1_inline_safe_expr_op(op: u64) -> u64 {
+    if (op == SSA_OP_ADD || op == SSA_OP_SUB || op == SSA_OP_MUL || op == SSA_OP_AND ||
+        op == SSA_OP_OR || op == SSA_OP_XOR || op == SSA_OP_SHL || op == SSA_OP_SHR ||
+        op == SSA_OP_SAR || op == SSA_OP_EQ || op == SSA_OP_NE || op == SSA_OP_LT ||
+        op == SSA_OP_LE || op == SSA_OP_GT || op == SSA_OP_GE || op == SSA_OP_ULT ||
+        op == SSA_OP_ULE || op == SSA_OP_UGT || op == SSA_OP_UGE) {
+        return 1;
+    }
+    return 0;
+}
+
+func ssa_o1_inline_map_param_operand(info: *SSACallInfo, idx: u64, out: *u64) -> u64 {
+    if (info == 0 || out == 0 || idx >= info.nargs || info.args_vec == 0) { return 0; }
+    var arg_reg: u64 = info.args_vec.get(idx);
+    if (arg_reg == 0) { return 0; }
+    *out = operand_reg(arg_reg);
+    return 1;
+}
+
+func ssa_o1_inline_record_param(param_map: *Vec<*SSAOptKV>, inst: *SSAInstruction) -> u64 {
+    if (param_map == 0 || inst == 0 || inst.dest == 0 || operand_is_const(inst.src1) == 0) { return 0; }
+    kv_set(param_map, inst.dest, operand_value(inst.src1) + 1);
+    return 1;
+}
+
+func ssa_o1_inline_record_const(const_map: *Vec<*SSAOptKV>, inst: *SSAInstruction) -> u64 {
+    if (const_map == 0 || inst == 0 || inst.dest == 0 || operand_is_const(inst.src1) == 0) { return 0; }
+    kv_set(const_map, inst.dest, operand_value(inst.src1));
+    return 1;
+}
+
+func ssa_o1_inline_map_operand(info: *SSACallInfo, param_map: *Vec<*SSAOptKV>, const_map: *Vec<*SSAOptKV>, opr: u64, out: *u64) -> u64 {
+    if (out == 0 || opr == 0) { return 0; }
+    if (operand_is_const(opr) != 0) {
+        *out = opr;
+        return 1;
+    }
+    var reg: u64 = operand_value(opr);
+    var param_entry: *SSAOptKV = kv_find(param_map, reg);
+    if (param_entry != 0 && param_entry.val != 0) {
+        return ssa_o1_inline_map_param_operand(info, param_entry.val - 1, out);
+    }
+    var const_entry: *SSAOptKV = kv_find(const_map, reg);
+    if (const_entry != 0) {
+        *out = operand_const(const_entry.val);
+        return 1;
+    }
+    return 0;
+}
+
+func ssa_o1_inline_try_trivial_call(ctx: *SSAContext, caller: *SSAFunction, call_inst: *SSAInstruction, summary: *SSAOptEscapeSummary) -> u64 {
+    if (ctx == 0 || caller == 0 || call_inst == 0 || op_of(call_inst) != SSA_OP_CALL || call_inst.dest == 0) { return 0; }
+    var info: *SSACallInfo = (*SSACallInfo)operand_value(call_inst.src1);
+    if (info == 0 || info.ret_struct_size != 0) { return 0; }
+    var callee: *SSAFunction = ssa_tag_find_func_by_name(ctx, info.name);
+    if (callee == 0 || callee == caller) { return 0; }
+    if (ssa_o1_count_function_insts(callee) > SSA_O1_INLINE_TRIVIAL_INST_LIMIT) { return 0; }
+    var blocks: []*SSABlock = callee.blocks;
+    if (slice_len(blocks) != 1) { return 0; }
+    var entry: *SSABlock = blocks[0];
+    if (entry == 0 || entry.phi_head != 0) { return 0; }
+
+    var param_map: *Vec<*SSAOptKV> = vec_new_scratch<*SSAOptKV>(g_ssa_o1_scratch_arena, 8);
+    var const_map: *Vec<*SSAOptKV> = vec_new_scratch<*SSAOptKV>(g_ssa_o1_scratch_arena, 8);
+    var expr_inst: *SSAInstruction = 0;
+    var expr_src1: u64 = 0;
+    var expr_src2: u64 = 0;
+    var ret_opr: u64 = 0;
+
+    var cur: *SSAInstruction = entry.inst_head;
+    while (cur != 0) {
+        var op: u64 = op_of(cur);
+        if (op == SSA_OP_PARAM) {
+            ssa_o1_inline_record_param(param_map, cur);
+        } else if (op == SSA_OP_CONST) {
+            ssa_o1_inline_record_const(const_map, cur);
+        } else if (op == SSA_OP_RET) {
+            ret_opr = cur.src1;
+        } else if (ssa_o1_inline_safe_expr_op(op) != 0 && cur.dest != 0 && expr_inst == 0) {
+            if (ssa_o1_inline_map_operand(info, param_map, const_map, cur.src1, &expr_src1) == 0) { return 0; }
+            if (ssa_o1_inline_map_operand(info, param_map, const_map, cur.src2, &expr_src2) == 0) { return 0; }
+            expr_inst = cur;
+        } else {
+            return 0;
+        }
+        cur = cur.next;
+    }
+
+    if (ret_opr == 0) { return 0; }
+    if (expr_inst != 0 && operand_is_const(ret_opr) == 0 && operand_value(ret_opr) == expr_inst.dest) {
+        set_op(call_inst, op_of(expr_inst));
+        call_inst.src1 = expr_src1;
+        call_inst.src2 = expr_src2;
+        if (summary != 0) { summary.inline_count = summary.inline_count + 1; }
+        return 1;
+    }
+
+    var mapped_ret: u64 = 0;
+    if (ssa_o1_inline_map_operand(info, param_map, const_map, ret_opr, &mapped_ret) == 0) { return 0; }
+    if (operand_is_const(mapped_ret) != 0) {
+        set_op(call_inst, SSA_OP_CONST);
+        call_inst.src1 = mapped_ret;
+        call_inst.src2 = 0;
+    } else {
+        set_op(call_inst, SSA_OP_COPY);
+        call_inst.src1 = mapped_ret;
+        call_inst.src2 = 0;
+    }
+    if (summary != 0) { summary.inline_count = summary.inline_count + 1; }
+    return 1;
+}
+
+func ssa_o1_inline_function(ctx: *SSAContext, fn: *SSAFunction, summary: *SSAOptEscapeSummary) -> u64 {
+    if (ctx == 0 || fn == 0) { return 0; }
+    var changed: u64 = 0;
+    var blocks: []*SSABlock = fn.blocks;
+    var bcount: u64 = slice_len(blocks);
+    for (var bi: u64 = 0; bi < bcount; bi = bi + 1) {
+        var b: *SSABlock = blocks[bi];
+        if (b == 0) { continue; }
+        var cur: *SSAInstruction = b.inst_head;
+        while (cur != 0) {
+            if (op_of(cur) == SSA_OP_CALL) {
+                changed = changed + ssa_o1_inline_try_trivial_call(ctx, fn, cur, summary);
+            }
+            cur = cur.next;
+        }
+    }
+    return changed;
+}
+
+func ssa_o1_inline_cost_model(ctx: *SSAContext, caller: *SSAFunction, info: *SSACallInfo, summary: *SSAOptEscapeSummary) -> u64 {
+    if (ctx == 0 || caller == 0 || info == 0 || summary == 0) { return 0; }
+    var callee: *SSAFunction = ssa_tag_find_func_by_name(ctx, info.name);
+    if (callee == 0 || callee == caller) { return 0; }
+    var callee_inst_count: u64 = ssa_o1_count_function_insts(callee);
+    if (callee_inst_count == 0 || callee_inst_count > SSA_O1_INLINE_SMALL_INST_LIMIT) { return 0; }
+    summary.inline_count = summary.inline_count + 1;
+    if (callee_inst_count <= SSA_O1_INLINE_TRIVIAL_INST_LIMIT) { summary.inline_count = summary.inline_count + 1; }
+    if (ssa_o1_call_const_arg_count(info) != 0) {
+        summary.inline_count = summary.inline_count + 1;
+        summary.pgo_count = summary.pgo_count + 1;
+    }
+    if (callee.tag_summary_bits != 0 || callee.tag_direct_summary_bits != 0) {
+        summary.tag2_count = summary.tag2_count + 1;
+    }
+    if (callee.opt_o1_memory_effect_summary_count != 0 || callee.opt_o1_memoryssa_count != 0) {
+        summary.inline_count = summary.inline_count + 1;
+    }
+    return 1;
+}
+
 func ssa_o1_roadmap_note_direct_call(ctx: *SSAContext, fn: *SSAFunction, info: *SSACallInfo, summary: *SSAOptEscapeSummary) -> u64 {
     if (info == 0 || summary == 0) { return 0; }
     var name: []u8 = info.name;
@@ -4302,20 +4457,7 @@ func ssa_o1_roadmap_note_direct_call(ctx: *SSAContext, fn: *SSAFunction, info: *
     }
     var callee: *SSAFunction = ssa_tag_find_func_by_name(ctx, name);
     if (callee != 0 && callee != fn) {
-        var callee_inst_count: u64 = ssa_o1_count_function_insts(callee);
-        if (callee_inst_count != 0 && callee_inst_count <= 18) {
-            summary.inline_count = summary.inline_count + 1;
-            if (ssa_o1_call_const_arg_count(info) != 0) {
-                summary.inline_count = summary.inline_count + 1;
-                summary.pgo_count = summary.pgo_count + 1;
-            }
-        }
-        if (callee.tag_summary_bits != 0 || callee.tag_direct_summary_bits != 0) {
-            summary.tag2_count = summary.tag2_count + 1;
-        }
-        if (callee.opt_o1_memory_effect_summary_count != 0) {
-            summary.inline_count = summary.inline_count + 1;
-        }
+        ssa_o1_inline_cost_model(ctx, fn, info, summary);
     }
     return 0;
 }
@@ -5068,6 +5210,12 @@ func ssa_o1_run_loop2_pass(ctx: *SSAContext, fn: *SSAFunction, summary: *SSAOptE
     return ssa_o1_loop2_function(ctx, fn, summary);
 }
 
+func ssa_o1_run_inline_pass(ctx: *SSAContext, fn: *SSAFunction, summary: *SSAOptEscapeSummary) -> u64 {
+    if (ctx == 0 || fn == 0) { return 0; }
+    if (summary != 0) { summary.pass_count = summary.pass_count + 1; }
+    return ssa_o1_inline_function(ctx, fn, summary);
+}
+
 func ssa_o1_run_roadmap_pass(ctx: *SSAContext, fn: *SSAFunction, summary: *SSAOptEscapeSummary) -> u64 {
     if (fn == 0) { return 0; }
     if (summary != 0) { summary.pass_count = summary.pass_count + 1; }
@@ -5118,10 +5266,11 @@ func run(ctx: *SSAContext) -> u64 {
         var memory_changed: u64 = ssa_o1_run_memoryssa_pass(fn, summary);
         ssa_o1_run_loop_pass(fn, summary);
         var loop2_changed: u64 = ssa_o1_run_loop2_pass(ctx, fn, summary);
+        var inline_changed: u64 = ssa_o1_run_inline_pass(ctx, fn, summary);
         ssa_o1_run_roadmap_pass(ctx, fn, summary);
         var copy_changed: u64 = ssa_o1_run_copy_prop_pass(fn, summary);
         ssa_o1_run_dce_pass(fn, summary);
-        if (sccp_changed != 0 || gvn_changed != 0 || memory_changed != 0 || loop2_changed != 0 || copy_changed != 0) {
+        if (sccp_changed != 0 || gvn_changed != 0 || memory_changed != 0 || loop2_changed != 0 || inline_changed != 0 || copy_changed != 0) {
             ssa_o1_run_cfg_simplify_pass(fn, summary);
             ssa_o1_run_dce_pass(fn, summary);
         }
