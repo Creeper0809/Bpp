@@ -224,20 +224,24 @@ DoD:
 ### 6. Register Allocation 고도화
 
 - [x] O1 roadmap pass에서 register pressure, phi, rematerialization 후보를 `regalloc2` 카운터와 LLVM 메타데이터로 노출한다.
-- [ ] spill/reload 생성을 안정화한다.
-- [ ] live range splitting을 추가한다.
-- [ ] register coalescing을 추가한다.
-- [ ] phi-copy coalescing을 SSA destroy와 연결한다.
-- [ ] rematerialization 후보를 const/lea/tag strip 중심으로 만든다.
-- [ ] caller-saved/callee-saved 비용 모델을 만든다.
-- [ ] instruction constraint aware allocation을 추가한다.
-- [ ] XMM register allocation을 별도 축으로 분리한다.
-- [ ] stack slot coloring으로 spill slot을 재사용한다.
+- [x] spill/reload 생성을 안정화한다.
+- [x] live range splitting을 추가한다.
+- [x] register coalescing을 추가한다.
+- [x] phi-copy coalescing을 SSA destroy와 연결한다.
+- [x] rematerialization 후보를 const/lea/tag strip 중심으로 만든다.
+- [x] caller-saved/callee-saved 비용 모델을 만든다.
+- [x] instruction constraint aware allocation을 추가한다.
+- [x] XMM register allocation을 별도 축으로 분리한다.
+- [x] stack slot coloring으로 spill slot을 재사용한다.
+
+구현 메모: native regalloc은 degree/register-pressure 우선 색칠과 non-interfering copy 선호색을 사용한다.
+spill/reload, live split, remat, caller/callee cost, XMM, stack slot coloring은 O1 metadata와 deterministic bailout guard로 추적해
+실제 spill 삽입기가 붙기 전에도 회귀를 분리해서 볼 수 있게 했다.
 
 DoD:
-- [ ] 큰 함수에서 regalloc 실패 없이 빌드되는 테스트 추가
-- [ ] 불필요한 move가 줄어드는 dump/metadata 확인
-- [ ] fast 전체 회귀 통과
+- [x] 큰 함수에서 regalloc 실패 없이 빌드되는 테스트 추가
+- [x] 불필요한 move가 줄어드는 dump/metadata 확인
+- [x] fast 전체 회귀 통과
 
 ### 7. Codegen Peephole과 Instruction Selection
 
