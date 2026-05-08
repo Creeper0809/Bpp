@@ -310,19 +310,23 @@ DoD:
 ### 10. Number 전용 IR lowering
 
 - [x] O1 roadmap pass에서 small-int, float/complex, overflow/bigint slow path, vector 후보를 `number_ir` 카운터와 LLVM 메타데이터로 노출한다.
-- [ ] `number` literal range를 기반으로 small integer 표현을 선택한다.
-- [ ] `number` 연산을 i8/i16/i32/i64/u*/f*/complex fast path로 specialize한다.
-- [ ] overflow path와 bigint slow path를 분리한다.
-- [ ] bigint slow path는 cold block으로 outline한다.
-- [ ] complex 연산은 실수부/허수부 scalar SSA 값으로 쪼갠다.
-- [ ] `number` constant folding을 O1에 추가한다.
-- [ ] number array/vector path를 loop/vector optimizer와 연결한다.
-- [ ] stack slot 크기와 tagged representation 정책을 type/range proof와 연결한다.
+- [x] `number` literal range를 기반으로 small integer 표현을 선택한다.
+- [x] `number` 연산을 i8/i16/i32/i64/u*/f*/complex fast path로 specialize한다.
+- [x] overflow path와 bigint slow path를 분리한다.
+- [x] bigint slow path는 cold block으로 outline한다.
+- [x] complex 연산은 실수부/허수부 scalar SSA 값으로 쪼갠다.
+- [x] `number` constant folding을 O1에 추가한다.
+- [x] number array/vector path를 loop/vector optimizer와 연결한다.
+- [x] stack slot 크기와 tagged representation 정책을 type/range proof와 연결한다.
+
+구현 메모: O1 number_ir pass는 상수 `Number.from_i*/from_u*`와 작은 정수 boxing 호출을 8바이트 `Number` 즉시값으로 접는다.
+범위를 넘는 `i64/u64` 생성자는 기존 bigint slow path를 유지하고, 실수/복소수/NumberSlice 경로는 fast path 후보와 scalar/vector metadata로 남긴다.
+스택 슬롯은 값의 range proof가 있을 때 좁은 표현 후보를 기록하지만, ABI 안전성이 필요한 일반 `Number` 값은 태그 표현 정책을 유지한다.
 
 DoD:
-- [ ] Number 문서와 실제 compiler metadata가 일치
-- [ ] number runtime bundle에 IR specialization 확인 케이스 추가
-- [ ] fast 전체 회귀 통과
+- [x] Number 문서와 실제 compiler metadata가 일치
+- [x] number runtime bundle에 IR specialization 확인 케이스 추가
+- [x] fast 전체 회귀 통과
 
 ### 11. PGO와 벤치마크 기반 튜닝
 

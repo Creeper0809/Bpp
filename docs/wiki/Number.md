@@ -130,6 +130,19 @@ if (z == w) {
 - 작은 정수 산술과 비교는 생성 코드에 빠른 인라인 경로가 있습니다.
   값이 작은 즉시값이 아니거나 연산이 작은 정수 범위를 넘을 때만 런타임
   보조 함수로 넘어갑니다.
+- O1 SSA 최적화는 상수 `Number.from_i8/i16/i32/i64`와
+  `Number.from_u8/u16/u32/u64` 중 작은 정수 범위로 증명되는 호출을
+  8바이트 `Number` 즉시값으로 접습니다.
+- LLVM 덤프에서는 다음 메타데이터로 `number` 최적화 상태를 확인할 수
+  있습니다.
+  - `bpp.ssa.number.range=small-int-selected`
+  - `bpp.ssa.number.fastpath=int-float-complex-specialized`
+  - `bpp.ssa.number.overflow=bigint-guarded-slow-path`
+  - `bpp.ssa.number.bigint_outline=cold-block-candidate`
+  - `bpp.ssa.number.complex_scalar=real-imag-ssa`
+  - `bpp.ssa.number.const_fold=o1-small-int`
+  - `bpp.ssa.number.vector=number-slice-loop-candidate`
+  - `bpp.ssa.number.stack_slot=range-tag-policy`
 
 런타임 쪽 최적화:
 
