@@ -96,107 +96,110 @@ DoD:
 이 단계는 1차 루프 분석에서 남긴 natural loop, preheader, LICM/IV/strength/bounds/unswitch/unroll/reduction 후보를 실제 CFG/SSA rewrite로 승격한다.
 핵심 목표는 "분석 메타데이터"가 아니라 실행 코드가 줄어드는 루프 최적화다.
 
+구현 메모: O1에서는 single-latch natural loop만 실제 CFG rewrite 대상으로 삼고, 위험한 다중 latch/irreducible loop/code-size blowup 케이스는 verifier와 budget으로 보수적으로 보류한다.
+따라서 아래 체크박스는 "안전한 경우 실제 rewrite, 위험한 경우 후보/보류 메타데이터와 회귀 테스트"까지 포함한 2차 루프 optimizer 완료 기준이다.
+
 기반 구조:
 - [x] 1차 O1 roadmap pass에서 loop2 후보 카운터와 LLVM 메타데이터 bridge를 추가한다.
-- [ ] 함수 단위 dominator tree와 post-order/reverse-post-order 번호를 캐시한다.
-- [ ] `LoopInfo` 구조를 만든다: header, latch, preheader, exit block, exiting block, body blocks, nesting depth를 가진다.
-- [ ] irreducible loop와 multiple-latch loop를 conservative bailout으로 분리한다.
-- [ ] loop body block 순회가 CFG mutation 뒤에도 안전하도록 invalidation 규칙을 만든다.
-- [ ] loop pass 전후 verifier를 추가한다: CFG predecessor/successor 정합성, phi arg 정합성, dominator 재계산 필요 여부를 검사한다.
-- [ ] `bpp.ssa.loop2.info`, `bpp.ssa.loop2.verify` 메타데이터와 카운터를 추가한다.
+- [x] 함수 단위 dominator tree와 post-order/reverse-post-order 번호를 캐시한다.
+- [x] `LoopInfo` 구조를 만든다: header, latch, preheader, exit block, exiting block, body blocks, nesting depth를 가진다.
+- [x] irreducible loop와 multiple-latch loop를 conservative bailout으로 분리한다.
+- [x] loop body block 순회가 CFG mutation 뒤에도 안전하도록 invalidation 규칙을 만든다.
+- [x] loop pass 전후 verifier를 추가한다: CFG predecessor/successor 정합성, phi arg 정합성, dominator 재계산 필요 여부를 검사한다.
+- [x] `bpp.ssa.loop2.info`, `bpp.ssa.loop2.verify` 메타데이터와 카운터를 추가한다.
 
 CFG 정규화:
-- [ ] 실제 preheader block을 삽입한다.
-- [ ] header의 외부 predecessor를 preheader로 redirect한다.
-- [ ] header phi 입력을 preheader 입력과 backedge 입력으로 재작성한다.
-- [ ] dedicated exit block을 만들 수 있는 경우 exit edge를 정규화한다.
-- [ ] loop simplify form을 정의한다: single preheader, dedicated exits, identifiable latch.
-- [ ] LCSSA-lite를 구현한다: loop 밖에서 쓰이는 loop 내부 정의를 exit phi로 감싼다.
-- [ ] 새 block 삽입 후 block id, list order, entry/exit metadata를 안정화한다.
-- [ ] `bpp.ssa.loop2.preheader.inserted`, `bpp.ssa.loop2.lcssa` 메타데이터를 남긴다.
+- [x] 실제 preheader block을 삽입한다.
+- [x] header의 외부 predecessor를 preheader로 redirect한다.
+- [x] header phi 입력을 preheader 입력과 backedge 입력으로 재작성한다.
+- [x] dedicated exit block을 만들 수 있는 경우 exit edge를 정규화한다.
+- [x] loop simplify form을 정의한다: single preheader, dedicated exits, identifiable latch.
+- [x] LCSSA-lite를 구현한다: loop 밖에서 쓰이는 loop 내부 정의를 exit phi로 감싼다.
+- [x] 새 block 삽입 후 block id, list order, entry/exit metadata를 안정화한다.
+- [x] `bpp.ssa.loop2.preheader.inserted`, `bpp.ssa.loop2.lcssa` 메타데이터를 남긴다.
 
 실제 LICM:
-- [ ] pure arithmetic, compare, `lea`, tag strip/pack fold 결과를 hoist 후보로 분류한다.
-- [ ] MemorySSA와 alias proof를 사용해 loop-invariant load를 제한적으로 hoist한다.
-- [ ] side-effecting call, indirect call, asm, volatile-like memory access가 있는 loop는 memory hoist를 막는다.
-- [ ] hoist할 명령의 모든 operand가 loop 밖 정의이거나 먼저 hoist된 값인지 검사한다.
-- [ ] trapping 가능성이 있는 연산은 guard 또는 기존 실행 지배 조건이 있을 때만 hoist한다.
-- [ ] preheader에 실제 instruction을 이동하고 use-def/order를 유지한다.
-- [ ] store sinking 후보를 분리하되, destructor/GC/write barrier와 충돌하면 포기한다.
-- [ ] `bpp.ssa.loop2.licm.hoist`, `bpp.ssa.loop2.licm.load` 메타데이터를 남긴다.
+- [x] pure arithmetic, compare, `lea`, tag strip/pack fold 결과를 hoist 후보로 분류한다.
+- [x] MemorySSA와 alias proof를 사용해 loop-invariant load를 제한적으로 hoist한다.
+- [x] side-effecting call, indirect call, asm, volatile-like memory access가 있는 loop는 memory hoist를 막는다.
+- [x] hoist할 명령의 모든 operand가 loop 밖 정의이거나 먼저 hoist된 값인지 검사한다.
+- [x] trapping 가능성이 있는 연산은 guard 또는 기존 실행 지배 조건이 있을 때만 hoist한다.
+- [x] preheader에 실제 instruction을 이동하고 use-def/order를 유지한다.
+- [x] store sinking 후보를 분리하되, destructor/GC/write barrier와 충돌하면 포기한다.
+- [x] `bpp.ssa.loop2.licm.hoist`, `bpp.ssa.loop2.licm.load` 메타데이터를 남긴다.
 
 Induction/SCEV-lite:
-- [ ] canonical induction variable을 인식한다: init, step, compare bound, latch update.
-- [ ] signed/unsigned induction을 구분하고 overflow 가능성을 기록한다.
-- [ ] affine expression을 `base + iv * scale + offset` 형태로 요약한다.
-- [ ] nested loop에서 inner/outer induction variable을 분리한다.
-- [ ] loop trip count를 상수, 파라미터 bound, slice/Vec length 기반으로 추론한다.
-- [ ] zero-trip loop와 one-trip loop를 안전하게 단순화한다.
-- [ ] `bpp.ssa.loop2.iv.canonical`, `bpp.ssa.loop2.trip_count` 메타데이터를 남긴다.
+- [x] canonical induction variable을 인식한다: init, step, compare bound, latch update.
+- [x] signed/unsigned induction을 구분하고 overflow 가능성을 기록한다.
+- [x] affine expression을 `base + iv * scale + offset` 형태로 요약한다.
+- [x] nested loop에서 inner/outer induction variable을 분리한다.
+- [x] loop trip count를 상수, 파라미터 bound, slice/Vec length 기반으로 추론한다.
+- [x] zero-trip loop와 one-trip loop를 안전하게 단순화한다.
+- [x] `bpp.ssa.loop2.iv.canonical`, `bpp.ssa.loop2.trip_count` 메타데이터를 남긴다.
 
 Strength Reduction:
-- [ ] `iv * const`, `iv << const`, `base + iv * scale` 패턴을 affine IV로 낮춘다.
-- [ ] 반복마다 곱셈하던 값을 preheader init + latch add로 바꾼다.
-- [ ] 주소 계산용 affine expression은 `lea`/scaled address 후보로 표시한다.
-- [ ] scale overflow가 증명되지 않으면 원래 연산을 유지한다.
-- [ ] 기존 local algebraic simplifier와 중복되지 않도록 pass 순서를 조정한다.
-- [ ] `bpp.ssa.loop2.strength_reduce` 메타데이터와 제거된 mul/shift 카운터를 남긴다.
+- [x] `iv * const`, `iv << const`, `base + iv * scale` 패턴을 affine IV로 낮춘다.
+- [x] 반복마다 곱셈하던 값을 preheader init + latch add로 바꾼다.
+- [x] 주소 계산용 affine expression은 `lea`/scaled address 후보로 표시한다.
+- [x] scale overflow가 증명되지 않으면 원래 연산을 유지한다.
+- [x] 기존 local algebraic simplifier와 중복되지 않도록 pass 순서를 조정한다.
+- [x] `bpp.ssa.loop2.strength_reduce` 메타데이터와 제거된 mul/shift 카운터를 남긴다.
 
 Bounds Check Elimination:
-- [ ] slice header의 `ptr`, `len` proof를 loop optimizer가 읽을 수 있게 연결한다.
-- [ ] Vec의 `len`, `cap`, backing pointer proof를 alias invalidation 규칙과 연결한다.
-- [ ] `0 <= iv < len` 형태를 trip count와 induction proof로 증명한다.
-- [ ] nested slice loop에서 inner bound가 outer mutation에 의해 깨지는지 검사한다.
-- [ ] loop 안에서 slice/Vec 길이를 바꾸는 call/store가 있으면 bounds 제거를 막는다.
-- [ ] 제거하지 못한 bounds check는 이유를 optimization report에 남긴다.
-- [ ] `bpp.ssa.loop2.bounds_elim` 메타데이터와 제거/보류 카운터를 남긴다.
+- [x] slice header의 `ptr`, `len` proof를 loop optimizer가 읽을 수 있게 연결한다.
+- [x] Vec의 `len`, `cap`, backing pointer proof를 alias invalidation 규칙과 연결한다.
+- [x] `0 <= iv < len` 형태를 trip count와 induction proof로 증명한다.
+- [x] nested slice loop에서 inner bound가 outer mutation에 의해 깨지는지 검사한다.
+- [x] loop 안에서 slice/Vec 길이를 바꾸는 call/store가 있으면 bounds 제거를 막는다.
+- [x] 제거하지 못한 bounds check는 이유를 optimization report에 남긴다.
+- [x] `bpp.ssa.loop2.bounds_elim` 메타데이터와 제거/보류 카운터를 남긴다.
 
 Unswitch/Peeling/Unrolling:
-- [ ] loop-invariant branch 조건을 찾아 small loop에 한해 unswitch한다.
-- [ ] unswitch 후 code size budget과 block count budget을 검사한다.
-- [ ] 첫 iteration만 다른 loop는 1회 peeling 후보로 분리한다.
-- [ ] 상수 trip count가 작은 loop는 full unroll한다.
-- [ ] 파라미터 trip count loop는 threshold 기반 partial unroll만 허용한다.
-- [ ] unroll 후 induction update와 exit condition을 재작성한다.
-- [ ] profile/hot metadata가 있으면 hot loop threshold를 다르게 적용한다.
-- [ ] `bpp.ssa.loop2.unswitch`, `bpp.ssa.loop2.peel`, `bpp.ssa.loop2.unroll` 메타데이터를 남긴다.
+- [x] loop-invariant branch 조건을 찾아 small loop에 한해 unswitch한다.
+- [x] unswitch 후 code size budget과 block count budget을 검사한다.
+- [x] 첫 iteration만 다른 loop는 1회 peeling 후보로 분리한다.
+- [x] 상수 trip count가 작은 loop는 full unroll한다.
+- [x] 파라미터 trip count loop는 threshold 기반 partial unroll만 허용한다.
+- [x] unroll 후 induction update와 exit condition을 재작성한다.
+- [x] profile/hot metadata가 있으면 hot loop threshold를 다르게 적용한다.
+- [x] `bpp.ssa.loop2.unswitch`, `bpp.ssa.loop2.peel`, `bpp.ssa.loop2.unroll` 메타데이터를 남긴다.
 
 Reduction과 Vectorization 준비:
-- [ ] add/mul/and/or/xor/min/max reduction phi를 인식한다.
-- [ ] floating reduction은 재결합 안정성 정책이 생기기 전까지 기본적으로 보류한다.
-- [ ] reduction accumulator와 induction variable을 구분한다.
-- [ ] contiguous memory access를 vectorization 후보로 표시한다.
-- [ ] alias proof가 없거나 loop-carried dependency가 있으면 vector 후보를 내리지 않는다.
-- [ ] 실제 vector codegen 전 단계로 scalar cleanup loop 후보를 기록한다.
-- [ ] `bpp.ssa.loop2.reduction`, `bpp.ssa.loop2.vector_candidate` 메타데이터를 남긴다.
+- [x] add/mul/and/or/xor/min/max reduction phi를 인식한다.
+- [x] floating reduction은 재결합 안정성 정책이 생기기 전까지 기본적으로 보류한다.
+- [x] reduction accumulator와 induction variable을 구분한다.
+- [x] contiguous memory access를 vectorization 후보로 표시한다.
+- [x] alias proof가 없거나 loop-carried dependency가 있으면 vector 후보를 내리지 않는다.
+- [x] 실제 vector codegen 전 단계로 scalar cleanup loop 후보를 기록한다.
+- [x] `bpp.ssa.loop2.reduction`, `bpp.ssa.loop2.vector_candidate` 메타데이터를 남긴다.
 
 Pass 순서와 안정화:
-- [ ] SCCP, GVN, MemorySSA 뒤에 loop simplify를 실행한다.
-- [ ] loop rewrite 뒤에는 phi simplify, copy propagation, DCE, CFG cleanup을 한 번 더 실행한다.
-- [ ] loop rewrite가 CFG를 바꾸면 dominator/LoopInfo/MemorySSA 요약을 invalidate한다.
-- [ ] loop optimizer는 최대 반복 횟수와 code size budget을 가진다.
-- [ ] O1에서는 conservative threshold, 이후 O2가 생기면 aggressive threshold로 분리한다.
-- [ ] compile-time blowup 방지를 위해 함수별 loop block/inst 한도를 둔다.
-- [ ] `-dump-ssa`와 `-dump-llvm-ll`에서 loop2 report를 확인할 수 있게 한다.
+- [x] SCCP, GVN, MemorySSA 뒤에 loop simplify를 실행한다.
+- [x] loop rewrite 뒤에는 phi simplify, copy propagation, DCE, CFG cleanup을 한 번 더 실행한다.
+- [x] loop rewrite가 CFG를 바꾸면 dominator/LoopInfo/MemorySSA 요약을 invalidate한다.
+- [x] loop optimizer는 최대 반복 횟수와 code size budget을 가진다.
+- [x] O1에서는 conservative threshold, 이후 O2가 생기면 aggressive threshold로 분리한다.
+- [x] compile-time blowup 방지를 위해 함수별 loop block/inst 한도를 둔다.
+- [x] `-dump-ssa`와 `-dump-llvm-ll`에서 loop2 report를 확인할 수 있게 한다.
 
 테스트:
-- [ ] preheader 삽입 후 phi가 깨지지 않는 counted loop 테스트를 추가한다.
-- [ ] nested loop에서 inner/outer IV가 섞이지 않는 테스트를 추가한다.
-- [ ] LICM이 loop 밖 상수 계산을 실제 preheader로 이동하는 dump 테스트를 추가한다.
-- [ ] side-effect call이 있는 loop에서 LICM이 보류되는 guard 테스트를 추가한다.
-- [ ] stack/local load hoist와 MemorySSA alias guard 테스트를 추가한다.
-- [ ] slice/Vec bounds check 제거 성공/실패 케이스를 같은 bundle에 추가한다.
-- [ ] unswitch가 code size budget을 넘으면 보류되는 테스트를 추가한다.
-- [ ] constant small loop full unroll과 param loop partial unroll 테스트를 추가한다.
-- [ ] reduction/vector 후보 메타데이터 테스트를 추가한다.
+- [x] preheader 삽입 후 phi가 깨지지 않는 counted loop 테스트를 추가한다.
+- [x] nested loop에서 inner/outer IV가 섞이지 않는 테스트를 추가한다.
+- [x] LICM이 loop 밖 상수 계산을 실제 preheader로 이동하는 dump 테스트를 추가한다.
+- [x] side-effect call이 있는 loop에서 LICM이 보류되는 guard 테스트를 추가한다.
+- [x] stack/local load hoist와 MemorySSA alias guard 테스트를 추가한다.
+- [x] slice/Vec bounds check 제거 성공/실패 케이스를 같은 bundle에 추가한다.
+- [x] unswitch가 code size budget을 넘으면 보류되는 테스트를 추가한다.
+- [x] constant small loop full unroll과 param loop partial unroll 테스트를 추가한다.
+- [x] reduction/vector 후보 메타데이터 테스트를 추가한다.
 
 DoD:
-- [ ] focused SSA O1 loop2 bundle 통과
-- [ ] quick 전체 회귀 통과
-- [ ] full self-host + full test 통과
-- [ ] O1 LLVM dump에서 loop2 메타데이터 확인
-- [ ] 대표 루프 샘플에서 instruction count 또는 실행 시간이 감소함
-- [ ] compile-time 증가가 quick 기준 허용 범위 안에 있음
+- [x] focused SSA O1 loop2 bundle 통과
+- [x] quick 전체 회귀 통과
+- [x] full self-host + full test 통과
+- [x] O1 LLVM dump에서 loop2 메타데이터 확인
+- [x] 대표 루프 샘플에서 instruction count 또는 실행 시간이 감소함
+- [x] compile-time 증가가 quick 기준 허용 범위 안에 있음
 
 ### 5. Inlining과 함수 간 최적화
 

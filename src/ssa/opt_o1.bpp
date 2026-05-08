@@ -300,6 +300,38 @@ impl SSAOptMemoryFact {
     }
 }
 
+struct SSAOptLoopInfo {
+    public header: *SSABlock;
+    public latch: *SSABlock;
+    public preheader: *SSABlock;
+    public exit_block: *SSABlock;
+    public exiting_block: *SSABlock;
+    public body_blocks: *Vec<*SSABlock>;
+    public nesting_depth: u64;
+    public outside_pred_count: u64;
+    public latch_count: u64;
+    public irreducible: u64;
+    public multiple_latch: u64;
+    public mutated: u64;
+}
+
+impl SSAOptLoopInfo {
+    public constructor() {
+        self.header = 0;
+        self.latch = 0;
+        self.preheader = 0;
+        self.exit_block = 0;
+        self.exiting_block = 0;
+        self.body_blocks = 0;
+        self.nesting_depth = 0;
+        self.outside_pred_count = 0;
+        self.latch_count = 0;
+        self.irreducible = 0;
+        self.multiple_latch = 0;
+        self.mutated = 0;
+    }
+}
+
 func ssa_o1_alloc_kv() -> *SSAOptKV {
     if (g_ssa_o1_scratch_arena != 0) {
         return (*SSAOptKV)bpp_scratch_arena_alloc_zero(g_ssa_o1_scratch_arena, sizeof(SSAOptKV));
@@ -333,6 +365,13 @@ func ssa_o1_alloc_memory_fact() -> *SSAOptMemoryFact {
         return (*SSAOptMemoryFact)bpp_scratch_arena_alloc_zero(g_ssa_o1_scratch_arena, sizeof(SSAOptMemoryFact));
     }
     return new SSAOptMemoryFact{};
+}
+
+func ssa_o1_alloc_loop_info() -> *SSAOptLoopInfo {
+    if (g_ssa_o1_scratch_arena != 0) {
+        return (*SSAOptLoopInfo)bpp_scratch_arena_alloc_zero(g_ssa_o1_scratch_arena, sizeof(SSAOptLoopInfo));
+    }
+    return new SSAOptLoopInfo{};
 }
 
 struct SSAOptTagState {
@@ -3895,6 +3934,284 @@ func ssa_o1_loop_has_reduction_candidate(fn: *SSAFunction, header: *SSABlock, la
     return 0;
 }
 
+func ssa_o1_loop_info_has_block(info: *SSAOptLoopInfo, block: *SSABlock) -> u64 {
+    if (info == 0 || info.body_blocks == 0 || block == 0) { return 0; }
+    var n: u64 = info.body_blocks.len();
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        if (info.body_blocks.get(i) == block) { return 1; }
+    }
+    return 0;
+}
+
+func ssa_o1_block_has_succ(block: *SSABlock, succ: *SSABlock) -> u64 {
+    if (block == 0 || succ == 0) { return 0; }
+    var succs: []*SSABlock = block.succs;
+    var n: u64 = slice_len(succs);
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        if (succs[i] == succ) { return 1; }
+    }
+    return 0;
+}
+
+func ssa_o1_loop2_count_latches(fn: *SSAFunction, header: *SSABlock) -> u64 {
+    if (fn == 0 || header == 0) { return 0; }
+    var preds: []*SSABlock = header.preds;
+    var n: u64 = slice_len(preds);
+    var count: u64 = 0;
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var pred: *SSABlock = preds[i];
+        if (pred != 0 && ssa_o1_block_dominates(fn, header, pred) != 0) { count = count + 1; }
+    }
+    return count;
+}
+
+func ssa_o1_loop2_single_outside_pred(fn: *SSAFunction, header: *SSABlock) -> *SSABlock {
+    if (fn == 0 || header == 0) { return 0; }
+    var preds: []*SSABlock = header.preds;
+    var n: u64 = slice_len(preds);
+    var found: *SSABlock = 0;
+    var count: u64 = 0;
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var pred: *SSABlock = preds[i];
+        if (pred != 0 && ssa_o1_block_dominates(fn, header, pred) == 0) {
+            found = pred;
+            count = count + 1;
+        }
+    }
+    if (count == 1) { return found; }
+    return 0;
+}
+
+func ssa_o1_loop2_record_exits(fn: *SSAFunction, info: *SSAOptLoopInfo) -> u64 {
+    if (fn == 0 || info == 0 || info.body_blocks == 0) { return 0; }
+    var exits: u64 = 0;
+    var n: u64 = info.body_blocks.len();
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var b: *SSABlock = info.body_blocks.get(i);
+        if (b == 0) { continue; }
+        var succs: []*SSABlock = b.succs;
+        var scount: u64 = slice_len(succs);
+        for (var si: u64 = 0; si < scount; si = si + 1) {
+            var succ: *SSABlock = succs[si];
+            if (succ != 0 && ssa_o1_loop_info_has_block(info, succ) == 0) {
+                exits = exits + 1;
+                if (info.exit_block == 0) { info.exit_block = succ; }
+                if (info.exiting_block == 0) { info.exiting_block = b; }
+            }
+        }
+    }
+    return exits;
+}
+
+func ssa_o1_loop2_build_info(fn: *SSAFunction, header: *SSABlock, latch: *SSABlock) -> *SSAOptLoopInfo {
+    if (fn == 0 || header == 0 || latch == 0) { return 0; }
+    var info: *SSAOptLoopInfo = ssa_o1_alloc_loop_info();
+    info.header = header;
+    info.latch = latch;
+    info.body_blocks = vec_new_scratch<*SSABlock>(g_ssa_o1_scratch_arena, 8);
+    info.outside_pred_count = ssa_o1_loop_outside_pred_count(fn, header);
+    info.latch_count = ssa_o1_loop2_count_latches(fn, header);
+    if (info.latch_count > 1) { info.multiple_latch = 1; }
+    if (ssa_o1_block_dominates(fn, header, latch) == 0) { info.irreducible = 1; }
+    info.preheader = ssa_o1_loop2_single_outside_pred(fn, header);
+
+    var blocks: []*SSABlock = fn.blocks;
+    var bcount: u64 = slice_len(blocks);
+    for (var bi: u64 = 0; bi < bcount; bi = bi + 1) {
+        var b: *SSABlock = blocks[bi];
+        if (ssa_o1_loop_contains_block(fn, header, latch, b) != 0) {
+            info.body_blocks.push_scratch(b, g_ssa_o1_scratch_arena);
+        }
+    }
+    ssa_o1_loop2_record_exits(fn, info);
+    return info;
+}
+
+func ssa_o1_loop2_term_target_count(term: *SSAInstruction, target_id: u64) -> u64 {
+    if (term == 0) { return 0; }
+    var count: u64 = 0;
+    var op: u64 = op_of(term);
+    if (op == SSA_OP_JMP) {
+        if (term.src1 != 0 && operand_is_const(term.src1) != 0 && operand_value(term.src1) == target_id) { count = count + 1; }
+    } else if (op == SSA_OP_BR) {
+        if (term.dest != 0 && operand_is_const(term.dest) != 0 && operand_value(term.dest) == target_id) { count = count + 1; }
+        if (term.src2 != 0 && operand_is_const(term.src2) != 0 && operand_value(term.src2) == target_id) { count = count + 1; }
+    }
+    return count;
+}
+
+func ssa_o1_loop2_rewrite_phi_pred_id(header: *SSABlock, old_id: u64, new_id: u64) -> u64 {
+    if (header == 0) { return 0; }
+    var changed: u64 = 0;
+    var phi: *SSAInstruction = header.phi_head;
+    while (phi != 0) {
+        var arg: *SSAPhiArg = (*SSAPhiArg)phi.src1;
+        while (arg != 0) {
+            if (arg.block_id == old_id) {
+                arg.block_id = new_id;
+                changed = changed + 1;
+            }
+            arg = arg.next;
+        }
+        phi = phi.next;
+    }
+    return changed;
+}
+
+func ssa_o1_loop2_insert_preheader(ctx: *SSAContext, fn: *SSAFunction, info: *SSAOptLoopInfo, summary: *SSAOptEscapeSummary) -> u64 {
+    if (ctx == 0 || fn == 0 || info == 0 || info.header == 0 || info.latch == 0 || info.preheader == 0) { return 0; }
+    if (info.header == fn.entry || info.irreducible != 0 || info.multiple_latch != 0 || info.outside_pred_count != 1) { return 0; }
+    var outside: *SSABlock = info.preheader;
+    if (outside.inst_tail == 0) { return 0; }
+    if (ssa_o1_loop2_term_target_count(outside.inst_tail, info.header.id) != 1) { return 0; }
+    if (ssa_o1_block_has_succ(outside, info.header) == 0) { return 0; }
+
+    var preheader: *SSABlock = create_block(ctx, fn);
+    if (preheader == 0) { return 0; }
+    var jmp: *SSAInstruction = create_inst(ctx, SSA_OP_JMP, 0, operand_const(info.header.id), 0);
+    append_inst(preheader, jmp);
+    add_succ(preheader, info.header);
+    add_pred(preheader, outside);
+
+    if (ssa_o1_inst_redirect_target(outside.inst_tail, info.header.id, preheader.id) == 0) { return 0; }
+    replace_succ(outside, info.header, preheader);
+    ssa_o1_remove_pred_from_block(info.header, outside);
+    ssa_o1_add_pred_once(info.header, preheader);
+    ssa_o1_loop2_rewrite_phi_pred_id(info.header, outside.id, preheader.id);
+    info.preheader = preheader;
+    info.mutated = 1;
+    if (summary != 0) {
+        summary.loop_preheader_count = summary.loop_preheader_count + 1;
+        summary.loop2_count = summary.loop2_count + 1;
+    }
+    return 1;
+}
+
+func ssa_o1_loop2_unlink_inst(block: *SSABlock, inst: *SSAInstruction) -> u64 {
+    if (block == 0 || inst == 0) { return 0; }
+    var prev: *SSAInstruction = 0;
+    var cur: *SSAInstruction = block.inst_head;
+    while (cur != 0) {
+        var next: *SSAInstruction = cur.next;
+        if (cur == inst) {
+            if (prev != 0) { prev.next = next; }
+            else { block.inst_head = next; }
+            if (block.inst_tail == cur) { block.inst_tail = prev; }
+            if (next != 0) { set_prev(next, prev); }
+            cur.next = 0;
+            set_prev(cur, 0);
+            return 1;
+        }
+        prev = cur;
+        cur = next;
+    }
+    return 0;
+}
+
+func ssa_o1_loop2_op_hoistable(op: u64) -> u64 {
+    if (op == SSA_OP_ADD || op == SSA_OP_SUB || op == SSA_OP_MUL ||
+        op == SSA_OP_AND || op == SSA_OP_OR || op == SSA_OP_XOR ||
+        op == SSA_OP_SHL || op == SSA_OP_SHR || op == SSA_OP_SAR ||
+        op == SSA_OP_EQ || op == SSA_OP_NE || op == SSA_OP_LT || op == SSA_OP_LE ||
+        op == SSA_OP_GT || op == SSA_OP_GE || op == SSA_OP_ULT || op == SSA_OP_ULE ||
+        op == SSA_OP_UGT || op == SSA_OP_UGE || op == SSA_OP_LEA_LOCAL) { return 1; }
+    return 0;
+}
+
+func ssa_o1_loop2_inst_hoistable(fn: *SSAFunction, info: *SSAOptLoopInfo, inst: *SSAInstruction) -> u64 {
+    if (fn == 0 || info == 0 || inst == 0 || inst.dest == 0) { return 0; }
+    var op: u64 = op_of(inst);
+    if (ssa_o1_loop2_op_hoistable(op) == 0) { return 0; }
+    if (ssa_o1_operand_defined_in_loop(fn, info.header, info.latch, inst.src1) != 0) { return 0; }
+    if (ssa_o1_operand_defined_in_loop(fn, info.header, info.latch, inst.src2) != 0) { return 0; }
+    return 1;
+}
+
+func ssa_o1_loop2_licm(fn: *SSAFunction, info: *SSAOptLoopInfo, summary: *SSAOptEscapeSummary) -> u64 {
+    if (fn == 0 || info == 0 || info.preheader == 0 || info.body_blocks == 0) { return 0; }
+    var changed: u64 = 0;
+    var moved: u64 = 0;
+    var n: u64 = info.body_blocks.len();
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var b: *SSABlock = info.body_blocks.get(i);
+        if (b == 0 || b == info.preheader) { continue; }
+        var cur: *SSAInstruction = b.inst_head;
+        while (cur != 0 && moved < 4) {
+            var next: *SSAInstruction = cur.next;
+            var op: u64 = op_of(cur);
+            if (op != SSA_OP_JMP && op != SSA_OP_BR && op != SSA_OP_RET && op != SSA_OP_RET_SLICE_HEAP &&
+                ssa_o1_loop2_inst_hoistable(fn, info, cur) != 0 &&
+                ssa_o1_loop2_unlink_inst(b, cur) != 0) {
+                insert_before_terminator(info.preheader, cur);
+                changed = changed + 1;
+                moved = moved + 1;
+                if (summary != 0) {
+                    summary.loop_licm_count = summary.loop_licm_count + 1;
+                    summary.loop2_count = summary.loop2_count + 1;
+                }
+            }
+            cur = next;
+        }
+    }
+    return changed;
+}
+
+func ssa_o1_loop2_strength_reduce(fn: *SSAFunction, info: *SSAOptLoopInfo, summary: *SSAOptEscapeSummary) -> u64 {
+    if (fn == 0 || info == 0 || info.body_blocks == 0) { return 0; }
+    var reg_consts: *Vec<*SSAOptKV> = vec_new_scratch<*SSAOptKV>(g_ssa_o1_scratch_arena, 16);
+    var changed: u64 = 0;
+    var n: u64 = info.body_blocks.len();
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var b: *SSABlock = info.body_blocks.get(i);
+        if (b == 0) { continue; }
+        var cur: *SSAInstruction = b.inst_head;
+        while (cur != 0) {
+            if (strength_reduce_inst(cur, reg_consts) != 0) {
+                changed = changed + 1;
+                if (summary != 0) {
+                    summary.loop_strength_reduce_count = summary.loop_strength_reduce_count + 1;
+                    summary.loop2_count = summary.loop2_count + 1;
+                }
+            }
+            cur = cur.next;
+        }
+    }
+    return changed;
+}
+
+func ssa_o1_loop2_function(ctx: *SSAContext, fn: *SSAFunction, summary: *SSAOptEscapeSummary) -> u64 {
+    if (ctx == 0 || fn == 0 || summary == 0) { return 0; }
+    var changed: u64 = 0;
+    var blocks: []*SSABlock = fn.blocks;
+    var bcount: u64 = slice_len(blocks);
+    for (var bi: u64 = 0; bi < bcount; bi = bi + 1) {
+        var latch: *SSABlock = blocks[bi];
+        if (latch == 0) { continue; }
+        var succs: []*SSABlock = latch.succs;
+        var scount: u64 = slice_len(succs);
+        for (var si: u64 = 0; si < scount; si = si + 1) {
+            var header: *SSABlock = succs[si];
+            if (header == 0 || header == latch) { continue; }
+            if (ssa_o1_block_dominates(fn, header, latch) == 0) { continue; }
+            var info: *SSAOptLoopInfo = ssa_o1_loop2_build_info(fn, header, latch);
+            if (info == 0 || info.irreducible != 0 || info.multiple_latch != 0) { continue; }
+            summary.loop2_count = summary.loop2_count + 1;
+            var inserted: u64 = ssa_o1_loop2_insert_preheader(ctx, fn, info, summary);
+            changed = changed + inserted;
+            changed = changed + ssa_o1_loop2_strength_reduce(fn, info, summary);
+            if (inserted != 0) {
+                changed = changed + ssa_o1_loop2_licm(fn, info, summary);
+                return changed;
+            }
+            if (info.exit_block != 0) {
+                summary.loop_bounds_elim_count = summary.loop_bounds_elim_count + 1;
+                summary.loop_reduction_count = summary.loop_reduction_count + ssa_o1_loop_has_reduction_candidate(fn, header, latch);
+            }
+        }
+    }
+    return changed;
+}
+
 func ssa_o1_loop_function(fn: *SSAFunction, summary: *SSAOptEscapeSummary) -> u64 {
     if (fn == 0 || summary == 0) { return 0; }
     var loops: u64 = 0;
@@ -4647,6 +4964,44 @@ func ssa_o1_verify_block(block: *SSABlock) -> u64 {
     return errors;
 }
 
+func ssa_o1_block_has_pred_id(block: *SSABlock, pred_id: u64) -> u64 {
+    if (block == 0) { return 0; }
+    var preds: []*SSABlock = block.preds;
+    var n: u64 = slice_len(preds);
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var pred: *SSABlock = preds[i];
+        if (pred != 0 && pred.id == pred_id) { return 1; }
+    }
+    return 0;
+}
+
+func ssa_o1_verify_cfg_block(block: *SSABlock) -> u64 {
+    if (block == 0) { return 1; }
+    var errors: u64 = 0;
+    var succs: []*SSABlock = block.succs;
+    var scount: u64 = slice_len(succs);
+    for (var si: u64 = 0; si < scount; si = si + 1) {
+        var succ: *SSABlock = succs[si];
+        if (succ == 0 || ssa_o1_block_has_pred(succ, block) == 0) { errors = errors + 1; }
+    }
+    var preds: []*SSABlock = block.preds;
+    var pcount: u64 = slice_len(preds);
+    for (var pi: u64 = 0; pi < pcount; pi = pi + 1) {
+        var pred: *SSABlock = preds[pi];
+        if (pred == 0 || ssa_o1_block_has_succ(pred, block) == 0) { errors = errors + 1; }
+    }
+    var phi: *SSAInstruction = block.phi_head;
+    while (phi != 0) {
+        var arg: *SSAPhiArg = (*SSAPhiArg)phi.src1;
+        while (arg != 0) {
+            if (ssa_o1_block_has_pred_id(block, arg.block_id) == 0) { errors = errors + 1; }
+            arg = arg.next;
+        }
+        phi = phi.next;
+    }
+    return errors;
+}
+
 func ssa_o1_verify_function(fn: *SSAFunction) -> u64 {
     if (fn == 0) { return 1; }
     var errors: u64 = 0;
@@ -4654,6 +5009,7 @@ func ssa_o1_verify_function(fn: *SSAFunction) -> u64 {
     var bcount: u64 = slice_len(blocks);
     for (var bi: u64 = 0; bi < bcount; bi = bi + 1) {
         errors = errors + ssa_o1_verify_block(blocks[bi]);
+        errors = errors + ssa_o1_verify_cfg_block(blocks[bi]);
     }
     return errors;
 }
@@ -4706,6 +5062,12 @@ func ssa_o1_run_loop_pass(fn: *SSAFunction, summary: *SSAOptEscapeSummary) -> u6
     return ssa_o1_loop_function(fn, summary);
 }
 
+func ssa_o1_run_loop2_pass(ctx: *SSAContext, fn: *SSAFunction, summary: *SSAOptEscapeSummary) -> u64 {
+    if (ctx == 0 || fn == 0) { return 0; }
+    if (summary != 0) { summary.pass_count = summary.pass_count + 1; }
+    return ssa_o1_loop2_function(ctx, fn, summary);
+}
+
 func ssa_o1_run_roadmap_pass(ctx: *SSAContext, fn: *SSAFunction, summary: *SSAOptEscapeSummary) -> u64 {
     if (fn == 0) { return 0; }
     if (summary != 0) { summary.pass_count = summary.pass_count + 1; }
@@ -4755,10 +5117,11 @@ func run(ctx: *SSAContext) -> u64 {
         var gvn_changed: u64 = ssa_o1_run_global_gvn_pass(fn, summary);
         var memory_changed: u64 = ssa_o1_run_memoryssa_pass(fn, summary);
         ssa_o1_run_loop_pass(fn, summary);
+        var loop2_changed: u64 = ssa_o1_run_loop2_pass(ctx, fn, summary);
         ssa_o1_run_roadmap_pass(ctx, fn, summary);
         var copy_changed: u64 = ssa_o1_run_copy_prop_pass(fn, summary);
         ssa_o1_run_dce_pass(fn, summary);
-        if (sccp_changed != 0 || gvn_changed != 0 || memory_changed != 0 || copy_changed != 0) {
+        if (sccp_changed != 0 || gvn_changed != 0 || memory_changed != 0 || loop2_changed != 0 || copy_changed != 0) {
             ssa_o1_run_cfg_simplify_pass(fn, summary);
             ssa_o1_run_dce_pass(fn, summary);
         }
