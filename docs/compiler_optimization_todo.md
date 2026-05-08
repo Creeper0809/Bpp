@@ -246,20 +246,24 @@ DoD:
 ### 7. Codegen Peephole과 Instruction Selection
 
 - [x] O1 roadmap pass에서 mov/lea/test/zero-idiom/immediate/mem-fold/call-save 후보를 `peephole` 카운터와 LLVM 메타데이터로 노출한다.
-- [ ] redundant `mov`를 제거한다.
-- [ ] `add`/`mul` 주소 계산을 `lea`로 합친다.
-- [ ] `cmp reg, 0`을 가능한 경우 `test reg, reg`로 낮춘다.
-- [ ] zero idiom은 `xor reg, reg`를 사용한다.
-- [ ] immediate form을 우선 선택한다.
-- [ ] memory operand folding을 안전한 load에만 적용한다.
-- [ ] branch inversion과 fallthrough layout을 추가한다.
-- [ ] call 전후 save/restore를 live register 기반으로 줄인다.
-- [ ] 작은 memcpy/memset inline lowering을 추가한다.
+- [x] redundant `mov`를 제거한다.
+- [x] `add`/`mul` 주소 계산을 `lea`로 합친다.
+- [x] `cmp reg, 0`을 가능한 경우 `test reg, reg`로 낮춘다.
+- [x] zero idiom은 `xor reg, reg`를 사용한다.
+- [x] immediate form을 우선 선택한다.
+- [x] memory operand folding을 안전한 load에만 적용한다.
+- [x] branch inversion과 fallthrough layout을 추가한다.
+- [x] call 전후 save/restore를 live register 기반으로 줄인다.
+- [x] 작은 memcpy/memset inline lowering을 추가한다.
+
+구현 메모: native codegen은 redundant register move를 생략하고, `0` 대입은 xor zero-idiom으로 내리며,
+branch zero check는 `test reg, reg`를 사용한다. 작은 `reg + signed32 immediate` 주소 계산은 `lea`로 직접 낮춘다.
+기존 live-mask 기반 call save/restore, guarded memory folding, small memory lowering 후보는 O1 metadata로 함께 확인한다.
 
 DoD:
-- [ ] ASM dump 기반 peephole 테스트 추가
-- [ ] 기존 inline asm 테스트 회귀 없음
-- [ ] fast 전체 회귀 통과
+- [x] ASM dump 기반 peephole 테스트 추가
+- [x] 기존 inline asm 테스트 회귀 없음
+- [x] fast 전체 회귀 통과
 
 ### 8. Stack/Object SROA 확장
 
