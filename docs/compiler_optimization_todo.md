@@ -268,18 +268,23 @@ DoD:
 ### 8. Stack/Object SROA 확장
 
 - [x] O1 roadmap pass에서 field scalarization, struct copy, dead field store, slice header 추적 후보를 `sroa2` 카운터와 LLVM 메타데이터로 노출한다.
-- [ ] stack object를 field별 SSA 값으로 쪼갠다.
-- [ ] struct copy를 field copy 또는 scalar copy로 낮춘다.
-- [ ] dead field store를 제거한다.
-- [ ] escaped field만 heap/object 경로로 유지한다.
-- [ ] aggregate return scalarization을 검토한다.
-- [ ] slice header의 `ptr`과 `len`을 별도 SSA 값으로 추적한다.
-- [ ] stack-new SROA와 일반 local object SROA를 같은 증명 체계로 합친다.
+- [x] stack object를 field별 SSA 값으로 쪼갠다.
+- [x] struct copy를 field copy 또는 scalar copy로 낮춘다.
+- [x] dead field store를 제거한다.
+- [x] escaped field만 heap/object 경로로 유지한다.
+- [x] aggregate return scalarization을 검토한다.
+- [x] slice header의 `ptr`과 `len`을 별도 SSA 값으로 추적한다.
+- [x] stack-new SROA와 일반 local object SROA를 같은 증명 체계로 합친다.
+
+구현 메모: O1 SROA는 `LEA_LOCAL + offset`을 field key로 추적해 로컬 객체의 store/load를 SSA copy로 forward하고,
+같은 field에 다시 store되는 이전 store를 제거한다. slice header는 `ptr`과 `len`을 각각 8바이트 field로 보며,
+escape가 보이는 call/간접 call/알 수 없는 포인터 쓰기는 기존 heap/object 경로를 유지하도록 barrier 처리한다.
+큰 aggregate return은 현재 scalarization 후보로 기록하고, 실제 위험한 ABI rewrite는 하지 않는다.
 
 DoD:
-- [ ] struct field store/load 제거 테스트 추가
-- [ ] stack-new bundled 테스트 회귀 없음
-- [ ] fast 전체 회귀 통과
+- [x] struct field store/load 제거 테스트 추가
+- [x] stack-new bundled 테스트 회귀 없음
+- [x] fast 전체 회귀 통과
 
 ### 9. Tagged Pointer 최적화 확장
 

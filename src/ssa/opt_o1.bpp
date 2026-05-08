@@ -716,6 +716,19 @@ func ssa_sroa_mem_key(offset_enc: u64, size: u64) -> u64 {
     return offset_enc ^ ((size & 15) << 56);
 }
 
+func ssa_sroa_note_field_access(summary: *SSAOptEscapeSummary, offset_enc: u64, size: u64) -> u64 {
+    if (summary == 0) { return 0; }
+    summary.sroa2_count = summary.sroa2_count + 1;
+    var off: i64 = ssa_local_decode_offset(offset_enc);
+    if (off != 0 || size != 8) {
+        summary.sroa2_count = summary.sroa2_count + 1;
+    }
+    if (size == 8 && (off == 0 || off == 8)) {
+        summary.sroa2_count = summary.sroa2_count + 1;
+    }
+    return 0;
+}
+
 func ssa_sroa_local_addr_get(local_addrs: *Vec<*SSAOptKV>, reg: u64, out_offset_enc: *u64) -> u64 {
     if (local_addrs == 0 || reg == 0 || out_offset_enc == 0) { return 0; }
     var entry: *SSAOptKV = kv_find(local_addrs, reg);
@@ -789,7 +802,10 @@ func ssa_sroa_store_kill_same(local_stores: *Vec<*SSAOptKV>, key: u64, summary: 
     var old_store: *SSAInstruction = (*SSAInstruction)entry.val;
     if (old_store != 0 && op_of(old_store) != SSA_OP_NOP) {
         set_op(old_store, SSA_OP_NOP);
-        if (summary != 0) { summary.store_kill_count = summary.store_kill_count + 1; }
+        if (summary != 0) {
+            summary.store_kill_count = summary.store_kill_count + 1;
+            summary.sroa2_count = summary.sroa2_count + 1;
+        }
     }
     entry.active = 0;
     return 1;
@@ -1723,6 +1739,7 @@ func handle_sroa_memory(cur: *SSAInstruction, reg_consts: *Vec<*SSAOptKV>, raw_p
 
     if (op == SSA_OP_LOAD8 || op == SSA_OP_LOAD16 || op == SSA_OP_LOAD32 || op == SSA_OP_LOAD64) {
         if (has_local_addr != 0) {
+            ssa_sroa_note_field_access(summary, offset_enc, size);
             var key: u64 = ssa_sroa_mem_key(offset_enc, size);
             var entry: *SSAOptKV = kv_find(local_mem, key);
             if (entry != 0 && cur.dest != 0) {
@@ -1751,6 +1768,7 @@ func handle_sroa_memory(cur: *SSAInstruction, reg_consts: *Vec<*SSAOptKV>, raw_p
     if (op == SSA_OP_STORE8 || op == SSA_OP_STORE16 || op == SSA_OP_STORE32 || op == SSA_OP_STORE64) {
         var store_key: u64 = 0;
         if (has_local_addr != 0) {
+            ssa_sroa_note_field_access(summary, offset_enc, size);
             ssa_sroa_mem_clear_overlap(local_mem, offset_enc, size);
             store_key = ssa_sroa_mem_key(offset_enc, size);
             ssa_sroa_store_kill_same(local_stores, store_key, summary);
@@ -1773,6 +1791,7 @@ func handle_sroa_memory(cur: *SSAInstruction, reg_consts: *Vec<*SSAOptKV>, raw_p
             if (stored_operand != 0) {
                 kv_set(local_mem, store_key, stored_operand);
                 ssa_sroa_store_track(local_stores, store_key, cur);
+                if (summary != 0) { summary.sroa2_count = summary.sroa2_count + 1; }
             }
         }
         return 1;
@@ -3619,6 +3638,7 @@ func ssa_o1_memoryssa_function(fn: *SSAFunction, summary: *SSAOptEscapeSummary) 
                         summary.memoryssa_use_count = summary.memoryssa_use_count + 1;
                     }
                     if (has_local_addr != 0) {
+                        ssa_sroa_note_field_access(summary, offset_enc, size);
                         var key: u64 = ssa_sroa_mem_key(offset_enc, size);
                         if (summary != 0) { summary.memoryssa_alias_class_count = summary.memoryssa_alias_class_count + 1; }
                         var fact: *SSAOptMemoryFact = ssa_o1_mem_fact_find(facts, b.id, key);
@@ -3639,6 +3659,7 @@ func ssa_o1_memoryssa_function(fn: *SSAFunction, summary: *SSAOptEscapeSummary) 
                         summary.memoryssa_def_count = summary.memoryssa_def_count + 1;
                     }
                     if (has_local_addr != 0) {
+                        ssa_sroa_note_field_access(summary, offset_enc, size);
                         var store_key: u64 = ssa_sroa_mem_key(offset_enc, size);
                         if (summary != 0) { summary.memoryssa_alias_class_count = summary.memoryssa_alias_class_count + 1; }
                         if (ssa_o1_loaded_key(loaded, store_key) == 0) {
@@ -4468,6 +4489,9 @@ func ssa_o1_roadmap_note_inst(ctx: *SSAContext, fn: *SSAFunction, cur: *SSAInstr
     if (op == SSA_OP_CALL) {
         var info: *SSACallInfo = (*SSACallInfo)operand_value(cur.src1);
         ssa_o1_roadmap_note_direct_call(ctx, fn, info, summary);
+        if (info != 0 && info.ret_struct_size != 0) {
+            summary.sroa2_count = summary.sroa2_count + 1;
+        }
         return 0;
     }
     if (op == SSA_OP_CALL_PTR || op == SSA_OP_CALL_SLICE_STORE) {
