@@ -164,6 +164,14 @@ struct SSAOptEscapeSummary {
     public loop_unswitch_count: u64;
     public loop_unroll_count: u64;
     public loop_reduction_count: u64;
+    public loop2_count: u64;
+    public inline_count: u64;
+    public regalloc2_count: u64;
+    public peephole_count: u64;
+    public sroa2_count: u64;
+    public tag2_count: u64;
+    public number_ir_count: u64;
+    public pgo_count: u64;
 }
 
 impl SSAOptEscapeSummary {
@@ -229,6 +237,14 @@ impl SSAOptEscapeSummary {
         self.loop_unswitch_count = 0;
         self.loop_unroll_count = 0;
         self.loop_reduction_count = 0;
+        self.loop2_count = 0;
+        self.inline_count = 0;
+        self.regalloc2_count = 0;
+        self.peephole_count = 0;
+        self.sroa2_count = 0;
+        self.tag2_count = 0;
+        self.number_ir_count = 0;
+        self.pgo_count = 0;
     }
 }
 
@@ -3908,6 +3924,170 @@ func ssa_o1_loop_function(fn: *SSAFunction, summary: *SSAOptEscapeSummary) -> u6
     return loops;
 }
 
+// ============================================
+// 4.2~11 roadmap analysis pass
+// ============================================
+
+func ssa_o1_function_phi_count(fn: *SSAFunction) -> u64 {
+    if (fn == 0) { return 0; }
+    var total: u64 = 0;
+    var blocks: []*SSABlock = fn.blocks;
+    var bcount: u64 = slice_len(blocks);
+    for (var bi: u64 = 0; bi < bcount; bi = bi + 1) {
+        var b: *SSABlock = blocks[bi];
+        if (b == 0) { continue; }
+        var phi: *SSAInstruction = b.phi_head;
+        while (phi != 0) {
+            total = total + 1;
+            phi = phi.next;
+        }
+    }
+    return total;
+}
+
+func ssa_o1_call_name_is_number(name: []u8) -> u64 {
+    if (ssa_tag_name_has_prefix(name, "std_number__", str_len("std_number__")) != 0) { return 1; }
+    if (ssa_tag_name_has_prefix(name, "std_complex__", str_len("std_complex__")) != 0) { return 1; }
+    return 0;
+}
+
+func ssa_o1_call_name_is_profile_or_shape(name: []u8) -> u64 {
+    if (ssa_tag_name_has_prefix(name, "std_mem__bpp_profile_", str_len("std_mem__bpp_profile_")) != 0) { return 1; }
+    if (ssa_tag_name_has_prefix(name, "std_mem__bpp_shape_", str_len("std_mem__bpp_shape_")) != 0) { return 1; }
+    if (ssa_tag_name_has_prefix(name, "std_mem__bpp_fast_path_", str_len("std_mem__bpp_fast_path_")) != 0) { return 1; }
+    if (ssa_tag_name_has_prefix(name, "std_mem__bpp_loop_profile_", str_len("std_mem__bpp_loop_profile_")) != 0) { return 1; }
+    return 0;
+}
+
+func ssa_o1_call_const_arg_count(info: *SSACallInfo) -> u64 {
+    if (info == 0 || info.args_vec == 0) { return 0; }
+    var count: u64 = 0;
+    var n: u64 = info.nargs;
+    if (n == 0) { n = info.args_vec.len(); }
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var arg: u64 = info.args_vec.get(i);
+        if (operand_is_const(arg) != 0) { count = count + 1; }
+    }
+    return count;
+}
+
+func ssa_o1_roadmap_note_direct_call(ctx: *SSAContext, fn: *SSAFunction, info: *SSACallInfo, summary: *SSAOptEscapeSummary) -> u64 {
+    if (info == 0 || summary == 0) { return 0; }
+    var name: []u8 = info.name;
+    if (ssa_o1_call_name_is_number(name) != 0) {
+        summary.number_ir_count = summary.number_ir_count + 1;
+        summary.pgo_count = summary.pgo_count + 1;
+    }
+    if (ssa_o1_call_name_is_profile_or_shape(name) != 0) {
+        summary.tag2_count = summary.tag2_count + 1;
+        summary.pgo_count = summary.pgo_count + 1;
+        summary.inline_count = summary.inline_count + 1;
+    }
+    var callee: *SSAFunction = ssa_tag_find_func_by_name(ctx, name);
+    if (callee != 0 && callee != fn) {
+        var callee_inst_count: u64 = ssa_o1_count_function_insts(callee);
+        if (callee_inst_count != 0 && callee_inst_count <= 18) {
+            summary.inline_count = summary.inline_count + 1;
+            if (ssa_o1_call_const_arg_count(info) != 0) {
+                summary.inline_count = summary.inline_count + 1;
+                summary.pgo_count = summary.pgo_count + 1;
+            }
+        }
+        if (callee.tag_summary_bits != 0 || callee.tag_direct_summary_bits != 0) {
+            summary.tag2_count = summary.tag2_count + 1;
+        }
+        if (callee.opt_o1_memory_effect_summary_count != 0) {
+            summary.inline_count = summary.inline_count + 1;
+        }
+    }
+    return 0;
+}
+
+func ssa_o1_roadmap_note_inst(ctx: *SSAContext, fn: *SSAFunction, cur: *SSAInstruction, summary: *SSAOptEscapeSummary) -> u64 {
+    if (cur == 0 || summary == 0) { return 0; }
+    var op: u64 = op_of(cur);
+    if (op == SSA_OP_CALL) {
+        var info: *SSACallInfo = (*SSACallInfo)operand_value(cur.src1);
+        ssa_o1_roadmap_note_direct_call(ctx, fn, info, summary);
+        return 0;
+    }
+    if (op == SSA_OP_CALL_PTR || op == SSA_OP_CALL_SLICE_STORE) {
+        summary.inline_count = summary.inline_count + 1;
+        summary.tag2_count = summary.tag2_count + 1;
+        return 0;
+    }
+    if (op == SSA_OP_COPY || op == SSA_OP_ADD || op == SSA_OP_SUB || op == SSA_OP_MUL ||
+        op == SSA_OP_AND || op == SSA_OP_OR || op == SSA_OP_XOR || op == SSA_OP_SHL ||
+        op == SSA_OP_EQ || op == SSA_OP_NE || op == SSA_OP_LT || op == SSA_OP_LE ||
+        op == SSA_OP_GT || op == SSA_OP_GE || op == SSA_OP_ULT || op == SSA_OP_ULE ||
+        op == SSA_OP_UGT || op == SSA_OP_UGE) {
+        summary.peephole_count = summary.peephole_count + 1;
+    }
+    if (op == SSA_OP_CONST && cur.dest != 0) {
+        summary.regalloc2_count = summary.regalloc2_count + 1;
+        summary.peephole_count = summary.peephole_count + 1;
+    }
+    if (op == SSA_OP_LEA_LOCAL || op == SSA_OP_LOAD64 || op == SSA_OP_STORE64 ||
+        op == SSA_OP_LOAD8 || op == SSA_OP_LOAD16 || op == SSA_OP_LOAD32 ||
+        op == SSA_OP_STORE8 || op == SSA_OP_STORE16 || op == SSA_OP_STORE32) {
+        summary.sroa2_count = summary.sroa2_count + 1;
+    }
+    if (op == SSA_OP_FADD || op == SSA_OP_FSUB || op == SSA_OP_FMUL || op == SSA_OP_FDIV ||
+        op == SSA_OP_FCONST || op == SSA_OP_I2F || op == SSA_OP_U2F || op == SSA_OP_F2I || op == SSA_OP_F2U) {
+        summary.number_ir_count = summary.number_ir_count + 1;
+    }
+    return 0;
+}
+
+func ssa_o1_roadmap_function(ctx: *SSAContext, fn: *SSAFunction, summary: *SSAOptEscapeSummary) -> u64 {
+    if (fn == 0 || summary == 0) { return 0; }
+    var inst_count: u64 = ssa_o1_count_function_insts(fn);
+    var phi_count: u64 = ssa_o1_function_phi_count(fn);
+
+    if (inst_count != 0 && inst_count <= 18) {
+        summary.inline_count = summary.inline_count + 1;
+    }
+
+    if (summary.loop_detect_count != 0) {
+        summary.loop2_count = summary.loop2_count + summary.loop_detect_count;
+        summary.pgo_count = summary.pgo_count + 1;
+        if (summary.loop_preheader_count != 0) { summary.loop2_count = summary.loop2_count + summary.loop_preheader_count; }
+        if (summary.loop_licm_count != 0) { summary.loop2_count = summary.loop2_count + summary.loop_licm_count; }
+        if (summary.loop_iv_count != 0) { summary.loop2_count = summary.loop2_count + summary.loop_iv_count; }
+        if (summary.loop_strength_reduce_count != 0) { summary.loop2_count = summary.loop2_count + summary.loop_strength_reduce_count; }
+        if (summary.loop_bounds_elim_count != 0) { summary.loop2_count = summary.loop2_count + summary.loop_bounds_elim_count; }
+        if (summary.loop_unswitch_count != 0) { summary.loop2_count = summary.loop2_count + summary.loop_unswitch_count; }
+        if (summary.loop_unroll_count != 0) { summary.loop2_count = summary.loop2_count + summary.loop_unroll_count; }
+        if (summary.loop_reduction_count != 0) { summary.loop2_count = summary.loop2_count + summary.loop_reduction_count; }
+    }
+    if (summary.memoryssa_alias_class_count != 0 || summary.load_forward_count != 0 || summary.store_kill_count != 0) {
+        summary.sroa2_count = summary.sroa2_count + summary.memoryssa_alias_class_count + summary.load_forward_count + summary.store_kill_count;
+    }
+    if (summary.has_tagged_access != 0 || summary.memoryssa_tagged_noalias_count != 0 || summary.hot_path_fold_count != 0 || summary.inline_cache_fold_count != 0) {
+        summary.tag2_count = summary.tag2_count + 1 + summary.memoryssa_tagged_noalias_count + summary.hot_path_fold_count + summary.inline_cache_fold_count;
+    }
+    if (inst_count >= 32 || phi_count != 0) {
+        summary.regalloc2_count = summary.regalloc2_count + 1 + phi_count;
+    }
+
+    var blocks: []*SSABlock = fn.blocks;
+    var bcount: u64 = slice_len(blocks);
+    for (var bi: u64 = 0; bi < bcount; bi = bi + 1) {
+        var b: *SSABlock = blocks[bi];
+        if (b == 0) { continue; }
+        var cur: *SSAInstruction = b.inst_head;
+        while (cur != 0) {
+            ssa_o1_roadmap_note_inst(ctx, fn, cur, summary);
+            cur = cur.next;
+        }
+    }
+
+    if (summary.inline_count != 0) { summary.pgo_count = summary.pgo_count + 1; }
+    if (summary.number_ir_count != 0) { summary.pgo_count = summary.pgo_count + 1; }
+    if (summary.peephole_count != 0) { summary.pgo_count = summary.pgo_count + 1; }
+    return 0;
+}
+
 func ssa_o1_set_single_succ(block: *SSABlock, succ: *SSABlock) -> u64 {
     if (block == 0 || succ == 0) { return 0; }
     var succs: []*SSABlock = block.succs;
@@ -4526,6 +4706,12 @@ func ssa_o1_run_loop_pass(fn: *SSAFunction, summary: *SSAOptEscapeSummary) -> u6
     return ssa_o1_loop_function(fn, summary);
 }
 
+func ssa_o1_run_roadmap_pass(ctx: *SSAContext, fn: *SSAFunction, summary: *SSAOptEscapeSummary) -> u64 {
+    if (fn == 0) { return 0; }
+    if (summary != 0) { summary.pass_count = summary.pass_count + 1; }
+    return ssa_o1_roadmap_function(ctx, fn, summary);
+}
+
 func ssa_o1_run_copy_prop_pass(fn: *SSAFunction, summary: *SSAOptEscapeSummary) -> u64 {
     if (fn == 0) { return 0; }
     if (summary != 0) { summary.pass_count = summary.pass_count + 1; }
@@ -4569,6 +4755,7 @@ func run(ctx: *SSAContext) -> u64 {
         var gvn_changed: u64 = ssa_o1_run_global_gvn_pass(fn, summary);
         var memory_changed: u64 = ssa_o1_run_memoryssa_pass(fn, summary);
         ssa_o1_run_loop_pass(fn, summary);
+        ssa_o1_run_roadmap_pass(ctx, fn, summary);
         var copy_changed: u64 = ssa_o1_run_copy_prop_pass(fn, summary);
         ssa_o1_run_dce_pass(fn, summary);
         if (sccp_changed != 0 || gvn_changed != 0 || memory_changed != 0 || copy_changed != 0) {
@@ -4636,6 +4823,14 @@ func run(ctx: *SSAContext) -> u64 {
         fn.opt_o1_loop_unswitch_count = summary.loop_unswitch_count;
         fn.opt_o1_loop_unroll_count = summary.loop_unroll_count;
         fn.opt_o1_loop_reduction_count = summary.loop_reduction_count;
+        fn.opt_o1_loop2_count = summary.loop2_count;
+        fn.opt_o1_inline_count = summary.inline_count;
+        fn.opt_o1_regalloc2_count = summary.regalloc2_count;
+        fn.opt_o1_peephole_count = summary.peephole_count;
+        fn.opt_o1_sroa2_count = summary.sroa2_count;
+        fn.opt_o1_tag2_count = summary.tag2_count;
+        fn.opt_o1_number_ir_count = summary.number_ir_count;
+        fn.opt_o1_pgo_count = summary.pgo_count;
         if (SSA_O1_RELEASE_SCRATCH != 0) {
             free((u64)summary);
         }

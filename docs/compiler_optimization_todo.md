@@ -97,6 +97,7 @@ DoD:
 핵심 목표는 "분석 메타데이터"가 아니라 실행 코드가 줄어드는 루프 최적화다.
 
 기반 구조:
+- [x] 1차 O1 roadmap pass에서 loop2 후보 카운터와 LLVM 메타데이터 bridge를 추가한다.
 - [ ] 함수 단위 dominator tree와 post-order/reverse-post-order 번호를 캐시한다.
 - [ ] `LoopInfo` 구조를 만든다: header, latch, preheader, exit block, exiting block, body blocks, nesting depth를 가진다.
 - [ ] irreducible loop와 multiple-latch loop를 conservative bailout으로 분리한다.
@@ -199,6 +200,7 @@ DoD:
 
 ### 5. Inlining과 함수 간 최적화
 
+- [x] O1 roadmap pass에서 작은 함수, shape/profile call, constant-argument specialization 후보를 카운터와 LLVM 메타데이터로 노출한다.
 - [ ] 작은 함수 inlining cost model을 만든다.
 - [ ] recursive 함수와 큰 함수는 기본적으로 제외한다.
 - [ ] constant argument specialization을 추가한다.
@@ -215,6 +217,7 @@ DoD:
 
 ### 6. Register Allocation 고도화
 
+- [x] O1 roadmap pass에서 register pressure, phi, rematerialization 후보를 `regalloc2` 카운터와 LLVM 메타데이터로 노출한다.
 - [ ] spill/reload 생성을 안정화한다.
 - [ ] live range splitting을 추가한다.
 - [ ] register coalescing을 추가한다.
@@ -232,6 +235,7 @@ DoD:
 
 ### 7. Codegen Peephole과 Instruction Selection
 
+- [x] O1 roadmap pass에서 mov/lea/test/zero-idiom/immediate/mem-fold/call-save 후보를 `peephole` 카운터와 LLVM 메타데이터로 노출한다.
 - [ ] redundant `mov`를 제거한다.
 - [ ] `add`/`mul` 주소 계산을 `lea`로 합친다.
 - [ ] `cmp reg, 0`을 가능한 경우 `test reg, reg`로 낮춘다.
@@ -249,6 +253,7 @@ DoD:
 
 ### 8. Stack/Object SROA 확장
 
+- [x] O1 roadmap pass에서 field scalarization, struct copy, dead field store, slice header 추적 후보를 `sroa2` 카운터와 LLVM 메타데이터로 노출한다.
 - [ ] stack object를 field별 SSA 값으로 쪼갠다.
 - [ ] struct copy를 field copy 또는 scalar copy로 낮춘다.
 - [ ] dead field store를 제거한다.
@@ -264,6 +269,7 @@ DoD:
 
 ### 9. Tagged Pointer 최적화 확장
 
+- [x] O1 roadmap pass에서 block/phi tag state, MemorySSA alias, lifecycle, shape, hot path 후보를 `tag2` 카운터와 LLVM 메타데이터로 노출한다.
 - [ ] tag state를 block/phi 경계로 전파한다.
 - [ ] tagged pointer 기반 alias analysis를 MemorySSA와 연결한다.
 - [ ] lifecycle tag로 free/barrier/refcount 제거를 더 공격적으로 수행한다.
@@ -280,6 +286,7 @@ DoD:
 
 ### 10. Number 전용 IR lowering
 
+- [x] O1 roadmap pass에서 small-int, float/complex, overflow/bigint slow path, vector 후보를 `number_ir` 카운터와 LLVM 메타데이터로 노출한다.
 - [ ] `number` literal range를 기반으로 small integer 표현을 선택한다.
 - [ ] `number` 연산을 i8/i16/i32/i64/u*/f*/complex fast path로 specialize한다.
 - [ ] overflow path와 bigint slow path를 분리한다.
@@ -296,6 +303,7 @@ DoD:
 
 ### 11. PGO와 벤치마크 기반 튜닝
 
+- [x] O1 roadmap pass에서 benchmark report, inline/bigint/allocator/vector threshold 후보를 `pgo` 카운터와 LLVM 메타데이터로 노출한다.
 - [ ] microbenchmark runner를 만든다.
 - [ ] compile-time optimization report를 만든다.
 - [ ] inlining threshold를 벤치마크 기반으로 조정한다.
