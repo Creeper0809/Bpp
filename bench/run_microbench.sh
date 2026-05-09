@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT_DIR="${OUT_DIR:-$ROOT_DIR/build/microbench}"
 BENCH_SOURCES="${BENCH_SOURCES:-bench/tagged_pointer_fastpaths.bpp}"
 OPT_LEVEL="${OPT_LEVEL:-O1}"
+OPT_LEVELS="${OPT_LEVELS:-$OPT_LEVEL}"
 BACKEND="${BACKEND:-llvm}"
 RUNS="${RUNS:-3}"
 THRESHOLD_FILE="${THRESHOLD_FILE:-$ROOT_DIR/bench/optimization_thresholds.tsv}"
@@ -27,10 +28,12 @@ if [ ! -x "$COMPILER" ]; then
     exit 1
 fi
 
-case "$OPT_LEVEL" in
-    O0|O1) ;;
-    *) echo "OPT_LEVEL must be O0 or O1: $OPT_LEVEL" >&2; exit 1 ;;
-esac
+for opt_level in $OPT_LEVELS; do
+    case "$opt_level" in
+        O0|O1|O2|O3|Os) ;;
+        *) echo "OPT_LEVELS contains unsupported level: $opt_level" >&2; exit 1 ;;
+    esac
+done
 
 case "$BACKEND" in
     llvm) ;;
@@ -81,6 +84,7 @@ run_one() {
     local compiler="$1"
     local label="$2"
     local source_rel="$3"
+    local opt_level="$4"
     local source_abs
     source_abs="$(abs_source "$source_rel")"
     if [ ! -f "$source_abs" ]; then
@@ -90,7 +94,7 @@ run_one() {
 
     local base
     base="$(basename "$source_abs" .bpp)"
-    local case_dir="$OUT_DIR/$label/$base"
+    local case_dir="$OUT_DIR/$label/$opt_level/$base"
     mkdir -p "$case_dir"
 
     local ll_file="$case_dir/$base.ll"
@@ -101,7 +105,7 @@ run_one() {
     local run_times="$case_dir/run.times"
 
     /usr/bin/time -f '%e	%U	%S	%M' -o "$compile_time" \
-        "$compiler" "-$OPT_LEVEL" -dump-llvm-ll "$source_abs" > "$ll_file"
+        "$compiler" "-$opt_level" -dump-llvm-ll "$source_abs" > "$ll_file"
 
     local compile_seconds
     local compile_rss
@@ -128,11 +132,11 @@ run_one() {
     local timestamp
     timestamp="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$timestamp" "$label" "$source_rel" "$OPT_LEVEL" "$o1_inline" "$o1_number_ir" "$o1_pgo" \
+        "$timestamp" "$label" "$source_rel" "$opt_level" "$o1_inline" "$o1_number_ir" "$o1_pgo" \
         "$o1_loop2" "$o1_tag2" "$o1_sroa2" "$o1_regalloc2" "$o1_peephole" "$threshold_hash" >> "$OPT_REPORT"
 
     (cd "$case_dir" && /usr/bin/time -f '%e	%U	%S	%M' -o "$build_time" \
-        "$compiler" "-$OPT_LEVEL" -llvm-build "$source_abs" > "$build_out" 2> "$build_err")
+        "$compiler" "-$opt_level" -llvm-build "$source_abs" > "$build_out" 2> "$build_err")
 
     local build_seconds
     local build_rss
@@ -182,19 +186,21 @@ run_one() {
 
     timestamp="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$timestamp" "$label" "$source_rel" "$BACKEND" "$OPT_LEVEL" "$RUNS" \
+        "$timestamp" "$label" "$source_rel" "$BACKEND" "$opt_level" "$RUNS" \
         "$compile_seconds" "$build_seconds" "$run_best" "$run_avg" "$max_rss" "$threshold_hash" >> "$REPORT"
 }
 
 for source in $BENCH_SOURCES; do
-    if [ -n "$BASELINE_COMPILER" ]; then
-        if [ ! -x "$BASELINE_COMPILER" ]; then
-            echo "baseline compiler is not executable: $BASELINE_COMPILER" >&2
-            exit 1
+    for opt_level in $OPT_LEVELS; do
+        if [ -n "$BASELINE_COMPILER" ]; then
+            if [ ! -x "$BASELINE_COMPILER" ]; then
+                echo "baseline compiler is not executable: $BASELINE_COMPILER" >&2
+                exit 1
+            fi
+            run_one "$BASELINE_COMPILER" baseline "$source" "$opt_level"
         fi
-        run_one "$BASELINE_COMPILER" baseline "$source"
-    fi
-    run_one "$COMPILER" candidate "$source"
+        run_one "$COMPILER" candidate "$source" "$opt_level"
+    done
 done
 
 if [ -n "$BASELINE_COMPILER" ]; then
