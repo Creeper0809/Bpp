@@ -154,6 +154,12 @@ STRICT_FAIL_DIAGNOSTICS=${STRICT_FAIL_DIAGNOSTICS:-1}
 TEST_TIMEOUT_SEC=${TEST_TIMEOUT_SEC:-15}
 TEST_FAST_IO_MIN_SHM_KB=${BPP_TEST_FAST_IO_MIN_SHM_KB:-262144}
 FAST_IO_ACTIVE=0
+NASM_BIN="${BPP_NASM_EXECUTABLE:-nasm}"
+read -r -a NASM_FLAGS <<< "${BPP_NASM_FLAGS:--f elf64 -O1}"
+NASM_SPLIT="${BPP_NASM_SPLIT:-auto}"
+read -r -a NASM_SPLIT_FLAGS <<< "${BPP_NASM_SPLIT_FLAGS:--f elf64 -O1}"
+NASM_SPLIT_LINES="${BPP_NASM_SPLIT_LINES:-60000}"
+NASM_SPLIT_THRESHOLD_LINES="${BPP_NASM_SPLIT_THRESHOLD_LINES:-120000}"
 
 TEST_SKIP_LLVM_BUILD="$(echo "$TEST_SKIP_LLVM_BUILD" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
 case "$TEST_SKIP_LLVM_BUILD" in
@@ -175,6 +181,21 @@ shm_available_kb() {
 
 compiler_clang_available() {
     [ -x "/usr/bin/clang" ] || [ -x "/usr/local/bin/clang" ] || [ -x "/bin/clang" ]
+}
+
+assemble_nasm_obj() {
+    local asm_file="$1"
+    local obj_file="$2"
+    local asm_lines=0
+    asm_lines="$(wc -l < "$asm_file" | tr -d '[:space:]')"
+    if [ "$NASM_SPLIT" != "0" ] && [ -x "$ROOT_DIR/tools/nasm_split_assemble.sh" ] && [ "$asm_lines" -ge "$NASM_SPLIT_THRESHOLD_LINES" ]; then
+        BPP_NASM_EXECUTABLE="$NASM_BIN" \
+        BPP_LINKER_EXECUTABLE="${BPP_LINKER_EXECUTABLE:-ld}" \
+        BPP_NASM_SPLIT_LINES="$NASM_SPLIT_LINES" \
+            "$ROOT_DIR/tools/nasm_split_assemble.sh" "$asm_file" "$obj_file" "${NASM_SPLIT_FLAGS[@]}"
+    else
+        "$NASM_BIN" "${NASM_FLAGS[@]}" "$asm_file" -o "$obj_file"
+    fi
 }
 
 selected_tests_need_llvm_build() {
@@ -579,6 +600,7 @@ run_matrix_case() {
     local compiler_args_file="${13}"
     local expect_asm_file="${14}"
     local compile_only="${15}"
+    local expect_asm_count_file="${16:-}"
 
     local case_tag="[$case_num] Testing $test_label ($mode $opt)"
     local case_pass=0
@@ -670,21 +692,60 @@ run_matrix_case() {
         if [ -n "$missing_asm_pat" ]; then
             case_fail=1
             case_status="FAIL (asm mismatch: $missing_asm_pat)"
-        elif [ "$expect_compile_fail" -eq 1 ]; then
+        else
+            local asm_count_fail=""
+            if [ -n "$expect_asm_count_file" ] && [ -f "$expect_asm_count_file" ]; then
+                while IFS='|' read -r pat max_count || [ -n "$pat" ]; do
+                    if [ -z "$pat" ]; then
+                        continue
+                    fi
+                    max_count="$(echo "$max_count" | tr -d '[:space:]')"
+                    if [ -z "$max_count" ]; then
+                        asm_count_fail="$pat|<missing max>"
+                        break
+                    fi
+                    local actual_count
+                    local count_pat="$pat"
+                    local scope_label=""
+                    if [[ "$count_pat" == scope=*";"* ]]; then
+                        scope_label="${count_pat#scope=}"
+                        scope_label="${scope_label%%;*}"
+                        count_pat="${count_pat#*;}"
+                        actual_count="$(awk -v scope="$scope_label" -v pat="$count_pat" '
+                            $0 == scope { in_scope = 1; next }
+                            in_scope != 0 && $0 ~ /^[A-Za-z_][A-Za-z0-9_]*:/ { exit }
+                            in_scope != 0 && index($0, pat) > 0 { count++ }
+                            END { print count + 0 }
+                        ' "$asm_file" | tr -d '[:space:]')"
+                    else
+                        actual_count="$(grep -F "$count_pat" "$asm_file" | wc -l | tr -d '[:space:]')"
+                    fi
+                    if [ "$actual_count" -gt "$max_count" ]; then
+                        asm_count_fail="$pat count=$actual_count max=$max_count"
+                        break
+                    fi
+                done < "$expect_asm_count_file"
+            fi
+            if [ -n "$asm_count_fail" ]; then
+                case_fail=1
+                case_status="FAIL (asm count limit: $asm_count_fail)"
+            fi
+        fi
+        if [ "$case_fail" -eq 0 ] && [ "$expect_compile_fail" -eq 1 ]; then
             case_fail=1
             case_status="FAIL (unexpected compile success)"
-        elif [ "$compile_only" = "1" ]; then
+        elif [ "$case_fail" -eq 0 ] && [ "$compile_only" = "1" ]; then
             case_pass=1
             case_status="PASS (compile only)"
-        elif ! nasm -f elf64 -O1 "$asm_file" -o "$obj_file" 2>"$err_file"; then
+        elif [ "$case_fail" -eq 0 ] && ! assemble_nasm_obj "$asm_file" "$obj_file" 2>"$err_file"; then
             persist_result_file "$err_file" "$err_file_persist"
             case_fail=1
             case_status="FAIL (assemble)"
-        elif ! ld "$obj_file" -o "$bin_file" 2>>"$err_file"; then
+        elif [ "$case_fail" -eq 0 ] && ! ld "$obj_file" -o "$bin_file" 2>>"$err_file"; then
             persist_result_file "$err_file" "$err_file_persist"
             case_fail=1
             case_status="FAIL (link)"
-        else
+        elif [ "$case_fail" -eq 0 ]; then
             local expect_stdout=0
             local exit_code=0
             if [ -n "$expect_stdout_file" ] && [ -f "$expect_stdout_file" ]; then
@@ -900,6 +961,7 @@ run_ir_case() {
 
     local ssa_out="$RESULTS_DIR/${test_name}.ssa.ir"
     local addr_out="$RESULTS_DIR/${test_name}.3addr.ir"
+    local machine_out="$RESULTS_DIR/${test_name}.machine.ir"
     local err_file="$RESULTS_DIR/${test_name}.ir.err"
     local err_file_persist="$RESULTS_DIR_BASE/${test_name}.ir.err"
     rm -f "$err_file"
@@ -936,12 +998,32 @@ run_ir_case() {
             case_fail=1
             case_status="FAIL (3addr has phi)"
         else
-            case_pass=1
+            local machine_exit=0
+            $COMPILER -O1 -dump-machine-ir "$test_file" > "$machine_out" 2>>"$err_file"
+            machine_exit="$?"
+            if [ "$machine_exit" -ne 0 ]; then
+                persist_result_file "$err_file" "$err_file_persist"
+                case_fail=1
+                if [ "$machine_exit" -ge 128 ]; then
+                    local sig3=$((machine_exit - 128))
+                    case_status="FAIL (machine ir dump crash: signal $sig3, exit=$machine_exit)"
+                else
+                    case_status="FAIL (machine ir dump exit=$machine_exit)"
+                fi
+            elif ! grep -q "bpp.machine_ir.stage=pre-regalloc" "$machine_out"; then
+                case_fail=1
+                case_status="FAIL (machine ir missing header)"
+            elif grep -q " = phi" "$machine_out"; then
+                case_fail=1
+                case_status="FAIL (machine ir still has phi)"
+            else
+                case_pass=1
+            fi
         fi
     fi
 
     if [ "$KEEP_TEST_ARTIFACTS" -eq 0 ]; then
-        rm -f "$ssa_out" "$addr_out" "$err_file"
+        rm -f "$ssa_out" "$addr_out" "$machine_out" "$err_file"
     fi
 
     {
@@ -1162,7 +1244,7 @@ for TEST_FILE in "${TEST_FILES[@]}"; do
             continue
         fi
     fi
-CONTENT_HASH=$(awk '{if ($0 !~ /^\/\/ (Covers:|Mode:|Opt:|Compiler args:|Compile only:|LLVM Build:|LLVM Only:|Expect exit code:|Expect compile fail:|Expect error contains:|Expect asm contains:|Expect llvm metadata contains:|Expect stdout:|Stdin:)/) print}' "$TEST_FILE" | md5sum | awk '{print $1}')
+CONTENT_HASH=$(awk '{if ($0 !~ /^\/\/ (Covers:|Mode:|Opt:|Compiler args:|Compile only:|LLVM Build:|LLVM Only:|Expect exit code:|Expect compile fail:|Expect error contains:|Expect asm contains:|Expect asm count <=:|Expect llvm metadata contains:|Expect stdout:|Stdin:)/) print}' "$TEST_FILE" | md5sum | awk '{print $1}')
     if [ -n "${SEEN_HASH[$CONTENT_HASH]}" ]; then
         if [ "$TEST_QUIET" -eq 0 ]; then
             echo "[SKIP] Duplicate content: $TEST_LABEL (same as ${SEEN_HASH[$CONTENT_HASH]})"
@@ -1209,6 +1291,13 @@ CONTENT_HASH=$(awk '{if ($0 !~ /^\/\/ (Covers:|Mode:|Opt:|Compiler args:|Compile
     if [ ! -s "$EXPECT_ASM_FILE" ]; then
         rm -f "$EXPECT_ASM_FILE"
         EXPECT_ASM_FILE=""
+    fi
+    EXPECT_ASM_COUNT_FILE="$JOBS_DIR/${RUN_TAG}_${TEST_NAME}.asm_count_expect"
+    rm -f "$EXPECT_ASM_COUNT_FILE"
+    grep -E '^// Expect asm count <=:' "$TEST_FILE" | sed -E 's|^// Expect asm count <=:[[:space:]]*||' > "$EXPECT_ASM_COUNT_FILE" || true
+    if [ ! -s "$EXPECT_ASM_COUNT_FILE" ]; then
+        rm -f "$EXPECT_ASM_COUNT_FILE"
+        EXPECT_ASM_COUNT_FILE=""
     fi
     EXPECT_LLVM_METADATA_FILE="$JOBS_DIR/${RUN_TAG}_${TEST_NAME}.llvm_metadata_expect"
     rm -f "$EXPECT_LLVM_METADATA_FILE"
@@ -1276,7 +1365,7 @@ CONTENT_HASH=$(awk '{if ($0 !~ /^\/\/ (Covers:|Mode:|Opt:|Compiler args:|Compile
                 TOTAL=$((TOTAL + 1))
                 RESULT_FILE="$JOBS_DIR/${RUN_TAG}_case_${TOTAL}.result"
                 CASE_RESULT_FILES+=("$RESULT_FILE")
-                launch_job_with_limit run_matrix_case "$TOTAL" "$TEST_FILE" "$TEST_NAME" "$TEST_LABEL" "$MODE" "$OPT" "$EXPECTED" "$EXPECT_COMPILE_FAIL" "$EXPECT_ERROR_FILE" "$EXPECT_STDOUT_FILE" "$STDIN_FILE" "$RESULT_FILE" "$COMPILER_ARGS_FILE" "$EXPECT_ASM_FILE" "$COMPILE_ONLY"
+                launch_job_with_limit run_matrix_case "$TOTAL" "$TEST_FILE" "$TEST_NAME" "$TEST_LABEL" "$MODE" "$OPT" "$EXPECTED" "$EXPECT_COMPILE_FAIL" "$EXPECT_ERROR_FILE" "$EXPECT_STDOUT_FILE" "$STDIN_FILE" "$RESULT_FILE" "$COMPILER_ARGS_FILE" "$EXPECT_ASM_FILE" "$COMPILE_ONLY" "$EXPECT_ASM_COUNT_FILE"
             done
         done
 
@@ -1294,7 +1383,7 @@ CONTENT_HASH=$(awk '{if ($0 !~ /^\/\/ (Covers:|Mode:|Opt:|Compiler args:|Compile
                     TOTAL=$((TOTAL + 1))
                     RESULT_FILE="$JOBS_DIR/${RUN_TAG}_case_${TOTAL}.result"
                     CASE_RESULT_FILES+=("$RESULT_FILE")
-                    launch_job_with_limit run_matrix_case "$TOTAL" "$TEST_FILE" "$TEST_NAME" "$TEST_LABEL" "$MODE" "$OPT" "$EXPECTED" "$EXPECT_COMPILE_FAIL" "$EXPECT_ERROR_FILE" "$EXPECT_STDOUT_FILE" "$STDIN_FILE" "$RESULT_FILE" "$COMPILER_ARGS_FILE" "$EXPECT_ASM_FILE" "$COMPILE_ONLY"
+                    launch_job_with_limit run_matrix_case "$TOTAL" "$TEST_FILE" "$TEST_NAME" "$TEST_LABEL" "$MODE" "$OPT" "$EXPECTED" "$EXPECT_COMPILE_FAIL" "$EXPECT_ERROR_FILE" "$EXPECT_STDOUT_FILE" "$STDIN_FILE" "$RESULT_FILE" "$COMPILER_ARGS_FILE" "$EXPECT_ASM_FILE" "$COMPILE_ONLY" "$EXPECT_ASM_COUNT_FILE"
                 done
             done
         fi

@@ -308,7 +308,7 @@ fi
 SRC_FILE="$SCRIPT_DIR/src/main.bpp"
 TEST_SCRIPT="$SCRIPT_DIR/test/run_tests.sh"
 BASE_COMPILER="${VERSION}_base"
-NASM_FLAGS="-felf64 -O1"
+NASM_FLAGS="${BPP_NASM_FLAGS:--felf64 -O1}"
 UPDATE_BOOTSTRAP="${UPDATE_BOOTSTRAP:-0}"
 TEST_FAST_IO_EXPLICIT=0
 if [ "${TEST_FAST_IO+x}" = "x" ]; then TEST_FAST_IO_EXPLICIT=1; fi
@@ -331,6 +331,25 @@ TEST_NAME_FILTER="${TEST_NAME_FILTER:-}"
 TEST_JOBS_SCALE="${TEST_JOBS_SCALE:-2}"
 NASM_BIN="${BPP_NASM_EXECUTABLE:-nasm}"
 LINKER_BIN="${BPP_LINKER_EXECUTABLE:-ld}"
+NASM_SPLIT="${BPP_NASM_SPLIT:-auto}"
+NASM_SPLIT_FLAGS="${BPP_NASM_SPLIT_FLAGS:--felf64 -O1}"
+NASM_SPLIT_LINES="${BPP_NASM_SPLIT_LINES:-60000}"
+NASM_SPLIT_THRESHOLD_LINES="${BPP_NASM_SPLIT_THRESHOLD_LINES:-120000}"
+
+assemble_nasm_obj() {
+    local asm_file="$1"
+    local obj_file="$2"
+    local asm_lines=0
+    asm_lines="$(wc -l < "$asm_file" | tr -d '[:space:]')"
+    if [ "$NASM_SPLIT" != "0" ] && [ -x "$SCRIPT_DIR/tools/nasm_split_assemble.sh" ] && [ "$asm_lines" -ge "$NASM_SPLIT_THRESHOLD_LINES" ]; then
+        BPP_NASM_EXECUTABLE="$NASM_BIN" \
+        BPP_LINKER_EXECUTABLE="$LINKER_BIN" \
+        BPP_NASM_SPLIT_LINES="$NASM_SPLIT_LINES" \
+            "$SCRIPT_DIR/tools/nasm_split_assemble.sh" "$asm_file" "$obj_file" ${NASM_SPLIT_FLAGS}
+    else
+        "$NASM_BIN" ${NASM_FLAGS} "$asm_file" -o "$obj_file"
+    fi
+}
 
 if [ "$BUILD_AND_TEST_PROFILE" = "fast" ]; then
     if [ -z "$TEST_PROFILE" ]; then TEST_PROFILE="quick"; fi
@@ -505,13 +524,13 @@ if [ -n "${TARGET_VER_NUM:-}" ] && [ -n "${BASE_VER_NUM:-}" ] \
    && [ -f "$LEGACY_SRC_FILE" ]; then
     echo "   (bootstrap bridge enabled: v${BASE_VER_NUM} -> old/${VERSION} -> ${VERSION})"
     "${BASE_BIN}" -asm "${LEGACY_SRC_FILE}" > "${BRIDGE_STAGE0_ASM}"
-    "${NASM_BIN}" ${NASM_FLAGS} "${BRIDGE_STAGE0_ASM}" -o "build/${VERSION}_bridge_stage0.o"
+    assemble_nasm_obj "${BRIDGE_STAGE0_ASM}" "build/${VERSION}_bridge_stage0.o"
     "${LINKER_BIN}" "build/${VERSION}_bridge_stage0.o" -o "bin/${VERSION}_bridge_stage0"
     BOOTSTRAP_BIN="./bin/${VERSION}_bridge_stage0"
 fi
 
 "${BOOTSTRAP_BIN}" -asm "${SRC_FILE}" > "${STAGE0_ASM}"
-"${NASM_BIN}" ${NASM_FLAGS} "${STAGE0_ASM}" -o "build/${VERSION}_stage0.o"
+assemble_nasm_obj "${STAGE0_ASM}" "build/${VERSION}_stage0.o"
 "${LINKER_BIN}" build/${VERSION}_stage0.o -o bin/${VERSION}_stage0
 echo "Stage 0 Build Completed"
 echo ""
@@ -519,7 +538,7 @@ echo ""
 # Step 2: 셀프 호스팅 (1단계)
 echo "[2/6] Self-Hosting Stage 1..."
 ./bin/${VERSION}_stage0 -asm "${SRC_FILE}" > "${STAGE1_ASM}"
-"${NASM_BIN}" ${NASM_FLAGS} "${STAGE1_ASM}" -o "build/${VERSION}_stage1.o"
+assemble_nasm_obj "${STAGE1_ASM}" "build/${VERSION}_stage1.o"
 "${LINKER_BIN}" build/${VERSION}_stage1.o -o bin/${VERSION}_stage1
 STAGE1_USABLE=1
 TEST_COMPILER_BIN="bin/${VERSION}_stage1"
@@ -636,7 +655,7 @@ fi
 echo ""
 echo "[6/6] Generating Executable..."
 OUT_OBJ="build/${VERSION}.out.o"
-"${NASM_BIN}" ${NASM_FLAGS} "${FINAL_ASM}" -o "${OUT_OBJ}"
+assemble_nasm_obj "${FINAL_ASM}" "${OUT_OBJ}"
 "${LINKER_BIN}" "${OUT_OBJ}" -o "build/${VERSION}.out"
 rm -f "${OUT_OBJ}"
 
