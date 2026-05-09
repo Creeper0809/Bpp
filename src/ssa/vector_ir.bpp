@@ -1,0 +1,104 @@
+// ssa_vector_ir.b - O2 target-independent vector planning
+
+import std.str;
+import ssa.datastruct;
+import ssa.core;
+
+struct SSAVectorIRSummary {
+    public engine_count: u64;
+    public plan_count: u64;
+    public legality_count: u64;
+    public scalar_tail_count: u64;
+    public horizontal_reduction_count: u64;
+    public target_feature_count: u64;
+    public fallback_count: u64;
+}
+
+impl SSAVectorIRSummary {
+    public constructor() {
+        self.engine_count = 0;
+        self.plan_count = 0;
+        self.legality_count = 0;
+        self.scalar_tail_count = 0;
+        self.horizontal_reduction_count = 0;
+        self.target_feature_count = 0;
+        self.fallback_count = 0;
+    }
+}
+
+func ssa_vector_ir_name_has_prefix(name: []u8, lit: u64, len: u64) -> u64 {
+    if (name.ptr == 0 || name.len < len) { return 0; }
+    return str_eq(slice(name.ptr, len), slice(lit, len));
+}
+
+func ssa_vector_ir_call_is_reduction(name: []u8) -> u64 {
+    if (ssa_vector_ir_name_has_prefix(name, "std_mem__bpp_tag_slice_sum_", str_len("std_mem__bpp_tag_slice_sum_")) != 0) { return 1; }
+    if (ssa_vector_ir_name_has_prefix(name, "std_mem__bpp_tag_slice_min_", str_len("std_mem__bpp_tag_slice_min_")) != 0) { return 1; }
+    if (ssa_vector_ir_name_has_prefix(name, "std_mem__bpp_tag_slice_max_", str_len("std_mem__bpp_tag_slice_max_")) != 0) { return 1; }
+    if (ssa_vector_ir_name_has_prefix(name, "std_mem__bpp_tag_slice_count_eq_", str_len("std_mem__bpp_tag_slice_count_eq_")) != 0) { return 1; }
+    if (ssa_vector_ir_name_has_prefix(name, "std_mem__bpp_tag_slice_find_eq_", str_len("std_mem__bpp_tag_slice_find_eq_")) != 0) { return 1; }
+    if (ssa_vector_ir_name_has_prefix(name, "std_mem__bpp_tag_slice_index_of_", str_len("std_mem__bpp_tag_slice_index_of_")) != 0) { return 1; }
+    return 0;
+}
+
+func ssa_vector_ir_is_numeric_op(op: u64) -> u64 {
+    if (op == SSA_OP_ADD || op == SSA_OP_SUB || op == SSA_OP_MUL || op == SSA_OP_AND || op == SSA_OP_OR || op == SSA_OP_XOR) { return 1; }
+    if (op == SSA_OP_FADD || op == SSA_OP_FSUB || op == SSA_OP_FMUL || op == SSA_OP_FDIV) { return 1; }
+    return 0;
+}
+
+func ssa_vector_ir_note_plan(summary: *SSAVectorIRSummary, legal: u64, horizontal: u64) -> u64 {
+    if (summary == 0) { return 0; }
+    summary.plan_count = summary.plan_count + 1;
+    if (legal != 0) {
+        summary.legality_count = summary.legality_count + 1;
+        summary.scalar_tail_count = summary.scalar_tail_count + 1;
+        summary.target_feature_count = summary.target_feature_count + 2;
+    } else {
+        summary.fallback_count = summary.fallback_count + 1;
+    }
+    if (horizontal != 0) {
+        summary.horizontal_reduction_count = summary.horizontal_reduction_count + 1;
+    }
+    return 0;
+}
+
+func ssa_vector_ir_analyze_function(fn: *SSAFunction) -> *SSAVectorIRSummary {
+    var summary: *SSAVectorIRSummary = new SSAVectorIRSummary{};
+    summary.engine_count = 1;
+    if (fn == 0) { return summary; }
+    var blocks: []*SSABlock = fn.blocks;
+    var n: u64 = slice_len(blocks);
+    for (var bi: u64 = 0; bi < n; bi = bi + 1) {
+        var block: *SSABlock = blocks[bi];
+        if (block == 0) { continue; }
+        var saw_load: u64 = 0;
+        var saw_numeric: u64 = 0;
+        var cur: *SSAInstruction = block.inst_head;
+        while (cur != 0) {
+            var op: u64 = op_of(cur);
+            if (op == SSA_OP_LOAD || op == SSA_OP_LOAD8 || op == SSA_OP_LOAD16 || op == SSA_OP_LOAD32 || op == SSA_OP_LOAD64) {
+                saw_load = 1;
+            }
+            if (ssa_vector_ir_is_numeric_op(op) != 0) {
+                saw_numeric = 1;
+            }
+            if (op == SSA_OP_CALL) {
+                var info: *SSACallInfo = (*SSACallInfo)operand_value(cur.src1);
+                if (info != 0 && ssa_vector_ir_call_is_reduction(info.name) != 0) {
+                    ssa_vector_ir_note_plan(summary, 1, 1);
+                }
+            } else if (op == SSA_OP_CALL_PTR || op == SSA_OP_ASM) {
+                summary.fallback_count = summary.fallback_count + 1;
+            }
+            cur = cur.next;
+        }
+        if (saw_load != 0 && saw_numeric != 0) {
+            ssa_vector_ir_note_plan(summary, 1, 0);
+        }
+    }
+    if (summary.plan_count == 0) {
+        summary.fallback_count = summary.fallback_count + 1;
+    }
+    return summary;
+}

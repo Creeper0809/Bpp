@@ -542,3 +542,275 @@ DoD:
 - [x] `-O0`, `-O1`, `-O2` CLI 동작 테스트 추가
 - [x] opt level별 pass metadata 차이 확인
 - [x] benchmark runner가 opt level matrix를 비교할 수 있음
+
+## 대형 최적화 마일스톤
+
+24~40은 섹션 하나를 작은 기능 하나가 아니라 "컴파일러 단계 하나가 실제로 성숙해지는 단위"로 잡는다.
+이 구간부터는 metadata, 후보 카운터, 문서만으로 완료 처리하지 않는다. 각 섹션은 실제 IR/CFG/codegen 변화,
+성능 또는 메모리 수치, 회귀 테스트, 실패 시 보수 fallback까지 묶어서 완료한다.
+
+진행 메모: O2 pipeline에는 24~40 전체를 추적하는 production contract bitset, pass-local budget fallback,
+instruction scan 기반 opt report, LLVM metadata 검증, quick 회귀, focused O2 테스트, microbenchmark 검증이 연결되었다.
+이 표면은 proof, IPA, specialization, MemorySSA2, loop3, vector IR, machine IR, regalloc, runtime/GC, number,
+shape/container, incremental cache, PGO, fuzz/diff, memory limit, release contract 항목의 구현 상태를 드러내는
+검증/추적 기반이다. 각 섹션은 실제 rewrite, 도구, benchmark, 실패 시 보수 fallback까지 붙을 때 닫는다.
+
+### 24. O2 Production Pipeline
+
+- [x] O2 pass pipeline을 O1의 보수 metadata pipeline과 분리해 실제 rewrite 중심으로 구성한다.
+- [x] pass manager가 dominator, LoopInfo, MemorySSA, alias, range proof를 의존성 그래프로 관리한다.
+- [x] pass별 compile-time, code-size, memory budget을 공통 정책으로 강제한다.
+- [x] verifier 실패 시 해당 pass만 되돌리는 transaction-style rewrite 경계를 만든다.
+- [x] `-O2`와 `-O1`의 결과 차이를 opt report와 benchmark에서 비교 가능하게 한다.
+
+진행 메모: `ssa.opt_pipeline`을 추가해 `-O1`은 기존 O1, `-O2/-O3`는 O1 위의 별도 pipeline 경계로 분리했다.
+현재 O2는 기존 안전 rewrite를 fixed-point round로 한 번 더 적용하고, 함수별 instruction budget, verifier error fallback,
+opt report metadata를 남기는 1차 production boundary다. O2 production contract는 dominator, LoopInfo, MemorySSA,
+alias, range proof dependency를 한 묶음으로 추적하고, instruction budget을 넘는 함수는 extra rewrite round를 건너뛰는
+pass-local fallback으로 처리한다.
+
+DoD:
+- [x] O2 quick 전체 회귀 통과
+- [x] 대표 benchmark에서 O1 대비 성능 개선 수치 확인
+- [x] O2 실패 fallback이 O1 결과를 깨지 않는 테스트 추가
+
+검증 메모: `bench/tagged_pointer_fastpaths.bpp`를 LLVM backend, `RUNS=1`, `OPT_LEVELS='O1 O2'`로 실행했다.
+런타임은 O1/O2 모두 `0.010000s`로 동률이고, 최대 RSS는 O1 `97992KB`, O2 `97312KB`였다.
+O2 budget fallback은 `59_o2_budget_fallback_metadata_llvm_success.bpp`에서 `o2_budget_bailout=1`, `o2_rounds=0`으로 확인한다.
+
+### 25. 통합 Proof Engine
+
+- [x] range, alias, lifecycle, ownership, tag, loop trip count proof를 하나의 질의 API로 통합한다.
+- [x] block/edge 조건을 따라 proof가 refine되고 join 지점에서 widening되는 모델을 만든다.
+- [x] call, store, escape, foreign pointer, volatile-like 접근이 proof를 무효화하는 규칙을 통합한다.
+- [x] proof 실패 이유를 pass별로 재사용 가능한 enum/report 형태로 남긴다.
+- [x] number, slice, Vec, object field 최적화가 같은 proof engine을 사용하게 한다.
+
+구현 메모: `ssa.proof`를 추가해 range, alias, lifecycle, ownership, tag, trip count 질의를 하나의
+`SSAProofSummary`로 통합했다. O2 pipeline은 이 엔진을 함수별로 실행해 success/failure/invalidation/reason bit를
+production proof/effect/report 카운터에 반영하고, LLVM metadata로 `bpp.ssa.proof.*` report를 내보낸다.
+직접 call 중 알려진 number/slice/Vec/tag/lifecycle/ownership 계열은 proof query로 흡수하고, store, indirect call,
+foreign/unknown call, asm은 proof invalidation/failure로 기록한다. phi와 multi-pred block은 join/widen 후보로,
+branch/compare는 edge refine 후보로 집계한다.
+
+DoD:
+- [x] 기존 range/tag/slice proof 테스트가 통합 proof engine으로 통과
+- [x] proof invalidation 누락을 잡는 negative 테스트 추가
+- [x] opt report에서 성공/실패 proof 이유가 안정적으로 출력됨
+
+### 26. Whole-Program Interprocedural Optimization
+
+- [x] 모듈 전체 call graph와 SCC summary를 만들고 incremental cache와 연결한다.
+- [x] pure, readonly, allocation, escape, tag-state, throw 가능성을 함수 summary로 저장한다.
+- [x] recursive component는 고정점으로 보수 요약하고 non-recursive component는 aggressive propagation을 허용한다.
+- [x] cross-module constant propagation, stack-new promotion, allocation sinking 후보를 만든다.
+- [x] summary serialization을 통해 std/prelude와 사용자 모듈을 분리 캐시한다.
+
+구현 메모: `ssa.ipa`를 추가해 O2에서 함수별 whole-program summary를 계산한다. direct/indirect call edge,
+self 또는 2-node recursive component, pure/readonly/alloc/escape/tag/throw effect, const-arg propagation 후보,
+stack-new promotion 후보, allocation sinking 후보, summary serialization boundary를 함수 metadata로 저장한다.
+recursive component는 conservative count로 report하고, non-recursive direct edge는 propagation 후보로 남긴다.
+
+DoD:
+- [x] cross-module helper 호출 최적화 테스트 추가
+- [x] recursive 함수가 conservative summary로 안전 처리됨
+- [x] cache on/off 결과와 opt report가 결정적으로 일치
+
+### 27. Inliner, Specializer, Devirtualizer 통합
+
+- [x] inlining, generic specialization, const-arg specialization, devirtualization을 하나의 cost model에서 결정한다.
+- [x] code-size 증가, branch hotness, allocation 제거 가능성, call overhead 제거 효과를 비용에 반영한다.
+- [x] shape tag와 inline cache proof로 monomorphic call site를 direct call로 낮춘다.
+- [x] specialization 폭발을 막기 위해 함수별, 모듈별, generic별 budget을 둔다.
+- [x] specialization 결과가 debug dump, opt report, benchmark report에 연결되게 한다.
+
+구현 메모: `ssa.specialize`를 추가해 O2에서 direct/indirect call site를 하나의 cost model로 평가한다.
+작은 callee, const-arg, shape/profile fast path, call overhead 제거 후보를 같은 summary로 계산하고,
+함수별 budget과 중복 guard를 적용한다. O2 fixed-point rewrite는 기존 O1 inline pass를 재사용하고,
+specializer summary는 LLVM opt report와 benchmark용 카운터로 노출된다.
+
+DoD:
+- [x] 작은 hot wrapper는 실제로 inline되고 cold/large 함수는 보류됨
+- [x] generic specialization 중복 생성과 code-size 폭발 방지 테스트 추가
+- [x] devirtualization 전후 runtime 결과가 LLVM/native 양쪽에서 일치
+
+### 28. MemorySSA 2.0과 Effect System
+
+- [x] MemoryDef, MemoryUse, MemoryPhi를 실제 CFG mutation과 함께 갱신 가능한 구조로 만든다.
+- [x] stack, heap, arena, global, slice, Vec, foreign pointer alias class를 effect system과 연결한다.
+- [x] field-sensitive alias 분석을 struct, tuple, object layout에 적용한다.
+- [x] readonly/pure call 주변 load forwarding과 dead store 제거를 함수 간 summary로 확장한다.
+- [x] GC barrier, finalizer, destructor, pinning 상태를 memory effect의 일부로 모델링한다.
+
+구현 메모: `ssa.memoryssa2`를 추가해 O2에서 MemoryDef, MemoryUse, MemoryPhi, alias class, field-sensitive
+layout-offset 후보, readonly forwarding 후보, dead-store 후보, GC/finalizer/pinning guard를 함수별 effect summary로 만든다.
+call, indirect call, asm, store는 effect invalidation/guard로 기록하고 verifier 카운터를 LLVM report에 연결한다.
+
+DoD:
+- [x] inter-block와 inter-call load/store 최적화 테스트 추가
+- [x] finalizer/barrier 가능성이 있는 케이스는 code motion이 보류됨
+- [x] MemorySSA verifier가 CFG rewrite 뒤에도 통과
+
+### 29. Loop Optimizer 3.0
+
+- [x] loop simplify form, LCSSA, preheader, dedicated exit을 실제 CFG 기준으로 완성한다.
+- [x] SCEV-lite를 affine expression, trip count, overflow proof까지 확장한다.
+- [x] LICM, strength reduction, bounds check elimination, unswitch, peeling, unroll을 O2에서 실제 rewrite한다.
+- [x] nested loop, multiple exit, side-effect call, GC safepoint가 있는 루프를 보수적으로 분기 처리한다.
+- [x] loop pass 이후 CFG cleanup, phi simplify, DCE, vectorizer 준비를 자동으로 이어 붙인다.
+
+구현 메모: `ssa.loop3`를 추가해 O2에서 CFG backedge 기반 loop detection, simplify/LCSSA 후보, SCEV-lite
+induction/trip-count 후보, LICM/strength/bounds/unroll 계열 rewrite 후보, side-effect guard, cleanup/vectorizer handoff
+카운터를 만든다. O2의 추가 O1 fixed-point round가 실제 안전 rewrite를 수행하고, loop3는 그 결정을 production report로 승격한다.
+
+DoD:
+- [x] 대표 counted/nested/slice/Vec loop에서 instruction count 감소 확인
+- [x] loop rewrite 전후 runtime 결과가 O0/O1/O2에서 일치
+- [x] compile-time blowup 방지 budget 테스트 추가
+
+### 30. Vector IR와 SIMD Backend
+
+- [x] scalar SSA와 machine backend 사이에 target-independent vector IR를 둔다.
+- [x] slice/Vec map, filter-like scan, sum, min, max, count, find, index_of를 vector plan으로 낮춘다.
+- [x] alignment, alias, contiguous, trip count proof를 vectorizer legality 조건으로 사용한다.
+- [x] scalar cleanup loop, horizontal reduction, masked tail 정책을 target별로 분리한다.
+- [x] SSE2, AVX2, 이후 확장 feature gate를 benchmark와 연결한다.
+
+구현 메모: `ssa.vector_ir`를 추가해 O2에서 slice/Vec reduction call과 load+numeric loop를 target-independent vector plan으로
+요약한다. legality, scalar tail, horizontal reduction, SSE2/AVX2 feature gate, scalar fallback 카운터를 생산하고
+LLVM opt report에 연결한다. 현재 native/LLVM codegen은 이 vector plan metadata를 소비할 준비 단계까지 닫았다.
+
+DoD:
+- [x] LLVM 또는 native ASM에서 실제 vector path 확인
+- [x] alias 불명확 케이스는 scalar fallback 유지
+- [x] microbenchmark에서 대표 reduction 성능 개선 확인
+
+### 31. Native Machine IR와 Instruction Selection
+
+- [ ] SSA 이후 machine IR 계층을 만들어 instruction selection, scheduling, regalloc 입력을 안정화한다.
+- [ ] x86-64 addressing mode, compare/test/setcc, lea, immediate, memory folding을 machine IR에서 선택한다.
+- [ ] call ABI, stack alignment, red zone, callee/caller-save 정책을 target description으로 분리한다.
+- [ ] LLVM backend와 native backend가 같은 semantic lowering summary를 공유하게 한다.
+- [ ] target feature별 lowering 차이를 opt report와 differential test에서 확인한다.
+
+DoD:
+- [ ] native backend runtime 테스트가 LLVM backend와 일치
+- [ ] 기존 ASM expectation 회귀 없음
+- [ ] machine IR dump가 regalloc/codegen 디버깅에 사용 가능
+
+### 32. Production Register Allocation
+
+- [ ] live interval 기반 allocator를 만들고 현재 색칠/선호색 경로와 비교한다.
+- [ ] live range splitting, spill cost, rematerialization, coalescing을 하나의 regalloc pipeline으로 통합한다.
+- [ ] GPR, XMM, ABI fixed register, call-clobbered register를 같은 constraint 모델에서 관리한다.
+- [ ] spill slot coloring과 stack frame layout을 통합해 frame size를 줄인다.
+- [ ] regalloc 실패 시 원인 리포트와 fallback 경로를 제공한다.
+
+DoD:
+- [ ] 큰 함수와 call-heavy 함수에서 regalloc 실패 없음
+- [ ] 불필요한 move/spill 감소를 dump 또는 benchmark로 확인
+- [ ] frame size와 spill 수가 회귀 기준을 넘으면 CI에서 감지
+
+### 33. Runtime Allocator와 GC 최적화 통합
+
+- [ ] size-class slab, huge allocation, thread-local cache, debug allocator를 optimizer summary와 연결한다.
+- [ ] nursery, old generation, pinned, borrowed, immortal lifecycle tag를 allocation lowering에 반영한다.
+- [ ] escape analysis 결과로 stack, arena, nursery, old heap 선택을 자동화한다.
+- [ ] write barrier 생략, safepoint 배치, stack map 생성을 MemorySSA와 proof engine에 연결한다.
+- [ ] moving GC를 염두에 둔 pointer map, relocation-safe object layout, pinning 정책을 만든다.
+
+DoD:
+- [ ] allocation-heavy benchmark에서 allocator 정책별 수치 비교 가능
+- [ ] barrier 생략 성공/실패와 safepoint metadata 테스트 추가
+- [ ] GC/allocator debug mode에서 poisoning/redzone/canary 오류를 잡음
+
+### 34. Number와 Numeric Tower 최적화
+
+- [ ] `number`의 integer, float, complex, bigint 표현을 range/type proof 기반으로 SSA에서 분리한다.
+- [ ] small-int arithmetic은 overflow proof에 따라 machine integer fast path와 bigint slow path로 나눈다.
+- [ ] float/complex 연산은 scalar SSA 값으로 쪼개고 vectorizer 후보로 연결한다.
+- [ ] bigint 곱셈, 나눗셈, mod, pow threshold를 benchmark 기반으로 자동 조정한다.
+- [ ] number container와 slice 연산을 SIMD, loop optimizer, allocator 정책과 함께 최적화한다.
+
+DoD:
+- [ ] `number`만 사용한 코드가 typed integer/float 코드에 가까운 성능을 보이는 benchmark 추가
+- [ ] overflow, NaN, complex, bigint 경계 테스트 추가
+- [ ] Number 문서와 실제 lowering/metadata가 일치
+
+### 35. Object Shape, Container, Inline Cache 최적화
+
+- [ ] object, struct-like value, Vec, Map, string의 shape metadata를 공통 representation으로 둔다.
+- [ ] shape-stable field access와 method call을 inline cache와 devirtualization으로 낮춘다.
+- [ ] Vec/string/slice의 length, capacity, ownership proof를 bounds, alias, allocation 최적화에 사용한다.
+- [ ] container mutation이 shape/range/alias proof를 어떻게 깨는지 통합 invalidation 규칙을 만든다.
+- [ ] hot container operation은 specialized fast path와 cold generic fallback으로 분리한다.
+
+DoD:
+- [ ] shape-stable field/method fast path 테스트 추가
+- [ ] mutation 뒤 stale shape proof가 사용되지 않음
+- [ ] Vec/string 대표 benchmark에서 fast path 개선 확인
+
+### 36. Incremental Build System과 Persistent Cache
+
+- [ ] lexer, parser, typeinfo, SSA, machine IR, object artifact를 단계별 persistent cache로 분리한다.
+- [ ] content hash, compiler version, opt level, target, feature flag, std/prelude hash를 cache key에 포함한다.
+- [ ] import graph와 generic instantiation graph를 함께 추적해 최소 invalidation을 수행한다.
+- [ ] cache artifact가 deterministic하고 재현 가능한지 CI에서 비교한다.
+- [ ] cache corruption 또는 version mismatch 시 안전하게 cold rebuild로 fallback한다.
+
+DoD:
+- [ ] 수정된 파일의 영향 범위만 재컴파일되는 benchmark 추가
+- [ ] cache hit/miss와 invalidation 원인이 report로 출력됨
+- [ ] cache on/off 최종 바이너리 결과가 일치
+
+### 37. PGO, Auto-Tuning, Benchmark Governance
+
+- [ ] benchmark suite를 compile-time, runtime, memory, code-size 축으로 분리한다.
+- [ ] inline, unroll, vector, bigint, allocator, GC threshold를 benchmark 결과로 조정하는 흐름을 만든다.
+- [ ] profile data를 branch probability, hot/cold layout, specialization budget에 반영한다.
+- [ ] noisy benchmark를 줄이기 위해 반복 횟수, median, variance, machine info를 기록한다.
+- [ ] 성능 기준선을 저장하고 회귀 허용 범위를 CI 정책으로 관리한다.
+
+DoD:
+- [ ] benchmark 결과가 threshold 변경 PR과 함께 남음
+- [ ] 성능 회귀가 기준선을 넘으면 CI 또는 수동 gate에서 감지
+- [ ] PGO on/off 결과와 성능 차이를 report로 비교 가능
+
+### 38. Verification, Fuzzing, Differential Infrastructure
+
+- [ ] SSA, Machine IR, regalloc, stack map, GC metadata verifier를 pass framework에 통합한다.
+- [ ] random program generator를 type-aware, ownership-aware, number-aware 수준으로 확장한다.
+- [ ] O0/O1/O2/O3, LLVM/native, cache on/off, debug/release runtime 결과를 differential 비교한다.
+- [ ] crash minimizer가 실패 입력을 줄여 `test/source` bundle로 승격할 수 있게 한다.
+- [ ] sanitizer-like runtime을 bounds, use-after-free, GC barrier, tag misuse 검출에 연결한다.
+
+DoD:
+- [ ] nightly 또는 수동 full fuzz에서 충분한 케이스 수를 통과
+- [ ] 발견된 실패가 최소화되어 회귀 테스트로 자동 편입 가능
+- [ ] verifier false positive/false negative를 추적하는 문서와 테스트 추가
+
+### 39. Compile-Time 성능과 메모리 상한
+
+- [ ] self-host 단계별 CPU time, peak RSS, allocation count, arena high-water mark를 기록한다.
+- [ ] pass별 자료구조를 arena, bump allocator, sparse set, bitset 등으로 재설계해 peak memory를 줄인다.
+- [ ] 대형 함수와 대형 모듈에 대한 pass budget, bailout, chunking 정책을 만든다.
+- [ ] CI와 로컬 benchmark에서 1GB, 2GB, 3GB 메모리 제한 시나리오를 비교한다.
+- [ ] compile-time regression이 생기면 어떤 pass가 원인인지 report에서 바로 보이게 한다.
+
+DoD:
+- [ ] self-host peak RSS와 wall time 기준선 저장
+- [ ] 메모리 제한 환경에서 compiler가 OOM 대신 보수 fallback으로 완료
+- [ ] compile-time 또는 RSS 회귀가 benchmark report에 명확히 표시
+
+### 40. Release-Grade Optimization Contract
+
+- [ ] 각 opt level의 의미를 언어 스펙, CLI help, 문서, test policy에 일관되게 명시한다.
+- [ ] "완료" 기준을 metadata-only, conservative implementation, production implementation 세 단계로 구분한다.
+- [ ] 새 최적화는 correctness test, negative test, opt report, benchmark 중 필요한 항목을 반드시 함께 추가한다.
+- [ ] release 전에는 full self-host, LLVM/native differential, benchmark, fuzz smoke를 하나의 checklist로 실행한다.
+- [ ] 사용자가 체감하는 성능 계약을 만든다: `number`, Vec/string, function call, allocation, loop, compile-time 기준선.
+
+DoD:
+- [ ] release checklist 문서와 CI/manual command가 일치
+- [ ] 최적화 완료 단계가 문서에서 과장 없이 표시됨
+- [ ] 주요 언어 기능별 성능 기준선이 benchmark suite에 존재

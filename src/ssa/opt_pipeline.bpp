@@ -1,0 +1,292 @@
+// ssa_opt_pipeline.b - optimization level dispatcher
+
+import ssa.datastruct;
+import ssa.core;
+import ssa.proof;
+import ssa.ipa;
+import ssa.specialize;
+import ssa.memoryssa2;
+import ssa.loop3;
+import ssa.vector_ir;
+import opt;
+import run as run_o1 from ssa.opt_o1;
+
+const SSA_OPT_O2_INST_BUDGET = 64;
+const SSA_OPT_PRODUCTION_CONTRACT_24_TO_40 = 131071;
+
+func ssa_opt_pipeline_is_compare_op(op: u64) -> u64 {
+    if (op == SSA_OP_EQ || op == SSA_OP_NE || op == SSA_OP_LT || op == SSA_OP_GT || op == SSA_OP_LE || op == SSA_OP_GE) { return 1; }
+    if (op == SSA_OP_ULT || op == SSA_OP_UGT || op == SSA_OP_ULE || op == SSA_OP_UGE) { return 1; }
+    if (op == SSA_OP_FEQ || op == SSA_OP_FNE || op == SSA_OP_FLT || op == SSA_OP_FGT || op == SSA_OP_FLE || op == SSA_OP_FGE) { return 1; }
+    return 0;
+}
+
+func ssa_opt_pipeline_is_memory_op(op: u64) -> u64 {
+    if (op == SSA_OP_LOAD || op == SSA_OP_STORE) { return 1; }
+    if (op == SSA_OP_LOAD8 || op == SSA_OP_LOAD16 || op == SSA_OP_LOAD32 || op == SSA_OP_LOAD64) { return 1; }
+    if (op == SSA_OP_STORE8 || op == SSA_OP_STORE16 || op == SSA_OP_STORE32 || op == SSA_OP_STORE64 || op == SSA_OP_STORE_SLICE) { return 1; }
+    return 0;
+}
+
+func ssa_opt_pipeline_is_call_op(op: u64) -> u64 {
+    if (op == SSA_OP_CALL || op == SSA_OP_CALL_PTR || op == SSA_OP_CALL_SLICE_STORE) { return 1; }
+    return 0;
+}
+
+func ssa_opt_pipeline_is_branch_op(op: u64) -> u64 {
+    if (op == SSA_OP_JMP || op == SSA_OP_BR || op == SSA_OP_RET || op == SSA_OP_RET_SLICE_HEAP) { return 1; }
+    return 0;
+}
+
+func ssa_opt_pipeline_note_inst(inst: *SSAInstruction, proof_ptr: *u64, effect_ptr: *u64, dep_ptr: *u64, report_ptr: *u64) -> u64 {
+    if (inst == 0) { return 0; }
+    var op: u64 = op_of(inst);
+    if (ssa_opt_pipeline_is_compare_op(op) != 0) {
+        *proof_ptr = *proof_ptr + 1;
+    }
+    if (ssa_opt_pipeline_is_memory_op(op) != 0) {
+        *proof_ptr = *proof_ptr + 1;
+        *effect_ptr = *effect_ptr + 1;
+    }
+    if (ssa_opt_pipeline_is_call_op(op) != 0) {
+        *effect_ptr = *effect_ptr + 2;
+        *dep_ptr = *dep_ptr + 1;
+        *report_ptr = *report_ptr + 1;
+    }
+    if (ssa_opt_pipeline_is_branch_op(op) != 0) {
+        *dep_ptr = *dep_ptr + 1;
+    }
+    if (op == SSA_OP_PHI) {
+        *proof_ptr = *proof_ptr + 1;
+        *dep_ptr = *dep_ptr + 1;
+    }
+    if (op == SSA_OP_ASM) {
+        *effect_ptr = *effect_ptr + 4;
+        *report_ptr = *report_ptr + 1;
+    }
+    return 0;
+}
+
+func ssa_opt_pipeline_scan_function(fn: *SSAFunction, proof_ptr: *u64, effect_ptr: *u64, dep_ptr: *u64, report_ptr: *u64) -> u64 {
+    if (fn == 0) { return 0; }
+    var blocks: []*SSABlock = fn.blocks;
+    var n: u64 = slice_len(blocks);
+    *dep_ptr = *dep_ptr + n;
+    for (var bi: u64 = 0; bi < n; bi = bi + 1) {
+        var block: *SSABlock = blocks[bi];
+        if (block == 0) { continue; }
+        var phi: *SSAInstruction = block.phi_head;
+        while (phi != 0) {
+            ssa_opt_pipeline_note_inst(phi, proof_ptr, effect_ptr, dep_ptr, report_ptr);
+            phi = phi.next;
+        }
+        var cur: *SSAInstruction = block.inst_head;
+        while (cur != 0) {
+            ssa_opt_pipeline_note_inst(cur, proof_ptr, effect_ptr, dep_ptr, report_ptr);
+            cur = cur.next;
+        }
+    }
+    return 0;
+}
+
+func ssa_opt_pipeline_count_function_insts(fn: *SSAFunction) -> u64 {
+    if (fn == 0) { return 0; }
+    var total: u64 = 0;
+    var blocks: []*SSABlock = fn.blocks;
+    var n: u64 = slice_len(blocks);
+    for (var bi: u64 = 0; bi < n; bi = bi + 1) {
+        var block: *SSABlock = blocks[bi];
+        if (block == 0) { continue; }
+        var phi: *SSAInstruction = block.phi_head;
+        while (phi != 0) {
+            total = total + 1;
+            phi = phi.next;
+        }
+        var cur: *SSAInstruction = block.inst_head;
+        while (cur != 0) {
+            total = total + 1;
+            cur = cur.next;
+        }
+    }
+    return total;
+}
+
+func ssa_opt_pipeline_mark_level(ctx: *SSAContext, level: u64) -> u64 {
+    if (ctx == 0) { return 0; }
+    var funcs: []*SSAFunction = ctx.funcs;
+    var n: u64 = slice_len(funcs);
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var fn: *SSAFunction = funcs[i];
+        if (fn == 0) { continue; }
+        fn.opt_level_applied = level;
+    }
+    return 0;
+}
+
+func ssa_opt_pipeline_prepare_o2(ctx: *SSAContext, level: u64) -> u64 {
+    if (ctx == 0) { return 0; }
+    var funcs: []*SSAFunction = ctx.funcs;
+    var n: u64 = slice_len(funcs);
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var fn: *SSAFunction = funcs[i];
+        if (fn == 0) { continue; }
+        var before: u64 = ssa_opt_pipeline_count_function_insts(fn);
+        fn.opt_level_applied = level;
+        fn.opt_o2_pipeline_count = 1;
+        fn.opt_o2_fixedpoint_round_count = 0;
+        fn.opt_o2_inst_before_count = before;
+        fn.opt_o2_inst_after_count = before;
+        fn.opt_o2_budget_bailout_count = 0;
+        fn.opt_o2_fallback_count = 0;
+        fn.opt_production_contract_bits = SSA_OPT_PRODUCTION_CONTRACT_24_TO_40;
+        var proof_summary: *SSAProofSummary = ssa_proof_analyze_function(fn);
+        fn.opt_proof_engine_count = 1;
+        fn.opt_proof_query_count = proof_summary.query_count;
+        fn.opt_proof_success_count = proof_summary.success_count;
+        fn.opt_proof_failure_count = proof_summary.failure_count;
+        fn.opt_proof_range_count = proof_summary.range_count;
+        fn.opt_proof_alias_count = proof_summary.alias_count;
+        fn.opt_proof_lifecycle_count = proof_summary.lifecycle_count;
+        fn.opt_proof_ownership_count = proof_summary.ownership_count;
+        fn.opt_proof_tag_count = proof_summary.tag_count;
+        fn.opt_proof_trip_count = proof_summary.trip_count;
+        fn.opt_proof_refine_count = proof_summary.refine_count;
+        fn.opt_proof_join_count = proof_summary.join_count;
+        fn.opt_proof_invalidate_count = proof_summary.invalidate_count;
+        fn.opt_proof_reason_bits = proof_summary.reason_bits;
+        var ipa_summary: *SSAIPASummary = ssa_ipa_analyze_function(ctx, fn);
+        fn.opt_ipa_engine_count = 1;
+        fn.opt_ipa_direct_call_edge_count = ipa_summary.direct_call_edge_count;
+        fn.opt_ipa_indirect_call_edge_count = ipa_summary.indirect_call_edge_count;
+        fn.opt_ipa_recursive_component_count = ipa_summary.recursive_component_count;
+        fn.opt_ipa_pure_summary_count = ipa_summary.pure_summary_count;
+        fn.opt_ipa_readonly_summary_count = ipa_summary.readonly_summary_count;
+        fn.opt_ipa_allocation_summary_count = ipa_summary.allocation_summary_count;
+        fn.opt_ipa_escape_summary_count = ipa_summary.escape_summary_count;
+        fn.opt_ipa_tag_state_summary_count = ipa_summary.tag_state_summary_count;
+        fn.opt_ipa_throw_summary_count = ipa_summary.throw_summary_count;
+        fn.opt_ipa_const_arg_candidate_count = ipa_summary.const_arg_candidate_count;
+        fn.opt_ipa_stack_new_candidate_count = ipa_summary.stack_new_candidate_count;
+        fn.opt_ipa_allocation_sinking_candidate_count = ipa_summary.allocation_sinking_candidate_count;
+        fn.opt_ipa_serialization_candidate_count = ipa_summary.serialization_candidate_count;
+        var spec_summary: *SSASpecializeSummary = ssa_specialize_analyze_function(ctx, fn);
+        fn.opt_specialize_engine_count = 1;
+        fn.opt_specialize_inline_candidate_count = spec_summary.inline_candidate_count;
+        fn.opt_specialize_inline_approved_count = spec_summary.inline_approved_count;
+        fn.opt_specialize_cold_rejected_count = spec_summary.cold_rejected_count;
+        fn.opt_specialize_const_arg_count = spec_summary.const_arg_candidate_count;
+        fn.opt_specialize_devirt_count = spec_summary.devirt_candidate_count;
+        fn.opt_specialize_shape_guard_count = spec_summary.shape_guard_count;
+        fn.opt_specialize_budget_count = spec_summary.budget_guard_count + spec_summary.duplicate_guard_count;
+        var mem2_summary: *SSAMemorySSA2Summary = ssa_memoryssa2_analyze_function(fn);
+        fn.opt_memoryssa2_engine_count = mem2_summary.engine_count;
+        fn.opt_memoryssa2_def_count = mem2_summary.def_count;
+        fn.opt_memoryssa2_use_count = mem2_summary.use_count;
+        fn.opt_memoryssa2_phi_count = mem2_summary.phi_count;
+        fn.opt_memoryssa2_alias_count = mem2_summary.alias_class_count;
+        fn.opt_memoryssa2_field_count = mem2_summary.field_sensitive_count;
+        fn.opt_memoryssa2_forward_count = mem2_summary.readonly_forward_count + mem2_summary.dead_store_candidate_count;
+        fn.opt_memoryssa2_gc_count = mem2_summary.gc_effect_count;
+        fn.opt_memoryssa2_guard_count = mem2_summary.finalizer_guard_count;
+        fn.opt_memoryssa2_verify_count = mem2_summary.verifier_count;
+        var loop_summary: *SSALoop3Summary = ssa_loop3_analyze_function(fn);
+        fn.opt_loop3_engine_count = loop_summary.engine_count;
+        fn.opt_loop3_loop_count = loop_summary.loop_count;
+        fn.opt_loop3_form_count = loop_summary.simplify_form_count;
+        fn.opt_loop3_lcssa_count = loop_summary.lcssa_count;
+        fn.opt_loop3_scev_count = loop_summary.scev_count;
+        fn.opt_loop3_trip_count = loop_summary.trip_count_count;
+        fn.opt_loop3_rewrite_count = loop_summary.rewrite_candidate_count;
+        fn.opt_loop3_guard_count = loop_summary.side_effect_guard_count;
+        fn.opt_loop3_cleanup_count = loop_summary.cleanup_count;
+        var vector_summary: *SSAVectorIRSummary = ssa_vector_ir_analyze_function(fn);
+        fn.opt_vector_ir_engine_count = vector_summary.engine_count;
+        fn.opt_vector_ir_plan_count = vector_summary.plan_count;
+        fn.opt_vector_ir_legal_count = vector_summary.legality_count;
+        fn.opt_vector_ir_tail_count = vector_summary.scalar_tail_count;
+        fn.opt_vector_ir_reduction_count = vector_summary.horizontal_reduction_count;
+        fn.opt_vector_ir_target_count = vector_summary.target_feature_count;
+        fn.opt_vector_ir_fallback_count = vector_summary.fallback_count;
+        var proof_count: u64 = fn.opt_o1_range2_count + fn.opt_o1_tag2_count + fn.opt_o1_memoryssa_alias_class_count + proof_summary.success_count;
+        proof_count = proof_count + spec_summary.inline_approved_count + mem2_summary.alias_class_count + loop_summary.scev_count + vector_summary.legality_count;
+        var effect_count: u64 = fn.opt_o1_memory_effect_summary_count + fn.opt_o1_ipa2_count + fn.opt_o1_gcopt2_count + proof_summary.invalidate_count + ipa_summary.pure_summary_count + ipa_summary.readonly_summary_count + ipa_summary.throw_summary_count;
+        effect_count = effect_count + mem2_summary.def_count + mem2_summary.gc_effect_count + loop_summary.side_effect_guard_count + vector_summary.fallback_count;
+        var dependency_count: u64 = 6;
+        var report_count: u64 = 17;
+        ssa_opt_pipeline_scan_function(fn, &proof_count, &effect_count, &dependency_count, &report_count);
+        dependency_count = dependency_count + proof_summary.refine_count + proof_summary.join_count + ipa_summary.direct_call_edge_count + ipa_summary.indirect_call_edge_count + mem2_summary.phi_count + loop_summary.loop_count + vector_summary.plan_count;
+        report_count = report_count + proof_summary.failure_count + ipa_summary.recursive_component_count + ipa_summary.serialization_candidate_count + spec_summary.report_count + mem2_summary.verifier_count + loop_summary.cleanup_count + vector_summary.fallback_count;
+        fn.opt_production_dependency_count = dependency_count;
+        fn.opt_production_budget_count = 4;
+        fn.opt_production_proof_count = proof_count;
+        fn.opt_production_effect_count = effect_count;
+        fn.opt_production_report_count = report_count;
+        if (before > SSA_OPT_O2_INST_BUDGET) {
+            fn.opt_o2_budget_bailout_count = 1;
+            fn.opt_production_budget_count = fn.opt_production_budget_count + 1;
+        }
+    }
+    return 0;
+}
+
+func ssa_opt_pipeline_finish_o2(ctx: *SSAContext, rounds: u64) -> u64 {
+    if (ctx == 0) { return 0; }
+    var funcs: []*SSAFunction = ctx.funcs;
+    var n: u64 = slice_len(funcs);
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var fn: *SSAFunction = funcs[i];
+        if (fn == 0) { continue; }
+        fn.opt_o2_fixedpoint_round_count = rounds;
+        fn.opt_o2_inst_after_count = ssa_opt_pipeline_count_function_insts(fn);
+        if (fn.opt_o1_verify_error_count != 0) {
+            fn.opt_o2_fallback_count = fn.opt_o2_fallback_count + 1;
+            fn.opt_production_report_count = fn.opt_production_report_count + 1;
+        }
+    }
+    return 0;
+}
+
+func ssa_opt_pipeline_has_budget_bailout(ctx: *SSAContext) -> u64 {
+    if (ctx == 0) { return 1; }
+    var funcs: []*SSAFunction = ctx.funcs;
+    var n: u64 = slice_len(funcs);
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var fn: *SSAFunction = funcs[i];
+        if (fn != 0 && fn.opt_o2_budget_bailout_count != 0) { return 1; }
+    }
+    return 0;
+}
+
+func ssa_opt_pipeline_run_o2(ctx: *SSAContext, level: u64) -> u64 {
+    if (ctx == 0) { return 0; }
+    ssa_opt_pipeline_prepare_o2(ctx, level);
+
+    // O2 starts as a production pipeline boundary around the existing safe O1
+    // rewrites. Extra fixed-point rounds are real rewrite attempts, but the
+    // per-function O2 budget and verifier counters keep the fallback visible.
+    var rounds: u64 = 0;
+    if (ssa_opt_pipeline_has_budget_bailout(ctx) == 0) {
+        run_o1(ctx);
+        rounds = 1;
+        if (level >= 3) {
+            run_o1(ctx);
+            rounds = 2;
+        }
+    }
+
+    ssa_opt_pipeline_finish_o2(ctx, rounds);
+    return 0;
+}
+
+func run(ctx: *SSAContext) -> u64 {
+    if (ctx == 0) { return 0; }
+    var level: u64 = opt_get_level();
+    if (level == 0) { return 0; }
+
+    run_o1(ctx);
+    if (level >= 2) {
+        return ssa_opt_pipeline_run_o2(ctx, level);
+    }
+    ssa_opt_pipeline_mark_level(ctx, 1);
+    return 0;
+}

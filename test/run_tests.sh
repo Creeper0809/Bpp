@@ -359,12 +359,15 @@ normalize_modes_csv() {
 
 normalize_opts_csv() {
     local raw
-    raw="$(echo "$1" | tr '[:lower:]' '[:upper:]' | tr -d '[:space:]')"
+    raw="$(echo "$1" | tr '[:lower:]' '[:upper:]' | tr '|' ',' | tr -d '[:space:]')"
     case "$raw" in
-        ""|"BOTH"|"ALL")
+        ""|"BOTH")
             echo "O0,O1"
             ;;
-        "O0"|"O1")
+        "ALL")
+            echo "O0,O1,O2,O3,OS"
+            ;;
+        "O0"|"O1"|"O2"|"O3"|"OS")
             echo "$raw"
             ;;
         "O0,O1"|"O1,O0")
@@ -374,7 +377,7 @@ normalize_opts_csv() {
             local out=""
             IFS=',' read -r -a parts <<< "$raw"
             for p in "${parts[@]}"; do
-                if [ "$p" != "O0" ] && [ "$p" != "O1" ]; then
+                if [ "$p" != "O0" ] && [ "$p" != "O1" ] && [ "$p" != "O2" ] && [ "$p" != "O3" ] && [ "$p" != "OS" ]; then
                     continue
                 fi
                 if [[ ",$out," != *",$p,"* ]]; then
@@ -601,9 +604,12 @@ run_matrix_case() {
         ir_flag="-dump-ssa"
     fi
     local opt_flag=""
-    if [ "$opt" = "O1" ]; then
-        opt_flag="-O1"
-    fi
+    case "$opt" in
+        O1) opt_flag="-O1" ;;
+        O2) opt_flag="-O2" ;;
+        O3) opt_flag="-O3" ;;
+        OS) opt_flag="-Os" ;;
+    esac
 
     local compile_exit=0
     local -a compiler_extra_args=()
@@ -1262,7 +1268,7 @@ CONTENT_HASH=$(awk '{if ($0 !~ /^\/\/ (Covers:|Mode:|Opt:|Compiler args:|Compile
             if ! csv_has "$GLOBAL_MODES_CSV" "$MODE" || ! csv_has "$TEST_MODES_CSV" "$MODE"; then
                 continue
             fi
-            for OPT in O0 O1; do
+            for OPT in O0 O1 O2 O3 OS; do
                 if ! csv_has "$GLOBAL_OPTS_CSV" "$OPT" || ! csv_has "$TEST_OPTS_CSV" "$OPT"; then
                     continue
                 fi
@@ -1280,7 +1286,7 @@ CONTENT_HASH=$(awk '{if ($0 !~ /^\/\/ (Covers:|Mode:|Opt:|Compiler args:|Compile
                 if ! csv_has "$TEST_MODES_CSV" "$MODE"; then
                     continue
                 fi
-                for OPT in O0 O1; do
+                for OPT in O0 O1 O2 O3 OS; do
                     if ! csv_has "$TEST_OPTS_CSV" "$OPT"; then
                         continue
                     fi

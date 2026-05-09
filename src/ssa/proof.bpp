@@ -1,0 +1,284 @@
+// ssa_proof.b - shared SSA proof engine
+
+import std.str;
+import ssa.datastruct;
+import ssa.core;
+
+const SSA_PROOF_REASON_RANGE = 1;
+const SSA_PROOF_REASON_ALIAS = 2;
+const SSA_PROOF_REASON_LIFECYCLE = 4;
+const SSA_PROOF_REASON_OWNERSHIP = 8;
+const SSA_PROOF_REASON_TAG = 16;
+const SSA_PROOF_REASON_TRIP = 32;
+const SSA_PROOF_REASON_REFINE = 64;
+const SSA_PROOF_REASON_JOIN = 128;
+const SSA_PROOF_REASON_INVALIDATE = 256;
+const SSA_PROOF_REASON_FAILURE = 512;
+
+struct SSAProofSummary {
+    public query_count: u64;
+    public success_count: u64;
+    public failure_count: u64;
+    public range_count: u64;
+    public alias_count: u64;
+    public lifecycle_count: u64;
+    public ownership_count: u64;
+    public tag_count: u64;
+    public trip_count: u64;
+    public refine_count: u64;
+    public join_count: u64;
+    public invalidate_count: u64;
+    public reason_bits: u64;
+}
+
+impl SSAProofSummary {
+    public constructor() {
+        self.query_count = 0;
+        self.success_count = 0;
+        self.failure_count = 0;
+        self.range_count = 0;
+        self.alias_count = 0;
+        self.lifecycle_count = 0;
+        self.ownership_count = 0;
+        self.tag_count = 0;
+        self.trip_count = 0;
+        self.refine_count = 0;
+        self.join_count = 0;
+        self.invalidate_count = 0;
+        self.reason_bits = 0;
+    }
+}
+
+func ssa_proof_name_eq(name: []u8, lit: u64, len: u64) -> u64 {
+    if (name.ptr == 0 || name.len != len) { return 0; }
+    return str_eq(name, slice(lit, len));
+}
+
+func ssa_proof_name_has_prefix(name: []u8, lit: u64, len: u64) -> u64 {
+    if (name.ptr == 0 || name.len < len) { return 0; }
+    return str_eq(slice(name.ptr, len), slice(lit, len));
+}
+
+func ssa_proof_note_success(summary: *SSAProofSummary, reason: u64) -> u64 {
+    if (summary == 0) { return 0; }
+    summary.query_count = summary.query_count + 1;
+    summary.success_count = summary.success_count + 1;
+    summary.reason_bits = summary.reason_bits | reason;
+    return 0;
+}
+
+func ssa_proof_note_failure(summary: *SSAProofSummary, reason: u64) -> u64 {
+    if (summary == 0) { return 0; }
+    summary.query_count = summary.query_count + 1;
+    summary.failure_count = summary.failure_count + 1;
+    summary.reason_bits = summary.reason_bits | reason | SSA_PROOF_REASON_FAILURE;
+    return 0;
+}
+
+func ssa_proof_note_invalidate(summary: *SSAProofSummary, reason: u64) -> u64 {
+    if (summary == 0) { return 0; }
+    summary.invalidate_count = summary.invalidate_count + 1;
+    summary.reason_bits = summary.reason_bits | reason | SSA_PROOF_REASON_INVALIDATE;
+    return 0;
+}
+
+func ssa_proof_is_compare_op(op: u64) -> u64 {
+    if (op == SSA_OP_EQ || op == SSA_OP_NE || op == SSA_OP_LT || op == SSA_OP_GT || op == SSA_OP_LE || op == SSA_OP_GE) { return 1; }
+    if (op == SSA_OP_ULT || op == SSA_OP_UGT || op == SSA_OP_ULE || op == SSA_OP_UGE) { return 1; }
+    if (op == SSA_OP_FEQ || op == SSA_OP_FNE || op == SSA_OP_FLT || op == SSA_OP_FGT || op == SSA_OP_FLE || op == SSA_OP_FGE) { return 1; }
+    return 0;
+}
+
+func ssa_proof_is_arith_op(op: u64) -> u64 {
+    if (op == SSA_OP_ADD || op == SSA_OP_SUB || op == SSA_OP_MUL || op == SSA_OP_DIV || op == SSA_OP_UDIV || op == SSA_OP_MOD || op == SSA_OP_UMOD) { return 1; }
+    if (op == SSA_OP_AND || op == SSA_OP_OR || op == SSA_OP_XOR || op == SSA_OP_SHL || op == SSA_OP_SHR || op == SSA_OP_SAR) { return 1; }
+    if (op == SSA_OP_FADD || op == SSA_OP_FSUB || op == SSA_OP_FMUL || op == SSA_OP_FDIV || op == SSA_OP_FNEG) { return 1; }
+    return 0;
+}
+
+func ssa_proof_is_memory_read_op(op: u64) -> u64 {
+    if (op == SSA_OP_LOAD || op == SSA_OP_LOAD8 || op == SSA_OP_LOAD16 || op == SSA_OP_LOAD32 || op == SSA_OP_LOAD64) { return 1; }
+    return 0;
+}
+
+func ssa_proof_is_memory_write_op(op: u64) -> u64 {
+    if (op == SSA_OP_STORE || op == SSA_OP_STORE8 || op == SSA_OP_STORE16 || op == SSA_OP_STORE32 || op == SSA_OP_STORE64 || op == SSA_OP_STORE_SLICE) { return 1; }
+    return 0;
+}
+
+func ssa_proof_is_address_op(op: u64) -> u64 {
+    if (op == SSA_OP_LEA_LOCAL || op == SSA_OP_LEA_GLOBAL || op == SSA_OP_LEA_STR || op == SSA_OP_LEA_FUNC) { return 1; }
+    return 0;
+}
+
+func ssa_proof_call_is_known_tag(name: []u8) -> u64 {
+    if (ssa_proof_name_has_prefix(name, "std_mem__bpp_tag_", str_len("std_mem__bpp_tag_")) != 0) { return 1; }
+    if (ssa_proof_name_has_prefix(name, "std_vec__Vec_tagged_", str_len("std_vec__Vec_tagged_")) != 0) { return 1; }
+    return 0;
+}
+
+func ssa_proof_call_is_known_lifecycle(name: []u8) -> u64 {
+    if (ssa_proof_name_has_prefix(name, "std_mem__bpp_heap_alloc_", str_len("std_mem__bpp_heap_alloc_")) != 0) { return 1; }
+    if (ssa_proof_name_has_prefix(name, "std_mem__bpp_gc_alloc_", str_len("std_mem__bpp_gc_alloc_")) != 0) { return 1; }
+    if (ssa_proof_name_has_prefix(name, "std_mem__bpp_tag_lifecycle", str_len("std_mem__bpp_tag_lifecycle")) != 0) { return 1; }
+    if (ssa_proof_name_has_prefix(name, "std_mem__bpp_tag_repack_lifecycle", str_len("std_mem__bpp_tag_repack_lifecycle")) != 0) { return 1; }
+    return 0;
+}
+
+func ssa_proof_call_is_known_ownership(name: []u8) -> u64 {
+    if (ssa_proof_name_has_prefix(name, "std_mem__bpp_tag_ownership", str_len("std_mem__bpp_tag_ownership")) != 0) { return 1; }
+    if (ssa_proof_name_has_prefix(name, "std_mem__bpp_fast_refcount_", str_len("std_mem__bpp_fast_refcount_")) != 0) { return 1; }
+    return 0;
+}
+
+func ssa_proof_call_is_slice_vec_or_number(name: []u8) -> u64 {
+    if (ssa_proof_name_has_prefix(name, "std_mem__bpp_tag_slice_", str_len("std_mem__bpp_tag_slice_")) != 0) { return 1; }
+    if (ssa_proof_name_has_prefix(name, "std_vec__", str_len("std_vec__")) != 0) { return 1; }
+    if (ssa_proof_name_has_prefix(name, "std_number__", str_len("std_number__")) != 0) { return 1; }
+    if (ssa_proof_name_has_prefix(name, "std_complex__", str_len("std_complex__")) != 0) { return 1; }
+    return 0;
+}
+
+func ssa_proof_query_range(summary: *SSAProofSummary) -> u64 {
+    if (summary == 0) { return 0; }
+    summary.range_count = summary.range_count + 1;
+    return ssa_proof_note_success(summary, SSA_PROOF_REASON_RANGE);
+}
+
+func ssa_proof_query_alias(summary: *SSAProofSummary) -> u64 {
+    if (summary == 0) { return 0; }
+    summary.alias_count = summary.alias_count + 1;
+    return ssa_proof_note_success(summary, SSA_PROOF_REASON_ALIAS);
+}
+
+func ssa_proof_query_lifecycle(summary: *SSAProofSummary) -> u64 {
+    if (summary == 0) { return 0; }
+    summary.lifecycle_count = summary.lifecycle_count + 1;
+    return ssa_proof_note_success(summary, SSA_PROOF_REASON_LIFECYCLE);
+}
+
+func ssa_proof_query_ownership(summary: *SSAProofSummary) -> u64 {
+    if (summary == 0) { return 0; }
+    summary.ownership_count = summary.ownership_count + 1;
+    return ssa_proof_note_success(summary, SSA_PROOF_REASON_OWNERSHIP);
+}
+
+func ssa_proof_query_tag(summary: *SSAProofSummary) -> u64 {
+    if (summary == 0) { return 0; }
+    summary.tag_count = summary.tag_count + 1;
+    return ssa_proof_note_success(summary, SSA_PROOF_REASON_TAG);
+}
+
+func ssa_proof_query_trip(summary: *SSAProofSummary) -> u64 {
+    if (summary == 0) { return 0; }
+    summary.trip_count = summary.trip_count + 1;
+    return ssa_proof_note_success(summary, SSA_PROOF_REASON_TRIP);
+}
+
+func ssa_proof_refine_edge(summary: *SSAProofSummary) -> u64 {
+    if (summary == 0) { return 0; }
+    summary.refine_count = summary.refine_count + 1;
+    return ssa_proof_note_success(summary, SSA_PROOF_REASON_REFINE);
+}
+
+func ssa_proof_join_phi(summary: *SSAProofSummary) -> u64 {
+    if (summary == 0) { return 0; }
+    summary.join_count = summary.join_count + 1;
+    return ssa_proof_note_success(summary, SSA_PROOF_REASON_JOIN);
+}
+
+func ssa_proof_query_call(info: *SSACallInfo, summary: *SSAProofSummary) -> u64 {
+    if (summary == 0) { return 0; }
+    if (info == 0) {
+        ssa_proof_note_failure(summary, SSA_PROOF_REASON_INVALIDATE);
+        return 0;
+    }
+    var name: []u8 = info.name;
+    var known: u64 = 0;
+    if (ssa_proof_call_is_known_tag(name) != 0) {
+        ssa_proof_query_tag(summary);
+        known = 1;
+    }
+    if (ssa_proof_call_is_known_lifecycle(name) != 0) {
+        ssa_proof_query_lifecycle(summary);
+        known = 1;
+    }
+    if (ssa_proof_call_is_known_ownership(name) != 0) {
+        ssa_proof_query_ownership(summary);
+        known = 1;
+    }
+    if (ssa_proof_call_is_slice_vec_or_number(name) != 0) {
+        ssa_proof_query_range(summary);
+        ssa_proof_query_alias(summary);
+        known = 1;
+    }
+    if (known == 0) {
+        ssa_proof_note_invalidate(summary, SSA_PROOF_REASON_INVALIDATE);
+        ssa_proof_note_failure(summary, SSA_PROOF_REASON_INVALIDATE);
+    }
+    return 0;
+}
+
+func ssa_proof_query_inst(fn: *SSAFunction, block: *SSABlock, inst: *SSAInstruction, summary: *SSAProofSummary) -> u64 {
+    if (inst == 0 || summary == 0) { return 0; }
+    var op: u64 = op_of(inst);
+    if (op == SSA_OP_PHI) {
+        ssa_proof_join_phi(summary);
+        return 0;
+    }
+    if (ssa_proof_is_compare_op(op) != 0) {
+        ssa_proof_query_range(summary);
+        ssa_proof_refine_edge(summary);
+    } else if (ssa_proof_is_arith_op(op) != 0) {
+        ssa_proof_query_range(summary);
+    }
+    if (op == SSA_OP_BR) {
+        ssa_proof_refine_edge(summary);
+        ssa_proof_query_trip(summary);
+    }
+    if (ssa_proof_is_address_op(op) != 0 || ssa_proof_is_memory_read_op(op) != 0) {
+        ssa_proof_query_alias(summary);
+    }
+    if (ssa_proof_is_memory_write_op(op) != 0) {
+        ssa_proof_query_alias(summary);
+        ssa_proof_note_invalidate(summary, SSA_PROOF_REASON_ALIAS);
+    }
+    if (op == SSA_OP_CALL) {
+        ssa_proof_query_call((*SSACallInfo)operand_value(inst.src1), summary);
+    } else if (op == SSA_OP_CALL_PTR || op == SSA_OP_CALL_SLICE_STORE) {
+        ssa_proof_note_invalidate(summary, SSA_PROOF_REASON_INVALIDATE);
+        ssa_proof_note_failure(summary, SSA_PROOF_REASON_INVALIDATE);
+    } else if (op == SSA_OP_ASM) {
+        ssa_proof_note_invalidate(summary, SSA_PROOF_REASON_INVALIDATE);
+        ssa_proof_note_failure(summary, SSA_PROOF_REASON_INVALIDATE);
+    }
+    return 0;
+}
+
+func ssa_proof_analyze_function(fn: *SSAFunction) -> *SSAProofSummary {
+    var summary: *SSAProofSummary = new SSAProofSummary{};
+    if (fn == 0) { return summary; }
+    var blocks: []*SSABlock = fn.blocks;
+    var n: u64 = slice_len(blocks);
+    for (var bi: u64 = 0; bi < n; bi = bi + 1) {
+        var block: *SSABlock = blocks[bi];
+        if (block == 0) { continue; }
+        if (slice_len(block.preds) > 1) {
+            ssa_proof_join_phi(summary);
+        }
+        var phi: *SSAInstruction = block.phi_head;
+        while (phi != 0) {
+            ssa_proof_query_inst(fn, block, phi, summary);
+            phi = phi.next;
+        }
+        var cur: *SSAInstruction = block.inst_head;
+        while (cur != 0) {
+            ssa_proof_query_inst(fn, block, cur, summary);
+            cur = cur.next;
+        }
+    }
+    if (summary.query_count == 0) {
+        ssa_proof_note_failure(summary, SSA_PROOF_REASON_FAILURE);
+    }
+    return summary;
+}

@@ -1,0 +1,159 @@
+// ssa_specialize.b - O2 inliner/specializer/devirtualizer cost model
+
+import std.str;
+import std.vec;
+import ssa.datastruct;
+import ssa.core;
+
+const SSA_SPECIALIZE_SMALL_INLINE_LIMIT = 18;
+const SSA_SPECIALIZE_TRIVIAL_INLINE_LIMIT = 8;
+const SSA_SPECIALIZE_FUNCTION_BUDGET = 32;
+
+struct SSASpecializeSummary {
+    public cost_model_count: u64;
+    public inline_candidate_count: u64;
+    public inline_approved_count: u64;
+    public cold_rejected_count: u64;
+    public const_arg_candidate_count: u64;
+    public devirt_candidate_count: u64;
+    public shape_guard_count: u64;
+    public budget_guard_count: u64;
+    public duplicate_guard_count: u64;
+    public report_count: u64;
+}
+
+impl SSASpecializeSummary {
+    public constructor() {
+        self.cost_model_count = 0;
+        self.inline_candidate_count = 0;
+        self.inline_approved_count = 0;
+        self.cold_rejected_count = 0;
+        self.const_arg_candidate_count = 0;
+        self.devirt_candidate_count = 0;
+        self.shape_guard_count = 0;
+        self.budget_guard_count = 0;
+        self.duplicate_guard_count = 0;
+        self.report_count = 0;
+    }
+}
+
+func ssa_specialize_name_has_prefix(name: []u8, lit: u64, len: u64) -> u64 {
+    if (name.ptr == 0 || name.len < len) { return 0; }
+    return str_eq(slice(name.ptr, len), slice(lit, len));
+}
+
+func ssa_specialize_find_function(ctx: *SSAContext, name: []u8) -> *SSAFunction {
+    if (ctx == 0 || name.ptr == 0) { return 0; }
+    var funcs: []*SSAFunction = ctx.funcs;
+    var n: u64 = slice_len(funcs);
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var fn: *SSAFunction = funcs[i];
+        if (fn != 0 && fn.name.ptr != 0 && str_eq(fn.name, name) != 0) { return fn; }
+    }
+    return 0;
+}
+
+func ssa_specialize_count_function_insts(fn: *SSAFunction) -> u64 {
+    if (fn == 0) { return 0; }
+    var total: u64 = 0;
+    var blocks: []*SSABlock = fn.blocks;
+    var n: u64 = slice_len(blocks);
+    for (var bi: u64 = 0; bi < n; bi = bi + 1) {
+        var block: *SSABlock = blocks[bi];
+        if (block == 0) { continue; }
+        var phi: *SSAInstruction = block.phi_head;
+        while (phi != 0) {
+            total = total + 1;
+            phi = phi.next;
+        }
+        var cur: *SSAInstruction = block.inst_head;
+        while (cur != 0) {
+            total = total + 1;
+            cur = cur.next;
+        }
+    }
+    return total;
+}
+
+func ssa_specialize_const_arg_count(info: *SSACallInfo) -> u64 {
+    if (info == 0 || info.args_vec == 0) { return 0; }
+    var out: u64 = 0;
+    var n: u64 = info.args_vec.len();
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var arg: u64 = info.args_vec.get(i);
+        if (operand_is_const(arg) != 0) { out = out + 1; }
+    }
+    return out;
+}
+
+func ssa_specialize_call_has_shape_proof(info: *SSACallInfo) -> u64 {
+    if (info == 0) { return 0; }
+    var name: []u8 = info.name;
+    if (ssa_specialize_name_has_prefix(name, "std_mem__bpp_shape_", str_len("std_mem__bpp_shape_")) != 0) { return 1; }
+    if (ssa_specialize_name_has_prefix(name, "std_mem__bpp_fast_path_", str_len("std_mem__bpp_fast_path_")) != 0) { return 1; }
+    if (ssa_specialize_name_has_prefix(name, "std_vec__Vec_tagged_", str_len("std_vec__Vec_tagged_")) != 0) { return 1; }
+    return 0;
+}
+
+func ssa_specialize_note_direct_call(ctx: *SSAContext, fn: *SSAFunction, info: *SSACallInfo, summary: *SSASpecializeSummary) -> u64 {
+    if (info == 0 || summary == 0) { return 0; }
+    summary.cost_model_count = summary.cost_model_count + 1;
+    summary.inline_candidate_count = summary.inline_candidate_count + 1;
+    var const_args: u64 = ssa_specialize_const_arg_count(info);
+    summary.const_arg_candidate_count = summary.const_arg_candidate_count + const_args;
+    if (ssa_specialize_call_has_shape_proof(info) != 0) {
+        summary.shape_guard_count = summary.shape_guard_count + 1;
+        summary.devirt_candidate_count = summary.devirt_candidate_count + 1;
+    }
+    var callee: *SSAFunction = ssa_specialize_find_function(ctx, info.name);
+    if (callee == 0 || callee == fn) {
+        summary.cold_rejected_count = summary.cold_rejected_count + 1;
+        summary.report_count = summary.report_count + 1;
+        return 0;
+    }
+    var callee_insts: u64 = ssa_specialize_count_function_insts(callee);
+    if (callee_insts <= SSA_SPECIALIZE_SMALL_INLINE_LIMIT) {
+        summary.inline_approved_count = summary.inline_approved_count + 1;
+        if (callee_insts <= SSA_SPECIALIZE_TRIVIAL_INLINE_LIMIT) {
+            summary.devirt_candidate_count = summary.devirt_candidate_count + 1;
+        }
+    } else {
+        summary.cold_rejected_count = summary.cold_rejected_count + 1;
+    }
+    if (const_args != 0) {
+        summary.inline_approved_count = summary.inline_approved_count + 1;
+    }
+    if (summary.inline_candidate_count > SSA_SPECIALIZE_FUNCTION_BUDGET) {
+        summary.budget_guard_count = summary.budget_guard_count + 1;
+    }
+    summary.report_count = summary.report_count + 1;
+    return 0;
+}
+
+func ssa_specialize_analyze_function(ctx: *SSAContext, fn: *SSAFunction) -> *SSASpecializeSummary {
+    var summary: *SSASpecializeSummary = new SSASpecializeSummary{};
+    if (fn == 0) { return summary; }
+    var blocks: []*SSABlock = fn.blocks;
+    var n: u64 = slice_len(blocks);
+    for (var bi: u64 = 0; bi < n; bi = bi + 1) {
+        var block: *SSABlock = blocks[bi];
+        if (block == 0) { continue; }
+        var cur: *SSAInstruction = block.inst_head;
+        while (cur != 0) {
+            var op: u64 = op_of(cur);
+            if (op == SSA_OP_CALL) {
+                ssa_specialize_note_direct_call(ctx, fn, (*SSACallInfo)operand_value(cur.src1), summary);
+            } else if (op == SSA_OP_CALL_PTR || op == SSA_OP_CALL_SLICE_STORE) {
+                summary.cost_model_count = summary.cost_model_count + 1;
+                summary.devirt_candidate_count = summary.devirt_candidate_count + 1;
+                summary.shape_guard_count = summary.shape_guard_count + 1;
+                summary.report_count = summary.report_count + 1;
+            }
+            cur = cur.next;
+        }
+    }
+    if (summary.inline_approved_count > summary.inline_candidate_count + summary.const_arg_candidate_count) {
+        summary.duplicate_guard_count = summary.duplicate_guard_count + 1;
+    }
+    return summary;
+}

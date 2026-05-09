@@ -1,0 +1,174 @@
+// ssa_ipa.b - whole-program SSA interprocedural summaries
+
+import std.str;
+import std.vec;
+import ssa.datastruct;
+import ssa.core;
+
+struct SSAIPASummary {
+    public direct_call_edge_count: u64;
+    public indirect_call_edge_count: u64;
+    public recursive_component_count: u64;
+    public pure_summary_count: u64;
+    public readonly_summary_count: u64;
+    public allocation_summary_count: u64;
+    public escape_summary_count: u64;
+    public tag_state_summary_count: u64;
+    public throw_summary_count: u64;
+    public const_arg_candidate_count: u64;
+    public stack_new_candidate_count: u64;
+    public allocation_sinking_candidate_count: u64;
+    public serialization_candidate_count: u64;
+}
+
+impl SSAIPASummary {
+    public constructor() {
+        self.direct_call_edge_count = 0;
+        self.indirect_call_edge_count = 0;
+        self.recursive_component_count = 0;
+        self.pure_summary_count = 0;
+        self.readonly_summary_count = 0;
+        self.allocation_summary_count = 0;
+        self.escape_summary_count = 0;
+        self.tag_state_summary_count = 0;
+        self.throw_summary_count = 0;
+        self.const_arg_candidate_count = 0;
+        self.stack_new_candidate_count = 0;
+        self.allocation_sinking_candidate_count = 0;
+        self.serialization_candidate_count = 0;
+    }
+}
+
+func ssa_ipa_name_eq(name: []u8, lit: u64, len: u64) -> u64 {
+    if (name.ptr == 0 || name.len != len) { return 0; }
+    return str_eq(name, slice(lit, len));
+}
+
+func ssa_ipa_name_has_prefix(name: []u8, lit: u64, len: u64) -> u64 {
+    if (name.ptr == 0 || name.len < len) { return 0; }
+    return str_eq(slice(name.ptr, len), slice(lit, len));
+}
+
+func ssa_ipa_find_function(ctx: *SSAContext, name: []u8) -> *SSAFunction {
+    if (ctx == 0 || name.ptr == 0) { return 0; }
+    var funcs: []*SSAFunction = ctx.funcs;
+    var n: u64 = slice_len(funcs);
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var fn: *SSAFunction = funcs[i];
+        if (fn != 0 && fn.name.ptr != 0 && str_eq(fn.name, name) != 0) { return fn; }
+    }
+    return 0;
+}
+
+func ssa_ipa_call_is_pure_number_or_tag(name: []u8) -> u64 {
+    if (ssa_ipa_name_has_prefix(name, "std_number__", str_len("std_number__")) != 0) { return 1; }
+    if (ssa_ipa_name_has_prefix(name, "std_complex__", str_len("std_complex__")) != 0) { return 1; }
+    if (ssa_ipa_name_has_prefix(name, "std_mem__bpp_tag_", str_len("std_mem__bpp_tag_")) != 0) { return 1; }
+    if (ssa_ipa_name_has_prefix(name, "std_mem__bpp_shape_", str_len("std_mem__bpp_shape_")) != 0) { return 1; }
+    return 0;
+}
+
+func ssa_ipa_call_is_allocation(name: []u8) -> u64 {
+    if (ssa_ipa_name_has_prefix(name, "std_mem__bpp_heap_alloc", str_len("std_mem__bpp_heap_alloc")) != 0) { return 1; }
+    if (ssa_ipa_name_has_prefix(name, "std_mem__bpp_gc_alloc", str_len("std_mem__bpp_gc_alloc")) != 0) { return 1; }
+    if (ssa_ipa_name_eq(name, "heap_alloc", str_len("heap_alloc")) != 0) { return 1; }
+    return 0;
+}
+
+func ssa_ipa_call_has_tag_state(name: []u8) -> u64 {
+    if (ssa_ipa_name_has_prefix(name, "std_mem__bpp_tag_", str_len("std_mem__bpp_tag_")) != 0) { return 1; }
+    if (ssa_ipa_name_has_prefix(name, "std_vec__Vec_tagged_", str_len("std_vec__Vec_tagged_")) != 0) { return 1; }
+    return 0;
+}
+
+func ssa_ipa_call_const_arg_count(info: *SSACallInfo) -> u64 {
+    if (info == 0 || info.args_vec == 0) { return 0; }
+    var out: u64 = 0;
+    var n: u64 = info.args_vec.len();
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var arg: u64 = info.args_vec.get(i);
+        if (operand_is_const(arg) != 0) { out = out + 1; }
+    }
+    return out;
+}
+
+func ssa_ipa_function_calls_name(fn: *SSAFunction, target: []u8) -> u64 {
+    if (fn == 0 || target.ptr == 0) { return 0; }
+    var blocks: []*SSABlock = fn.blocks;
+    var n: u64 = slice_len(blocks);
+    for (var bi: u64 = 0; bi < n; bi = bi + 1) {
+        var block: *SSABlock = blocks[bi];
+        if (block == 0) { continue; }
+        var cur: *SSAInstruction = block.inst_head;
+        while (cur != 0) {
+            if (op_of(cur) == SSA_OP_CALL) {
+                var info: *SSACallInfo = (*SSACallInfo)operand_value(cur.src1);
+                if (info != 0 && info.name.ptr != 0 && str_eq(info.name, target) != 0) { return 1; }
+            }
+            cur = cur.next;
+        }
+    }
+    return 0;
+}
+
+func ssa_ipa_note_call(ctx: *SSAContext, fn: *SSAFunction, info: *SSACallInfo, summary: *SSAIPASummary) -> u64 {
+    if (summary == 0) { return 0; }
+    if (info == 0) {
+        summary.throw_summary_count = summary.throw_summary_count + 1;
+        summary.escape_summary_count = summary.escape_summary_count + 1;
+        return 0;
+    }
+    summary.direct_call_edge_count = summary.direct_call_edge_count + 1;
+    var callee: *SSAFunction = ssa_ipa_find_function(ctx, info.name);
+    if (callee == fn || (callee != 0 && ssa_ipa_function_calls_name(callee, fn.name) != 0)) {
+        summary.recursive_component_count = summary.recursive_component_count + 1;
+    }
+    if (ssa_ipa_call_is_pure_number_or_tag(info.name) != 0) {
+        summary.pure_summary_count = summary.pure_summary_count + 1;
+        summary.readonly_summary_count = summary.readonly_summary_count + 1;
+    } else {
+        summary.throw_summary_count = summary.throw_summary_count + 1;
+    }
+    if (ssa_ipa_call_is_allocation(info.name) != 0) {
+        summary.allocation_summary_count = summary.allocation_summary_count + 1;
+        summary.stack_new_candidate_count = summary.stack_new_candidate_count + 1;
+        summary.allocation_sinking_candidate_count = summary.allocation_sinking_candidate_count + 1;
+    }
+    if (ssa_ipa_call_has_tag_state(info.name) != 0) {
+        summary.tag_state_summary_count = summary.tag_state_summary_count + 1;
+    }
+    if (info.ret_ptr_depth != 0 || info.ret_struct_size != 0) {
+        summary.escape_summary_count = summary.escape_summary_count + 1;
+    }
+    summary.const_arg_candidate_count = summary.const_arg_candidate_count + ssa_ipa_call_const_arg_count(info);
+    summary.serialization_candidate_count = summary.serialization_candidate_count + 1;
+    return 0;
+}
+
+func ssa_ipa_analyze_function(ctx: *SSAContext, fn: *SSAFunction) -> *SSAIPASummary {
+    var summary: *SSAIPASummary = new SSAIPASummary{};
+    if (fn == 0) { return summary; }
+    var blocks: []*SSABlock = fn.blocks;
+    var n: u64 = slice_len(blocks);
+    for (var bi: u64 = 0; bi < n; bi = bi + 1) {
+        var block: *SSABlock = blocks[bi];
+        if (block == 0) { continue; }
+        var cur: *SSAInstruction = block.inst_head;
+        while (cur != 0) {
+            var op: u64 = op_of(cur);
+            if (op == SSA_OP_CALL) {
+                ssa_ipa_note_call(ctx, fn, (*SSACallInfo)operand_value(cur.src1), summary);
+            } else if (op == SSA_OP_CALL_PTR || op == SSA_OP_CALL_SLICE_STORE) {
+                summary.indirect_call_edge_count = summary.indirect_call_edge_count + 1;
+                summary.escape_summary_count = summary.escape_summary_count + 1;
+                summary.throw_summary_count = summary.throw_summary_count + 1;
+            }
+            cur = cur.next;
+        }
+    }
+    if (summary.direct_call_edge_count == 0 && summary.indirect_call_edge_count == 0) {
+        summary.pure_summary_count = summary.pure_summary_count + 1;
+        summary.readonly_summary_count = summary.readonly_summary_count + 1;
+    }
+    return summary;
+}
