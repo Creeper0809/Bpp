@@ -9,11 +9,95 @@ import ssa.memoryssa2;
 import ssa.loop3;
 import ssa.vector_ir;
 import ssa.backend_contract;
+import std.vec;
 import opt;
 import run as run_o1 from ssa.opt_o1;
 
 const SSA_OPT_O2_INST_BUDGET = 64;
 const SSA_OPT_PRODUCTION_CONTRACT_24_TO_40 = 131071;
+
+struct SSAOptPipelineInstSnapshot {
+    public inst: *SSAInstruction;
+    public op: u64;
+    public dest: u64;
+    public src1: u64;
+    public src2: u64;
+}
+
+impl SSAOptPipelineInstSnapshot {
+    public constructor() {
+        self.inst = 0;
+        self.op = 0;
+        self.dest = 0;
+        self.src1 = 0;
+        self.src2 = 0;
+    }
+}
+
+func ssa_opt_pipeline_new_inst_snapshot_vec() -> *Vec<*SSAOptPipelineInstSnapshot> {
+    return new Vec<*SSAOptPipelineInstSnapshot>{heap_alloc((256) * sizeof(*SSAOptPipelineInstSnapshot)), 0, 256};
+}
+
+func ssa_opt_pipeline_snapshot_inst(snaps: *Vec<*SSAOptPipelineInstSnapshot>, inst: *SSAInstruction) -> u64 {
+    if (snaps == 0 || inst == 0) { return 0; }
+    var snap: *SSAOptPipelineInstSnapshot = new SSAOptPipelineInstSnapshot{};
+    snap.inst = inst;
+    snap.op = op_of(inst);
+    snap.dest = inst.dest;
+    snap.src1 = inst.src1;
+    snap.src2 = inst.src2;
+    snaps.push(snap);
+    return 1;
+}
+
+func ssa_opt_pipeline_snapshot_function(snaps: *Vec<*SSAOptPipelineInstSnapshot>, fn: *SSAFunction) -> u64 {
+    if (snaps == 0 || fn == 0) { return 0; }
+    var total: u64 = 0;
+    var blocks: []*SSABlock = fn.blocks;
+    var n: u64 = slice_len(blocks);
+    for (var bi: u64 = 0; bi < n; bi = bi + 1) {
+        var block: *SSABlock = blocks[bi];
+        if (block == 0) { continue; }
+        var phi: *SSAInstruction = block.phi_head;
+        while (phi != 0) {
+            total = total + ssa_opt_pipeline_snapshot_inst(snaps, phi);
+            phi = phi.next;
+        }
+        var cur: *SSAInstruction = block.inst_head;
+        while (cur != 0) {
+            total = total + ssa_opt_pipeline_snapshot_inst(snaps, cur);
+            cur = cur.next;
+        }
+    }
+    return total;
+}
+
+func ssa_opt_pipeline_snapshot_context(ctx: *SSAContext) -> *Vec<*SSAOptPipelineInstSnapshot> {
+    var snaps: *Vec<*SSAOptPipelineInstSnapshot> = ssa_opt_pipeline_new_inst_snapshot_vec();
+    if (ctx == 0) { return snaps; }
+    var funcs: []*SSAFunction = ctx.funcs;
+    var n: u64 = slice_len(funcs);
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        ssa_opt_pipeline_snapshot_function(snaps, funcs[i]);
+    }
+    return snaps;
+}
+
+func ssa_opt_pipeline_restore_snapshot(snaps: *Vec<*SSAOptPipelineInstSnapshot>) -> u64 {
+    if (snaps == 0) { return 0; }
+    var restored: u64 = 0;
+    var n: u64 = snaps.len();
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var snap: *SSAOptPipelineInstSnapshot = snaps.get(i);
+        if (snap == 0 || snap.inst == 0) { continue; }
+        set_op(snap.inst, snap.op);
+        snap.inst.dest = snap.dest;
+        snap.inst.src1 = snap.src1;
+        snap.inst.src2 = snap.src2;
+        restored = restored + 1;
+    }
+    return restored;
+}
 
 func ssa_opt_pipeline_is_compare_op(op: u64) -> u64 {
     if (op == SSA_OP_EQ || op == SSA_OP_NE || op == SSA_OP_LT || op == SSA_OP_GT || op == SSA_OP_LE || op == SSA_OP_GE) { return 1; }
@@ -177,6 +261,7 @@ func ssa_opt_pipeline_prepare_o2(ctx: *SSAContext, level: u64) -> u64 {
         fn.opt_specialize_cold_rejected_count = spec_summary.cold_rejected_count;
         fn.opt_specialize_const_arg_count = spec_summary.const_arg_candidate_count;
         fn.opt_specialize_devirt_count = spec_summary.devirt_candidate_count;
+        fn.opt_specialize_devirt_rewrite_count = spec_summary.devirt_rewrite_count;
         fn.opt_specialize_shape_guard_count = spec_summary.shape_guard_count;
         fn.opt_specialize_budget_count = spec_summary.budget_guard_count + spec_summary.duplicate_guard_count;
         var mem2_summary: *SSAMemorySSA2Summary = ssa_memoryssa2_analyze_function(fn);
@@ -291,15 +376,52 @@ func ssa_opt_pipeline_has_budget_bailout(ctx: *SSAContext) -> u64 {
     return 0;
 }
 
+func ssa_opt_pipeline_has_memoryssa2_verify_error(ctx: *SSAContext) -> u64 {
+    if (ctx == 0) { return 1; }
+    var funcs: []*SSAFunction = ctx.funcs;
+    var n: u64 = slice_len(funcs);
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var fn: *SSAFunction = funcs[i];
+        if (fn != 0 && fn.opt_memoryssa2_verify_error_count != 0) { return 1; }
+    }
+    return 0;
+}
+
+func ssa_opt_pipeline_mark_transaction_fallback(ctx: *SSAContext) -> u64 {
+    if (ctx == 0) { return 0; }
+    var funcs: []*SSAFunction = ctx.funcs;
+    var n: u64 = slice_len(funcs);
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var fn: *SSAFunction = funcs[i];
+        if (fn == 0 || fn.opt_o2_budget_bailout_count != 0) { continue; }
+        fn.opt_o2_fallback_count = fn.opt_o2_fallback_count + 1;
+        fn.opt_production_report_count = fn.opt_production_report_count + 1;
+    }
+    return 0;
+}
+
+func ssa_opt_pipeline_run_memoryssa2_transaction(ctx: *SSAContext) -> u64 {
+    if (ctx == 0) { return 0; }
+    var changed: u64 = ssa_specialize_rewrite_context(ctx);
+    var snaps: *Vec<*SSAOptPipelineInstSnapshot> = ssa_opt_pipeline_snapshot_context(ctx);
+    changed = changed + ssa_memoryssa2_rewrite_context(ctx);
+    if (ssa_opt_pipeline_has_memoryssa2_verify_error(ctx) != 0) {
+        ssa_opt_pipeline_restore_snapshot(snaps);
+        ssa_opt_pipeline_mark_transaction_fallback(ctx);
+        return changed;
+    }
+    return changed;
+}
+
 func ssa_opt_pipeline_run_o2(ctx: *SSAContext, level: u64) -> u64 {
     if (ctx == 0) { return 0; }
     ssa_opt_pipeline_prepare_o2(ctx, level);
 
-    // O2 starts as a production pipeline boundary around the existing safe O1
-    // rewrites. Extra fixed-point rounds are real rewrite attempts, but the
-    // per-function O2 budget and verifier counters keep the fallback visible.
+    // O2 wraps each extra rewrite family in a pass-local transaction. The
+    // snapshot is intentionally instruction-local because MemorySSA2 mutates
+    // opcodes and operands but does not create or remove CFG edges here.
     var rounds: u64 = 0;
-    ssa_memoryssa2_rewrite_context(ctx);
+    ssa_opt_pipeline_run_memoryssa2_transaction(ctx);
     if (ssa_opt_pipeline_has_budget_bailout(ctx) == 0) {
         run_o1(ctx);
         rounds = 1;

@@ -1134,7 +1134,7 @@ run_llvm_case() {
             fi
         else
             local run_exit
-            run_exit="$(sed -n 's/^\[RUN\] exit=//p' "$out_file" | tail -n 1)"
+            run_exit="$(perl -0ne 'if (/\[RUN\] exit=(-?[0-9]+)/s) { print $1; }' "$out_file" | tail -n 1)"
             local expected_raw="$expected"
             if [ "$expected_raw" -ne 0 ]; then
                 expected_raw=$((expected_raw * 256))

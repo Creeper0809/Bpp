@@ -5,6 +5,9 @@ import std.vec;
 import ssa.datastruct;
 import ssa.core;
 
+const SSA_IPA_TRANSITIVE_RECURSION_DEPTH = 4;
+const SSA_IPA_TRANSITIVE_CALL_SCAN_LIMIT = 32;
+
 struct SSAIPASummary {
     public direct_call_edge_count: u64;
     public indirect_call_edge_count: u64;
@@ -47,6 +50,16 @@ func ssa_ipa_name_eq(name: []u8, lit: u64, len: u64) -> u64 {
 func ssa_ipa_name_has_prefix(name: []u8, lit: u64, len: u64) -> u64 {
     if (name.ptr == 0 || name.len < len) { return 0; }
     return str_eq(slice(name.ptr, len), slice(lit, len));
+}
+
+func ssa_ipa_transitive_scan_candidate(name: []u8) -> u64 {
+    if (name.ptr == 0 || name.len == 0) { return 0; }
+    if (ssa_ipa_name_has_prefix(name, "std_", str_len("std_")) != 0) { return 0; }
+    if (ssa_ipa_name_has_prefix(name, "llvm_", str_len("llvm_")) != 0) { return 0; }
+    if (ssa_ipa_name_has_prefix(name, "compiler_", str_len("compiler_")) != 0) { return 0; }
+    if (ssa_ipa_name_has_prefix(name, "parser_", str_len("parser_")) != 0) { return 0; }
+    if (ssa_ipa_name_has_prefix(name, "ssa_", str_len("ssa_")) != 0) { return 0; }
+    return 1;
 }
 
 func ssa_ipa_find_function(ctx: *SSAContext, name: []u8) -> *SSAFunction {
@@ -111,6 +124,33 @@ func ssa_ipa_function_calls_name(fn: *SSAFunction, target: []u8) -> u64 {
     return 0;
 }
 
+func ssa_ipa_function_reaches_name(ctx: *SSAContext, fn: *SSAFunction, target: []u8, depth: u64) -> u64 {
+    if (ctx == 0 || fn == 0 || target.ptr == 0 || depth == 0) { return 0; }
+    if (ssa_ipa_transitive_scan_candidate(fn.name) == 0 || ssa_ipa_transitive_scan_candidate(target) == 0) { return 0; }
+    var blocks: []*SSABlock = fn.blocks;
+    var n: u64 = slice_len(blocks);
+    var scanned_calls: u64 = 0;
+    for (var bi: u64 = 0; bi < n; bi = bi + 1) {
+        var block: *SSABlock = blocks[bi];
+        if (block == 0) { continue; }
+        var cur: *SSAInstruction = block.inst_head;
+        while (cur != 0) {
+            if (op_of(cur) == SSA_OP_CALL) {
+                scanned_calls = scanned_calls + 1;
+                if (scanned_calls > SSA_IPA_TRANSITIVE_CALL_SCAN_LIMIT) { return 0; }
+                var info: *SSACallInfo = (*SSACallInfo)operand_value(cur.src1);
+                if (info != 0 && info.name.ptr != 0) {
+                    if (str_eq(info.name, target) != 0) { return 1; }
+                    var callee: *SSAFunction = ssa_ipa_find_function(ctx, info.name);
+                    if (callee != 0 && callee != fn && ssa_ipa_transitive_scan_candidate(info.name) != 0 && ssa_ipa_function_reaches_name(ctx, callee, target, depth - 1) != 0) { return 1; }
+                }
+            }
+            cur = cur.next;
+        }
+    }
+    return 0;
+}
+
 func ssa_ipa_note_call(ctx: *SSAContext, fn: *SSAFunction, info: *SSACallInfo, summary: *SSAIPASummary) -> u64 {
     if (summary == 0) { return 0; }
     if (info == 0) {
@@ -120,7 +160,7 @@ func ssa_ipa_note_call(ctx: *SSAContext, fn: *SSAFunction, info: *SSACallInfo, s
     }
     summary.direct_call_edge_count = summary.direct_call_edge_count + 1;
     var callee: *SSAFunction = ssa_ipa_find_function(ctx, info.name);
-    if (callee == fn || (callee != 0 && ssa_ipa_function_calls_name(callee, fn.name) != 0)) {
+    if (callee == fn || (callee != 0 && ssa_ipa_transitive_scan_candidate(fn.name) != 0 && ssa_ipa_transitive_scan_candidate(info.name) != 0 && ssa_ipa_function_reaches_name(ctx, callee, fn.name, SSA_IPA_TRANSITIVE_RECURSION_DEPTH) != 0)) {
         summary.recursive_component_count = summary.recursive_component_count + 1;
     }
     if (ssa_ipa_call_is_pure_number_or_tag(info.name) != 0) {

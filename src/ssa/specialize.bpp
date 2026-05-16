@@ -16,6 +16,7 @@ struct SSASpecializeSummary {
     public cold_rejected_count: u64;
     public const_arg_candidate_count: u64;
     public devirt_candidate_count: u64;
+    public devirt_rewrite_count: u64;
     public shape_guard_count: u64;
     public budget_guard_count: u64;
     public duplicate_guard_count: u64;
@@ -30,11 +31,40 @@ impl SSASpecializeSummary {
         self.cold_rejected_count = 0;
         self.const_arg_candidate_count = 0;
         self.devirt_candidate_count = 0;
+        self.devirt_rewrite_count = 0;
         self.shape_guard_count = 0;
         self.budget_guard_count = 0;
         self.duplicate_guard_count = 0;
         self.report_count = 0;
     }
+}
+
+struct SSASpecializeNameRef {
+    public ptr: u64;
+    public len: u64;
+}
+
+impl SSASpecializeNameRef {
+    public constructor() {
+        self.ptr = 0;
+        self.len = 0;
+    }
+}
+
+struct SSASpecializeFuncAddrFact {
+    public reg: u64;
+    public name: []u8;
+}
+
+impl SSASpecializeFuncAddrFact {
+    public constructor() {
+        self.reg = 0;
+        self.name = slice(0, 0);
+    }
+}
+
+func ssa_specialize_new_func_addr_vec() -> *Vec<*SSASpecializeFuncAddrFact> {
+    return new Vec<*SSASpecializeFuncAddrFact>{heap_alloc((8) * sizeof(*SSASpecializeFuncAddrFact)), 0, 8};
 }
 
 func ssa_specialize_name_has_prefix(name: []u8, lit: u64, len: u64) -> u64 {
@@ -95,6 +125,89 @@ func ssa_specialize_call_has_shape_proof(info: *SSACallInfo) -> u64 {
     return 0;
 }
 
+func ssa_specialize_note_func_addr(addrs: *Vec<*SSASpecializeFuncAddrFact>, inst: *SSAInstruction) -> *SSASpecializeFuncAddrFact {
+    if (addrs == 0 || inst == 0 || inst.dest == 0 || op_of(inst) != SSA_OP_LEA_FUNC) { return 0; }
+    var name_ref: *SSASpecializeNameRef = (*SSASpecializeNameRef)operand_value(inst.src1);
+    if (name_ref == 0 || name_ref.ptr == 0 || name_ref.len == 0) { return 0; }
+    var fact: *SSASpecializeFuncAddrFact = new SSASpecializeFuncAddrFact{};
+    fact.reg = inst.dest;
+    fact.name = slice(name_ref.ptr, name_ref.len);
+    addrs.push(fact);
+    return fact;
+}
+
+func ssa_specialize_find_func_addr(addrs: *Vec<*SSASpecializeFuncAddrFact>, reg: u64) -> *SSASpecializeFuncAddrFact {
+    if (addrs == 0 || reg == 0) { return 0; }
+    var n: u64 = addrs.len();
+    while (n > 0) {
+        n = n - 1;
+        var fact: *SSASpecializeFuncAddrFact = addrs.get(n);
+        if (fact != 0 && fact.reg == reg && fact.name.ptr != 0) { return fact; }
+    }
+    return 0;
+}
+
+func ssa_specialize_rewrite_call_ptr(ctx: *SSAContext, addrs: *Vec<*SSASpecializeFuncAddrFact>, fallback: *SSASpecializeFuncAddrFact, inst: *SSAInstruction) -> u64 {
+    if (ctx == 0 || addrs == 0 || inst == 0 || op_of(inst) != SSA_OP_CALL_PTR) { return 0; }
+    var ptr_info: *SSACallPtrInfo = (*SSACallPtrInfo)operand_value(inst.src1);
+    if (ptr_info == 0 || ptr_info.callee_reg == 0) { return 0; }
+    var fact: *SSASpecializeFuncAddrFact = ssa_specialize_find_func_addr(addrs, ptr_info.callee_reg);
+    if (fact == 0 && fallback != 0) { fact = fallback; }
+    if (fact == 0 || fact.name.ptr == 0) { return 0; }
+    var call_info: *SSACallInfo = new SSACallInfo{};
+    call_info.name = slice(fact.name.ptr, fact.name.len);
+    call_info.args_vec = ptr_info.args_vec;
+    call_info.nargs = ptr_info.nargs;
+    call_info.ret_type = ptr_info.ret_type;
+    call_info.ret_ptr_depth = ptr_info.ret_ptr_depth;
+    call_info.ret_struct_size = ptr_info.ret_struct_size;
+    inst.src1 = operand_const((u64)call_info);
+    set_op(inst, SSA_OP_CALL);
+    return 1;
+}
+
+func ssa_specialize_rewrite_function(ctx: *SSAContext, fn: *SSAFunction) -> u64 {
+    if (ctx == 0 || fn == 0 || fn.opt_o2_budget_bailout_count != 0) { return 0; }
+    var changed: u64 = 0;
+    var blocks: []*SSABlock = fn.blocks;
+    var n: u64 = slice_len(blocks);
+    for (var bi: u64 = 0; bi < n; bi = bi + 1) {
+        var block: *SSABlock = blocks[bi];
+        if (block == 0) { continue; }
+        var addrs: *Vec<*SSASpecializeFuncAddrFact> = ssa_specialize_new_func_addr_vec();
+        var immediate_func_addr: *SSASpecializeFuncAddrFact = 0;
+        var cur: *SSAInstruction = block.inst_head;
+        while (cur != 0) {
+            var op: u64 = op_of(cur);
+            var noted: *SSASpecializeFuncAddrFact = ssa_specialize_note_func_addr(addrs, cur);
+            if (noted != 0) { immediate_func_addr = noted; }
+            if (ssa_specialize_rewrite_call_ptr(ctx, addrs, immediate_func_addr, cur) != 0) {
+                changed = changed + 1;
+            }
+            if (op != SSA_OP_LEA_FUNC && op != SSA_OP_NOP) { immediate_func_addr = 0; }
+            cur = cur.next;
+        }
+    }
+    if (changed != 0) {
+        fn.opt_specialize_devirt_count = fn.opt_specialize_devirt_count + changed;
+        fn.opt_specialize_devirt_rewrite_count = fn.opt_specialize_devirt_rewrite_count + changed;
+        fn.opt_specialize_shape_guard_count = fn.opt_specialize_shape_guard_count + changed;
+        fn.opt_production_report_count = fn.opt_production_report_count + changed;
+    }
+    return changed;
+}
+
+func ssa_specialize_rewrite_context(ctx: *SSAContext) -> u64 {
+    if (ctx == 0) { return 0; }
+    var changed: u64 = 0;
+    var funcs: []*SSAFunction = ctx.funcs;
+    var n: u64 = slice_len(funcs);
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        changed = changed + ssa_specialize_rewrite_function(ctx, funcs[i]);
+    }
+    return changed;
+}
+
 func ssa_specialize_note_direct_call(ctx: *SSAContext, fn: *SSAFunction, info: *SSACallInfo, summary: *SSASpecializeSummary) -> u64 {
     if (info == 0 || summary == 0) { return 0; }
     summary.cost_model_count = summary.cost_model_count + 1;
@@ -138,9 +251,13 @@ func ssa_specialize_analyze_function(ctx: *SSAContext, fn: *SSAFunction) -> *SSA
     for (var bi: u64 = 0; bi < n; bi = bi + 1) {
         var block: *SSABlock = blocks[bi];
         if (block == 0) { continue; }
+        var addrs: *Vec<*SSASpecializeFuncAddrFact> = ssa_specialize_new_func_addr_vec();
+        var immediate_func_addr: *SSASpecializeFuncAddrFact = 0;
         var cur: *SSAInstruction = block.inst_head;
         while (cur != 0) {
             var op: u64 = op_of(cur);
+            var noted: *SSASpecializeFuncAddrFact = ssa_specialize_note_func_addr(addrs, cur);
+            if (noted != 0) { immediate_func_addr = noted; }
             if (op == SSA_OP_CALL) {
                 ssa_specialize_note_direct_call(ctx, fn, (*SSACallInfo)operand_value(cur.src1), summary);
             } else if (op == SSA_OP_CALL_PTR || op == SSA_OP_CALL_SLICE_STORE) {
@@ -148,7 +265,11 @@ func ssa_specialize_analyze_function(ctx: *SSAContext, fn: *SSAFunction) -> *SSA
                 summary.devirt_candidate_count = summary.devirt_candidate_count + 1;
                 summary.shape_guard_count = summary.shape_guard_count + 1;
                 summary.report_count = summary.report_count + 1;
+                if (op == SSA_OP_CALL_PTR && ssa_specialize_rewrite_call_ptr(ctx, addrs, immediate_func_addr, cur) != 0) {
+                    summary.devirt_rewrite_count = summary.devirt_rewrite_count + 1;
+                }
             }
+            if (op != SSA_OP_LEA_FUNC && op != SSA_OP_NOP) { immediate_func_addr = 0; }
             cur = cur.next;
         }
     }
