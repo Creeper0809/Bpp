@@ -497,6 +497,7 @@ STABILITY_FAILED=0
 # De-dup by content (ignore directive headers)
 declare -A SEEN_HASH
 declare -A TEST_DISPLAY_NAME
+declare -A RESULT_LABEL
 
 echo "========================================"
 echo "${VERSION} Compiler Test Suite"
@@ -1365,6 +1366,7 @@ CONTENT_HASH=$(awk '{if ($0 !~ /^\/\/ (Covers:|Mode:|Opt:|Compiler args:|Compile
                 TOTAL=$((TOTAL + 1))
                 RESULT_FILE="$JOBS_DIR/${RUN_TAG}_case_${TOTAL}.result"
                 CASE_RESULT_FILES+=("$RESULT_FILE")
+                RESULT_LABEL["$RESULT_FILE"]="[$TOTAL] Testing $TEST_LABEL ($MODE $OPT)"
                 launch_job_with_limit run_matrix_case "$TOTAL" "$TEST_FILE" "$TEST_NAME" "$TEST_LABEL" "$MODE" "$OPT" "$EXPECTED" "$EXPECT_COMPILE_FAIL" "$EXPECT_ERROR_FILE" "$EXPECT_STDOUT_FILE" "$STDIN_FILE" "$RESULT_FILE" "$COMPILER_ARGS_FILE" "$EXPECT_ASM_FILE" "$COMPILE_ONLY" "$EXPECT_ASM_COUNT_FILE"
             done
         done
@@ -1383,6 +1385,7 @@ CONTENT_HASH=$(awk '{if ($0 !~ /^\/\/ (Covers:|Mode:|Opt:|Compiler args:|Compile
                     TOTAL=$((TOTAL + 1))
                     RESULT_FILE="$JOBS_DIR/${RUN_TAG}_case_${TOTAL}.result"
                     CASE_RESULT_FILES+=("$RESULT_FILE")
+                    RESULT_LABEL["$RESULT_FILE"]="[$TOTAL] Testing $TEST_LABEL ($MODE $OPT)"
                     launch_job_with_limit run_matrix_case "$TOTAL" "$TEST_FILE" "$TEST_NAME" "$TEST_LABEL" "$MODE" "$OPT" "$EXPECTED" "$EXPECT_COMPILE_FAIL" "$EXPECT_ERROR_FILE" "$EXPECT_STDOUT_FILE" "$STDIN_FILE" "$RESULT_FILE" "$COMPILER_ARGS_FILE" "$EXPECT_ASM_FILE" "$COMPILE_ONLY" "$EXPECT_ASM_COUNT_FILE"
                 done
             done
@@ -1400,6 +1403,7 @@ CONTENT_HASH=$(awk '{if ($0 !~ /^\/\/ (Covers:|Mode:|Opt:|Compiler args:|Compile
         TOTAL=$((TOTAL + 1))
         RESULT_FILE="$JOBS_DIR/${RUN_TAG}_llvm_${TOTAL}.result"
         LLVM_RESULT_FILES+=("$RESULT_FILE")
+        RESULT_LABEL["$RESULT_FILE"]="[$TOTAL] LLVM $TEST_LABEL"
         launch_job_with_limit run_llvm_case "$TOTAL" "$TEST_FILE" "$TEST_NAME" "$TEST_LABEL" "$EXPECTED" "$RESULT_FILE" "$STDIN_FILE" "$EXPECT_STDOUT_FILE" "$COMPILER_ARGS_FILE" "$COMPILE_ONLY" "$EXPECT_LLVM_METADATA_FILE"
     fi
 done
@@ -1409,6 +1413,7 @@ wait_for_launched_jobs
 for RESULT_FILE in "${CASE_RESULT_FILES[@]}"; do
     if [ ! -f "$RESULT_FILE" ]; then
         FAILED=$((FAILED + 1))
+        echo -e "${RED}${RESULT_LABEL[$RESULT_FILE]:-$RESULT_FILE} FAIL (missing result file)${NC}"
         continue
     fi
     CASE_TAG=""
@@ -1428,18 +1433,19 @@ for RESULT_FILE in "${CASE_RESULT_FILES[@]}"; do
     STABILITY_PASSED=$((STABILITY_PASSED + CASE_STABILITY_PASS))
     STABILITY_FAILED=$((STABILITY_FAILED + CASE_STABILITY_FAIL))
 
-    if [ "$TEST_QUIET" -eq 0 ]; then
-        if [ "$CASE_FAIL" -eq 0 ]; then
+    if [ "$CASE_FAIL" -eq 0 ]; then
+        if [ "$TEST_QUIET" -eq 0 ]; then
             echo -e "${GREEN}${CASE_TAG} ${CASE_STATUS}${NC}"
-        else
-            echo -e "${RED}${CASE_TAG} ${CASE_STATUS}${NC}"
         fi
+    else
+        echo -e "${RED}${CASE_TAG} ${CASE_STATUS}${NC}"
     fi
 done
 
 for RESULT_FILE in "${LLVM_RESULT_FILES[@]}"; do
     if [ ! -f "$RESULT_FILE" ]; then
         FAILED=$((FAILED + 1))
+        echo -e "${RED}${RESULT_LABEL[$RESULT_FILE]:-$RESULT_FILE} FAIL (missing result file)${NC}"
         continue
     fi
     CASE_TAG=""
@@ -1451,12 +1457,12 @@ for RESULT_FILE in "${LLVM_RESULT_FILES[@]}"; do
     PASSED=$((PASSED + CASE_PASS))
     FAILED=$((FAILED + CASE_FAIL))
 
-    if [ "$TEST_QUIET" -eq 0 ]; then
-        if [ "$CASE_FAIL" -eq 0 ]; then
+    if [ "$CASE_FAIL" -eq 0 ]; then
+        if [ "$TEST_QUIET" -eq 0 ]; then
             echo -e "${GREEN}${CASE_TAG} ${CASE_STATUS}${NC}"
-        else
-            echo -e "${RED}${CASE_TAG} ${CASE_STATUS}${NC}"
         fi
+    else
+        echo -e "${RED}${CASE_TAG} ${CASE_STATUS}${NC}"
     fi
 done
 
@@ -1474,6 +1480,7 @@ for TEST_FILE in $IR_TEST_FILES; do
     TEST_NAME=$(basename "$TEST_FILE" .bpp)
     RESULT_FILE="$JOBS_DIR/${RUN_TAG}_ir_${TOTAL}.result"
     IR_RESULT_FILES+=("$RESULT_FILE")
+    RESULT_LABEL["$RESULT_FILE"]="[$TOTAL] IR $TEST_NAME"
     launch_job_with_limit run_ir_case "$TOTAL" "$TEST_FILE" "$TEST_NAME" "$RESULT_FILE"
 done
 
@@ -1482,6 +1489,7 @@ wait_for_launched_jobs
 for RESULT_FILE in "${IR_RESULT_FILES[@]}"; do
     if [ ! -f "$RESULT_FILE" ]; then
         FAILED=$((FAILED + 1))
+        echo -e "${RED}${RESULT_LABEL[$RESULT_FILE]:-$RESULT_FILE} FAIL (missing result file)${NC}"
         continue
     fi
     CASE_TAG=""
@@ -1492,12 +1500,12 @@ for RESULT_FILE in "${IR_RESULT_FILES[@]}"; do
     PASSED=$((PASSED + CASE_PASS))
     FAILED=$((FAILED + CASE_FAIL))
 
-    if [ "$TEST_QUIET" -eq 0 ]; then
-        if [ "$CASE_FAIL" -eq 0 ]; then
+    if [ "$CASE_FAIL" -eq 0 ]; then
+        if [ "$TEST_QUIET" -eq 0 ]; then
             echo -e "${GREEN}${CASE_TAG} ${CASE_STATUS}${NC}"
-        else
-            echo -e "${RED}${CASE_TAG} ${CASE_STATUS}${NC}"
         fi
+    else
+        echo -e "${RED}${CASE_TAG} ${CASE_STATUS}${NC}"
     fi
 done
 

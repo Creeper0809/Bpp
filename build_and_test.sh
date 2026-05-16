@@ -286,6 +286,13 @@ is_container_env() {
     return 1
 }
 
+is_github_linux_env() {
+    if [ "${GITHUB_ACTIONS:-}" = "true" ] && [ "${RUNNER_OS:-}" = "Linux" ]; then
+        return 0
+    fi
+    return 1
+}
+
 shm_available_kb() {
     if [ ! -d "/dev/shm" ] || [ ! -w "/dev/shm" ]; then
         return 1
@@ -403,6 +410,13 @@ if [ "$TEST_JOBS_EXPLICIT" -eq 0 ] && is_container_env; then
     if [ "$CONTAINER_TEST_JOBS" -gt 0 ] && [ "$TEST_JOBS" -gt "$CONTAINER_TEST_JOBS" ]; then
         echo "[WARN] TEST_JOBS capped for container build: $TEST_JOBS -> $CONTAINER_TEST_JOBS."
         TEST_JOBS="$CONTAINER_TEST_JOBS"
+    fi
+fi
+if [ "$TEST_JOBS_EXPLICIT" -eq 0 ] && is_github_linux_env; then
+    GITHUB_LINUX_TEST_JOBS="${BPP_GITHUB_LINUX_TEST_JOBS:-4}"
+    if [ "$GITHUB_LINUX_TEST_JOBS" -gt 0 ] && [ "$TEST_JOBS" -gt "$GITHUB_LINUX_TEST_JOBS" ]; then
+        echo "[WARN] TEST_JOBS capped for GitHub Linux build: $TEST_JOBS -> $GITHUB_LINUX_TEST_JOBS."
+        TEST_JOBS="$GITHUB_LINUX_TEST_JOBS"
     fi
 fi
 
