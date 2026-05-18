@@ -1,7 +1,8 @@
-// ssa_loop3.b - O2 loop canonicalization and SCEV-lite summary
+// ssa_loop3.b - O2 loop canonicalization and conservative loop rewrite
 
 import ssa.datastruct;
 import ssa.core;
+import std.vec;
 
 struct SSALoop3Summary {
     public engine_count: u64;
@@ -29,6 +30,34 @@ impl SSALoop3Summary {
     }
 }
 
+struct SSALoop3Info {
+    public header: *SSABlock;
+    public latch: *SSABlock;
+    public preheader: *SSABlock;
+    public body_blocks: *Vec<*SSABlock>;
+    public outside_pred_count: u64;
+    public latch_count: u64;
+    public exit_count: u64;
+    public side_effect_count: u64;
+    public nested_count: u64;
+    public mutated: u64;
+}
+
+impl SSALoop3Info {
+    public constructor() {
+        self.header = 0;
+        self.latch = 0;
+        self.preheader = 0;
+        self.body_blocks = new Vec<*SSABlock>{8};
+        self.outside_pred_count = 0;
+        self.latch_count = 0;
+        self.exit_count = 0;
+        self.side_effect_count = 0;
+        self.nested_count = 0;
+        self.mutated = 0;
+    }
+}
+
 func ssa_loop3_is_compare(op: u64) -> u64 {
     if (op == SSA_OP_EQ || op == SSA_OP_NE || op == SSA_OP_LT || op == SSA_OP_LE || op == SSA_OP_GT || op == SSA_OP_GE) { return 1; }
     if (op == SSA_OP_ULT || op == SSA_OP_ULE || op == SSA_OP_UGT || op == SSA_OP_UGE) { return 1; }
@@ -46,6 +75,199 @@ func ssa_loop3_is_side_effect(op: u64) -> u64 {
     return 0;
 }
 
+func ssa_loop3_is_hoistable(op: u64) -> u64 {
+    if (op == SSA_OP_ADD || op == SSA_OP_SUB || op == SSA_OP_MUL ||
+        op == SSA_OP_AND || op == SSA_OP_OR || op == SSA_OP_XOR ||
+        op == SSA_OP_SHL || op == SSA_OP_SHR || op == SSA_OP_SAR ||
+        op == SSA_OP_EQ || op == SSA_OP_NE || op == SSA_OP_LT || op == SSA_OP_LE ||
+        op == SSA_OP_GT || op == SSA_OP_GE || op == SSA_OP_ULT || op == SSA_OP_ULE ||
+        op == SSA_OP_UGT || op == SSA_OP_UGE || op == SSA_OP_LEA_LOCAL) { return 1; }
+    return 0;
+}
+
+func ssa_loop3_is_pow2(v: u64) -> u64 {
+    if (v == 0) { return 0; }
+    return (v & (v - 1)) == 0;
+}
+
+func ssa_loop3_log2_pow2(v: u64) -> u64 {
+    var out: u64 = 0;
+    var cur: u64 = v;
+    while (cur > 1) {
+        cur = cur >> 1;
+        out = out + 1;
+    }
+    return out;
+}
+
+func ssa_loop3_vec_has_block(vec: *Vec<*SSABlock>, block: *SSABlock) -> u64 {
+    if (vec == 0 || block == 0) { return 0; }
+    var n: u64 = vec.len();
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        if (vec.get(i) == block) { return 1; }
+    }
+    return 0;
+}
+
+func ssa_loop3_vec_push_unique(vec: *Vec<*SSABlock>, block: *SSABlock) -> u64 {
+    if (vec == 0 || block == 0) { return 0; }
+    if (ssa_loop3_vec_has_block(vec, block) != 0) { return 0; }
+    vec.push(block);
+    return 1;
+}
+
+func ssa_loop3_reachable_without_block(fn: *SSAFunction, blocked: *SSABlock, target: *SSABlock) -> u64 {
+    if (fn == 0 || fn.entry == 0 || blocked == 0 || target == 0) { return 0; }
+    if (target == blocked || fn.entry == blocked) { return 0; }
+    var reach: *Vec<*SSABlock> = new Vec<*SSABlock>{32};
+    ssa_loop3_vec_push_unique(reach, fn.entry);
+    var changed: u64 = 1;
+    while (changed != 0) {
+        changed = 0;
+        var blocks: []*SSABlock = fn.blocks;
+        var bcount: u64 = slice_len(blocks);
+        for (var bi: u64 = 0; bi < bcount; bi = bi + 1) {
+            var b: *SSABlock = blocks[bi];
+            if (b == 0 || b == blocked || ssa_loop3_vec_has_block(reach, b) == 0) { continue; }
+            var succs: []*SSABlock = b.succs;
+            var scount: u64 = slice_len(succs);
+            for (var si: u64 = 0; si < scount; si = si + 1) {
+                var succ: *SSABlock = succs[si];
+                if (succ == 0 || succ == blocked || ssa_loop3_vec_has_block(reach, succ) != 0) { continue; }
+                if (succ == target) { return 1; }
+                changed = changed + ssa_loop3_vec_push_unique(reach, succ);
+            }
+        }
+    }
+    return ssa_loop3_vec_has_block(reach, target);
+}
+
+func ssa_loop3_block_dominates(fn: *SSAFunction, dom: *SSABlock, block: *SSABlock) -> u64 {
+    if (fn == 0 || dom == 0 || block == 0) { return 0; }
+    if (dom == block) { return 1; }
+    return ssa_loop3_reachable_without_block(fn, dom, block) == 0;
+}
+
+func ssa_loop3_block_reaches(fn: *SSAFunction, start: *SSABlock, target: *SSABlock) -> u64 {
+    if (fn == 0 || start == 0 || target == 0) { return 0; }
+    if (start == target) { return 1; }
+    var reach: *Vec<*SSABlock> = new Vec<*SSABlock>{32};
+    ssa_loop3_vec_push_unique(reach, start);
+    var changed: u64 = 1;
+    while (changed != 0) {
+        changed = 0;
+        var blocks: []*SSABlock = fn.blocks;
+        var bcount: u64 = slice_len(blocks);
+        for (var bi: u64 = 0; bi < bcount; bi = bi + 1) {
+            var b: *SSABlock = blocks[bi];
+            if (b == 0 || ssa_loop3_vec_has_block(reach, b) == 0) { continue; }
+            var succs: []*SSABlock = b.succs;
+            var scount: u64 = slice_len(succs);
+            for (var si: u64 = 0; si < scount; si = si + 1) {
+                var succ: *SSABlock = succs[si];
+                if (succ == 0 || ssa_loop3_vec_has_block(reach, succ) != 0) { continue; }
+                if (succ == target) { return 1; }
+                changed = changed + ssa_loop3_vec_push_unique(reach, succ);
+            }
+        }
+    }
+    return ssa_loop3_vec_has_block(reach, target);
+}
+
+func ssa_loop3_contains_block(fn: *SSAFunction, header: *SSABlock, latch: *SSABlock, block: *SSABlock) -> u64 {
+    if (fn == 0 || header == 0 || latch == 0 || block == 0) { return 0; }
+    if (block == header || block == latch) { return 1; }
+    if (ssa_loop3_block_dominates(fn, header, block) == 0) { return 0; }
+    return ssa_loop3_block_reaches(fn, block, latch);
+}
+
+func ssa_loop3_count_latches(fn: *SSAFunction, header: *SSABlock) -> u64 {
+    if (fn == 0 || header == 0) { return 0; }
+    var preds: []*SSABlock = header.preds;
+    var n: u64 = slice_len(preds);
+    var count: u64 = 0;
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var pred: *SSABlock = preds[i];
+        if (pred != 0 && ssa_loop3_block_dominates(fn, header, pred) != 0) { count = count + 1; }
+    }
+    return count;
+}
+
+func ssa_loop3_single_outside_pred(fn: *SSAFunction, header: *SSABlock, count_ptr: *u64) -> *SSABlock {
+    if (fn == 0 || header == 0) { return 0; }
+    var preds: []*SSABlock = header.preds;
+    var n: u64 = slice_len(preds);
+    var found: *SSABlock = 0;
+    var count: u64 = 0;
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var pred: *SSABlock = preds[i];
+        if (pred != 0 && ssa_loop3_block_dominates(fn, header, pred) == 0) {
+            found = pred;
+            count = count + 1;
+        }
+    }
+    if (count_ptr != 0) { *count_ptr = count; }
+    if (count == 1) { return found; }
+    return 0;
+}
+
+func ssa_loop3_info_has_block(info: *SSALoop3Info, block: *SSABlock) -> u64 {
+    if (info == 0 || info.body_blocks == 0) { return 0; }
+    return ssa_loop3_vec_has_block(info.body_blocks, block);
+}
+
+func ssa_loop3_collect_body(fn: *SSAFunction, info: *SSALoop3Info) -> u64 {
+    if (fn == 0 || info == 0 || info.body_blocks == 0) { return 0; }
+    var count: u64 = 0;
+    var blocks: []*SSABlock = fn.blocks;
+    var bcount: u64 = slice_len(blocks);
+    for (var bi: u64 = 0; bi < bcount; bi = bi + 1) {
+        var b: *SSABlock = blocks[bi];
+        if (ssa_loop3_contains_block(fn, info.header, info.latch, b) != 0) {
+            count = count + ssa_loop3_vec_push_unique(info.body_blocks, b);
+        }
+    }
+    return count;
+}
+
+func ssa_loop3_note_loop_shape(fn: *SSAFunction, info: *SSALoop3Info) -> u64 {
+    if (fn == 0 || info == 0 || info.body_blocks == 0) { return 0; }
+    var n: u64 = info.body_blocks.len();
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var b: *SSABlock = info.body_blocks.get(i);
+        if (b == 0) { continue; }
+        var cur: *SSAInstruction = b.inst_head;
+        while (cur != 0) {
+            if (ssa_loop3_is_side_effect(op_of(cur)) != 0) { info.side_effect_count = info.side_effect_count + 1; }
+            cur = cur.next;
+        }
+        var succs: []*SSABlock = b.succs;
+        var scount: u64 = slice_len(succs);
+        for (var si: u64 = 0; si < scount; si = si + 1) {
+            var succ: *SSABlock = succs[si];
+            if (succ == 0) { continue; }
+            if (ssa_loop3_info_has_block(info, succ) == 0) {
+                info.exit_count = info.exit_count + 1;
+            } else if (succ.id <= b.id && !(b == info.latch && succ == info.header)) {
+                info.nested_count = info.nested_count + 1;
+            }
+        }
+    }
+    return 0;
+}
+
+func ssa_loop3_build_info(fn: *SSAFunction, header: *SSABlock, latch: *SSABlock) -> *SSALoop3Info {
+    if (fn == 0 || header == 0 || latch == 0) { return 0; }
+    var info: *SSALoop3Info = new SSALoop3Info{};
+    info.header = header;
+    info.latch = latch;
+    info.latch_count = ssa_loop3_count_latches(fn, header);
+    info.preheader = ssa_loop3_single_outside_pred(fn, header, &info.outside_pred_count);
+    ssa_loop3_collect_body(fn, info);
+    ssa_loop3_note_loop_shape(fn, info);
+    return info;
+}
+
 func ssa_loop3_block_has_backedge(block: *SSABlock) -> u64 {
     if (block == 0) { return 0; }
     var succs: []*SSABlock = block.succs;
@@ -57,12 +279,567 @@ func ssa_loop3_block_has_backedge(block: *SSABlock) -> u64 {
     return 0;
 }
 
+func ssa_loop3_term_target_count(term: *SSAInstruction, target_id: u64) -> u64 {
+    if (term == 0) { return 0; }
+    var count: u64 = 0;
+    var op: u64 = op_of(term);
+    if (op == SSA_OP_JMP) {
+        if (term.src1 != 0 && operand_is_const(term.src1) != 0 && operand_value(term.src1) == target_id) { count = count + 1; }
+    } else if (op == SSA_OP_BR) {
+        if (term.dest != 0 && operand_is_const(term.dest) != 0 && operand_value(term.dest) == target_id) { count = count + 1; }
+        if (term.src2 != 0 && operand_is_const(term.src2) != 0 && operand_value(term.src2) == target_id) { count = count + 1; }
+    }
+    return count;
+}
+
+func ssa_loop3_redirect_target(term: *SSAInstruction, old_id: u64, new_id: u64) -> u64 {
+    if (term == 0) { return 0; }
+    var op: u64 = op_of(term);
+    if (op == SSA_OP_JMP) {
+        if (term.src1 != 0 && operand_is_const(term.src1) != 0 && operand_value(term.src1) == old_id) {
+            term.src1 = operand_const(new_id);
+            return 1;
+        }
+        return 0;
+    }
+    if (op == SSA_OP_BR) {
+        var changed: u64 = 0;
+        if (term.dest != 0 && operand_is_const(term.dest) != 0 && operand_value(term.dest) == old_id) {
+            term.dest = operand_const(new_id);
+            changed = 1;
+        }
+        if (term.src2 != 0 && operand_is_const(term.src2) != 0 && operand_value(term.src2) == old_id) {
+            term.src2 = operand_const(new_id);
+            changed = 1;
+        }
+        return changed;
+    }
+    return 0;
+}
+
+func ssa_loop3_remove_pred_from_block(block: *SSABlock, pred: *SSABlock) -> u64 {
+    if (block == 0 || pred == 0) { return 0; }
+    var preds: []*SSABlock = block.preds;
+    var n: u64 = slice_len(preds);
+    var write: u64 = 0;
+    var removed: u64 = 0;
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var cur: *SSABlock = preds[i];
+        if (cur == pred) {
+            removed = removed + 1;
+            continue;
+        }
+        preds[write] = cur;
+        write = write + 1;
+    }
+    if (removed != 0) {
+        var raw: *u64 = (*u64)&block.preds;
+        raw[1] = write;
+    }
+    return removed;
+}
+
+func ssa_loop3_block_has_pred(block: *SSABlock, pred: *SSABlock) -> u64 {
+    if (block == 0 || pred == 0) { return 0; }
+    var preds: []*SSABlock = block.preds;
+    var n: u64 = slice_len(preds);
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        if (preds[i] == pred) { return 1; }
+    }
+    return 0;
+}
+
+func ssa_loop3_block_has_succ(block: *SSABlock, succ: *SSABlock) -> u64 {
+    if (block == 0 || succ == 0) { return 0; }
+    var succs: []*SSABlock = block.succs;
+    var n: u64 = slice_len(succs);
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        if (succs[i] == succ) { return 1; }
+    }
+    return 0;
+}
+
+func ssa_loop3_count_pred(block: *SSABlock, pred: *SSABlock) -> u64 {
+    if (block == 0 || pred == 0) { return 0; }
+    var preds: []*SSABlock = block.preds;
+    var n: u64 = slice_len(preds);
+    var count: u64 = 0;
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        if (preds[i] == pred) { count = count + 1; }
+    }
+    return count;
+}
+
+func ssa_loop3_count_succ(block: *SSABlock, succ: *SSABlock) -> u64 {
+    if (block == 0 || succ == 0) { return 0; }
+    var succs: []*SSABlock = block.succs;
+    var n: u64 = slice_len(succs);
+    var count: u64 = 0;
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        if (succs[i] == succ) { count = count + 1; }
+    }
+    return count;
+}
+
+func ssa_loop3_add_pred_once(block: *SSABlock, pred: *SSABlock) -> u64 {
+    if (block == 0 || pred == 0) { return 0; }
+    if (ssa_loop3_block_has_pred(block, pred) != 0) { return 0; }
+    add_pred(block, pred);
+    return 1;
+}
+
+func ssa_loop3_rewrite_phi_pred_id(header: *SSABlock, old_id: u64, new_id: u64) -> u64 {
+    if (header == 0) { return 0; }
+    var changed: u64 = 0;
+    var phi: *SSAInstruction = header.phi_head;
+    while (phi != 0) {
+        var arg: *SSAPhiArg = (*SSAPhiArg)phi.src1;
+        while (arg != 0) {
+            if (arg.block_id == old_id) {
+                arg.block_id = new_id;
+                changed = changed + 1;
+            }
+            arg = arg.next;
+        }
+        phi = phi.next;
+    }
+    return changed;
+}
+
+func ssa_loop3_phi_pred_count(phi: *SSAInstruction, pred_id: u64) -> u64 {
+    if (phi == 0 || op_of(phi) != SSA_OP_PHI) { return 0; }
+    var count: u64 = 0;
+    var arg: *SSAPhiArg = (*SSAPhiArg)phi.src1;
+    while (arg != 0) {
+        if (arg.block_id == pred_id) { count = count + 1; }
+        arg = arg.next;
+    }
+    return count;
+}
+
+func ssa_loop3_header_phi_has_one_pred(header: *SSABlock, pred_id: u64) -> u64 {
+    if (header == 0) { return 0; }
+    var phi: *SSAInstruction = header.phi_head;
+    while (phi != 0) {
+        if (ssa_loop3_phi_pred_count(phi, pred_id) != 1) { return 0; }
+        phi = phi.next;
+    }
+    return 1;
+}
+
+func ssa_loop3_header_phi_has_no_pred(header: *SSABlock, pred_id: u64) -> u64 {
+    if (header == 0) { return 0; }
+    var phi: *SSAInstruction = header.phi_head;
+    while (phi != 0) {
+        if (ssa_loop3_phi_pred_count(phi, pred_id) != 0) { return 0; }
+        phi = phi.next;
+    }
+    return 1;
+}
+
+func ssa_loop3_is_trivial_preheader(block: *SSABlock, header: *SSABlock) -> u64 {
+    if (block == 0 || header == 0 || block.inst_head == 0 || block.inst_head != block.inst_tail) { return 0; }
+    if (op_of(block.inst_tail) != SSA_OP_JMP) { return 0; }
+    if (ssa_loop3_term_target_count(block.inst_tail, header.id) != 1) { return 0; }
+    var succs: []*SSABlock = block.succs;
+    if (slice_len(succs) != 1 || succs[0] != header) { return 0; }
+    return 1;
+}
+
+func ssa_loop3_preheader_ready(info: *SSALoop3Info) -> u64 {
+    if (info == 0 || info.header == 0 || info.preheader == 0) { return 0; }
+    if (ssa_loop3_is_trivial_preheader(info.preheader, info.header) == 0) { return 0; }
+    if (ssa_loop3_count_succ(info.preheader, info.header) != 1) { return 0; }
+    if (ssa_loop3_count_pred(info.header, info.preheader) != 1) { return 0; }
+    if (ssa_loop3_header_phi_has_one_pred(info.header, info.preheader.id) == 0) { return 0; }
+    return 1;
+}
+
+func ssa_loop3_can_insert_preheader(fn: *SSAFunction, info: *SSALoop3Info) -> u64 {
+    if (fn == 0 || info == 0 || info.header == 0 || info.latch == 0 || info.preheader == 0) { return 0; }
+    if (info.header == fn.entry || info.latch_count != 1 || info.outside_pred_count != 1) { return 0; }
+    if (info.side_effect_count != 0 || info.nested_count != 0 || info.exit_count > 2) { return 0; }
+    var outside: *SSABlock = info.preheader;
+    if (outside == info.header || outside == info.latch) { return 0; }
+    if (ssa_loop3_info_has_block(info, outside) != 0) { return 0; }
+    if (ssa_loop3_info_has_block(info, info.header) == 0) { return 0; }
+    if (ssa_loop3_info_has_block(info, info.latch) == 0) { return 0; }
+    if (outside.inst_tail == 0) { return 0; }
+    if (ssa_loop3_term_target_count(outside.inst_tail, info.header.id) != 1) { return 0; }
+    if (ssa_loop3_count_succ(outside, info.header) != 1) { return 0; }
+    if (ssa_loop3_count_pred(info.header, outside) != 1) { return 0; }
+    if (ssa_loop3_count_succ(info.latch, info.header) == 0) { return 0; }
+    if (ssa_loop3_count_pred(info.header, info.latch) == 0) { return 0; }
+    if (ssa_loop3_header_phi_has_one_pred(info.header, outside.id) == 0) { return 0; }
+    return 1;
+}
+
+func ssa_loop3_validate_inserted_preheader(outside: *SSABlock, preheader: *SSABlock, header: *SSABlock) -> u64 {
+    if (outside == 0 || preheader == 0 || header == 0) { return 0; }
+    if (ssa_loop3_is_trivial_preheader(preheader, header) == 0) { return 0; }
+    if (ssa_loop3_count_succ(outside, preheader) != 1) { return 0; }
+    if (ssa_loop3_count_succ(outside, header) != 0) { return 0; }
+    if (ssa_loop3_count_pred(preheader, outside) != 1) { return 0; }
+    if (ssa_loop3_count_succ(preheader, header) != 1) { return 0; }
+    if (ssa_loop3_count_pred(header, preheader) != 1) { return 0; }
+    if (ssa_loop3_count_pred(header, outside) != 0) { return 0; }
+    if (ssa_loop3_header_phi_has_one_pred(header, preheader.id) == 0) { return 0; }
+    if (ssa_loop3_header_phi_has_no_pred(header, outside.id) == 0) { return 0; }
+    return 1;
+}
+
+func ssa_loop3_insert_preheader(ctx: *SSAContext, fn: *SSAFunction, info: *SSALoop3Info, summary: *SSALoop3Summary) -> u64 {
+    if (ctx == 0 || fn == 0 || info == 0 || info.header == 0 || info.latch == 0 || info.preheader == 0) { return 0; }
+    var outside: *SSABlock = info.preheader;
+    if (ssa_loop3_is_trivial_preheader(outside, info.header) != 0) {
+        if (ssa_loop3_preheader_ready(info) == 0) { return 0; }
+        if (summary != 0) {
+            summary.simplify_form_count = summary.simplify_form_count + 1;
+            summary.lcssa_count = summary.lcssa_count + 1;
+        }
+        return 0;
+    }
+    if (ssa_loop3_can_insert_preheader(fn, info) == 0) {
+        if (summary != 0) { summary.side_effect_guard_count = summary.side_effect_guard_count + 1; }
+        return 0;
+    }
+
+    var preheader: *SSABlock = create_block(ctx, fn);
+    if (preheader == 0) { return 0; }
+    var jmp: *SSAInstruction = create_inst(ctx, SSA_OP_JMP, 0, operand_const(info.header.id), 0);
+    append_inst(preheader, jmp);
+    add_succ(preheader, info.header);
+    add_pred(preheader, outside);
+
+    if (ssa_loop3_redirect_target(outside.inst_tail, info.header.id, preheader.id) == 0) { return 0; }
+    replace_succ(outside, info.header, preheader);
+    ssa_loop3_remove_pred_from_block(info.header, outside);
+    ssa_loop3_add_pred_once(info.header, preheader);
+    ssa_loop3_rewrite_phi_pred_id(info.header, outside.id, preheader.id);
+    if (ssa_loop3_validate_inserted_preheader(outside, preheader, info.header) == 0) {
+        if (summary != 0) { summary.side_effect_guard_count = summary.side_effect_guard_count + 1; }
+        return 0;
+    }
+    info.preheader = preheader;
+    info.mutated = 1;
+    if (summary != 0) {
+        summary.simplify_form_count = summary.simplify_form_count + 1;
+        summary.lcssa_count = summary.lcssa_count + 1;
+        summary.cleanup_count = summary.cleanup_count + 1;
+    }
+    return 1;
+}
+
+func ssa_loop3_find_def_in_loop(fn: *SSAFunction, info: *SSALoop3Info, reg: u64) -> *SSAInstruction {
+    if (fn == 0 || info == 0 || reg == 0 || info.body_blocks == 0) { return 0; }
+    var n: u64 = info.body_blocks.len();
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var b: *SSABlock = info.body_blocks.get(i);
+        if (b == 0) { continue; }
+        var phi: *SSAInstruction = b.phi_head;
+        while (phi != 0) {
+            if (phi.dest == reg) { return phi; }
+            phi = phi.next;
+        }
+        var cur: *SSAInstruction = b.inst_head;
+        while (cur != 0) {
+            if (cur.dest == reg) { return cur; }
+            cur = cur.next;
+        }
+    }
+    return 0;
+}
+
+func ssa_loop3_find_def(fn: *SSAFunction, reg: u64) -> *SSAInstruction {
+    if (fn == 0 || reg == 0) { return 0; }
+    var blocks: []*SSABlock = fn.blocks;
+    var n: u64 = slice_len(blocks);
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var b: *SSABlock = blocks[i];
+        if (b == 0) { continue; }
+        var phi: *SSAInstruction = b.phi_head;
+        while (phi != 0) {
+            if (phi.dest == reg) { return phi; }
+            phi = phi.next;
+        }
+        var cur: *SSAInstruction = b.inst_head;
+        while (cur != 0) {
+            if (cur.dest == reg) { return cur; }
+            cur = cur.next;
+        }
+    }
+    return 0;
+}
+
+func ssa_loop3_operand_const_value(fn: *SSAFunction, opr: u64, out: *u64) -> u64 {
+    if (out == 0 || opr == 0) { return 0; }
+    if (operand_is_const(opr) != 0) {
+        *out = operand_value(opr);
+        return 1;
+    }
+    var def: *SSAInstruction = ssa_loop3_find_def(fn, operand_value(opr));
+    if (def == 0) { return 0; }
+    if (op_of(def) == SSA_OP_CONST && operand_is_const(def.src1) != 0) {
+        *out = operand_value(def.src1);
+        return 1;
+    }
+    if (op_of(def) == SSA_OP_COPY && operand_is_const(def.src1) != 0) {
+        *out = operand_value(def.src1);
+        return 1;
+    }
+    return 0;
+}
+
+func ssa_loop3_operand_defined_in_loop(fn: *SSAFunction, info: *SSALoop3Info, opr: u64) -> u64 {
+    if (opr == 0 || operand_is_const(opr) != 0) { return 0; }
+    return ssa_loop3_find_def_in_loop(fn, info, operand_value(opr)) != 0;
+}
+
+func ssa_loop3_phi_arg_value(phi: *SSAInstruction, block_id: u64) -> u64 {
+    if (phi == 0 || op_of(phi) != SSA_OP_PHI) { return 0; }
+    var arg: *SSAPhiArg = (*SSAPhiArg)phi.src1;
+    while (arg != 0) {
+        if (arg.block_id == block_id) { return arg.val; }
+        arg = arg.next;
+    }
+    return 0;
+}
+
+func ssa_loop3_inst_uses_reg(inst: *SSAInstruction, reg: u64) -> u64 {
+    if (inst == 0 || reg == 0) { return 0; }
+    if (inst.src1 != 0 && operand_is_const(inst.src1) == 0 && operand_value(inst.src1) == reg) { return 1; }
+    if (inst.src2 != 0 && operand_is_const(inst.src2) == 0 && operand_value(inst.src2) == reg) { return 1; }
+    return 0;
+}
+
+func ssa_loop3_iv_update_is_affine(phi: *SSAInstruction, update: *SSAInstruction) -> u64 {
+    if (phi == 0 || update == 0 || phi.dest == 0) { return 0; }
+    var op: u64 = op_of(update);
+    if (op != SSA_OP_ADD && op != SSA_OP_SUB) { return 0; }
+    if (update.src1 != 0 && operand_is_const(update.src1) == 0 && operand_value(update.src1) == phi.dest && operand_is_const(update.src2) != 0) { return 1; }
+    if (op == SSA_OP_ADD && update.src2 != 0 && operand_is_const(update.src2) == 0 && operand_value(update.src2) == phi.dest && operand_is_const(update.src1) != 0) { return 1; }
+    return 0;
+}
+
+func ssa_loop3_find_affine_update(fn: *SSAFunction, info: *SSALoop3Info, phi: *SSAInstruction) -> *SSAInstruction {
+    if (fn == 0 || info == 0 || phi == 0 || info.latch == 0) { return 0; }
+    var latch_val: u64 = ssa_loop3_phi_arg_value(phi, info.latch.id);
+    if (latch_val == 0) { return 0; }
+    var update: *SSAInstruction = ssa_loop3_find_def_in_loop(fn, info, latch_val);
+    if (ssa_loop3_iv_update_is_affine(phi, update) != 0) { return update; }
+    return 0;
+}
+
+func ssa_loop3_compare_uses_iv(fn: *SSAFunction, info: *SSALoop3Info, cmp: *SSAInstruction, phi: *SSAInstruction) -> u64 {
+    if (fn == 0 || info == 0 || cmp == 0 || phi == 0 || phi.dest == 0) { return 0; }
+    if (ssa_loop3_is_compare(op_of(cmp)) == 0) { return 0; }
+    if (cmp.src1 != 0 && operand_is_const(cmp.src1) == 0 && operand_value(cmp.src1) == phi.dest) {
+        return ssa_loop3_operand_defined_in_loop(fn, info, cmp.src2) == 0;
+    }
+    if (cmp.src2 != 0 && operand_is_const(cmp.src2) == 0 && operand_value(cmp.src2) == phi.dest) {
+        return ssa_loop3_operand_defined_in_loop(fn, info, cmp.src1) == 0;
+    }
+    return 0;
+}
+
+func ssa_loop3_has_trip_compare(fn: *SSAFunction, info: *SSALoop3Info, phi: *SSAInstruction) -> u64 {
+    if (fn == 0 || info == 0 || phi == 0 || info.body_blocks == 0) { return 0; }
+    var n: u64 = info.body_blocks.len();
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var b: *SSABlock = info.body_blocks.get(i);
+        if (b == 0) { continue; }
+        var cur: *SSAInstruction = b.inst_head;
+        while (cur != 0) {
+            if (ssa_loop3_compare_uses_iv(fn, info, cur, phi) != 0) { return 1; }
+            cur = cur.next;
+        }
+    }
+    return 0;
+}
+
+func ssa_loop3_note_scev_lite(fn: *SSAFunction, info: *SSALoop3Info, summary: *SSALoop3Summary) -> u64 {
+    if (fn == 0 || info == 0 || summary == 0 || info.header == 0) { return 0; }
+    if (info.latch_count != 1 || info.outside_pred_count != 1 || info.nested_count != 0) { return 0; }
+    var phi: *SSAInstruction = info.header.phi_head;
+    while (phi != 0) {
+        if (op_of(phi) == SSA_OP_PHI && phi.dest != 0 && ssa_loop3_find_affine_update(fn, info, phi) != 0) {
+            summary.scev_count = summary.scev_count + 1;
+            if (ssa_loop3_has_trip_compare(fn, info, phi) != 0) {
+                summary.trip_count_count = summary.trip_count_count + 1;
+                summary.scev_count = summary.scev_count + 1;
+            }
+        }
+        phi = phi.next;
+    }
+    return 0;
+}
+
+func ssa_loop3_unlink_inst(block: *SSABlock, inst: *SSAInstruction) -> u64 {
+    if (block == 0 || inst == 0) { return 0; }
+    var prev: *SSAInstruction = 0;
+    var cur: *SSAInstruction = block.inst_head;
+    while (cur != 0) {
+        var next: *SSAInstruction = cur.next;
+        if (cur == inst) {
+            if (prev != 0) { prev.next = next; }
+            else { block.inst_head = next; }
+            if (block.inst_tail == cur) { block.inst_tail = prev; }
+            if (next != 0) { set_prev(next, prev); }
+            cur.next = 0;
+            set_prev(cur, 0);
+            return 1;
+        }
+        prev = cur;
+        cur = next;
+    }
+    return 0;
+}
+
+func ssa_loop3_inst_hoistable(fn: *SSAFunction, info: *SSALoop3Info, inst: *SSAInstruction) -> u64 {
+    if (fn == 0 || info == 0 || inst == 0 || inst.dest == 0) { return 0; }
+    var op: u64 = op_of(inst);
+    if (ssa_loop3_is_hoistable(op) == 0) { return 0; }
+    if (ssa_loop3_operand_defined_in_loop(fn, info, inst.src1) != 0) { return 0; }
+    if (ssa_loop3_operand_defined_in_loop(fn, info, inst.src2) != 0) { return 0; }
+    return 1;
+}
+
+func ssa_loop3_licm(fn: *SSAFunction, info: *SSALoop3Info, summary: *SSALoop3Summary) -> u64 {
+    if (fn == 0 || info == 0 || info.preheader == 0 || info.body_blocks == 0) { return 0; }
+    if (info.side_effect_count != 0 || info.nested_count != 0 || info.latch_count != 1) { return 0; }
+    var changed: u64 = 0;
+    var moved: u64 = 0;
+    var n: u64 = info.body_blocks.len();
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var b: *SSABlock = info.body_blocks.get(i);
+        if (b == 0 || b == info.preheader) { continue; }
+        var cur: *SSAInstruction = b.inst_head;
+        while (cur != 0 && moved < 4) {
+            var next: *SSAInstruction = cur.next;
+            var op: u64 = op_of(cur);
+            if (op != SSA_OP_JMP && op != SSA_OP_BR && op != SSA_OP_RET && op != SSA_OP_RET_SLICE_HEAP &&
+                ssa_loop3_inst_hoistable(fn, info, cur) != 0 &&
+                ssa_loop3_unlink_inst(b, cur) != 0) {
+                insert_before_terminator(info.preheader, cur);
+                changed = changed + 1;
+                moved = moved + 1;
+                if (summary != 0) { summary.rewrite_candidate_count = summary.rewrite_candidate_count + 1; }
+            }
+            cur = next;
+        }
+    }
+    if (changed != 0 && summary != 0) { summary.cleanup_count = summary.cleanup_count + 1; }
+    return changed;
+}
+
+func ssa_loop3_strength_reduce_inst(fn: *SSAFunction, cur: *SSAInstruction) -> u64 {
+    if (cur == 0) { return 0; }
+    var op: u64 = op_of(cur);
+    var lhs: u64 = 0;
+    var rhs: u64 = 0;
+    var lhs_const: u64 = ssa_loop3_operand_const_value(fn, cur.src1, &lhs);
+    var rhs_const: u64 = ssa_loop3_operand_const_value(fn, cur.src2, &rhs);
+
+    if (op == SSA_OP_MUL) {
+        var all_ones: u64 = 0 - 1;
+        if (lhs_const != 0 && lhs == 1) {
+            set_op(cur, SSA_OP_COPY);
+            cur.src1 = cur.src2;
+            cur.src2 = 0;
+            return 1;
+        }
+        if (rhs_const != 0 && rhs == 1) {
+            set_op(cur, SSA_OP_COPY);
+            cur.src2 = 0;
+            return 1;
+        }
+        if (lhs_const != 0 && lhs == all_ones) {
+            set_op(cur, SSA_OP_SUB);
+            cur.src1 = operand_const(0);
+            return 1;
+        }
+        if (rhs_const != 0 && rhs == all_ones) {
+            set_op(cur, SSA_OP_SUB);
+            cur.src2 = cur.src1;
+            cur.src1 = operand_const(0);
+            return 1;
+        }
+        if (lhs_const != 0 && ssa_loop3_is_pow2(lhs) != 0) {
+            set_op(cur, SSA_OP_SHL);
+            cur.src1 = cur.src2;
+            cur.src2 = operand_const(ssa_loop3_log2_pow2(lhs));
+            return 1;
+        }
+        if (rhs_const != 0 && ssa_loop3_is_pow2(rhs) != 0) {
+            set_op(cur, SSA_OP_SHL);
+            cur.src2 = operand_const(ssa_loop3_log2_pow2(rhs));
+            return 1;
+        }
+    }
+    if (op == SSA_OP_UDIV && rhs_const != 0 && ssa_loop3_is_pow2(rhs) != 0) {
+        var shift: u64 = ssa_loop3_log2_pow2(rhs);
+        if (shift == 0) {
+            set_op(cur, SSA_OP_COPY);
+            cur.src2 = 0;
+            return 1;
+        }
+        set_op(cur, SSA_OP_SHR);
+        cur.src2 = operand_const(shift);
+        return 1;
+    }
+    if (op == SSA_OP_UMOD && rhs_const != 0 && ssa_loop3_is_pow2(rhs) != 0) {
+        set_op(cur, SSA_OP_AND);
+        cur.src2 = operand_const(rhs - 1);
+        return 1;
+    }
+    return 0;
+}
+
+func ssa_loop3_strength_reduce(fn: *SSAFunction, info: *SSALoop3Info, summary: *SSALoop3Summary) -> u64 {
+    if (fn == 0 || info == 0 || info.body_blocks == 0) { return 0; }
+    var changed: u64 = 0;
+    var n: u64 = info.body_blocks.len();
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var b: *SSABlock = info.body_blocks.get(i);
+        if (b == 0) { continue; }
+        var cur: *SSAInstruction = b.inst_head;
+        while (cur != 0) {
+            if (ssa_loop3_strength_reduce_inst(fn, cur) != 0) {
+                changed = changed + 1;
+                if (summary != 0) { summary.rewrite_candidate_count = summary.rewrite_candidate_count + 1; }
+            }
+            cur = cur.next;
+        }
+    }
+    if (changed != 0 && summary != 0) { summary.cleanup_count = summary.cleanup_count + 1; }
+    return changed;
+}
+
+func ssa_loop3_strength_reduce_function_linear(fn: *SSAFunction, summary: *SSALoop3Summary) -> u64 {
+    if (fn == 0 || summary == 0 || summary.loop_count == 0) { return 0; }
+    var changed: u64 = 0;
+    var blocks: []*SSABlock = fn.blocks;
+    var n: u64 = slice_len(blocks);
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var b: *SSABlock = blocks[i];
+        if (b == 0) { continue; }
+        var cur: *SSAInstruction = b.inst_head;
+        while (cur != 0) {
+            if (ssa_loop3_strength_reduce_inst(fn, cur) != 0) {
+                changed = changed + 1;
+                summary.rewrite_candidate_count = summary.rewrite_candidate_count + 1;
+            }
+            cur = cur.next;
+        }
+    }
+    if (changed != 0) { summary.cleanup_count = summary.cleanup_count + 1; }
+    return changed;
+}
+
 func ssa_loop3_note_block(block: *SSABlock, summary: *SSALoop3Summary) -> u64 {
     if (block == 0 || summary == 0) { return 0; }
     if (ssa_loop3_block_has_backedge(block) != 0) {
         summary.loop_count = summary.loop_count + 1;
-        summary.simplify_form_count = summary.simplify_form_count + 1;
-        summary.lcssa_count = summary.lcssa_count + 1;
     }
     var phi: *SSAInstruction = block.phi_head;
     while (phi != 0) {
@@ -94,6 +871,20 @@ func ssa_loop3_note_block(block: *SSABlock, summary: *SSALoop3Summary) -> u64 {
     return 0;
 }
 
+func ssa_loop3_note_info(info: *SSALoop3Info, summary: *SSALoop3Summary) -> u64 {
+    if (info == 0 || summary == 0) { return 0; }
+    if (info.latch_count == 1 && info.outside_pred_count == 1) {
+        summary.simplify_form_count = summary.simplify_form_count + 1;
+        if (info.exit_count <= 2) { summary.lcssa_count = summary.lcssa_count + 1; }
+    }
+    if (info.side_effect_count != 0 || info.nested_count != 0 || info.latch_count != 1 || info.outside_pred_count != 1) {
+        summary.side_effect_guard_count = summary.side_effect_guard_count + info.side_effect_count + info.nested_count;
+        if (info.latch_count != 1) { summary.side_effect_guard_count = summary.side_effect_guard_count + 1; }
+        if (info.outside_pred_count != 1) { summary.side_effect_guard_count = summary.side_effect_guard_count + 1; }
+    }
+    return 0;
+}
+
 func ssa_loop3_analyze_function(fn: *SSAFunction) -> *SSALoop3Summary {
     var summary: *SSALoop3Summary = new SSALoop3Summary{};
     summary.engine_count = 1;
@@ -103,8 +894,95 @@ func ssa_loop3_analyze_function(fn: *SSAFunction) -> *SSALoop3Summary {
     for (var bi: u64 = 0; bi < n; bi = bi + 1) {
         ssa_loop3_note_block(blocks[bi], summary);
     }
-    if (summary.loop_count != 0 || summary.rewrite_candidate_count != 0) {
+    // From here on loop3_rewrite_count records mutations, not candidates.
+    summary.rewrite_candidate_count = 0;
+    for (var li: u64 = 0; li < n; li = li + 1) {
+        var latch: *SSABlock = blocks[li];
+        if (latch == 0) { continue; }
+        var succs: []*SSABlock = latch.succs;
+        var scount: u64 = slice_len(succs);
+        for (var si: u64 = 0; si < scount; si = si + 1) {
+            var header: *SSABlock = succs[si];
+            if (header == 0 || header == latch) { continue; }
+            if (ssa_loop3_block_dominates(fn, header, latch) == 0) { continue; }
+            var info: *SSALoop3Info = ssa_loop3_build_info(fn, header, latch);
+            ssa_loop3_note_info(info, summary);
+            ssa_loop3_note_scev_lite(fn, info, summary);
+        }
+    }
+    if (summary.loop_count != 0 || summary.rewrite_candidate_count != 0 || summary.simplify_form_count != 0) {
         summary.cleanup_count = summary.cleanup_count + summary.loop_count + 1;
+    }
+    return summary;
+}
+
+func ssa_loop3_rewrite_function(ctx: *SSAContext, fn: *SSAFunction) -> *SSALoop3Summary {
+    var summary: *SSALoop3Summary = new SSALoop3Summary{};
+    summary.engine_count = 1;
+    if (ctx == 0 || fn == 0) { return summary; }
+    var blocks: []*SSABlock = fn.blocks;
+    var n: u64 = slice_len(blocks);
+    for (var bi: u64 = 0; bi < n; bi = bi + 1) {
+        ssa_loop3_note_block(blocks[bi], summary);
+    }
+    // From here on loop3_rewrite_count records mutations, not candidates.
+    summary.rewrite_candidate_count = 0;
+    for (var li: u64 = 0; li < n; li = li + 1) {
+        var latch: *SSABlock = blocks[li];
+        if (latch == 0) { continue; }
+        var succs: []*SSABlock = latch.succs;
+        var scount: u64 = slice_len(succs);
+        for (var si: u64 = 0; si < scount; si = si + 1) {
+            var header: *SSABlock = succs[si];
+            if (header == 0 || header == latch) { continue; }
+            if (ssa_loop3_block_dominates(fn, header, latch) == 0) { continue; }
+            var info: *SSALoop3Info = ssa_loop3_build_info(fn, header, latch);
+            ssa_loop3_note_info(info, summary);
+            ssa_loop3_note_scev_lite(fn, info, summary);
+            ssa_loop3_strength_reduce(fn, info, summary);
+            if (info.side_effect_count != 0 || info.nested_count != 0 || info.latch_count != 1 || info.outside_pred_count != 1) { continue; }
+            ssa_loop3_insert_preheader(ctx, fn, info, summary);
+            if (ssa_loop3_preheader_ready(info) != 0) {
+                ssa_loop3_licm(fn, info, summary);
+            }
+        }
+    }
+    if (summary.loop_count != 0 && summary.cleanup_count == 0) {
+        summary.cleanup_count = summary.cleanup_count + 1;
+    }
+    if (summary.rewrite_candidate_count == 0) {
+        ssa_loop3_strength_reduce_function_linear(fn, summary);
+    }
+    return summary;
+}
+
+func ssa_loop3_strength_rewrite_function(ctx: *SSAContext, fn: *SSAFunction) -> *SSALoop3Summary {
+    var summary: *SSALoop3Summary = new SSALoop3Summary{};
+    summary.engine_count = 1;
+    if (ctx == 0 || fn == 0) { return summary; }
+    var blocks: []*SSABlock = fn.blocks;
+    var n: u64 = slice_len(blocks);
+    for (var bi: u64 = 0; bi < n; bi = bi + 1) {
+        ssa_loop3_note_block(blocks[bi], summary);
+    }
+    summary.rewrite_candidate_count = 0;
+    for (var li: u64 = 0; li < n; li = li + 1) {
+        var latch: *SSABlock = blocks[li];
+        if (latch == 0) { continue; }
+        var succs: []*SSABlock = latch.succs;
+        var scount: u64 = slice_len(succs);
+        for (var si: u64 = 0; si < scount; si = si + 1) {
+            var header: *SSABlock = succs[si];
+            if (header == 0 || header == latch) { continue; }
+            if (ssa_loop3_block_dominates(fn, header, latch) == 0) { continue; }
+            var info: *SSALoop3Info = ssa_loop3_build_info(fn, header, latch);
+            ssa_loop3_note_info(info, summary);
+            ssa_loop3_note_scev_lite(fn, info, summary);
+            ssa_loop3_strength_reduce(fn, info, summary);
+        }
+    }
+    if (summary.rewrite_candidate_count == 0) {
+        ssa_loop3_strength_reduce_function_linear(fn, summary);
     }
     return summary;
 }

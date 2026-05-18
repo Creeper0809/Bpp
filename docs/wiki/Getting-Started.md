@@ -47,6 +47,40 @@ bpp your_file.bpp
 ./bin/stage1 your_file.bpp
 ```
 
+## 4.1 릴리즈 패키지 설치
+
+릴리즈에서 사용자가 받는 기본 산출물은 bootstrap 단일 바이너리가 아니라 SDK 압축
+패키지입니다.
+
+```text
+bpp-<version>-linux-x86_64.tar.gz
+```
+
+패키지 안에는 `bin/bpp`, 해당 버전 컴파일러, 해당 버전 표준 라이브러리가 함께
+들어 있습니다.
+
+```bash
+tar -xzf bpp-<version>-linux-x86_64.tar.gz
+cd bpp-<version>-linux-x86_64
+./install.sh
+```
+
+PATH 등록이나 의존성 설치가 필요하면 명시적으로 옵션을 줍니다.
+
+```bash
+./install.sh --add-path
+./install.sh --install-deps
+./install.sh --prefix /opt/bpp
+```
+
+설치하지 않고 바로 사용할 수도 있습니다.
+
+```bash
+./bin/bpp your_file.bpp
+```
+
+현재 native backend는 여전히 시스템의 `nasm`과 `ld`를 사용합니다.
+
 ## 5. 흔한 이슈
 
 - `nasm not found`: NASM 설치 및 PATH 확인

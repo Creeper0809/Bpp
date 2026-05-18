@@ -65,6 +65,34 @@ sudo cmake --install build-linux
 bpp hello.bpp
 ```
 
+### Linux Release Package
+
+GitHub bootstrap releases also publish a user-facing SDK tarball:
+
+```text
+bpp-<version>-linux-x86_64.tar.gz
+```
+
+It contains `bin/bpp`, the matching self-hosted compiler binary under
+`libexec/bpp`, and the matching standard library under `share/bpp/src/std`.
+Install it with:
+
+```bash
+tar -xzf bpp-<version>-linux-x86_64.tar.gz
+cd bpp-<version>-linux-x86_64
+./install.sh
+```
+
+Useful install options:
+
+```bash
+./install.sh --add-path
+./install.sh --install-deps
+./install.sh --prefix /opt/bpp
+```
+
+The native backend still requires `nasm` and `ld` from the system toolchain.
+
 ### Windows
 ```powershell
 # Configure (auto-download NASM when missing)

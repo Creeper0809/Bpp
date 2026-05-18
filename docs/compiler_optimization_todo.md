@@ -740,8 +740,16 @@ DoD:
 
 구현 메모: `ssa.loop3`를 추가해 O2에서 CFG backedge 기반 loop detection, simplify/LCSSA 후보, SCEV-lite
 induction/trip-count 후보, LICM/strength/bounds/unroll 계열 rewrite 후보, side-effect guard, cleanup/vectorizer handoff
-카운터를 만든다. O2의 추가 O1 fixed-point round가 일부 안전 rewrite를 수행하지만, loop3 자체의 CFG rewrite는 아직
-완료되지 않았다.
+카운터를 만든다. 현재는 natural-loop 정보, latch/outside predecessor/exit/side-effect/nested-loop guard를 실제 CFG에서
+계산하고, header phi, latch update, compare를 묶어 affine/trip-count 후보를 실제 루프 구조에서 확인한다.
+O2 초기와 post-O1에는 CFG를 바꾸지 않는 loop strength reduction을 먼저 수행한다. 이 단계는 operand immediate와
+CONST 레지스터를 모두 추적해 2의 거듭제곱 곱셈/나눗셈/나머지와, u64 래핑 산술에서 안전한
+`x * 18446744073709551615 -> 0 - x` 변환을 실제로 수행한다. natural-loop body 탐지가 보수적으로 막히는
+경우에도, 루프가 있는 함수 안의 같은 위치 산술 opcode 치환은 fallback 선형 스캔으로 놓치지 않는다. 안전한
+경우 preheader CFG 삽입과 post-O1 loop form 검증 메타데이터도 만든다. preheader 삽입은 outside/header/latch
+edge, header phi incoming, trivial preheader form을 사전/사후 검증하며, LICM은 검증된 trivial preheader가 있을 때만
+실행한다. O2의 추가 O1 fixed-point round가 일부 안전 rewrite를 수행하지만, loop3 자체의
+bounds/unswitch/peeling/unroll 전체 rewrite는 아직 완료되지 않았다.
 
 DoD:
 - [ ] 대표 counted/nested/slice/Vec loop에서 instruction count 감소 확인
