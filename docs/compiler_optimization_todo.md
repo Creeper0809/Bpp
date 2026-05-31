@@ -733,7 +733,7 @@ DoD:
 - [x] CFG backedge 기반 loop 후보와 side-effect guard를 summary로 만든다.
 - [x] SCEV-lite induction/trip-count 후보를 summary로 만든다.
 - [ ] loop simplify form, LCSSA, preheader, dedicated exit을 실제 CFG 기준으로 완성한다.
-- [ ] SCEV-lite를 affine expression, trip count, overflow proof까지 확장한다.
+- [x] SCEV-lite를 affine expression, trip count, overflow proof까지 확장한다.
 - [ ] LICM, strength reduction, bounds check elimination, unswitch, peeling, unroll을 O2에서 실제 rewrite한다.
 - [ ] nested loop, multiple exit, side-effect call, GC safepoint가 있는 루프를 보수적으로 분기 처리한다.
 - [ ] loop pass 이후 CFG cleanup, phi simplify, DCE, vectorizer 준비를 자동으로 이어 붙인다.
@@ -748,7 +748,10 @@ CONST 레지스터를 모두 추적해 2의 거듭제곱 곱셈/나눗셈/나머
 경우에도, 루프가 있는 함수 안의 같은 위치 산술 opcode 치환은 fallback 선형 스캔으로 놓치지 않는다. 안전한
 경우 preheader CFG 삽입과 post-O1 loop form 검증 메타데이터도 만든다. preheader 삽입은 outside/header/latch
 edge, header phi incoming, trivial preheader form을 사전/사후 검증하며, LICM은 검증된 trivial preheader가 있을 때만
-실행한다. O2의 추가 O1 fixed-point round가 일부 안전 rewrite를 수행하지만, loop3 자체의
+실행한다. SCEV-lite는 header phi의 constant init, latch의 affine `+const`/`-const` update, unsigned upper-bound
+compare를 묶어 constant-bound trip count와 unit-step invariant-bound no-wrap update를 검증한다. 따라서
+`loop3_trip_count`와 `bpp.ssa.loop3.actual.scev`는 단순 compare 후보가 아니라 이 proof가 성공한 경우에만 증가한다.
+O2의 추가 O1 fixed-point round가 일부 안전 rewrite를 수행하지만, loop3 자체의
 bounds/unswitch/peeling/unroll 전체 rewrite는 아직 완료되지 않았다.
 
 DoD:

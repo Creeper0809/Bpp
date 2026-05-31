@@ -142,6 +142,7 @@ TEST_FAST_IO=${TEST_FAST_IO:-0}
 TEST_SKIP_LLVM_BUILD=${TEST_SKIP_LLVM_BUILD:-0}
 TEST_QUIET=${TEST_QUIET:-0}
 TEST_PROGRESS=${TEST_PROGRESS:-1}
+TEST_TIMING=${TEST_TIMING:-0}
 KEEP_TEST_ARTIFACTS=${KEEP_TEST_ARTIFACTS:-1}
 TEST_JOBS=${TEST_JOBS:-0}
 TEST_PROFILE=${TEST_PROFILE:-full}
@@ -171,6 +172,15 @@ case "$TEST_PROGRESS" in
     1|true|yes) TEST_PROGRESS=1 ;;
     *) TEST_PROGRESS=0 ;;
 esac
+TEST_TIMING="$(echo "$TEST_TIMING" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+case "$TEST_TIMING" in
+    1|true|yes) TEST_TIMING=1 ;;
+    *) TEST_TIMING=0 ;;
+esac
+
+now_ms() {
+    date +%s%3N
+}
 
 shm_available_kb() {
     if [ ! -d "/dev/shm" ] || [ ! -w "/dev/shm" ]; then
@@ -523,6 +533,7 @@ if [ "$TEST_QUIET" -eq 0 ]; then
     echo "[INFO] Stress runs: $STRESS_RUNS"
     echo "[INFO] Stability runs: $STABILITY_RUNS"
     echo "[INFO] Progress: $TEST_PROGRESS"
+    echo "[INFO] Timing: $TEST_TIMING"
     echo ""
 fi
 
@@ -611,6 +622,12 @@ run_matrix_case() {
     local case_stability_pass=0
     local case_stability_fail=0
     local case_status="PASS"
+    local case_start_ms
+    local compile_ms=0
+    local assemble_ms=0
+    local link_ms=0
+    local run_ms=0
+    case_start_ms="$(now_ms)"
 
     local asm_file="$BUILD_DIR/${test_id}.${mode}.${opt}.asm"
     local obj_file="$BUILD_DIR/${test_id}.${mode}.${opt}.o"
@@ -639,8 +656,13 @@ run_matrix_case() {
     if [ -n "$compiler_args_file" ] && [ -f "$compiler_args_file" ]; then
         read -r -a compiler_extra_args < "$compiler_args_file"
     fi
+    local compile_start_ms
+    local compile_end_ms
+    compile_start_ms="$(now_ms)"
     $COMPILER $opt_flag $ir_flag "${compiler_extra_args[@]}" -asm "$test_file" > "$asm_file" 2>"$err_file"
     compile_exit="$?"
+    compile_end_ms="$(now_ms)"
+    compile_ms=$((compile_end_ms - compile_start_ms))
 
     if [ "$compile_exit" -ne 0 ]; then
         persist_result_file "$err_file" "$err_file_persist"
@@ -738,130 +760,163 @@ run_matrix_case() {
         elif [ "$case_fail" -eq 0 ] && [ "$compile_only" = "1" ]; then
             case_pass=1
             case_status="PASS (compile only)"
-        elif [ "$case_fail" -eq 0 ] && ! assemble_nasm_obj "$asm_file" "$obj_file" 2>"$err_file"; then
-            persist_result_file "$err_file" "$err_file_persist"
-            case_fail=1
-            case_status="FAIL (assemble)"
-        elif [ "$case_fail" -eq 0 ] && ! ld "$obj_file" -o "$bin_file" 2>>"$err_file"; then
-            persist_result_file "$err_file" "$err_file_persist"
-            case_fail=1
-            case_status="FAIL (link)"
         elif [ "$case_fail" -eq 0 ]; then
-            local expect_stdout=0
-            local exit_code=0
-            if [ -n "$expect_stdout_file" ] && [ -f "$expect_stdout_file" ]; then
-                expect_stdout=1
-                run_binary_capture_split "$bin_file" "$stdin_file" "$out_file" "$err_file"
-                exit_code="$?"
-            else
-                run_binary_silent "$bin_file" "$stdin_file"
-                exit_code="$?"
-            fi
-            if [ "$exit_code" -eq "$expected" ]; then
-                if [ "$expect_stdout" -eq 1 ] && ! cmp -s "$out_file" "$expect_stdout_file"; then
-                    persist_result_file "$out_file" "$out_file_persist"
-                    persist_result_file "$err_file" "$err_file_persist"
-                    case_fail=1
-                    case_status="FAIL (stdout mismatch)"
-                else
-                    case_pass=1
-                fi
-
-                if [ "$case_fail" -eq 0 ] && [ "$STRESS_RUNS" -gt 0 ]; then
-                    local stress_ok=1
-                    local i=0
-                    local stress_exit=0
-                    local stress_reason="exit"
-                    for ((i=1; i<=STRESS_RUNS; i++)); do
-                        if [ "$expect_stdout" -eq 1 ]; then
-                            run_binary_capture_split "$bin_file" "$stdin_file" "$out_file" "$err_file"
-                            stress_exit="$?"
-                            if [ "$stress_exit" -eq "$expected" ] && ! cmp -s "$out_file" "$expect_stdout_file"; then
-                                stress_reason="stdout"
-                                stress_ok=0
-                                break
-                            fi
-                        else
-                            run_binary_silent "$bin_file" "$stdin_file"
-                            stress_exit="$?"
-                        fi
-                        if [ "$stress_exit" -ne "$expected" ]; then
-                            stress_reason="exit"
-                            stress_ok=0
-                            break
-                        fi
-                    done
-                    if [ "$stress_ok" -eq 1 ]; then
-                        case_stress_pass=1
-                    else
-                        if [ "$expect_stdout" -eq 1 ]; then
-                            persist_result_file "$out_file" "$out_file_persist"
-                            persist_result_file "$err_file" "$err_file_persist"
-                        fi
-                        case_stress_fail=1
-                        case_fail=$((case_fail + 1))
-                        if [ "$stress_reason" = "stdout" ]; then
-                            case_status="STRESS FAIL (run=$i, stdout mismatch)"
-                        else
-                            case_status="STRESS FAIL (run=$i, exit=$stress_exit, expect=$expected)"
-                        fi
-                    fi
-                fi
-
-                if [ "$case_stress_fail" -eq 0 ] && [ "$STABILITY_RUNS" -gt 0 ]; then
-                    local stability_ok=1
-                    local j=0
-                    local stability_exit=0
-                    local stability_reason="exit"
-                    for ((j=1; j<=STABILITY_RUNS; j++)); do
-                        if [ "$expect_stdout" -eq 1 ]; then
-                            run_binary_capture_split "$bin_file" "$stdin_file" "$out_file" "$err_file"
-                            stability_exit="$?"
-                            if [ "$stability_exit" -eq "$expected" ] && ! cmp -s "$out_file" "$expect_stdout_file"; then
-                                stability_reason="stdout"
-                                stability_ok=0
-                                break
-                            fi
-                        else
-                            run_binary_silent "$bin_file" "$stdin_file"
-                            stability_exit="$?"
-                        fi
-                        if [ "$stability_exit" -ne "$expected" ]; then
-                            stability_reason="exit"
-                            stability_ok=0
-                            break
-                        fi
-                    done
-                    if [ "$stability_ok" -eq 1 ]; then
-                        case_stability_pass=1
-                    else
-                        if [ "$expect_stdout" -eq 1 ]; then
-                            persist_result_file "$out_file" "$out_file_persist"
-                            persist_result_file "$err_file" "$err_file_persist"
-                        fi
-                        case_stability_fail=1
-                        case_fail=$((case_fail + 1))
-                        if [ "$stability_reason" = "stdout" ]; then
-                            case_status="STABILITY FAIL (run=$j, stdout mismatch)"
-                        else
-                            case_status="STABILITY FAIL (run=$j, exit=$stability_exit, expect=$expected)"
-                        fi
-                    fi
-                fi
-            else
-                if [ "$expect_stdout" -eq 0 ]; then
-                    run_binary_capture_all "$bin_file" "$stdin_file" "$out_file"
-                fi
-                persist_result_file "$out_file" "$out_file_persist"
+            local assemble_start_ms
+            local assemble_end_ms
+            local assemble_exit=0
+            assemble_start_ms="$(now_ms)"
+            assemble_nasm_obj "$asm_file" "$obj_file" 2>"$err_file"
+            assemble_exit="$?"
+            assemble_end_ms="$(now_ms)"
+            assemble_ms=$((assemble_end_ms - assemble_start_ms))
+            if [ "$assemble_exit" -ne 0 ]; then
                 persist_result_file "$err_file" "$err_file_persist"
                 case_fail=1
-                case_status="FAIL (exit=$exit_code, expect=$expected)"
+                case_status="FAIL (assemble)"
+            else
+                local link_start_ms
+                local link_end_ms
+                local link_exit=0
+                link_start_ms="$(now_ms)"
+                ld "$obj_file" -o "$bin_file" 2>>"$err_file"
+                link_exit="$?"
+                link_end_ms="$(now_ms)"
+                link_ms=$((link_end_ms - link_start_ms))
+                if [ "$link_exit" -ne 0 ]; then
+                    persist_result_file "$err_file" "$err_file_persist"
+                    case_fail=1
+                    case_status="FAIL (link)"
+                else
+                    local expect_stdout=0
+                    local exit_code=0
+                    local run_start_ms
+                    local run_end_ms
+                    run_start_ms="$(now_ms)"
+                    if [ -n "$expect_stdout_file" ] && [ -f "$expect_stdout_file" ]; then
+                        expect_stdout=1
+                        run_binary_capture_split "$bin_file" "$stdin_file" "$out_file" "$err_file"
+                        exit_code="$?"
+                    else
+                        run_binary_silent "$bin_file" "$stdin_file"
+                        exit_code="$?"
+                    fi
+                    run_end_ms="$(now_ms)"
+                    run_ms=$((run_end_ms - run_start_ms))
+                    if [ "$exit_code" -eq "$expected" ]; then
+                        if [ "$expect_stdout" -eq 1 ] && ! cmp -s "$out_file" "$expect_stdout_file"; then
+                            persist_result_file "$out_file" "$out_file_persist"
+                            persist_result_file "$err_file" "$err_file_persist"
+                            case_fail=1
+                            case_status="FAIL (stdout mismatch)"
+                        else
+                            case_pass=1
+                        fi
+
+                        if [ "$case_fail" -eq 0 ] && [ "$STRESS_RUNS" -gt 0 ]; then
+                            local stress_ok=1
+                            local i=0
+                            local stress_exit=0
+                            local stress_reason="exit"
+                            for ((i=1; i<=STRESS_RUNS; i++)); do
+                                if [ "$expect_stdout" -eq 1 ]; then
+                                    run_binary_capture_split "$bin_file" "$stdin_file" "$out_file" "$err_file"
+                                    stress_exit="$?"
+                                    if [ "$stress_exit" -eq "$expected" ] && ! cmp -s "$out_file" "$expect_stdout_file"; then
+                                        stress_reason="stdout"
+                                        stress_ok=0
+                                        break
+                                    fi
+                                else
+                                    run_binary_silent "$bin_file" "$stdin_file"
+                                    stress_exit="$?"
+                                fi
+                                if [ "$stress_exit" -ne "$expected" ]; then
+                                    stress_reason="exit"
+                                    stress_ok=0
+                                    break
+                                fi
+                            done
+                            if [ "$stress_ok" -eq 1 ]; then
+                                case_stress_pass=1
+                            else
+                                if [ "$expect_stdout" -eq 1 ]; then
+                                    persist_result_file "$out_file" "$out_file_persist"
+                                    persist_result_file "$err_file" "$err_file_persist"
+                                fi
+                                case_stress_fail=1
+                                case_fail=$((case_fail + 1))
+                                if [ "$stress_reason" = "stdout" ]; then
+                                    case_status="STRESS FAIL (run=$i, stdout mismatch)"
+                                else
+                                    case_status="STRESS FAIL (run=$i, exit=$stress_exit, expect=$expected)"
+                                fi
+                            fi
+                        fi
+
+                        if [ "$case_stress_fail" -eq 0 ] && [ "$STABILITY_RUNS" -gt 0 ]; then
+                            local stability_ok=1
+                            local j=0
+                            local stability_exit=0
+                            local stability_reason="exit"
+                            for ((j=1; j<=STABILITY_RUNS; j++)); do
+                                if [ "$expect_stdout" -eq 1 ]; then
+                                    run_binary_capture_split "$bin_file" "$stdin_file" "$out_file" "$err_file"
+                                    stability_exit="$?"
+                                    if [ "$stability_exit" -eq "$expected" ] && ! cmp -s "$out_file" "$expect_stdout_file"; then
+                                        stability_reason="stdout"
+                                        stability_ok=0
+                                        break
+                                    fi
+                                else
+                                    run_binary_silent "$bin_file" "$stdin_file"
+                                    stability_exit="$?"
+                                fi
+                                if [ "$stability_exit" -ne "$expected" ]; then
+                                    stability_reason="exit"
+                                    stability_ok=0
+                                    break
+                                fi
+                            done
+                            if [ "$stability_ok" -eq 1 ]; then
+                                case_stability_pass=1
+                            else
+                                if [ "$expect_stdout" -eq 1 ]; then
+                                    persist_result_file "$out_file" "$out_file_persist"
+                                    persist_result_file "$err_file" "$err_file_persist"
+                                fi
+                                case_stability_fail=1
+                                case_fail=$((case_fail + 1))
+                                if [ "$stability_reason" = "stdout" ]; then
+                                    case_status="STABILITY FAIL (run=$j, stdout mismatch)"
+                                else
+                                    case_status="STABILITY FAIL (run=$j, exit=$stability_exit, expect=$expected)"
+                                fi
+                            fi
+                        fi
+                    else
+                        if [ "$expect_stdout" -eq 0 ]; then
+                            run_binary_capture_all "$bin_file" "$stdin_file" "$out_file"
+                        fi
+                        persist_result_file "$out_file" "$out_file_persist"
+                        persist_result_file "$err_file" "$err_file_persist"
+                        case_fail=1
+                        case_status="FAIL (exit=$exit_code, expect=$expected)"
+                    fi
+                fi
             fi
         fi
     fi
 
     if [ "$KEEP_TEST_ARTIFACTS" -eq 0 ]; then
         rm -f "$asm_file" "$obj_file" "$bin_file" "$out_file" "$err_file"
+    fi
+
+    local case_end_ms
+    local case_time_ms=0
+    case_end_ms="$(now_ms)"
+    case_time_ms=$((case_end_ms - case_start_ms))
+    if [ "$TEST_TIMING" -eq 1 ]; then
+        case_status="$case_status time=${case_time_ms}ms compile=${compile_ms}ms asm=${assemble_ms}ms link=${link_ms}ms run=${run_ms}ms"
     fi
 
     {

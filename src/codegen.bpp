@@ -12,6 +12,7 @@ import std.util;
 import std.str;
 import types;
 import std.vec;
+import std.hashmap;
 import ast;
 import compiler;
 import compiler.core_utils;
@@ -45,6 +46,7 @@ const CG_USED_HAS_CALL_PTR = 1;
 const CG_USED_HAS_METHOD_CALL = 2;
 const CG_USED_HAS_FUNC_ADDR = 4;
 var g_cg_trace_runtime_needed: u64 = 0;
+var g_collect_used_symtab: *HashMap<u64, *TypeInfo>;
 
 func used_mark_flag(flags_ptr: u64, mask: u64) -> u64 {
     *(flags_ptr) = *(flags_ptr) | mask;
@@ -61,6 +63,27 @@ func used_has_name(used: *Vec<*NameInfo>, name: []u8) -> u64 {
         if (len == name.len && str_eq(slice(ptr, len), name) != 0) { return true; }
     }
     return false;
+}
+
+func used_has_name_prefix(used: *Vec<*NameInfo>, prefix: []u8) -> u64 {
+    if (used == 0 || prefix.ptr == 0 || prefix.len == 0) { return false; }
+    var n: u64 = used.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var info: *NameInfo = used.get(i);
+        if (info == 0 || info.len < prefix.len) { continue; }
+        if (str_eq(slice(info.ptr, prefix.len), prefix) != 0) { return true; }
+    }
+    return false;
+}
+
+func codegen_name_has_prefix(name: []u8, prefix: []u8) -> u64 {
+    if (name.ptr == 0 || prefix.ptr == 0 || name.len < prefix.len) { return 0; }
+    return str_eq(slice(name.ptr, prefix.len), prefix) != 0;
+}
+
+func codegen_name_has_suffix(name: []u8, suffix: []u8) -> u64 {
+    if (name.ptr == 0 || suffix.ptr == 0 || name.len < suffix.len) { return 0; }
+    return str_eq(slice(name.ptr + name.len - suffix.len, suffix.len), suffix) != 0;
 }
 
 func used_add_name(used: *Vec<*NameInfo>, name: []u8) -> u64 {
@@ -107,9 +130,37 @@ func collect_calls_in_call_ptr(cp: *AstCallPtr, used: *Vec<*NameInfo>, flags_ptr
 }
 
 func collect_calls_in_method_call(mc: *AstMethodCall, used: *Vec<*NameInfo>, flags_ptr: u64) -> u64 {
-    used_mark_flag(flags_ptr, CG_USED_HAS_METHOD_CALL);
     collect_calls_in_expr(mc.receiver, used, flags_ptr);
-    return collect_calls_in_args_vec(mc.args_vec, used, flags_ptr);
+    collect_calls_in_args_vec(mc.args_vec, used, flags_ptr);
+    var resolved: u64 = 0;
+    if (g_collect_used_symtab != 0) {
+        var recv_ti: *TypeInfo = generic_infer_expr_type(mc.receiver, g_collect_used_symtab);
+        if (recv_ti != 0 && recv_ti.type_kind == TYPE_STRUCT && u8_slice_ptr(recv_ti.struct_name) != 0 && u8_slice_len(recv_ti.struct_name) != 0) {
+            var arg_count_hint: u64 = 0;
+            if (mc.args_vec != 0) { arg_count_hint = mc.args_vec.len(); }
+            var arg_types: *Vec<*TypeInfo> = generic_collect_call_arg_types(mc.args_vec, g_collect_used_symtab);
+            var method_res: CompilerMethodResolveResult = sym_resolve_method_overload_with_count_fallback(recv_ti.struct_name, mc.method, arg_types, arg_count_hint);
+            if (method_res.found != 0 && method_res.fn != 0) {
+                used_add_resolved_name(used, method_res.fn.name);
+                resolved = 1;
+            } else {
+                var fallback_name: *NameInfo = build_method_name(recv_ti.struct_name, mc.method);
+                if (fallback_name != 0) {
+                    var resolved_fallback: *NameInfo = resolve_name(slice(fallback_name.ptr, fallback_name.len));
+                    var fb_name: []u8 = slice(fallback_name.ptr, fallback_name.len);
+                    if (resolved_fallback != 0) { fb_name = slice(resolved_fallback.ptr, resolved_fallback.len); }
+                    if (sym_func_exists(fb_name) != 0) {
+                        used_add_name(used, fb_name);
+                        resolved = 1;
+                    }
+                }
+            }
+        }
+    }
+    if (resolved == 0) {
+        used_mark_flag(flags_ptr, CG_USED_HAS_METHOD_CALL);
+    }
+    return 0;
 }
 
 func collect_calls_in_binary(bin: *AstBinary, used: *Vec<*NameInfo>, flags_ptr: u64) -> u64 {
@@ -298,7 +349,9 @@ func collect_calls_in_stmt(node: *AstNode, used: *Vec<*NameInfo>, flags_ptr: u64
 
 func collect_calls_in_func(fn: *AstFunc, used: *Vec<*NameInfo>, flags_ptr: u64) -> u64 {
     if (fn == 0) { return 0; }
+    g_collect_used_symtab = generic_build_symtab_for_func(fn);
     collect_calls_in_stmt(fn.body, used, flags_ptr);
+    g_collect_used_symtab = 0;
     return 0;
 }
 
@@ -328,30 +381,233 @@ func collect_property_hook_func_names(program: *AstProgram, used: *Vec<*NameInfo
 
 func collect_add_number_runtime_helper_names(used: *Vec<*NameInfo>) -> u64 {
     if (used == 0) { return 0; }
-    used_add_resolved_name(used, slice("std_number__Number_from_i8", 26));
-    used_add_resolved_name(used, slice("std_number__Number_from_i16", 27));
-    used_add_resolved_name(used, slice("std_number__Number_from_i32", 27));
-    used_add_resolved_name(used, slice("std_number__Number_from_i64", 27));
-    used_add_resolved_name(used, slice("std_number__Number_from_u8", 26));
-    used_add_resolved_name(used, slice("std_number__Number_from_u16", 27));
-    used_add_resolved_name(used, slice("std_number__Number_from_u32", 27));
-    used_add_resolved_name(used, slice("std_number__Number_from_u64", 27));
-    used_add_resolved_name(used, slice("std_number__Number_from_f64", 27));
-    used_add_resolved_name(used, slice("std_number__Number_from_complex", 31));
+    used_add_resolved_name(used, slice("std_number__Number_from_i8", str_len("std_number__Number_from_i8")));
+    used_add_resolved_name(used, slice("std_number__Number_from_i16", str_len("std_number__Number_from_i16")));
+    used_add_resolved_name(used, slice("std_number__Number_from_i32", str_len("std_number__Number_from_i32")));
+    used_add_resolved_name(used, slice("std_number__Number_from_i64", str_len("std_number__Number_from_i64")));
+    used_add_resolved_name(used, slice("std_number__Number_from_u8", str_len("std_number__Number_from_u8")));
+    used_add_resolved_name(used, slice("std_number__Number_from_u16", str_len("std_number__Number_from_u16")));
+    used_add_resolved_name(used, slice("std_number__Number_from_u32", str_len("std_number__Number_from_u32")));
+    used_add_resolved_name(used, slice("std_number__Number_from_u64", str_len("std_number__Number_from_u64")));
+    used_add_resolved_name(used, slice("std_number__Number_from_f64", str_len("std_number__Number_from_f64")));
+    used_add_resolved_name(used, slice("std_number__Number_from_complex", str_len("std_number__Number_from_complex")));
     used_add_resolved_name(used, slice("std_number__Number_from_rational", str_len("std_number__Number_from_rational")));
     used_add_resolved_name(used, slice("std_number__Number_from_decimal", str_len("std_number__Number_from_decimal")));
     used_add_resolved_name(used, slice("std_number__Number_from_bigfloat", str_len("std_number__Number_from_bigfloat")));
-    used_add_resolved_name(used, slice("std_number__Number_cmp_ptr", 26));
+    used_add_resolved_name(used, slice("std_number__Number_cmp_ptr", str_len("std_number__Number_cmp_ptr")));
     used_add_resolved_name(used, slice("std_number__Number_eq_cmp_ptr", str_len("std_number__Number_eq_cmp_ptr")));
-    used_add_resolved_name(used, slice("std_number__Number_add_values", 29));
-    used_add_resolved_name(used, slice("std_number__Number_sub_values", 29));
-    used_add_resolved_name(used, slice("std_number__Number_mul_values", 29));
-    used_add_resolved_name(used, slice("std_number__Number_div_values", 29));
-    used_add_resolved_name(used, slice("std_number__Number_mod_values", 29));
-    used_add_resolved_name(used, slice("std_number__Number_bitwise_values", 33));
-    used_add_resolved_name(used, slice("std_number__Number_shift_amount", 32));
-    used_add_resolved_name(used, slice("std_number__Number_shl_values", 29));
-    used_add_resolved_name(used, slice("std_number__Number_shr_values", 29));
+    used_add_resolved_name(used, slice("std_number__Number_add_values", str_len("std_number__Number_add_values")));
+    used_add_resolved_name(used, slice("std_number__Number_sub_values", str_len("std_number__Number_sub_values")));
+    used_add_resolved_name(used, slice("std_number__Number_mul_values", str_len("std_number__Number_mul_values")));
+    used_add_resolved_name(used, slice("std_number__Number_div_values", str_len("std_number__Number_div_values")));
+    used_add_resolved_name(used, slice("std_number__Number_mod_values", str_len("std_number__Number_mod_values")));
+    used_add_resolved_name(used, slice("std_number__Number_bitwise_values", str_len("std_number__Number_bitwise_values")));
+    used_add_resolved_name(used, slice("std_number__Number_bitnot_values", str_len("std_number__Number_bitnot_values")));
+    used_add_resolved_name(used, slice("std_number__Number_shift_amount", str_len("std_number__Number_shift_amount")));
+    used_add_resolved_name(used, slice("std_number__Number_shl_values", str_len("std_number__Number_shl_values")));
+    used_add_resolved_name(used, slice("std_number__Number_shr_values", str_len("std_number__Number_shr_values")));
+    return 0;
+}
+
+func collect_add_gc_runtime_helper_names(used: *Vec<*NameInfo>) -> u64 {
+    if (used == 0) { return 0; }
+    used_add_resolved_name(used, slice("std_mem__bpp_gc_root_slot_push", str_len("std_mem__bpp_gc_root_slot_push")));
+    used_add_resolved_name(used, slice("std_mem__bpp_gc_root_slot_remove", str_len("std_mem__bpp_gc_root_slot_remove")));
+    used_add_resolved_name(used, slice("std_mem__bpp_gc_alloc_raw", str_len("std_mem__bpp_gc_alloc_raw")));
+    used_add_resolved_name(used, slice("std_mem__bpp_gc_alloc_raw_rooted", str_len("std_mem__bpp_gc_alloc_raw_rooted")));
+    used_add_resolved_name(used, slice("std_mem__bpp_heap_alloc_auto_tagged", str_len("std_mem__bpp_heap_alloc_auto_tagged")));
+    used_add_resolved_name(used, slice("std_mem__bpp_stack_alloc_auto_tagged_from_raw", str_len("std_mem__bpp_stack_alloc_auto_tagged_from_raw")));
+    used_add_resolved_name(used, slice("std_mem____bpp_delete_begin", str_len("std_mem____bpp_delete_begin")));
+    used_add_resolved_name(used, slice("std_mem____bpp_tagged_delete_begin", str_len("std_mem____bpp_tagged_delete_begin")));
+    used_add_resolved_name(used, slice("std_mem____bpp_delete_end", str_len("std_mem____bpp_delete_end")));
+    used_add_resolved_name(used, slice("std_mem__bpp_tag_write_barrier_runtime_slot", str_len("std_mem__bpp_tag_write_barrier_runtime_slot")));
+    return 0;
+}
+
+func codegen_expr_vec_has_gc_runtime_need(args: *Vec<*AstNode>) -> u64 {
+    if (args == 0) { return 0; }
+    var n: u64 = args.len();
+    for (var i: u64 = 0; i < n; i++) {
+        if (codegen_expr_has_gc_runtime_need(args.get(i)) != 0) { return 1; }
+    }
+    return 0;
+}
+
+func codegen_expr_has_gc_runtime_need(node: *AstNode) -> u64 {
+    if (node == 0) { return 0; }
+    var kind: u64 = ast_kind(node);
+    var nref: AstNodeTagRef;
+    nref.node = node;
+    match (kind) {
+        case AST_NEW: return 1;
+        case AST_CALL:
+            return codegen_expr_vec_has_gc_runtime_need(nref.call.args_vec);
+        case AST_CALL_PTR:
+            if (codegen_expr_has_gc_runtime_need(nref.call_ptr.callee) != 0) { return 1; }
+            return codegen_expr_vec_has_gc_runtime_need(nref.call_ptr.args_vec);
+        case AST_METHOD_CALL:
+        case AST_SAFE_METHOD_CALL:
+            if (codegen_expr_has_gc_runtime_need(nref.method_call.receiver) != 0) { return 1; }
+            return codegen_expr_vec_has_gc_runtime_need(nref.method_call.args_vec);
+        case AST_BINARY:
+            if (codegen_expr_has_gc_runtime_need(nref.binary.left) != 0) { return 1; }
+            return codegen_expr_has_gc_runtime_need(nref.binary.right);
+        case AST_UNARY: return codegen_expr_has_gc_runtime_need(nref.unary.operand);
+        case AST_ADDR_OF: return codegen_expr_has_gc_runtime_need(nref.addr_of.operand);
+        case AST_DEREF: return codegen_expr_has_gc_runtime_need(nref.deref.operand);
+        case AST_DEREF8: return codegen_expr_has_gc_runtime_need(nref.deref8.operand);
+        case AST_INDEX:
+        case AST_SAFE_INDEX:
+            if (codegen_expr_has_gc_runtime_need(nref.index_expr.base) != 0) { return 1; }
+            return codegen_expr_has_gc_runtime_need(nref.index_expr.index);
+        case AST_CAST: return codegen_expr_has_gc_runtime_need(nref.cast_expr.expr);
+        case AST_MEMBER_ACCESS:
+        case AST_SAFE_MEMBER_ACCESS:
+            return codegen_expr_has_gc_runtime_need(nref.member_access.object);
+        case AST_ASSIGN:
+            if (codegen_expr_has_gc_runtime_need(nref.assign_stmt.target) != 0) { return 1; }
+            return codegen_expr_has_gc_runtime_need(nref.assign_stmt.value);
+        case AST_STACK_CTOR:
+            if (nref.stack_ctor.is_tagged != 0) { return 1; }
+            return codegen_expr_vec_has_gc_runtime_need(nref.stack_ctor.ctor_args_vec);
+        case AST_STRUCT_LITERAL:
+            return codegen_expr_vec_has_gc_runtime_need(nref.struct_lit.values_vec);
+    }
+    return 0;
+}
+
+func codegen_stmt_has_gc_runtime_need(node: *AstNode) -> u64 {
+    if (node == 0) { return 0; }
+    var kind: u64 = ast_kind(node);
+    var nref: AstNodeTagRef;
+    nref.node = node;
+    match (kind) {
+        case AST_RETURN:
+            return codegen_expr_has_gc_runtime_need(nref.ret_stmt.expr);
+        case AST_VAR_DECL:
+            if (nref.var_decl.ptr_depth > 0) { return 1; }
+            if (nref.var_decl.is_tagged != 0) { return 1; }
+            return codegen_expr_has_gc_runtime_need(nref.var_decl.init_expr);
+        case AST_CONST_DECL:
+            return codegen_expr_has_gc_runtime_need(nref.const_decl.value);
+        case AST_ASSIGN:
+            if (codegen_expr_has_gc_runtime_need(nref.assign_stmt.target) != 0) { return 1; }
+            return codegen_expr_has_gc_runtime_need(nref.assign_stmt.value);
+        case AST_DELETE:
+            return 1;
+        case AST_EXPR_STMT:
+            return codegen_expr_has_gc_runtime_need(nref.expr_stmt.expr);
+        case AST_DEFER:
+            return codegen_stmt_has_gc_runtime_need(nref.defer_stmt.stmt);
+        case AST_IF:
+            if (codegen_expr_has_gc_runtime_need(nref.if_stmt.cond) != 0) { return 1; }
+            if (codegen_stmt_has_gc_runtime_need(nref.if_stmt.then_block) != 0) { return 1; }
+            return codegen_stmt_has_gc_runtime_need(nref.if_stmt.else_block);
+        case AST_WHILE:
+            if (codegen_expr_has_gc_runtime_need(nref.while_stmt.cond) != 0) { return 1; }
+            return codegen_stmt_has_gc_runtime_need(nref.while_stmt.body);
+        case AST_FOR:
+            if (codegen_stmt_has_gc_runtime_need(nref.for_stmt.init) != 0) { return 1; }
+            if (codegen_expr_has_gc_runtime_need(nref.for_stmt.cond) != 0) { return 1; }
+            if (codegen_stmt_has_gc_runtime_need(nref.for_stmt.update) != 0) { return 1; }
+            return codegen_stmt_has_gc_runtime_need(nref.for_stmt.body);
+        case AST_SWITCH:
+        case AST_MATCH:
+            if (codegen_expr_has_gc_runtime_need(nref.switch_stmt.expr) != 0) { return 1; }
+            var cases: *Vec<*AstCase> = nref.switch_stmt.cases_vec;
+            if (cases == 0) { return 0; }
+            var cn: u64 = cases.len();
+            for (var ci: u64 = 0; ci < cn; ci++) {
+                var cs: *AstCase = cases.get(ci);
+                if (cs == 0) { continue; }
+                if (cs.is_default == 0 && codegen_expr_has_gc_runtime_need(cs.value) != 0) { return 1; }
+                if (codegen_stmt_has_gc_runtime_need(cs.body) != 0) { return 1; }
+            }
+            return 0;
+        case AST_BLOCK:
+            var stmts: *Vec<*AstNode> = nref.block_stmt.stmts_vec;
+            if (stmts == 0) { return 0; }
+            var sn: u64 = stmts.len();
+            for (var si: u64 = 0; si < sn; si++) {
+                if (codegen_stmt_has_gc_runtime_need(stmts.get(si)) != 0) { return 1; }
+            }
+            return 0;
+    }
+    return 0;
+}
+
+func codegen_gc_codegen_disabled_for_name(name: []u8) -> u64 {
+    if (codegen_name_has_prefix(name, slice("std_", str_len("std_"))) != 0) { return 1; }
+    if (codegen_name_has_prefix(name, slice("std.", str_len("std."))) != 0) { return 1; }
+    if (codegen_name_has_prefix(name, slice("bpp_gc_", str_len("bpp_gc_"))) != 0) { return 1; }
+    if (codegen_name_has_prefix(name, slice("bpp_tag_", str_len("bpp_tag_"))) != 0) { return 1; }
+    if (codegen_name_has_prefix(name, slice("__bpp_", str_len("__bpp_"))) != 0) { return 1; }
+    if (codegen_name_has_prefix(name, slice("emitter_", str_len("emitter_"))) != 0) { return 1; }
+    if (codegen_name_has_prefix(name, slice("emitter.", str_len("emitter."))) != 0) { return 1; }
+    if (codegen_name_has_prefix(name, slice("ssa_", str_len("ssa_"))) != 0) { return 1; }
+    if (codegen_name_has_prefix(name, slice("ssa.", str_len("ssa."))) != 0) { return 1; }
+    if (codegen_name_has_prefix(name, slice("compiler_", str_len("compiler_"))) != 0) { return 1; }
+    if (codegen_name_has_prefix(name, slice("compiler.", str_len("compiler."))) != 0) { return 1; }
+    if (codegen_name_has_prefix(name, slice("llvm_", str_len("llvm_"))) != 0) { return 1; }
+    if (codegen_name_has_prefix(name, slice("llvm.", str_len("llvm."))) != 0) { return 1; }
+    if (codegen_name_has_prefix(name, slice("parser_", str_len("parser_"))) != 0) { return 1; }
+    if (codegen_name_has_prefix(name, slice("parser.", str_len("parser."))) != 0) { return 1; }
+    if (codegen_name_has_prefix(name, slice("lexer_", str_len("lexer_"))) != 0) { return 1; }
+    if (codegen_name_has_prefix(name, slice("lexer.", str_len("lexer."))) != 0) { return 1; }
+    if (codegen_name_has_prefix(name, slice("codegen__", str_len("codegen__"))) != 0) { return 1; }
+    if (codegen_name_has_prefix(name, slice("codegen.", str_len("codegen."))) != 0) { return 1; }
+    return 0;
+}
+
+func codegen_program_has_gc_runtime_need(program: *AstProgram, used: *Vec<*NameInfo>) -> u64 {
+    if (program == 0 || program.funcs_vec == 0) { return 0; }
+    var funcs: *Vec<*AstFunc> = program.funcs_vec;
+    var n: u64 = funcs.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var fn: *AstFunc = funcs.get(i);
+        if (fn == 0 || fn.body == 0) { continue; }
+        if (used != 0 && used_has_resolved_name(used, fn.name) == 0) { continue; }
+        if (codegen_gc_codegen_disabled_for_name(fn.name) != 0) { continue; }
+        if (codegen_stmt_has_gc_runtime_need(fn.body) != 0) { return 1; }
+    }
+    return 0;
+}
+
+func collect_trait_vtable_impl_func_names(used: *Vec<*NameInfo>) -> u64 {
+    if (used == 0) { return 0; }
+    var impls: *Vec<*TraitImpl> = sym_get_trait_impls();
+    if (impls == 0) { return 0; }
+
+    var inum: u64 = impls.len();
+    for (var ii: u64 = 0; ii < inum; ii++) {
+        var impl_info: *TraitImpl = impls.get(ii);
+        if (impl_info == 0 || impl_info.methods_vec == 0) { continue; }
+        var mn: u64 = impl_info.methods_vec.len();
+        for (var mi: u64 = 0; mi < mn; mi++) {
+            var method: *TraitImplMethod = impl_info.methods_vec.get(mi);
+            if (method == 0 || method.func_def == 0) { continue; }
+            used_add_resolved_name(used, method.func_def.name);
+        }
+    }
+    return 0;
+}
+
+func collect_used_func_closure(funcs: *Vec<*AstFunc>, used: *Vec<*NameInfo>, flags_ptr: u64) -> u64 {
+    if (funcs == 0) { return 0; }
+    var changed: u64 = 1;
+    while (changed != 0) {
+        changed = 0;
+        var n: u64 = funcs.len();
+        for (var i: u64 = 0; i < n; i++) {
+            var fn: *AstFunc = funcs.get(i);
+            if (used_has_resolved_name(used, fn.name) != 0) {
+                set_current_module_for_func(fn.name);
+                var before: u64 = used.len();
+                collect_calls_in_func(fn, used, flags_ptr);
+                if (used.len() != before) { changed = 1; }
+            }
+        }
+    }
     return 0;
 }
 
@@ -372,23 +628,35 @@ func collect_used_func_names(program: *AstProgram, used: *Vec<*NameInfo>, flags_
         if (annotation_count_name(seed_fn.annotations_vec, slice("used", str_len("used"))) != 0) {
             used_add_name(used, seed_fn.name);
         }
+        if (annotation_has_complexity_contract_annotation(seed_fn) != 0) {
+            used_add_name(used, seed_fn.name);
+        }
+        if (codegen_name_has_suffix(seed_fn.name, slice("_destructor", str_len("_destructor"))) != 0) {
+            used_add_name(used, seed_fn.name);
+        }
+        if (codegen_name_has_prefix(seed_fn.name, slice("__thunk_", str_len("__thunk_"))) != 0) {
+            used_add_name(used, seed_fn.name);
+        }
     }
 
     collect_property_hook_func_names(program, used);
-    collect_add_number_runtime_helper_names(used);
+    collect_trait_vtable_impl_func_names(used);
 
-    var changed: u64 = 1;
-    while (changed != 0) {
-        changed = 0;
-        var n: u64 = funcs.len();
-        for (var i: u64 = 0; i < n; i++) {
-            var fn: *AstFunc = funcs.get(i);
-            if (used_has_resolved_name(used, fn.name) != 0) {
-                set_current_module_for_func(fn.name);
-                var before: u64 = used.len();
-                collect_calls_in_func(fn, used, flags_ptr);
-                if (used.len() != before) { changed = 1; }
-            }
+    collect_used_func_closure(funcs, used, flags_ptr);
+    if (codegen_program_has_gc_runtime_need(program, used) != 0 ||
+        used_has_name_prefix(used, slice("std_mem__bpp_gc_", str_len("std_mem__bpp_gc_"))) != 0 ||
+        used_has_name_prefix(used, slice("std_number__", str_len("std_number__"))) != 0) {
+        var before_gc: u64 = used.len();
+        collect_add_gc_runtime_helper_names(used);
+        if (used.len() != before_gc) {
+            collect_used_func_closure(funcs, used, flags_ptr);
+        }
+    }
+    if (used_has_name_prefix(used, slice("std_number__", str_len("std_number__"))) != 0) {
+        var before_number: u64 = used.len();
+        collect_add_number_runtime_helper_names(used);
+        if (used.len() != before_number) {
+            collect_used_func_closure(funcs, used, flags_ptr);
         }
     }
     return 0;
@@ -1012,13 +1280,19 @@ func collect_used_names(program: *AstProgram, has_runtime_init: u64) -> *Vec<*Na
     var used_names: *Vec<*NameInfo> = new Vec<*NameInfo>{heap_alloc((64) * sizeof(*NameInfo)), 0, (64)};
     var used_flags: u64 = 0;
     collect_used_func_names(program, used_names, &used_flags);
-    if ((used_flags & (CG_USED_HAS_CALL_PTR | CG_USED_HAS_METHOD_CALL | CG_USED_HAS_FUNC_ADDR)) != 0) {
+    if ((used_flags & (CG_USED_HAS_CALL_PTR | CG_USED_HAS_FUNC_ADDR)) != 0) {
         return 0;
     }
     if (has_runtime_init != 0) {
         used_add_resolved_name(used_names, slice((u64)"__global_init", 13));
     }
     return used_names;
+}
+
+func codegen_force_emit_generated_func(name: []u8) -> u64 {
+    if (codegen_name_has_prefix(name, slice("__thunk_", str_len("__thunk_"))) != 0) { return 1; }
+    if (codegen_name_has_suffix(name, slice("_destructor", str_len("_destructor"))) != 0) { return 1; }
+    return 0;
 }
 
 const CG_EXPR_FEATURE_SAFE_NAV = 1;
@@ -1215,9 +1489,9 @@ func program_has_float(program: *AstProgram) -> u64 {
     return false;
 }
 
-func build_ssa_pipeline(program: *AstProgram, use_ssa: u64) -> *SSAContext {
+func build_ssa_pipeline(program: *AstProgram, use_ssa: u64, used_names: *Vec<*NameInfo>) -> *SSAContext {
     if (use_ssa == 0) { return 0; }
-    var ssa_ctx_ptr: *SSAContext = build_program(program);
+    var ssa_ctx_ptr: *SSAContext = build_program_used(program, used_names);
     to_ssa(ssa_ctx_ptr);
     if (CODEGEN_DEBUG != 0) {
         println("[DEBUG] codegen: mem2reg", 25);
@@ -1262,6 +1536,20 @@ func build_ssa_pipeline(program: *AstProgram, use_ssa: u64) -> *SSAContext {
         annotation_dump_llvm_contract_adapter_stderr(program);
     }
     return ssa_ctx_ptr;
+}
+
+func find_ssa_func_by_name(ssa_ctx: *SSAContext, name: []u8) -> *SSAFunction {
+    if (ssa_ctx == 0) { return 0; }
+    var funcs: []*SSAFunction = ssa_ctx.funcs;
+    var n: u64 = slice_len(funcs);
+    for (var i: u64 = 0; i < n; i++) {
+        var fn: *SSAFunction = funcs[i];
+        if (fn == 0) { continue; }
+        if (fn.name.len == name.len && str_eq(slice(fn.name.ptr, fn.name.len), name) != 0) {
+            return fn;
+        }
+    }
+    return 0;
 }
 
 func init_globals(program: *AstProgram) -> u64 {
@@ -1368,22 +1656,18 @@ func emit_trace_runtime() -> u64 {
 }
 
 func emit_functions(program: *AstProgram, used_names: *Vec<*NameInfo>, use_ssa: u64, ssa_ctx: *SSAContext) -> u64 {
-    var ssa_funcs: []*SSAFunction = slice(0, 0);
-    if (use_ssa != 0) {
-        ssa_funcs = ssa_ctx.funcs;
-    }
     for (var i: u64 = 0; i < program.funcs_vec.len(); i++) {
         if (diag_should_stop_pass() != 0) { break; }
         var fn: *AstFunc = program.funcs_vec.get(i);
         if (generic_template_fn(fn) != 0) {
             continue;
         }
-        if (used_names != 0 && used_has_resolved_name(used_names, fn.name) == 0) {
+        if (used_names != 0 && used_has_resolved_name(used_names, fn.name) == 0 && codegen_force_emit_generated_func(fn.name) == 0) {
             continue;
         }
         var force_non_ssa_codegen: u64 = func_has_codegen_annotation(fn);
         if (use_ssa != 0 && force_non_ssa_codegen == 0) {
-            var ssa_fn_ptr: *SSAFunction = ssa_funcs[i];
+            var ssa_fn_ptr: *SSAFunction = find_ssa_func_by_name(ssa_ctx, fn.name);
             var ssa_ready: u64 = 0;
             if (ssa_fn_ptr != 0 && ssa_fn_ptr.regalloc_failed == 0 && ssa_fn_ptr.regalloc_done != 0) {
                 ssa_ready = 1;
@@ -1423,7 +1707,7 @@ func program_with_sigs(prog: *AstProgram, sigs: *Vec<*AstFunc>) -> u64 {
     var use_ssa: u64 = 0;
     if (ir_mode == IR_SSA) { use_ssa = 1; }
 
-    var ssa_ctx: *SSAContext = build_ssa_pipeline(program, use_ssa);
+    var ssa_ctx: *SSAContext = build_ssa_pipeline(program, use_ssa, used_names);
     if (ssa_ctx == 0) { use_ssa = 0; }
 
     init_state();
