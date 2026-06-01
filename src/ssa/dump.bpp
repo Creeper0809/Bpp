@@ -1,11 +1,13 @@
 // ssa_dump.b - SSA/3addr 텍스트 덤프 (v3_17)
 
 import std.io;
+import std.str;
 import std.util;
 import std.vec;
 import ssa.datastruct;
 import ssa.core;
 import types;
+import opt;
 
 func op_name(op: u64) -> u64 {
     push_trace("op_name", "ssa_dump.b", __LINE__);
@@ -353,4 +355,246 @@ func dump_machine(ctx: *SSAContext) -> u64 {
     emit("; bpp.machine_ir.lowering=ssa-destroy+lower-phys\n");
     emit("; bpp.machine_ir.addr=explicit-local-address-ops\n");
     return dump(ctx, 0);
+}
+
+func ssa_json_escape(ptr: u64, len: u64) -> u64 {
+    emit_char(34);
+    if (ptr != 0 && len != 0) {
+        var bytes: *u8 = (*u8)ptr;
+        for (var i: u64 = 0; i < len; i++) {
+            var c: u64 = bytes[i];
+            if (c == 34) { emit("\\\""); }
+            else if (c == 92) { emit("\\\\"); }
+            else if (c == 10) { emit("\\n"); }
+            else if (c == 13) { emit("\\r"); }
+            else if (c == 9) { emit("\\t"); }
+            else if (c < 32) { emit_char(63); }
+            else { emit_char(c); }
+        }
+    }
+    emit_char(34);
+    return 0;
+}
+
+func ssa_json_emit_id(prefix: u64, prefix_len: u64, id: u64) -> u64 {
+    emit_char(34);
+    emit_len(prefix, prefix_len);
+    emit_u64(id);
+    emit_char(34);
+    return 0;
+}
+
+func ssa_json_emit_operand(opr: u64) -> u64 {
+    if (operand_is_const(opr) != 0) {
+        emit("{\"kind\":\"const\",\"value\":");
+        emit_u64(operand_value(opr));
+        emit("}");
+        return 0;
+    }
+    emit("{\"kind\":\"reg\",\"id\":");
+    emit_u64(operand_value(opr));
+    emit("}");
+    return 0;
+}
+
+func ssa_json_emit_source_ranges(inst: *SSAInstruction) -> u64 {
+    if (inst == 0 || inst.source_file_ptr == 0 || inst.source_start_line == 0) {
+        emit("[]");
+        return 0;
+    }
+    emit("[{");
+    if (inst.source_range_id != 0) {
+        emit("\"rangeId\":");
+        ssa_json_emit_id("range-", str_len("range-"), inst.source_range_id);
+        emit(",\"astNodeId\":");
+        ssa_json_emit_id("ast-", str_len("ast-"), inst.source_range_id);
+        emit(",\"originNodeId\":");
+        ssa_json_emit_id("ast-", str_len("ast-"), inst.source_range_id);
+        emit(",");
+    }
+    emit("\"file\":");
+    ssa_json_escape(inst.source_file_ptr, inst.source_file_len);
+    emit(",\"startLine\":");
+    emit_u64(inst.source_start_line);
+    emit(",\"startColumn\":");
+    emit_u64(inst.source_start_col);
+    emit(",\"endLine\":");
+    emit_u64(inst.source_end_line);
+    emit(",\"endColumn\":");
+    emit_u64(inst.source_end_col);
+    emit(",\"startOffset\":");
+    emit_u64(inst.source_start_offset);
+    emit(",\"endOffset\":");
+    emit_u64(inst.source_end_offset);
+    emit("}]");
+    return 0;
+}
+
+func ssa_json_inst_matches_source_filter(inst: *SSAInstruction) -> u64 {
+    if (opt_source_map_user_only() == 0) { return 1; }
+    var filter_ptr: u64 = opt_source_map_file_ptr();
+    var filter_len: u64 = opt_source_map_file_len();
+    if (filter_ptr == 0 || filter_len == 0) { return 1; }
+    if (inst == 0 || inst.source_file_ptr == 0 || inst.source_file_len != filter_len) { return 0; }
+    if (str_eq(slice(inst.source_file_ptr, inst.source_file_len), slice(filter_ptr, filter_len)) != 0) { return 1; }
+    return 0;
+}
+
+func ssa_json_emit_ast_node_ids(inst: *SSAInstruction) -> u64 {
+    emit("[");
+    if (inst != 0 && inst.source_range_id != 0) {
+        ssa_json_emit_id("ast-", str_len("ast-"), inst.source_range_id);
+    }
+    emit("]");
+    return 0;
+}
+
+func ssa_json_emit_inst(inst: *SSAInstruction, first: *u64) -> u64 {
+    if (inst == 0) { return 0; }
+    if (ssa_json_inst_matches_source_filter(inst) == 0) { return 0; }
+    var op: u64 = op_of(inst);
+    if (op == SSA_OP_NOP || op == SSA_OP_ENTRY) { return 0; }
+    if (*first == 0) { emit(","); } else { *first = 0; }
+    emit("{\"id\":");
+    ssa_json_emit_id("ssa-", str_len("ssa-"), inst.id);
+    emit(",\"numericId\":");
+    emit_u64(inst.id);
+    emit(",\"opcode\":\"");
+    op_name(op);
+    emit("\"");
+    emit(",\"result\":");
+    if (inst.dest != 0 && op != SSA_OP_BR && op != SSA_OP_RET_SLICE_HEAP) {
+        emit("{\"kind\":\"reg\",\"id\":");
+        emit_u64(inst.dest);
+        emit("}");
+    } else {
+        emit("null");
+    }
+    emit(",\"operands\":[");
+    var operand_first: u64 = 1;
+    if (inst.src1 != 0) {
+        ssa_json_emit_operand(inst.src1);
+        operand_first = 0;
+    }
+    if (inst.src2 != 0) {
+        if (operand_first == 0) { emit(","); }
+        ssa_json_emit_operand(inst.src2);
+        operand_first = 0;
+    }
+    if (op == SSA_OP_BR && inst.dest != 0) {
+        if (operand_first == 0) { emit(","); }
+        ssa_json_emit_operand(inst.dest);
+    }
+    emit("],\"sourceRanges\":");
+    ssa_json_emit_source_ranges(inst);
+    emit(",\"astNodeIds\":");
+    ssa_json_emit_ast_node_ids(inst);
+    emit(",\"generated\":");
+    if (inst.source_file_ptr != 0 && inst.source_start_line != 0) {
+        emit("false,\"generatedReason\":\"\"");
+    } else if (op == SSA_OP_PHI) {
+        emit("true,\"generatedReason\":\"phi\"");
+    } else {
+        emit("true,\"generatedReason\":\"compiler\"");
+    }
+    emit("}");
+    return 0;
+}
+
+func ssa_json_emit_phi_args(phi_inst: *SSAInstruction) -> u64 {
+    emit("[");
+    if (phi_inst == 0 || op_of(phi_inst) != SSA_OP_PHI) {
+        emit("]");
+        return 0;
+    }
+    var arg: *SSAPhiArg = (*SSAPhiArg)phi_inst.src1;
+    var first: u64 = 1;
+    while (arg != 0) {
+        if (first == 0) { emit(","); } else { first = 0; }
+        emit("{\"blockId\":\"b");
+        emit_u64(arg.block_id);
+        emit("\",\"value\":{\"kind\":\"reg\",\"id\":");
+        emit_u64(arg.val);
+        emit("}}");
+        arg = arg.next;
+    }
+    emit("]");
+    return 0;
+}
+
+func ssa_json_emit_inst_with_phi(inst: *SSAInstruction, first: *u64) -> u64 {
+    if (inst == 0) { return 0; }
+    if (ssa_json_inst_matches_source_filter(inst) == 0) { return 0; }
+    var op: u64 = op_of(inst);
+    if (op != SSA_OP_PHI) {
+        return ssa_json_emit_inst(inst, first);
+    }
+    if (*first == 0) { emit(","); } else { *first = 0; }
+    emit("{\"id\":");
+    ssa_json_emit_id("ssa-", str_len("ssa-"), inst.id);
+    emit(",\"numericId\":");
+    emit_u64(inst.id);
+    emit(",\"opcode\":\"phi\",\"result\":{\"kind\":\"reg\",\"id\":");
+    emit_u64(inst.dest);
+    emit("},\"operands\":");
+    ssa_json_emit_phi_args(inst);
+    emit(",\"sourceRanges\":");
+    ssa_json_emit_source_ranges(inst);
+    emit(",\"astNodeIds\":");
+    ssa_json_emit_ast_node_ids(inst);
+    emit(",\"generated\":");
+    if (inst.source_file_ptr != 0 && inst.source_start_line != 0) {
+        emit("false,\"generatedReason\":\"\"");
+    } else {
+        emit("true,\"generatedReason\":\"phi\"");
+    }
+    emit("}");
+    return 0;
+}
+
+func dump_json(ctx: *SSAContext, with_phi: u64, stage: u64) -> u64 {
+    if (ctx == 0) {
+        emit("{\"schemaVersion\":1,\"sourceRangeSemantics\":{\"endColumn\":\"exclusive\",\"columnEncoding\":\"byte\",\"offsetEncoding\":\"byte\"},\"ssa\":{\"functions\":[]}}\n");
+        return 0;
+    }
+    emit("{\"schemaVersion\":1,\"sourceRangeSemantics\":{\"endColumn\":\"exclusive\",\"columnEncoding\":\"byte\",\"offsetEncoding\":\"byte\"},\"ssa\":{\"stage\":");
+    ssa_json_escape(stage, str_len(stage));
+    emit(",\"functions\":[");
+    var funcs: []*SSAFunction = ctx.funcs;
+    var n: u64 = slice_len(funcs);
+    for (var i: u64 = 0; i < n; i++) {
+        if (i != 0) { emit(","); }
+        var fn: *SSAFunction = funcs[i];
+        emit("{\"id\":\"ssa-func-");
+        emit_u64(i);
+        emit("\",\"name\":");
+        ssa_json_escape(u8_slice_ptr(fn.name), u8_slice_len(fn.name));
+        emit(",\"blocks\":[");
+        var blocks: []*SSABlock = fn.blocks;
+        var bcount: u64 = slice_len(blocks);
+        for (var bi: u64 = 0; bi < bcount; bi++) {
+            if (bi != 0) { emit(","); }
+            var b: *SSABlock = blocks[bi];
+            emit("{\"id\":\"b");
+            emit_u64(b.id);
+            emit("\",\"sourceRanges\":[],\"generated\":true,\"generatedReason\":\"cfg-block\",\"instructions\":[");
+            var first_inst: u64 = 1;
+            if (with_phi != 0) {
+                var p: *SSAInstruction = b.phi_head;
+                while (p != 0) {
+                    ssa_json_emit_inst_with_phi(p, &first_inst);
+                    p = p.next;
+                }
+            }
+            var cur: *SSAInstruction = b.inst_head;
+            while (cur != 0) {
+                ssa_json_emit_inst_with_phi(cur, &first_inst);
+                cur = cur.next;
+            }
+            emit("]}");
+        }
+        emit("]}");
+    }
+    emit("]}}\n");
+    return 0;
 }

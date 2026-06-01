@@ -1018,6 +1018,10 @@ run_ir_case() {
     local ssa_out="$RESULTS_DIR/${test_name}.ssa.ir"
     local addr_out="$RESULTS_DIR/${test_name}.3addr.ir"
     local machine_out="$RESULTS_DIR/${test_name}.machine.ir"
+    local ssa_json_out="$RESULTS_DIR/${test_name}.ssa.json"
+    local ssa_json_o1_out="$RESULTS_DIR/${test_name}.ssa.o1.json"
+    local addr_json_out="$RESULTS_DIR/${test_name}.3addr.json"
+    local unified_json_out="$RESULTS_DIR/${test_name}.unified.json"
     local err_file="$RESULTS_DIR/${test_name}.ir.err"
     local err_file_persist="$RESULTS_DIR_BASE/${test_name}.ir.err"
     rm -f "$err_file"
@@ -1073,7 +1077,55 @@ run_ir_case() {
                 case_fail=1
                 case_status="FAIL (machine ir still has phi)"
             else
-                case_pass=1
+                local ssa_json_exit=0
+                $COMPILER -dump-ssa-json --source-map-user-only "$test_file" > "$ssa_json_out" 2>>"$err_file"
+                ssa_json_exit="$?"
+                if [ "$ssa_json_exit" -ne 0 ]; then
+                    persist_result_file "$err_file" "$err_file_persist"
+                    case_fail=1
+                    case_status="FAIL (ssa json exit=$ssa_json_exit)"
+                elif ! grep -q '"schemaVersion":1' "$ssa_json_out" || ! grep -q '"sourceRanges":' "$ssa_json_out" || ! grep -q '"astNodeIds":' "$ssa_json_out" || ! grep -q '"generatedReason":' "$ssa_json_out"; then
+                    case_fail=1
+                    case_status="FAIL (ssa json missing source map fields)"
+                else
+                    local ssa_json_o1_exit=0
+                    $COMPILER -O1 -dump-ssa-json --source-map-user-only "$test_file" > "$ssa_json_o1_out" 2>>"$err_file"
+                    ssa_json_o1_exit="$?"
+                    if [ "$ssa_json_o1_exit" -ne 0 ]; then
+                        persist_result_file "$err_file" "$err_file_persist"
+                        case_fail=1
+                        case_status="FAIL (ssa json O1 exit=$ssa_json_o1_exit)"
+                    elif ! grep -q '"schemaVersion":1' "$ssa_json_o1_out" || ! grep -q '"sourceRanges":' "$ssa_json_o1_out"; then
+                        case_fail=1
+                        case_status="FAIL (ssa json O1 missing source ranges)"
+                    else
+                        local addr_json_exit=0
+                        $COMPILER -dump-ir-json --source-map-user-only "$test_file" > "$addr_json_out" 2>>"$err_file"
+                        addr_json_exit="$?"
+                        if [ "$addr_json_exit" -ne 0 ]; then
+                            persist_result_file "$err_file" "$err_file_persist"
+                            case_fail=1
+                            case_status="FAIL (3addr json exit=$addr_json_exit)"
+                        elif ! grep -q '"stage":"ir"' "$addr_json_out" || ! grep -q '"sourceRanges":' "$addr_json_out"; then
+                            case_fail=1
+                            case_status="FAIL (3addr json missing source map fields)"
+                        else
+                            local unified_json_exit=0
+                            $COMPILER --emit-json --views ast,ir,ssa,asm --source-map-user-only --ast-no-std "$test_file" > "$unified_json_out" 2>>"$err_file"
+                            unified_json_exit="$?"
+                            if [ "$unified_json_exit" -ne 0 ]; then
+                                persist_result_file "$err_file" "$err_file_persist"
+                                case_fail=1
+                                case_status="FAIL (unified json exit=$unified_json_exit)"
+                            elif ! grep -q '"views":{"ast":' "$unified_json_out" || ! grep -q '"ssa":' "$unified_json_out" || ! grep -q '"asm":' "$unified_json_out" || ! grep -q '"sourceRangeSemantics"' "$unified_json_out"; then
+                                case_fail=1
+                                case_status="FAIL (unified json missing views/source map schema)"
+                            else
+                                case_pass=1
+                            fi
+                        fi
+                    fi
+                fi
             fi
         fi
     fi
