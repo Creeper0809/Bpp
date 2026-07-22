@@ -188,6 +188,16 @@ function Test-IsCrashExitCode {
     return $false
 }
 
+function Convert-ToPortableTestExitCode {
+    param([int]$ExitCode)
+
+    # Match the Linux runner's conventional 128 + signal result for the
+    # deliberate UD2 trap used by checked casts. Windows reports the same
+    # processor exception as STATUS_ILLEGAL_INSTRUCTION (0xC000001D).
+    if ($ExitCode -eq -1073741795) { return 132 }
+    return $ExitCode
+}
+
 function Get-SanitizedCaseName {
     param([string]$Name)
 
@@ -520,7 +530,8 @@ foreach ($testCase in $testVariants) {
                     } else {
                         $runResult = Invoke-TestProcess -ExePath $exeFile -Timeout $TimeoutMs -StdinText $stdinText
                         $runExit = $runResult.ExitCode
-                        if ($runExit -ne $expectedExit) {
+                        $portableRunExit = Convert-ToPortableTestExitCode -ExitCode $runExit
+                        if ($portableRunExit -ne $expectedExit) {
                             $caseOk = $false
                             $status = "FAIL (exit=$runExit expect=$expectedExit)"
                         } elseif ($expectedStdout -ne "" -and $runResult.Stdout -ne $expectedStdout) {
