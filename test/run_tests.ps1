@@ -304,7 +304,7 @@ foreach ($testCase in $testCases) {
 
     $expectCompileFail = Get-BooleanDirectiveValue -Lines $lines -Pattern '^//\s*Expect compile fail:\s*(.+)$'
     $compileOnly = Get-BooleanDirectiveValue -Lines $lines -Pattern '^//\s*Compile only:\s*(.+)$'
-    $compilerArgs = Split-CompilerArgs -Raw (Read-DirectiveValue -Lines $lines -Pattern '^//\s*Compiler args:\s*(.+)$')
+    $compilerArgs = @(Split-CompilerArgs -Raw (Read-DirectiveValue -Lines $lines -Pattern '^//\s*Compiler args:\s*(.+)$'))
     $stdinText = Decode-EscapedDirectiveText -Raw (Read-DirectiveValue -Lines $lines -Pattern '^//\s*Stdin:\s*(.+)$')
     $expectedStdout = Decode-EscapedDirectiveText -Raw (Read-DirectiveValue -Lines $lines -Pattern '^//\s*Expect stdout:\s*(.+)$')
     $expectErrContainsList = @(Read-DirectiveValues -Lines $lines -Pattern '^//\s*Expect error contains:\s*(.+)$')
