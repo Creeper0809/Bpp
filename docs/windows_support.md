@@ -74,6 +74,13 @@ To run a focused test subset:
   -NameFilter '18_target_windows|01_generics'
 ```
 
+The native runner follows the Linux assembly-test matrix by default
+(`nossa,ssa` and `O0,O1`) and narrows it with each fixture's `// Mode:` and
+`// Opt:` directives. Override the global matrix with `-ModeFilter`,
+`-OptFilter`, or the matching `TEST_MODE_FILTER`/`TEST_OPT_FILTER`
+environment variables. LLVM-only fixtures are reported as skipped because
+hosted `-llvm-build` is not available on Windows.
+
 ## Bootstrap release flow
 
 The first Windows seed is produced on Linux by

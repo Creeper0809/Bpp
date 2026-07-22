@@ -128,3 +128,7 @@ bash test/run_regression.sh
 # Windows
 .\test\run_tests.ps1 -CompilerPath .\bin\stage1.exe
 ```
+
+The Windows runner uses the same native `nossa/ssa` and `O0/O1` test matrix
+and per-fixture `Mode`/`Opt` directives as the Linux runner. Hosted LLVM-only
+fixtures remain skipped on Windows.

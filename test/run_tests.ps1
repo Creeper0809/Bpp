@@ -8,6 +8,8 @@ param(
     [int]$CompilerTimeoutMs = 600000,
     [UInt64]$MemoryLimitBytes = 4294967296,
     [string]$NameFilter = "",
+    [string]$ModeFilter = "",
+    [string]$OptFilter = "",
     [bool]$StrictFailDiagnostics = $true,
     [switch]$Quiet
 )
@@ -51,8 +53,14 @@ function Invoke-Link {
         "kernel32.lib"
     )
 
-    & $Linker @args 2> $ErrorFile
-    return $LASTEXITCODE
+    $result = Invoke-BppLimitedProcess `
+        -FilePath $Linker `
+        -ArgumentList $args `
+        -TimeoutMs $CompilerTimeoutMs `
+        -StderrPath $ErrorFile `
+        -WorkingDirectory $RootDir `
+        -MemoryLimitBytes $MemoryLimitBytes
+    return $result.ExitCode
 }
 
 function Read-DirectiveValue {
@@ -86,7 +94,7 @@ function Read-DirectiveValues {
         }
     }
 
-    return ,$values.ToArray()
+    return $values.ToArray()
 }
 
 function Get-BooleanDirectiveValue {
@@ -105,6 +113,47 @@ function Split-CompilerArgs {
     if (-not $Raw) { return @() }
     $parts = $Raw -split '\s+'
     return @($parts | Where-Object { $_ -ne "" })
+}
+
+function Get-NormalizedModes {
+    param([string]$Raw)
+
+    if (-not $Raw) { return @("nossa", "ssa") }
+    $normalized = $Raw.ToLowerInvariant() -replace '\s+', '' -replace '\|', ','
+    if ($normalized -eq "all" -or $normalized -eq "both") {
+        return @("nossa", "ssa")
+    }
+
+    $selected = @()
+    foreach ($mode in @("nossa", "ssa")) {
+        if (@($normalized -split ',') -contains $mode) {
+            $selected += $mode
+        }
+    }
+    if ($selected.Count -eq 0) { return @("nossa", "ssa") }
+    return $selected
+}
+
+function Get-NormalizedOpts {
+    param([string]$Raw)
+
+    if (-not $Raw) { return @("O0", "O1") }
+    $normalized = $Raw.ToUpperInvariant() -replace '\s+', '' -replace '\|', ','
+    if ($normalized -eq "ALL") {
+        return @("O0", "O1", "O2", "O3", "OS")
+    }
+    if ($normalized -eq "BOTH") {
+        return @("O0", "O1")
+    }
+
+    $selected = @()
+    foreach ($opt in @("O0", "O1", "O2", "O3", "OS")) {
+        if (@($normalized -split ',') -contains $opt) {
+            $selected += $opt
+        }
+    }
+    if ($selected.Count -eq 0) { return @("O0", "O1") }
+    return $selected
 }
 
 function Decode-EscapedDirectiveText {
@@ -187,7 +236,11 @@ function Expand-SuiteCases {
             $safeCaseName = Get-SanitizedCaseName -Name $rawCaseName
             $caseFileName = "{0}__{1:D3}_{2}.bpp" -f $suiteBase, $caseIndex, $safeCaseName
             $casePath = Join-Path $suiteOutDir $caseFileName
-            Set-Content -Path $casePath -Value $caseLines -Encoding UTF8
+            [System.IO.File]::WriteAllLines(
+                $casePath,
+                [string[]]$caseLines.ToArray(),
+                (New-Object System.Text.UTF8Encoding($false))
+            )
             $cases += [PSCustomObject]@{
                 Path = $casePath
                 Name = "$suiteBase::$rawCaseName"
@@ -277,6 +330,49 @@ foreach ($sourceFile in $sourceFiles) {
     }
 }
 
+$EffectiveModeFilter = if ($ModeFilter) { $ModeFilter } elseif ($env:TEST_MODE_FILTER) { $env:TEST_MODE_FILTER } else { "" }
+$EffectiveOptFilter = if ($OptFilter) { $OptFilter } elseif ($env:TEST_OPT_FILTER) { $env:TEST_OPT_FILTER } else { "" }
+$globalModes = @(Get-NormalizedModes -Raw $EffectiveModeFilter)
+$globalOpts = @(Get-NormalizedOpts -Raw $EffectiveOptFilter)
+
+$llvmSkipped = 0
+$testVariants = @()
+foreach ($testCase in $testCases) {
+    $lines = @(Get-Content $testCase.Path)
+    $llvmOnly = Get-BooleanDirectiveValue -Lines $lines -Pattern '^//\s*LLVM Only:\s*(.+)$'
+    if ($llvmOnly) {
+        $llvmSkipped += 1
+        if (-not $Quiet) {
+            Write-Host "[SKIP] $($testCase.Name) - LLVM-only is not supported by the Windows native runner"
+        }
+        continue
+    }
+
+    $testModeRaw = Read-DirectiveValue -Lines $lines -Pattern '^//\s*Mode:\s*(.+)$'
+    $testOptRaw = Read-DirectiveValue -Lines $lines -Pattern '^//\s*Opt:\s*(.+)$'
+    $testModes = @(Get-NormalizedModes -Raw $testModeRaw)
+    $testOpts = @(Get-NormalizedOpts -Raw $testOptRaw)
+    $selectedModes = @($testModes | Where-Object { $globalModes -contains $_ })
+    $selectedOpts = @($testOpts | Where-Object { $globalOpts -contains $_ })
+
+    # Match the Linux runner: a per-test directive still runs when a global
+    # quick filter would otherwise eliminate every requested variant.
+    if ($selectedModes.Count -eq 0) { $selectedModes = $testModes }
+    if ($selectedOpts.Count -eq 0) { $selectedOpts = $testOpts }
+
+    foreach ($mode in $selectedModes) {
+        foreach ($opt in $selectedOpts) {
+            $testVariants += [PSCustomObject]@{
+                Path = $testCase.Path
+                Name = $testCase.Name
+                Mode = $mode
+                Opt = $opt
+                Lines = $lines
+            }
+        }
+    }
+}
+
 $total = 0
 $passed = 0
 $failed = 0
@@ -289,14 +385,17 @@ Write-Host "[INFO] NASM    : $NasmPath"
 Write-Host "[INFO] Linker  : $LinkerPath"
 Write-Host "[INFO] Strict fail diagnostics: $StrictFailDiagnostics"
 Write-Host "[INFO] Memory limit: $MemoryLimitBytes bytes"
+Write-Host "[INFO] Mode filter: $($globalModes -join ',')"
+Write-Host "[INFO] Opt filter : $($globalOpts -join ',')"
 if ($EffectiveNameFilter) { Write-Host "[INFO] Name filter: $EffectiveNameFilter" }
 Write-Host ""
 
-foreach ($testCase in $testCases) {
+foreach ($testCase in $testVariants) {
     $total += 1
-    $name = [System.IO.Path]::GetFileNameWithoutExtension($testCase.Path)
-    $displayName = $testCase.Name
-    $lines = Get-Content $testCase.Path
+    $baseName = [System.IO.Path]::GetFileNameWithoutExtension($testCase.Path)
+    $name = "${baseName}.$($testCase.Mode).$($testCase.Opt)"
+    $displayName = "$($testCase.Name) ($($testCase.Mode) $($testCase.Opt))"
+    $lines = $testCase.Lines
 
     $expectedExitRaw = Read-DirectiveValue -Lines $lines -Pattern '^//\s*Expect exit code:\s*(.+)$'
     $expectedExit = 0
@@ -324,6 +423,15 @@ foreach ($testCase in $testCases) {
     if (Test-Path $errFile) { Remove-Item $errFile -Force }
 
     $compilerInvocationArgs = @("--target", "windows-x86_64")
+    switch ($testCase.Opt) {
+        "O1" { $compilerInvocationArgs += "-O1" }
+        "O2" { $compilerInvocationArgs += "-O2" }
+        "O3" { $compilerInvocationArgs += "-O3" }
+        "OS" { $compilerInvocationArgs += "-Os" }
+    }
+    if ($testCase.Mode -eq "ssa") {
+        $compilerInvocationArgs += "-dump-ssa"
+    }
     if ($compilerArgs.Count -gt 0) {
         $compilerInvocationArgs += $compilerArgs
     }
@@ -389,11 +497,19 @@ foreach ($testCase in $testCases) {
                 }
             }
 
-            if ($caseOk -and $compileOnly) {
-                $status = "PASS (compile only)"
-            } else {
-                & $NasmPath -f win64 -O1 $asmFile -o $objFile 2> $errFile
-                if ($LASTEXITCODE -ne 0) {
+            if ($compileOnly) {
+                if ($caseOk) {
+                    $status = "PASS (compile only)"
+                }
+            } elseif ($caseOk) {
+                $nasmResult = Invoke-BppLimitedProcess `
+                    -FilePath $NasmPath `
+                    -ArgumentList @("-f", "win64", "-O1", $asmFile, "-o", $objFile) `
+                    -TimeoutMs $CompilerTimeoutMs `
+                    -StderrPath $errFile `
+                    -WorkingDirectory $RootDir `
+                    -MemoryLimitBytes $MemoryLimitBytes
+                if ($nasmResult.ExitCode -ne 0) {
                     $caseOk = $false
                     $status = "FAIL (assemble)"
                 } else {
@@ -435,6 +551,7 @@ Write-Host "========================================"
 Write-Host "Total:  $total"
 Write-Host "Passed: $passed"
 Write-Host "Failed: $failed"
+Write-Host "LLVM skipped: $llvmSkipped"
 
 if ($failed -ne 0) {
     exit 1
