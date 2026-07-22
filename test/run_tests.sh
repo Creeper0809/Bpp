@@ -250,6 +250,15 @@ persist_result_file() {
     fi
 }
 
+print_failure_diagnostics() {
+    local diagnostic_file="$1"
+    if [ -z "$diagnostic_file" ] || [ ! -s "$diagnostic_file" ]; then
+        return
+    fi
+    echo "  diagnostics: $diagnostic_file"
+    tail -n 40 "$diagnostic_file" | sed 's/^/    /'
+}
+
 cleanup_llvm_build_artifacts() {
     local out_file="$1"
     local artifact_dir="$2"
@@ -928,6 +937,7 @@ run_matrix_case() {
         echo "CASE_STRESS_FAIL=$case_stress_fail"
         echo "CASE_STABILITY_PASS=$case_stability_pass"
         echo "CASE_STABILITY_FAIL=$case_stability_fail"
+        printf 'CASE_ERROR_FILE=%q\n' "$err_file_persist"
     } > "$result_file"
     return 0
 }
@@ -1531,6 +1541,7 @@ for RESULT_FILE in "${CASE_RESULT_FILES[@]}"; do
     CASE_STRESS_FAIL=0
     CASE_STABILITY_PASS=0
     CASE_STABILITY_FAIL=0
+    CASE_ERROR_FILE=""
     source "$RESULT_FILE"
 
     PASSED=$((PASSED + CASE_PASS))
@@ -1546,6 +1557,7 @@ for RESULT_FILE in "${CASE_RESULT_FILES[@]}"; do
         fi
     else
         echo -e "${RED}${CASE_TAG} ${CASE_STATUS}${NC}"
+        print_failure_diagnostics "$CASE_ERROR_FILE"
     fi
 done
 
