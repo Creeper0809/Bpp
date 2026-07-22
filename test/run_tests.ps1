@@ -5,6 +5,9 @@ param(
     [string]$NasmPath = "nasm.exe",
     [string]$LinkerPath = "link.exe",
     [int]$TimeoutMs = 5000,
+    [int]$CompilerTimeoutMs = 600000,
+    [UInt64]$MemoryLimitBytes = 4294967296,
+    [string]$NameFilter = "",
     [bool]$StrictFailDiagnostics = $true,
     [switch]$Quiet
 )
@@ -14,6 +17,11 @@ $ErrorActionPreference = "Stop"
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RootDir = Resolve-Path (Join-Path $ScriptDir "..")
+$ProcessHelper = Join-Path $RootDir "tools\windows_process.ps1"
+if (-not (Test-Path -LiteralPath $ProcessHelper)) {
+    throw "Windows process helper not found: $ProcessHelper"
+}
+. $ProcessHelper
 
 function Get-VersionFromCompilerPath {
     param([string]$Path)
@@ -35,6 +43,7 @@ function Invoke-Link {
 
     $args = @(
         "/nologo",
+        "/Brepro",
         "/subsystem:console",
         "/entry:mainCRTStartup",
         "/out:$OutputExe",
@@ -112,45 +121,12 @@ function Invoke-TestProcess {
         [string]$StdinText = ""
     )
 
-    $stdoutFile = [System.IO.Path]::GetTempFileName()
-    $stderrFile = [System.IO.Path]::GetTempFileName()
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = $ExePath
-    $psi.UseShellExecute = $false
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
-    $psi.RedirectStandardInput = $true
-    $psi.CreateNoWindow = $true
-
-    $proc = New-Object System.Diagnostics.Process
-    $proc.StartInfo = $psi
-    [void]$proc.Start()
-
-    if ($StdinText -ne "") {
-        $proc.StandardInput.Write($StdinText)
-    }
-    $proc.StandardInput.Close()
-
-    $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
-    $stderrTask = $proc.StandardError.ReadToEndAsync()
-    $exited = $proc.WaitForExit($Timeout)
-    if (-not $exited) {
-        try { $proc.Kill() } catch { }
-        return [PSCustomObject]@{
-            ExitCode = 124
-            Stdout = ""
-            Stderr = ""
-            TimedOut = $true
-        }
-    }
-
-    $proc.WaitForExit()
-    return [PSCustomObject]@{
-        ExitCode = $proc.ExitCode
-        Stdout = $stdoutTask.Result
-        Stderr = $stderrTask.Result
-        TimedOut = $false
-    }
+    return Invoke-BppLimitedProcess `
+        -FilePath $ExePath `
+        -TimeoutMs $Timeout `
+        -StdinText $StdinText `
+        -WorkingDirectory $RootDir `
+        -MemoryLimitBytes $MemoryLimitBytes
 }
 
 function Test-IsCrashExitCode {
@@ -266,13 +242,22 @@ $ResultDir = Join-Path $RootDir "build\test_results_win"
 New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
 New-Item -ItemType Directory -Force -Path $ResultDir | Out-Null
 
-$TestDir = Join-Path $RootDir "test\source"
-$sourceFiles = Get-ChildItem -Path $TestDir -Filter "*.bpp" |
-    Where-Object { $_.BaseName -match '^[0-9]+_' } |
-    Sort-Object Name
+$TestDirs = @(
+    (Join-Path $RootDir "test\source"),
+    (Join-Path $RootDir "test\source_fail")
+)
+$sourceFiles = @($TestDirs | ForEach-Object {
+    Get-ChildItem -Path $_ -Filter "*.bpp" |
+        Where-Object { $_.BaseName -match '^[0-9]+_' }
+}) | Sort-Object FullName
+
+$EffectiveNameFilter = if ($NameFilter) { $NameFilter } elseif ($env:TEST_NAME_FILTER) { $env:TEST_NAME_FILTER } else { "" }
+if ($EffectiveNameFilter) {
+    $sourceFiles = @($sourceFiles | Where-Object { $_.BaseName -match $EffectiveNameFilter })
+}
 
 if (-not $sourceFiles) {
-    throw "No test files found: $TestDir"
+    throw "No Windows test files matched. Directories: $($TestDirs -join ', '); filter: $EffectiveNameFilter"
 }
 
 $suiteOutputRoot = Join-Path $BuildDir "suite_cases"
@@ -303,6 +288,8 @@ Write-Host "[INFO] Compiler: $CompilerPath"
 Write-Host "[INFO] NASM    : $NasmPath"
 Write-Host "[INFO] Linker  : $LinkerPath"
 Write-Host "[INFO] Strict fail diagnostics: $StrictFailDiagnostics"
+Write-Host "[INFO] Memory limit: $MemoryLimitBytes bytes"
+if ($EffectiveNameFilter) { Write-Host "[INFO] Name filter: $EffectiveNameFilter" }
 Write-Host ""
 
 foreach ($testCase in $testCases) {
@@ -341,14 +328,24 @@ foreach ($testCase in $testCases) {
         $compilerInvocationArgs += $compilerArgs
     }
     $compilerInvocationArgs += @("-asm", $testCase.Path)
-    & $CompilerPath @compilerInvocationArgs > $asmFile 2> $errFile
-    $compileCode = $LASTEXITCODE
+    $compileResult = Invoke-BppLimitedProcess `
+        -FilePath $CompilerPath `
+        -ArgumentList $compilerInvocationArgs `
+        -TimeoutMs $CompilerTimeoutMs `
+        -StdoutPath $asmFile `
+        -StderrPath $errFile `
+        -WorkingDirectory $RootDir `
+        -MemoryLimitBytes $MemoryLimitBytes
+    $compileCode = $compileResult.ExitCode
 
     $caseOk = $true
     $status = "PASS"
 
     if ($compileCode -ne 0) {
-        if (Test-IsCrashExitCode -ExitCode $compileCode) {
+        if ($compileResult.TimedOut) {
+            $caseOk = $false
+            $status = "FAIL (compiler timeout)"
+        } elseif (Test-IsCrashExitCode -ExitCode $compileCode) {
             $caseOk = $false
             $status = "FAIL (compiler crash exit=$compileCode)"
         } elseif ($expectCompileFail) {

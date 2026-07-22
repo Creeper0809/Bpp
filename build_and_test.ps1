@@ -6,6 +6,8 @@ param(
     [string]$BootstrapRepository = "Creeper0809/Bpp",
     [string]$BootstrapBaseUrl = "https://github.com",
     [string]$BootstrapReleaseTag = "",
+    [int]$CompilerTimeoutMs = 600000,
+    [UInt64]$MemoryLimitBytes = 4294967296,
     [switch]$ToolchainOnly,
     [switch]$SkipTests
 )
@@ -16,6 +18,12 @@ $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RootDir = Resolve-Path $ScriptDir
 $ConfigPath = Join-Path $ScriptDir "config.ini"
+$CompilerPathWasExplicit = [bool]$CompilerPath
+$ProcessHelper = Join-Path $ScriptDir "tools\windows_process.ps1"
+if (-not (Test-Path -LiteralPath $ProcessHelper)) {
+    throw "Windows process helper not found: $ProcessHelper"
+}
+. $ProcessHelper
 
 function Get-IniValue {
     param(
@@ -44,34 +52,47 @@ function Get-VersionFromCompilerPath {
     return ""
 }
 
+function Test-IsWindowsExecutable {
+    param([string]$Path)
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    $stream = [System.IO.File]::OpenRead((Resolve-Path -LiteralPath $Path).Path)
+    try {
+        if ($stream.Length -lt 2) { return $false }
+        return ($stream.ReadByte() -eq 0x4D -and $stream.ReadByte() -eq 0x5A)
+    } finally {
+        $stream.Dispose()
+    }
+}
+
 function Find-DefaultCompiler {
     param(
         [string]$Root,
         [string]$VersionHint
     )
 
-    if ($env:BPP_COMPILER -and (Test-Path $env:BPP_COMPILER)) {
+    if ($env:BPP_COMPILER -and (Test-IsWindowsExecutable $env:BPP_COMPILER)) {
         return (Resolve-Path $env:BPP_COMPILER).Path
+    }
+    if ($env:BPP_BASE_COMPILER -and (Test-IsWindowsExecutable $env:BPP_BASE_COMPILER)) {
+        return (Resolve-Path $env:BPP_BASE_COMPILER).Path
     }
 
     $candidates = New-Object System.Collections.Generic.List[string]
     if ($VersionHint) {
         $candidates.Add((Join-Path $Root "bin\${VersionHint}_stage1.exe"))
-        $candidates.Add((Join-Path $Root "bin\${VersionHint}_stage1"))
         $candidates.Add((Join-Path $Root "bin\${VersionHint}_base.exe"))
     }
     $candidates.Add((Join-Path $Root "bin\bootstrap.exe"))
-    $candidates.Add((Join-Path $Root "bin\bootstrap"))
     $candidates.Add((Join-Path $Root "bin\stage1.exe"))
-    $candidates.Add((Join-Path $Root "bin\stage1"))
 
     foreach ($candidate in $candidates) {
-        if (Test-Path $candidate) {
+        if (Test-IsWindowsExecutable $candidate) {
             return (Resolve-Path $candidate).Path
         }
     }
 
-    $glob = Get-ChildItem -Path (Join-Path $Root "bin") -Filter "*_stage1*" -File -ErrorAction SilentlyContinue |
+    $glob = Get-ChildItem -Path (Join-Path $Root "bin") -Filter "*_stage1.exe" -File -ErrorAction SilentlyContinue |
+        Where-Object { Test-IsWindowsExecutable $_.FullName } |
         Sort-Object Name
     if ($glob) {
         return $glob[-1].FullName
@@ -114,8 +135,11 @@ function Download-BootstrapCompiler {
 
     New-Item -ItemType Directory -Force -Path $toolsDir | Out-Null
 
-    if (Test-Path $downloadPath) {
+    if (Test-IsWindowsExecutable $downloadPath) {
         return (Resolve-Path $downloadPath).Path
+    }
+    if (Test-Path -LiteralPath $downloadPath) {
+        Remove-Item -LiteralPath $downloadPath -Force
     }
 
     Write-Host "[INFO] Downloading Windows bootstrap compiler: $downloadUrl"
@@ -128,8 +152,11 @@ function Download-BootstrapCompiler {
         return ""
     }
 
-    if (Test-Path $downloadPath) {
+    if (Test-IsWindowsExecutable $downloadPath) {
         return (Resolve-Path $downloadPath).Path
+    }
+    if (Test-Path -LiteralPath $downloadPath) {
+        Remove-Item -LiteralPath $downloadPath -Force
     }
 
     return ""
@@ -165,6 +192,7 @@ function Invoke-Link {
 
     $args = @(
         "/nologo",
+        "/Brepro",
         "/subsystem:console",
         "/entry:mainCRTStartup",
         "/out:$OutputExe",
@@ -181,14 +209,23 @@ function Invoke-CompileToAsm {
         [string]$Compiler,
         [string]$SourceFile,
         [string]$AsmFile,
-        [string]$ErrorFile
+        [string]$ErrorFile,
+        [int]$TimeoutMs,
+        [UInt64]$ProcessMemoryLimitBytes
     )
 
     if (Test-Path $AsmFile) { Remove-Item $AsmFile -Force }
     if (Test-Path $ErrorFile) { Remove-Item $ErrorFile -Force }
 
-    & $Compiler --target windows-x86_64 -asm $SourceFile > $AsmFile 2> $ErrorFile
-    return $LASTEXITCODE
+    $result = Invoke-BppLimitedProcess `
+        -FilePath $Compiler `
+        -ArgumentList @("--target", "windows-x86_64", "-asm", $SourceFile) `
+        -TimeoutMs $TimeoutMs `
+        -StdoutPath $AsmFile `
+        -StderrPath $ErrorFile `
+        -WorkingDirectory $RootDir `
+        -MemoryLimitBytes $ProcessMemoryLimitBytes
+    return $result.ExitCode
 }
 
 function Invoke-StageBuild {
@@ -199,7 +236,9 @@ function Invoke-StageBuild {
         [string]$BuildDir,
         [string]$BinDir,
         [string]$Nasm,
-        [string]$Linker
+        [string]$Linker,
+        [int]$TimeoutMs,
+        [UInt64]$ProcessMemoryLimitBytes
     )
 
     $asmFile = Join-Path $BuildDir "${StageName}.asm"
@@ -208,7 +247,13 @@ function Invoke-StageBuild {
     $errFile = Join-Path $BuildDir "${StageName}.err"
 
     Write-Host "[INFO] Building ${StageName}.exe with $Compiler"
-    $compileCode = Invoke-CompileToAsm -Compiler $Compiler -SourceFile $SourceFile -AsmFile $asmFile -ErrorFile $errFile
+    $compileCode = Invoke-CompileToAsm `
+        -Compiler $Compiler `
+        -SourceFile $SourceFile `
+        -AsmFile $asmFile `
+        -ErrorFile $errFile `
+        -TimeoutMs $TimeoutMs `
+        -ProcessMemoryLimitBytes $ProcessMemoryLimitBytes
     if ($compileCode -ne 0) {
         $errText = if (Test-Path $errFile) { Get-Content $errFile -Raw } else { "" }
         throw "Compiler failed while building ${StageName}.asm (exit=$compileCode)`n$errText"
@@ -276,7 +321,11 @@ if ($ToolchainOnly) {
     exit 0
 }
 
-if (-not (Test-Path $CompilerPath)) {
+if ($CompilerPathWasExplicit -and -not (Test-IsWindowsExecutable $CompilerPath)) {
+    throw "CompilerPath must point to a PE/COFF Windows executable: $CompilerPath"
+}
+
+if (-not (Test-IsWindowsExecutable $CompilerPath)) {
     $fallbackFound = Find-DefaultCompiler -Root $RootDir -VersionHint $VersionHint
     if ($fallbackFound) {
         $CompilerPath = $fallbackFound
@@ -292,7 +341,7 @@ if (-not (Test-Path $CompilerPath)) {
         } else {
             throw @"
 Windows hosted compiler binary was not found.
-Tried: BPP_COMPILER, bin/\${BPP_VERSION}_stage1(.exe), bin/bootstrap(.exe), bin/stage1(.exe), bin/*_stage1*
+Tried: BPP_COMPILER, BPP_BASE_COMPILER, bin/<version>_stage1.exe, bin/bootstrap.exe, bin/stage1.exe, bin/*_stage1.exe
 
 Attempted bootstrap asset download:
   Repository : $BootstrapRepository
@@ -300,7 +349,7 @@ Attempted bootstrap asset download:
   Asset      : $(Get-WindowsBootstrapAssetName -Version $Version)
 
 Current repository contains Linux stage binaries only.
-Provide or publish a Windows stage compiler binary first, then rerun this script.
+Provide a Windows bootstrap compiler, or publish the cross-bootstrap artifact first, then rerun this script.
 "@
         }
     }
@@ -320,6 +369,7 @@ New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
 
 $Stage0Name = "${Version}_stage0"
 $Stage1Name = "${Version}_stage1"
+$Stage2Name = "${Version}_stage2"
 
 Write-Host "[INFO] Building Windows hosted compiler stages"
 $Stage0Compiler = Invoke-StageBuild `
@@ -329,7 +379,9 @@ $Stage0Compiler = Invoke-StageBuild `
     -BuildDir $BuildDir `
     -BinDir $BinDir `
     -Nasm $ResolvedNasm `
-    -Linker $ResolvedLinker
+    -Linker $ResolvedLinker `
+    -TimeoutMs $CompilerTimeoutMs `
+    -ProcessMemoryLimitBytes $MemoryLimitBytes
 
 $Stage1Compiler = Invoke-StageBuild `
     -Compiler $Stage0Compiler `
@@ -338,10 +390,31 @@ $Stage1Compiler = Invoke-StageBuild `
     -BuildDir $BuildDir `
     -BinDir $BinDir `
     -Nasm $ResolvedNasm `
-    -Linker $ResolvedLinker
+    -Linker $ResolvedLinker `
+    -TimeoutMs $CompilerTimeoutMs `
+    -ProcessMemoryLimitBytes $MemoryLimitBytes
+
+$Stage2Compiler = Invoke-StageBuild `
+    -Compiler $Stage1Compiler `
+    -SourceFile $SourceFile `
+    -StageName $Stage2Name `
+    -BuildDir $BuildDir `
+    -BinDir $BinDir `
+    -Nasm $ResolvedNasm `
+    -Linker $ResolvedLinker `
+    -TimeoutMs $CompilerTimeoutMs `
+    -ProcessMemoryLimitBytes $MemoryLimitBytes
+
+$Stage1Hash = (Get-FileHash -LiteralPath $Stage1Compiler -Algorithm SHA256).Hash
+$Stage2Hash = (Get-FileHash -LiteralPath $Stage2Compiler -Algorithm SHA256).Hash
+if ($Stage1Hash -ne $Stage2Hash) {
+    throw "Self-hosting failed: Stage 1 and Stage 2 differ.`nStage 1: $Stage1Hash`nStage 2: $Stage2Hash"
+}
 
 Copy-Item -Force $Stage1Compiler (Join-Path $BinDir "stage1.exe")
 Write-Host "[INFO] Stage1: $Stage1Compiler"
+Write-Host "[INFO] Stage2: $Stage2Compiler"
+Write-Host "Self-Hosting Success! (Stage 1 == Stage 2)"
 
 if ($SkipTests) {
     Write-Host "[INFO] SkipTests requested."
@@ -353,5 +426,10 @@ if (-not (Test-Path $TestRunner)) {
     throw "Windows test runner not found: $TestRunner"
 }
 
-& $TestRunner -CompilerPath $Stage1Compiler -NasmPath $ResolvedNasm -LinkerPath $ResolvedLinker
+& $TestRunner `
+    -CompilerPath $Stage1Compiler `
+    -NasmPath $ResolvedNasm `
+    -LinkerPath $ResolvedLinker `
+    -CompilerTimeoutMs $CompilerTimeoutMs `
+    -MemoryLimitBytes $MemoryLimitBytes
 exit $LASTEXITCODE

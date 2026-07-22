@@ -87,43 +87,108 @@ function(bpp_resolve_nasm OUT_VAR)
     set(${OUT_VAR} "${_nasm_exe}" PARENT_SCOPE)
 endfunction()
 
+function(bpp_is_host_bootstrap_compiler CANDIDATE OUT_VAR)
+    if(NOT EXISTS "${CANDIDATE}" OR IS_DIRECTORY "${CANDIDATE}")
+        set(${OUT_VAR} FALSE PARENT_SCOPE)
+        return()
+    endif()
+
+    file(READ "${CANDIDATE}" _bpp_magic LIMIT 4 HEX)
+    string(TOUPPER "${_bpp_magic}" _bpp_magic)
+    if(WIN32)
+        string(LENGTH "${_bpp_magic}" _bpp_magic_len)
+        if(_bpp_magic_len LESS 4)
+            set(${OUT_VAR} FALSE PARENT_SCOPE)
+            return()
+        endif()
+        string(SUBSTRING "${_bpp_magic}" 0 4 _bpp_prefix)
+        if(_bpp_prefix STREQUAL "4D5A")
+            set(_bpp_matches TRUE)
+        else()
+            set(_bpp_matches FALSE)
+        endif()
+    elseif(UNIX)
+        if(_bpp_magic STREQUAL "7F454C46")
+            set(_bpp_matches TRUE)
+        else()
+            set(_bpp_matches FALSE)
+        endif()
+    else()
+        set(_bpp_matches TRUE)
+    endif()
+    set(${OUT_VAR} ${_bpp_matches} PARENT_SCOPE)
+endfunction()
+
 function(bpp_resolve_local_bootstrap_compiler ROOT_DIR VERSION_HINT OUT_VAR)
     set(_candidates)
-    if(VERSION_HINT)
+    if(WIN32 AND VERSION_HINT)
+        list(APPEND _candidates
+            "${ROOT_DIR}/bin/${VERSION_HINT}_stage1.exe"
+            "${ROOT_DIR}/bin/${VERSION_HINT}_base.exe"
+        )
+        list(APPEND _candidates
+            "${ROOT_DIR}/bin/stage1.exe"
+            "${ROOT_DIR}/bin/bootstrap.exe"
+        )
+    elseif(VERSION_HINT)
         list(APPEND _candidates
             "${ROOT_DIR}/bin/${VERSION_HINT}_stage1"
-            "${ROOT_DIR}/bin/${VERSION_HINT}_stage1.exe"
             "${ROOT_DIR}/bin/${VERSION_HINT}_base"
-            "${ROOT_DIR}/bin/${VERSION_HINT}_base.exe"
+        )
+        list(APPEND _candidates
+            "${ROOT_DIR}/bin/stage1"
+            "${ROOT_DIR}/bin/bootstrap"
+        )
+    elseif(WIN32)
+        list(APPEND _candidates
+            "${ROOT_DIR}/bin/stage1.exe"
+            "${ROOT_DIR}/bin/bootstrap.exe"
+        )
+    else()
+        list(APPEND _candidates
+            "${ROOT_DIR}/bin/stage1"
+            "${ROOT_DIR}/bin/bootstrap"
         )
     endif()
 
-    list(APPEND _candidates
-        "${ROOT_DIR}/bin/stage1"
-        "${ROOT_DIR}/bin/stage1.exe"
-        "${ROOT_DIR}/bin/bootstrap"
-        "${ROOT_DIR}/bin/bootstrap.exe"
-    )
-
     foreach(_candidate IN LISTS _candidates)
-        if(EXISTS "${_candidate}")
+        bpp_is_host_bootstrap_compiler("${_candidate}" _candidate_is_native)
+        if(_candidate_is_native)
             set(${OUT_VAR} "${_candidate}" PARENT_SCOPE)
             return()
         endif()
     endforeach()
 
-    file(GLOB _stage1_candidates
-        "${ROOT_DIR}/bin/*_stage1"
-        "${ROOT_DIR}/bin/*_stage1.exe"
-    )
-    if(_stage1_candidates)
-        list(SORT _stage1_candidates)
-        list(GET _stage1_candidates -1 _latest_stage1)
-        set(${OUT_VAR} "${_latest_stage1}" PARENT_SCOPE)
-        return()
+    if(WIN32)
+        file(GLOB _stage1_candidates "${ROOT_DIR}/bin/*_stage1.exe")
+    else()
+        file(GLOB _stage1_candidates "${ROOT_DIR}/bin/*_stage1")
     endif()
+    list(SORT _stage1_candidates)
+    list(REVERSE _stage1_candidates)
+    foreach(_latest_stage1 IN LISTS _stage1_candidates)
+        bpp_is_host_bootstrap_compiler("${_latest_stage1}" _candidate_is_native)
+        if(_candidate_is_native)
+            set(${OUT_VAR} "${_latest_stage1}" PARENT_SCOPE)
+            return()
+        endif()
+    endforeach()
 
     set(${OUT_VAR} "" PARENT_SCOPE)
+endfunction()
+
+function(bpp_validate_explicit_bootstrap_compiler CANDIDATE)
+    bpp_is_host_bootstrap_compiler("${CANDIDATE}" _candidate_is_native)
+    if(NOT _candidate_is_native)
+        if(WIN32)
+            set(_expected_format "PE/COFF Windows executable")
+        else()
+            set(_expected_format "ELF executable")
+        endif()
+        message(FATAL_ERROR
+            "BPP_BASE_COMPILER is not a host-native ${_expected_format}: ${CANDIDATE}"
+        )
+    endif()
 endfunction()
 
 function(bpp_download_bootstrap_compiler OUT_VAR)
@@ -213,6 +278,13 @@ function(bpp_download_bootstrap_compiler OUT_VAR)
             )
         endif()
 
+        bpp_is_host_bootstrap_compiler("${_downloaded_path}" _download_is_native)
+        if(NOT _download_is_native)
+            file(REMOVE "${_downloaded_path}")
+            message(STATUS "Ignoring bootstrap asset with the wrong host format: ${_bootstrap_url}")
+            continue()
+        endif()
+
         if(NOT _candidate_index EQUAL 0)
             message(STATUS "Using previous BPP bootstrap compiler: ${_candidate_release}/${_candidate_asset}")
         endif()
@@ -231,6 +303,7 @@ endfunction()
 function(bpp_resolve_bootstrap_compiler ROOT_DIR VERSION_HINT OUT_VAR)
     if(DEFINED ENV{BPP_BASE_COMPILER} AND NOT "$ENV{BPP_BASE_COMPILER}" STREQUAL "")
         if(EXISTS "$ENV{BPP_BASE_COMPILER}")
+            bpp_validate_explicit_bootstrap_compiler("$ENV{BPP_BASE_COMPILER}")
             set(${OUT_VAR} "$ENV{BPP_BASE_COMPILER}" PARENT_SCOPE)
             return()
         endif()

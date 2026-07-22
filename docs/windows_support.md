@@ -1,71 +1,100 @@
 # Windows Support Guide
 
-## Current Scope (v11)
+## Supported scope
 
-Windows support is split into two layers:
+Bpp supports a hosted x86-64 Windows pipeline:
 
-1. Toolchain layer (available now)
-- NASM availability (auto-bootstrap through CMake)
-- Linker detection (`link.exe` or `lld-link`)
-- Executable smoke test in CI on `windows-latest`
+- Win64 code generation and the Microsoft x64 ABI
+- Windows runtime primitives backed by `kernel32.dll`
+- NASM `win64` assembly and `link.exe` or `lld-link`
+- Native Stage 0/1/2 self-hosting with a Stage 1 == Stage 2 check
+- Runtime and compile-fail tests through PowerShell
 
-2. Full hosted compiler/runtime layer (in progress)
-- A Windows-hosted stage compiler binary (`bin/v11_stage1.exe`)
-- Target-aware std runtime selection for `std.os`
-- Windows entry/link/test-runner plumbing (`mainCRTStartup`, `link.exe`/`lld-link`)
-- File/process/heap primitives needed by the hosted compiler are being rebuilt
+`-llvm-build` is not yet available from a Windows-hosted compiler. The native
+assembly backend is the supported Windows backend.
 
-## Quick Start
+## Requirements
+
+- 64-bit Windows 10 or newer
+- CMake 3.22 or newer
+- Visual Studio Build Tools with the x64 C++ toolchain, or LLVM `lld-link`
+- PowerShell 5.1 or newer
+
+NASM can be downloaded automatically by CMake, so it does not need to be
+installed globally.
+
+## Configure the toolchain
+
+Run these commands from an x64 Native Tools command prompt:
 
 ```powershell
 cmake -S . -B build-win -DBPP_BOOTSTRAP_NASM=ON
-cmake --build build-win --target toolchain-check windows-smoke
+cmake --build build-win --target toolchain-check windows-smoke --config Release
+cmake --build build-win --target bpp-selfhost --config Release
 ```
 
-CMake writes resolved tool paths to:
-- `build-win/bpp_toolchain.env`
+CMake writes the resolved paths to `build-win/bpp_toolchain.env`. On Windows,
+bootstrap discovery accepts PE executables only; checked-in Linux ELF stage
+binaries are ignored.
 
-## Required Tools
+Use `bpp-selfhost-fast` to perform Stage 0/1/2 equality without the test suite.
 
-### NASM
-- Auto-download is supported on Windows via:
-  - `-DBPP_BOOTSTRAP_NASM=ON`
-- Manual install reference:
-  - https://www.nasm.us/pub/nasm/releasebuilds/
+## Build and test the compiler
 
-### Linker
-One of these must exist:
-- `link.exe` (recommended)
-- `lld-link`
-
-Install sources:
-- Visual Studio Build Tools (`link.exe`):
-  - https://aka.ms/vs/17/release/vs_BuildTools.exe
-- LLVM (`lld-link`):
-  - https://releases.llvm.org/
-
-## Windows Hosted Test Runner
-
-When a Windows compiler binary is available:
+If a matching bootstrap release exists, CMake and `build_and_test.ps1` can use
+it automatically. You can also pass a PE seed explicitly:
 
 ```powershell
-.\build_and_test.ps1
+./build_and_test.ps1 `
+  -CompilerPath C:\path\to\bpp-bootstrap-v13-windows-x86_64.exe `
+  -NasmPath C:\path\to\nasm.exe `
+  -LinkerPath C:\path\to\link.exe
 ```
 
-or directly:
+The script builds Stage 0, Stage 1, and Stage 2, links reproducible PE files,
+requires Stage 1 and Stage 2 hashes to match, and then runs the Windows test
+suite. Compiler processes and generated test programs run in Windows Job
+Objects with a 4 GiB per-process memory limit.
+
+If local execution policy blocks project scripts, use a process-scoped bypass:
 
 ```powershell
-.\test\run_tests.ps1 -CompilerPath .\bin\v11_stage1.exe
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build_and_test.ps1
 ```
 
-`build_and_test.ps1` now uses the seed compiler to build `bin\<version>_stage0.exe`
-and `bin\<version>_stage1.exe` before running the Windows test suite.
+This does not change the machine-wide execution policy.
 
-The PowerShell runner invokes the compiler with `--target windows-x86_64` so the
-Windows entry/runtime path is used consistently.
+To run a focused test subset:
 
-If `bin/v11_stage1.exe` is missing, the script exits with an explicit bootstrap requirement message.
+```powershell
+./test/run_tests.ps1 `
+  -CompilerPath .\bin\v13_stage1.exe `
+  -NasmPath C:\path\to\nasm.exe `
+  -LinkerPath C:\path\to\link.exe `
+  -NameFilter '18_target_windows|01_generics'
+```
 
-The PowerShell runner also supports downloading a release bootstrap asset named
-`bpp-bootstrap-<version>-windows-x86_64.exe` from the `bootstrap-<version>` release tag.
-This asset currently acts as a seed binary until full Windows self-host builds are implemented.
+## Bootstrap release flow
+
+The first Windows seed is produced on Linux by
+`tools/build_windows_bootstrap.sh`. It runs the verified Linux compiler under
+the 4 GiB limit, emits Win64 assembly, and links a PE seed with MinGW
+cross-binutils. GitHub Actions transfers that seed to a Windows runner, where
+the normal Stage 0/1/2 self-host and test pipeline validates it before release.
+
+Windows users do not need WSL or MinGW; those tools are only used by the release
+workflow to break the initial bootstrap cycle.
+
+## Tool installation
+
+Visual Studio Build Tools:
+
+https://aka.ms/vs/17/release/vs_BuildTools.exe
+
+LLVM releases (`lld-link`):
+
+https://releases.llvm.org/
+
+NASM releases:
+
+https://www.nasm.us/pub/nasm/releasebuilds/

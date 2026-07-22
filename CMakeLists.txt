@@ -147,6 +147,14 @@ if(UNIX AND NOT WIN32)
 endif()
 
 if(WIN32)
+    find_program(BPP_POWERSHELL_EXECUTABLE NAMES pwsh powershell REQUIRED)
+    set(_bpp_windows_compiler_args)
+    if(BPP_BASE_COMPILER_EXECUTABLE)
+        list(APPEND _bpp_windows_compiler_args
+            -CompilerPath "${BPP_BASE_COMPILER_EXECUTABLE}"
+        )
+    endif()
+
     add_custom_target(windows-smoke
         COMMAND "${CMAKE_COMMAND}"
             "-DBPP_NASM_EXECUTABLE:FILEPATH=${BPP_NASM_EXECUTABLE}"
@@ -154,5 +162,34 @@ if(WIN32)
             -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/WindowsSmoke.cmake"
         DEPENDS toolchain-check
         COMMENT "Build and run a minimal Windows executable with NASM + linker"
+    )
+
+    add_custom_target(bpp-selfhost-fast
+        COMMAND "${BPP_POWERSHELL_EXECUTABLE}"
+            -NoProfile
+            -ExecutionPolicy Bypass
+            -File "${CMAKE_CURRENT_SOURCE_DIR}/build_and_test.ps1"
+            ${_bpp_windows_compiler_args}
+            -NasmPath "${BPP_NASM_EXECUTABLE}"
+            -LinkerPath "${BPP_LINKER_EXECUTABLE}"
+            -SkipTests
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        DEPENDS toolchain-check
+        USES_TERMINAL
+        COMMENT "Self-host the Windows compiler through Stage 2"
+    )
+
+    add_custom_target(bpp-selfhost
+        COMMAND "${BPP_POWERSHELL_EXECUTABLE}"
+            -NoProfile
+            -ExecutionPolicy Bypass
+            -File "${CMAKE_CURRENT_SOURCE_DIR}/build_and_test.ps1"
+            ${_bpp_windows_compiler_args}
+            -NasmPath "${BPP_NASM_EXECUTABLE}"
+            -LinkerPath "${BPP_LINKER_EXECUTABLE}"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        DEPENDS toolchain-check
+        USES_TERMINAL
+        COMMENT "Self-host and test the Windows compiler"
     )
 endif()
