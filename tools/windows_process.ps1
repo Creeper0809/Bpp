@@ -194,9 +194,12 @@ function Invoke-BppLimitedProcess {
     $process.StartInfo = $psi
     $job = [IntPtr]::Zero
     $timedOut = $false
+    $previousInputEncoding = $null
 
     try {
         $job = [Bpp.Windows.JobMemoryLimiter]::Create($MemoryLimitBytes)
+        $previousInputEncoding = [Console]::InputEncoding
+        [Console]::InputEncoding = $utf8NoBom
         if (-not $process.Start()) { throw "Failed to start process: $resolvedFile" }
         try {
             [Bpp.Windows.JobMemoryLimiter]::Assign($job, $process.Handle)
@@ -207,6 +210,8 @@ function Invoke-BppLimitedProcess {
 
         if ($StdinText -ne "") { $process.StandardInput.Write($StdinText) }
         $process.StandardInput.Close()
+        [Console]::InputEncoding = $previousInputEncoding
+        $previousInputEncoding = $null
 
         $stdoutTask = $process.StandardOutput.ReadToEndAsync()
         $stderrTask = $process.StandardError.ReadToEndAsync()
@@ -236,6 +241,7 @@ function Invoke-BppLimitedProcess {
             TimedOut = $timedOut
         }
     } finally {
+        if ($null -ne $previousInputEncoding) { [Console]::InputEncoding = $previousInputEncoding }
         if ($job -ne [IntPtr]::Zero) { [Bpp.Windows.JobMemoryLimiter]::Close($job) }
         $process.Dispose()
     }
