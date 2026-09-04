@@ -1,0 +1,65 @@
+# Progress: Compiler design fixes round 2
+
+## 2026-09-05
+- Restored the previous re-audit evidence and confirmed the current authoritative git state.
+- Created a new isolated implementation plan covering all nine requested fixes.
+- Created branch `codex/compiler-design-fixes-round2` from synchronized `dev`.
+- Mapped the declaration insertion sites and every legacy `symtab_add` allocation source for Phase 1.
+- Confirmed the assembler stream cannot be cheaply patched after body emission and selected a layout-prepass design for exact legacy frame reservation.
+- Improved the frame design: use a NASM forward local `equ` resolved after emission, so all real `symtab_add` allocations—including generated temporaries—determine the reserve without duplicating lowering logic.
+- Implemented the forward frame-size equate in legacy prologue/save/restore generation and emit the final aligned size after each function.
+- Validated the intended forward-equate syntax with NASM win64 before modifying the compiler.
+- Bootstrapped the modified compiler source to win64 assembly and assembled it successfully with NASM.
+- Linked and ran the modified stage-0 compiler. The 4,096-byte local probe now emits `.Lbpp_frame_size equ 4096`; its full output assembles successfully.
+- Implemented deterministic duplicate checks for globals, constants, structs, fields, and traits before later compiler passes.
+- Replaced recursive inheritance DFS with a non-recursive dependency-resolution traversal that diagnoses unresolved cycles without consuming the host call stack.
+- Recompiled and assembled the compiler successfully after the validation changes.
+- Linked the new stage and verified duplicate globals, structs, constants, and fields now fail with stable validation diagnostics.
+- The deep-700 probe still stack-overflows in a later pipeline path; started call-stack localization for the remaining recursion.
+- Native backtrace confirms the remaining deep-inheritance failure occurs during a recursive path involving struct lookup; source inventory identified virtual-dispatch parent collection and layout helpers as remaining recursive consumers.
+- Replaced virtual-dispatch abstract-method ancestry collection with an explicit post-order frame stack and deduplication map.
+- The compiler still self-builds and assembles after that change. The deep probe no longer reports the original stack-overflow status but now exits with an access violation, so further localization is required before this requirement is complete.
+- GDB localized the new access violation to the iterative collector's completion branch. Generated assembly inspection points at the aggregate `Vec<VdispatchCollectFrame>` path, so the next implementation will use simpler pointer/index containers.
+- Replaced the aggregate frame vector with parallel struct-pointer and parent-index vectors.
+- Rebuilt stage 3 successfully; the valid 700-level inheritance AST probe now completes with exit 0.
+- Inspected the directive-based regression layout and reserved new round-two test cases rather than modifying or reducing existing coverage.
+- Added regression fixtures for 4,096-byte automatic local storage, duplicate global/struct/constant/field diagnostics, and a mechanically generated 700-level acyclic inheritance graph.
+- Completed the shared walker coverage for all current expression/statement kinds and made unknown kinds diagnostic instead of silent.
+- Added a pre-output semantic gate for LLVM contract/prototype and unified non-AST views while retaining AST-only modes as explicit parse/lowering inspection.
+- Rebuilt stage 4 successfully, then found the stricter walker exposed the language's intentional use of `AST_ASSIGN` in expression position. Preparing the missing mixed-category handler before semantic-mode verification.
+- The first corrected rebuild used stage 4 and failed because that compiler binary contains the very walker omission being fixed. Switching bootstrap input back to known-good stage 3.
+- Re-bootstrapped from stage 3 successfully after adding expression-position assignment handling.
+- Verified output contracts: invalid typing remains accepted by AST-only/AST-only unified views, while LLVM contract, LLVM prototype, and mixed unified views now fail before writing output.
+- Added success/failure regression fixtures that lock the parse-only AST contract and semantic-gated LLVM/unified contracts.
+- Began Windows host-execution diagnosis; the declared Win64 CreateProcess argument positions, structure sizes, and shadow-space count appear superficially correct, so the next check is allocation/pointer validity and generated call-site stack layout.
+- GDB confirmed the command-line allocation and contents are valid at CreateProcess dispatch. Refined debugging to stop at the compiler's own instruction immediately before the external call rather than interpreting system-thunk stack offsets.
+- Disassembly identified the exact compiler-side call instruction and confirmed the emitted six stack arguments occupy caller offsets 32 through 72. The initial absolute breakpoint attempt ran before PE image load and will be retried after `starti`.
+- Switched to a symbol-relative breakpoint and confirmed the actual caller stack layout is correct. Fixed the GDB pointer inspection type to avoid truncating 64-bit arena addresses on the next run.
+- Verified both structures in memory and captured the actual fault. Root cause is now confirmed as legacy Win64 call-site stack misalignment (`rsp` is 8 mod 16 immediately before the external call), not bad CreateProcess data.
+- Audited call-padding helpers and selected the minimal systemic repair: establish the 16-byte steady-state stack invariant in the Win64 function prologue with one target-specific alignment word.
+- Rechecked alignment from the PE entry point through `main`: Windows enters `mainCRTStartup` already 16-byte aligned, so its `sub rsp, 56` inverted the invariant before the first call and every descendant inherited the error. Moved the repair to the actual source by changing the entry reservation to 48 bytes; ordinary legacy and SSA prologues can retain their ABI-correct 16-byte frame sizing.
+- Verified the repaired hosted pipeline end to end: the compiler launched vendored NASM and the MSVC linker through `CreateProcess`, produced a PE executable, ran it, and observed exit code 0.
+- Added an always-on Windows test-runner smoke that exercises the compiler's own default assemble/link/run path before the regular runner-managed matrix.
+- Corrected the AST-only regression's JSON spelling from `var_decl` to the actual stable `VarDecl` node name; the focused Windows runner now passes together with the new default-pipeline preflight.
+- Replaced the allocator's fixed virtual-register/instruction rejection thresholds with budgeted graph coloring plus interval allocation for large functions, batch spilling, dynamic spill capacity, and victim replacement under pressure.
+- Added opt-in backend fallback reporting and made strict SSA reject real semantic/codegen incompatibilities instead of silently mixing backends.
+- Replaced instruction-embedded auxiliary process addresses with typed, stable, one-based auxiliary IDs backed by an SSA-context-owned table; JSON output is now deterministic across processes.
+- Added explicit SSA auxiliary cleanup, including owned inline-assembly payload containers.
+- Converted compiler state selection to explicit, independently allocatable `CompilerCtx` sessions, moved diagnostic counters into the active session, and added reset/destroy lifecycle APIs.
+- Used a bootstrap-compatible common owned-buffer adapter for context teardown after the bootstrap compiler rejected nested generic release-helper instantiation.
+- Forced stable NASM operand widths for forward frame-size equates and selected `-O1` for NASM invocation; self-host assembly now completes in seconds instead of pathological multi-pass time.
+- Made Windows and Linux entry stubs skip process-argument setup for the language's validated zero-argument entry contract.
+- Unified strict and automatic SSA reachability at O0. A normal-prelude strict SSA probe fell from more than two minutes to 0.81 seconds; automatic `-dump-ssa` fallback-report compilation fell to 0.71 seconds.
+- Ran all 16 focused variants for the nine requirements; after the reachability correction, the affected 4-variant SSA subset passes completely and the prior 15 variants were green.
+- Added exact roots for address-taken functions, generic calls, struct operators, property accessors, trait targets, and virtual-dispatch table thunks without restoring whole-prelude SSA compilation.
+- Corrected duplicate-struct validation to use a per-source declaration namespace. Equal short type names across modules remain legal, while duplicates inside one file fail during parsing.
+- Made inheritance-cycle state definition-indexed rather than name-indexed, avoiding false cycles and nontermination when different modules share a short struct name.
+- Updated the bundled stack-constructor fixture's second `Pair` to `PairCtor26`; the duplicate-definition regression remains active and passes.
+- Focused final regression: 59/59 affected cases passed, followed by 4/4 duplicate declaration cases after the parser error-count correction.
+- Full 4 GiB-limited Windows verification completed: self-host Stage1 equals Stage2, 767/767 tests passed, 0 failed, and 1 LLVM-only case was skipped by the Windows runner in 266.9 seconds.
+- `git diff --check` passed. WSL has no usable installed distribution on this host, so the Linux shell runner was not locally available.
+
+## Errors
+- PowerShell parsed GCC's `-Wl,-e,...` argument as a comma expression. The retry will pass GCC arguments through an explicit array.
+- The explicit GCC argument-array retry linked successfully; no further action required.
+- A raw struct pointer cannot be used as a key in this repository's `HashMap<K,V>` implementation because keys are always byte slices; doing so produced an access violation in the generated compiler. Replaced it with index-addressed state.

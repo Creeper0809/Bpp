@@ -25,6 +25,7 @@ import compiler.timings;
 import llvm.contract_adapter;
 import ssa.datastruct;
 import ssa;
+import ssa_context_release_aux from ssa.core;
 import run as to_ssa from ssa.mem2reg;
 import run as optimize_ssa from ssa.opt_pipeline;
 import run as lower_phi from ssa.destroy;
@@ -47,6 +48,7 @@ const CODEGEN_DEBUG = 0;
 const CG_USED_HAS_CALL_PTR = 1;
 const CG_USED_HAS_METHOD_CALL = 2;
 const CG_USED_HAS_FUNC_ADDR = 4;
+const CG_USED_HAS_BINARY = 8;
 var g_cg_trace_runtime_needed: u64 = 0;
 var g_collect_used_symtab: *HashMap<u64, *TypeInfo>;
 var g_used_name_membership: *HashMap<u64, u64> = 0;
@@ -184,6 +186,17 @@ func collect_calls_in_method_call(mc: *AstMethodCall, used: *Vec<*NameInfo>, fla
 }
 
 func collect_calls_in_binary(bin: *AstBinary, used: *Vec<*NameInfo>, flags_ptr: u64) -> u64 {
+    // Primitive binary operations lower directly. Struct-valued operands may
+    // invoke generated overloads, which are not represented as calls in this
+    // AST and therefore need an implicit reachability root.
+    if (g_collect_used_symtab != 0) {
+        var left_ti: *TypeInfo = generic_infer_expr_type(bin.left, g_collect_used_symtab);
+        var right_ti: *TypeInfo = generic_infer_expr_type(bin.right, g_collect_used_symtab);
+        if ((left_ti != 0 && left_ti.type_kind == TYPE_STRUCT) ||
+            (right_ti != 0 && right_ti.type_kind == TYPE_STRUCT)) {
+            used_mark_flag(flags_ptr, CG_USED_HAS_BINARY);
+        }
+    }
     collect_calls_in_expr(bin.left, used, flags_ptr);
     collect_calls_in_expr(bin.right, used, flags_ptr);
     return 0;
@@ -195,6 +208,7 @@ func collect_calls_in_addr_of(ao: *AstAddrOf, used: *Vec<*NameInfo>, flags_ptr: 
         var idn: *AstIdent = (*AstIdent)ao.operand;
         if (sym_func_exists(idn.name) != 0) {
             used_mark_flag(flags_ptr, CG_USED_HAS_FUNC_ADDR);
+            used_add_resolved_name(used, idn.name);
         }
     }
     collect_calls_in_expr(ao.operand, used, flags_ptr);
@@ -237,14 +251,57 @@ func collect_calls_in_stack_ctor(sc: *AstStackCtor, used: *Vec<*NameInfo>, flags
     return 0;
 }
 
+func collect_calls_in_property_member(member: *AstMemberAccess, used: *Vec<*NameInfo>, is_write: u64) -> u64 {
+    if (member == 0 || g_collect_used_symtab == 0) { return 0; }
+    var recv_ti: *TypeInfo = generic_infer_expr_type(member.object, g_collect_used_symtab);
+    if (recv_ti == 0 || recv_ti.type_kind != TYPE_STRUCT || u8_slice_ptr(recv_ti.struct_name) == 0) { return 0; }
+    var struct_def: *AstStructDef = get_struct_def(recv_ti.struct_name);
+    if (struct_def == 0) { return 0; }
+    var field_offset: u64 = 0;
+    var field: *FieldDesc = 0;
+    if (struct_find_field_desc_scoped(struct_def, member.parent, member.member, &field_offset, &field) == 0 || field == 0) { return 0; }
+    if (is_write != 0) {
+        if (u8_slice_ptr(field.setter_hook) != 0 && u8_slice_len(field.setter_hook) != 0) {
+            used_add_resolved_name(used, field.setter_hook);
+        }
+    } else {
+        if (u8_slice_ptr(field.getter_hook) != 0 && u8_slice_len(field.getter_hook) != 0) {
+            used_add_resolved_name(used, field.getter_hook);
+        }
+    }
+    return 0;
+}
+
+func collect_calls_in_assign(assign: *AstAssign, used: *Vec<*NameInfo>, flags_ptr: u64) -> u64 {
+    if (assign == 0) { return 0; }
+    var target_kind: u64 = ast_kind(assign.target);
+    if (target_kind == AST_MEMBER_ACCESS || target_kind == AST_SAFE_MEMBER_ACCESS) {
+        var target_member: *AstMemberAccess = (*AstMemberAccess)assign.target;
+        collect_calls_in_property_member(target_member, used, 1);
+        collect_calls_in_expr(target_member.object, used, flags_ptr);
+    } else {
+        collect_calls_in_expr(assign.target, used, flags_ptr);
+    }
+    collect_calls_in_expr(assign.value, used, flags_ptr);
+    return 0;
+}
+
 func collect_calls_in_expr(node: *AstNode, used: *Vec<*NameInfo>, flags_ptr: u64) -> u64 {
     if (node == 0) { return 0; }
     var kind: u64 = ast_kind(node);
     var nref: AstNodeTagRef;
     nref.node = node;
     match (kind) {
+        case AST_IDENT:
+            var ident: *AstIdent = nref.ident;
+            if (ident != 0 && sym_func_exists(ident.name) != 0) {
+                used_mark_flag(flags_ptr, CG_USED_HAS_FUNC_ADDR);
+                used_add_resolved_name(used, ident.name);
+            }
+            return 0;
         case AST_CALL: return collect_calls_in_call(nref.call, used, flags_ptr);
         case AST_GENERIC_CALL:
+            used_add_resolved_name(used, nref.generic_call.name);
             return collect_calls_in_args_vec(nref.generic_call.args_vec, used, flags_ptr);
         case AST_STATIC_GENERIC_CALL:
             return collect_calls_in_args_vec(nref.static_generic_call.args_vec, used, flags_ptr);
@@ -261,12 +318,12 @@ func collect_calls_in_expr(node: *AstNode, used: *Vec<*NameInfo>, flags_ptr: u64
             return collect_calls_in_index(nref.index_expr, used, flags_ptr);
         case AST_CAST: return collect_calls_in_expr(nref.cast_expr.expr, used, flags_ptr);
         case AST_SIZEOF_EXPR: return collect_calls_in_expr(nref.sizeof_expr.expr, used, flags_ptr);
-        case AST_MEMBER_ACCESS: return collect_calls_in_expr(nref.member_access.object, used, flags_ptr);
-        case AST_SAFE_MEMBER_ACCESS: return collect_calls_in_expr(nref.member_access.object, used, flags_ptr);
+        case AST_MEMBER_ACCESS:
+        case AST_SAFE_MEMBER_ACCESS:
+            collect_calls_in_property_member(nref.member_access, used, 0);
+            return collect_calls_in_expr(nref.member_access.object, used, flags_ptr);
         case AST_ASSIGN:
-            collect_calls_in_expr(nref.assign_stmt.target, used, flags_ptr);
-            collect_calls_in_expr(nref.assign_stmt.value, used, flags_ptr);
-            return 0;
+            return collect_calls_in_assign(nref.assign_stmt, used, flags_ptr);
         case AST_NEW: return collect_calls_in_new(nref.new_expr, used, flags_ptr);
         case AST_STACK_CTOR: return collect_calls_in_stack_ctor(nref.stack_ctor, used, flags_ptr);
         case AST_SLICE:
@@ -364,9 +421,7 @@ func collect_calls_in_stmt(node: *AstNode, used: *Vec<*NameInfo>, flags_ptr: u64
         case AST_CONST_DECL:
             return collect_calls_in_expr(nref.const_decl.value, used, flags_ptr);
         case AST_ASSIGN:
-            collect_calls_in_expr(nref.assign_stmt.target, used, flags_ptr);
-            collect_calls_in_expr(nref.assign_stmt.value, used, flags_ptr);
-            return 0;
+            return collect_calls_in_assign(nref.assign_stmt, used, flags_ptr);
         case AST_DELETE: return collect_calls_in_delete(nref.delete_stmt, used, flags_ptr);
         case AST_EXPR_STMT:
             return collect_calls_in_expr(nref.expr_stmt.expr, used, flags_ptr);
@@ -688,6 +743,13 @@ func collect_build_func_index(funcs: *Vec<*AstFunc>) -> u64 {
     return 0;
 }
 
+func codegen_ssa_requested() -> u64 {
+    var backend_mode: u64 = opt_get_backend_mode();
+    if (backend_mode == BACKEND_SSA) { return 1; }
+    if (backend_mode == BACKEND_AUTO && opt_get_ir_mode() == IR_SSA) { return 1; }
+    return 0;
+}
+
 func collect_used_func_names(program: *AstProgram, used: *Vec<*NameInfo>, flags_ptr: u64) -> u64 {
     if (program == 0) { return 0; }
     var funcs: *Vec<*AstFunc> = program.funcs_vec;
@@ -698,19 +760,40 @@ func collect_used_func_names(program: *AstProgram, used: *Vec<*NameInfo>, flags_
     var entry_len: u64 = entry_func_len();
     used_add_name(used, slice(entry_ptr, entry_len));
     used_add_name(used, slice((u64)"std_io__sys_exit", 16));
-    if (compiler_target() == COMPILER_TARGET_WINDOWS_X86_64) {
+    var entry_fn: *AstFunc = sym_get_func(slice(entry_ptr, entry_len));
+    var entry_param_n: u64 = 0;
+    if (entry_fn != 0 && entry_fn.params_vec != 0) {
+        entry_param_n = entry_fn.params_vec.len();
+    }
+    if (compiler_target() == COMPILER_TARGET_WINDOWS_X86_64 && entry_param_n != 0) {
         // The PE entry stub calls this helper directly, so it is not visible
         // to the AST call-graph walk used by optimized dead-code elimination.
         used_add_name(used, slice("std_os__os_main_args", str_len("std_os__os_main_args")));
     }
 
+    // Legacy optimized codegen has a few implicit call sites which are not
+    // represented in the source AST. Strict SSA instead uses the exact
+    // reachable closure; dynamic dispatch makes that closure unknowable and
+    // is handled conservatively by collect_used_names below.
+    var seed_implicit_codegen: u64 = codegen_ssa_requested() == 0;
     var seed_n: u64 = funcs.len();
     for (var si: u64 = 0; si < seed_n; si++) {
         var seed_fn: *AstFunc = funcs.get(si);
         if (seed_fn == 0) { continue; }
         // Operator calls are created by the lowering pass. Seed their bodies
         // before closure so calls made by an operator remain reachable too.
-        if (codegen_name_contains(seed_fn.name, slice("__op_", str_len("__op_"))) != 0) {
+        if (seed_implicit_codegen != 0 && codegen_name_contains(seed_fn.name, slice("__op_", str_len("__op_"))) != 0) {
+            used_add_resolved_name(used, seed_fn.name);
+        }
+        if (seed_implicit_codegen != 0 && codegen_name_has_suffix(seed_fn.name, slice("_destructor", str_len("_destructor"))) != 0) {
+            used_add_name(used, seed_fn.name);
+        }
+        if (seed_implicit_codegen != 0 && codegen_name_has_prefix(seed_fn.name, slice("__thunk_", str_len("__thunk_"))) != 0) {
+            used_add_name(used, seed_fn.name);
+        }
+        // Virtual-dispatch tables reference these thunks from emitted data,
+        // not from an AST call node. They are roots in every backend mode.
+        if (codegen_name_has_prefix(seed_fn.name, slice("__thunk___Virt_", str_len("__thunk___Virt_"))) != 0) {
             used_add_resolved_name(used, seed_fn.name);
         }
         if (seed_fn.annotations_vec == 0) { continue; }
@@ -720,18 +803,36 @@ func collect_used_func_names(program: *AstProgram, used: *Vec<*NameInfo>, flags_
         if (annotation_has_complexity_contract_annotation(seed_fn) != 0) {
             used_add_name(used, seed_fn.name);
         }
-        if (codegen_name_has_suffix(seed_fn.name, slice("_destructor", str_len("_destructor"))) != 0) {
-            used_add_name(used, seed_fn.name);
-        }
-        if (codegen_name_has_prefix(seed_fn.name, slice("__thunk_", str_len("__thunk_"))) != 0) {
-            used_add_name(used, seed_fn.name);
-        }
     }
 
-    collect_property_hook_func_names(program, used);
-    collect_trait_vtable_impl_func_names(used);
+    if (seed_implicit_codegen != 0) {
+        collect_property_hook_func_names(program, used);
+        collect_trait_vtable_impl_func_names(used);
+    }
 
     collect_used_func_closure(funcs, used, flags_ptr);
+    var collected_flags: u64 = *(flags_ptr);
+    if (seed_implicit_codegen == 0 && (collected_flags & (CG_USED_HAS_METHOD_CALL | CG_USED_HAS_BINARY)) != 0) {
+        // An unresolved method edge may dispatch through a trait vtable or an
+        // implicit destructor. Add exactly those generated targets, then
+        // close over calls made by their bodies.
+        if ((collected_flags & CG_USED_HAS_METHOD_CALL) != 0) {
+            collect_trait_vtable_impl_func_names(used);
+        }
+        for (var di: u64 = 0; di < seed_n; di++) {
+            var generated_target: *AstFunc = funcs.get(di);
+            if (generated_target == 0) { continue; }
+            var needs_method_target: u64 = (collected_flags & CG_USED_HAS_METHOD_CALL) != 0 &&
+                (codegen_name_has_suffix(generated_target.name, slice("_destructor", str_len("_destructor"))) != 0 ||
+                 codegen_name_has_prefix(generated_target.name, slice("__thunk_", str_len("__thunk_"))) != 0);
+            var needs_operator_target: u64 = (collected_flags & CG_USED_HAS_BINARY) != 0 &&
+                codegen_name_contains(generated_target.name, slice("__op_", str_len("__op_"))) != 0;
+            if (needs_method_target != 0 || needs_operator_target != 0) {
+                used_add_resolved_name(used, generated_target.name);
+            }
+        }
+        collect_used_func_closure(funcs, used, flags_ptr);
+    }
     if (codegen_program_has_gc_runtime_need(program, used) != 0 ||
         used_has_name_prefix(used, slice("std_mem__bpp_gc_", str_len("std_mem__bpp_gc_"))) != 0 ||
         used_has_name_prefix(used, slice("std_number__", str_len("std_number__"))) != 0) {
@@ -1075,8 +1176,9 @@ func emit_func_trace_enter(level: u64) -> u64 {
 
 func func_has_codegen_annotation(fn: *AstFunc) -> u64 {
     if (fn == 0 || fn.annotations_vec == 0) { return 0; }
-    if (annotation_count_name(fn.annotations_vec, slice("hot", str_len("hot"))) != 0) { return 1; }
-    if (annotation_count_name(fn.annotations_vec, slice("cold", str_len("cold"))) != 0) { return 1; }
+    // hot/cold are placement hints and do not change function semantics. The
+    // SSA backend may safely ignore them; trace/config still require legacy
+    // prologue and instrumentation support.
     if (annotation_count_name(fn.annotations_vec, slice("trace", str_len("trace"))) != 0) { return 1; }
     if (annotation_count_name(fn.annotations_vec, slice("config", str_len("config"))) != 0) { return 1; }
     return 0;
@@ -1249,12 +1351,7 @@ func emit_func_prologue(fn: *AstFunc, g_symtab: *Symtab, section_kind: u64, stac
 
     emitln("    push rbp");
     emitln("    mov rbp, rsp");
-    var frame_reserve: u64 = stack_reserve + 32;
-    if (frame_reserve != 0) {
-        emit("    sub rsp, ");
-        emit_u64(frame_reserve);
-        emit_nl();
-    }
+    emitln("    sub rsp, strict qword (.Lbpp_frame_size + 32)");
     emit_legacy_nonvolatile_save(stack_reserve);
 
     if (fn.ret_type == TYPE_STRUCT && fn.ret_ptr_depth == 0) {
@@ -1281,6 +1378,19 @@ func emit_func_epilogue() -> u64 {
     emitln("    pop rbp");
     emitln("   ret");
     return 0;
+}
+
+func emit_func_frame_size_equ(symtab: *Symtab, configured_reserve: u64) -> u64 {
+    var required: u64 = 0;
+    if (symtab != 0) {
+        required = 0 - symtab.stack_offset;
+    }
+    required = align_up_16(required);
+    if (required < configured_reserve) { required = configured_reserve; }
+    emit(".Lbpp_frame_size equ ");
+    emit_u64(required);
+    emit_nl();
+    return required;
 }
 
 func emit_target_arg_reg_name(idx: u64) -> u64 {
@@ -1350,6 +1460,7 @@ func emit_func(fn: *AstFunc) -> u64 {
     emit_block(fn.body);
 
     emit_func_epilogue();
+    emit_func_frame_size_equ(g_symtab, stack_reserve);
 }
 
 // ============================================
@@ -1368,13 +1479,19 @@ func program_has_runtime_global_init(program: *AstProgram) -> u64 {
 }
 
 func collect_used_names(program: *AstProgram, has_runtime_init: u64) -> *Vec<*NameInfo> {
-    if (opt_get_level() < 1) { return 0; }
+    // Strict SSA validates and emits the reachable closure even at O0. Building
+    // every unused prelude function would make the backend contract depend on
+    // unrelated library implementation details and multiply allocation time.
+    if (opt_get_level() < 1 && codegen_ssa_requested() == 0) { return 0; }
     var used_names: *Vec<*NameInfo> = new Vec<*NameInfo>{heap_alloc((64) * sizeof(*NameInfo)), 0, (64)};
     g_used_name_membership = new HashMap<u64, u64>{0, 0, 0};
     g_used_name_membership.ensure_capacity(256);
     var used_flags: u64 = 0;
     collect_used_func_names(program, used_names, &used_flags);
-    if ((used_flags & (CG_USED_HAS_CALL_PTR | CG_USED_HAS_FUNC_ADDR)) != 0) {
+    // Address-taken functions are added to the closure at the address
+    // expression. Fall back to the whole program only when an indirect call
+    // has no statically visible target anywhere in the reachable source.
+    if ((used_flags & CG_USED_HAS_CALL_PTR) != 0 && (used_flags & CG_USED_HAS_FUNC_ADDR) == 0) {
         return 0;
     }
     if (has_runtime_init != 0) {
@@ -1383,13 +1500,6 @@ func collect_used_names(program: *AstProgram, has_runtime_init: u64) -> *Vec<*Na
         }
     }
     return used_names;
-}
-
-func codegen_force_emit_generated_func(name: []u8) -> u64 {
-    if (codegen_name_has_prefix(name, slice("__thunk_", str_len("__thunk_"))) != 0) { return 1; }
-    if (codegen_name_has_suffix(name, slice("_destructor", str_len("_destructor"))) != 0) { return 1; }
-    if (codegen_name_contains(name, slice("__op_", str_len("__op_"))) != 0) { return 1; }
-    return 0;
 }
 
 const CG_EXPR_FEATURE_SAFE_NAV = 1;
@@ -1593,6 +1703,10 @@ func build_ssa_pipeline(program: *AstProgram, use_ssa: u64, used_names: *Vec<*Na
     var ssa_ctx_ptr: *SSAContext = build_program_used(program, used_names);
     if (ssa_ctx_ptr == 0) { return 0; }
     timings_add_ssa_span(1, ssa_detail_started);
+    // Type/build diagnostics make every later SSA phase invalid. Stop before
+    // optimization, lowering, and register allocation so failing source files
+    // do not spend most of their time compiling unrelated runtime helpers.
+    if (diag_has_errors() != 0) { return ssa_ctx_ptr; }
     ssa_detail_started = timings_profile_start();
     to_ssa(ssa_ctx_ptr);
     timings_add_ssa_span(2, ssa_detail_started);
@@ -1705,22 +1819,27 @@ func emit_windows_runtime_externs() -> u64 {
     return 0;
 }
 
-func emit_windows_entry(has_runtime_init: u64, entry: []u8) -> u64 {
+func emit_windows_entry(has_runtime_init: u64, entry: []u8, pass_process_args: u64) -> u64 {
     emitln("default rel");
     emitln("section .text");
     emitln("global _start");
     emitln("global mainCRTStartup");
     emitln("_start:");
     emitln("mainCRTStartup:");
-    emitln("    sub rsp, 56");
+    // Windows transfers control to the PE entry point with a 16-byte aligned
+    // stack. Reserve the 32-byte home area plus two output slots while keeping
+    // rsp aligned at every call site.
+    emitln("    sub rsp, 48");
     if (has_runtime_init != 0) {
         emitln("    call __global_init");
     }
-    emitln("    lea rcx, [rsp+32]");
-    emitln("    lea rdx, [rsp+40]");
-    emitln("    call std_os__os_main_args");
-    emitln("    mov rcx, [rsp+32]");
-    emitln("    mov rdx, [rsp+40]");
+    if (pass_process_args != 0) {
+        emitln("    lea rcx, [rsp+32]");
+        emitln("    lea rdx, [rsp+40]");
+        emitln("    call std_os__os_main_args");
+        emitln("    mov rcx, [rsp+32]");
+        emitln("    mov rdx, [rsp+40]");
+    }
     emit("    call ");
     emit_len(entry.ptr, entry.len);
     emit_nl();
@@ -1729,11 +1848,16 @@ func emit_windows_entry(has_runtime_init: u64, entry: []u8) -> u64 {
     return 0;
 }
 
-func emit_entry(has_runtime_init: u64) -> u64 {
+func emit_entry(program: *AstProgram, has_runtime_init: u64) -> u64 {
     var entry_ptr: u64 = entry_func_ptr();
     var entry_len: u64 = entry_func_len();
+    var entry_fn: *AstFunc = sym_get_func(slice(entry_ptr, entry_len));
+    var pass_process_args: u64 = 0;
+    if (entry_fn != 0 && entry_fn.params_vec != 0 && entry_fn.params_vec.len() != 0) {
+        pass_process_args = 1;
+    }
     if (compiler_target() == COMPILER_TARGET_WINDOWS_X86_64) {
-        return emit_windows_entry(has_runtime_init, slice(entry_ptr, entry_len));
+        return emit_windows_entry(has_runtime_init, slice(entry_ptr, entry_len), pass_process_args);
     }
     emitln("default rel");
     emitln("section .text");
@@ -1742,10 +1866,12 @@ func emit_entry(has_runtime_init: u64) -> u64 {
     if (has_runtime_init != 0) {
         emitln("    call __global_init");
     }
-    emitln("    pop rdi          ; argc");
-    emitln("    mov rsi, rsp     ; argv");
-    emitln("    push rsi");
-    emitln("    push rdi");
+    if (pass_process_args != 0) {
+        emitln("    pop rdi          ; argc");
+        emitln("    mov rsi, rsp     ; argv");
+        emitln("    push rsi");
+        emitln("    push rdi");
+    }
     emit("    call ");
     emit_len(entry_ptr, entry_len);
     emit_nl();
@@ -1777,6 +1903,16 @@ func emit_trace_runtime() -> u64 {
     return 0;
 }
 
+func emit_backend_fallback_report(fn: *AstFunc, reason: u64) -> u64 {
+    if (opt_get_backend_report() == 0 || fn == 0) { return 0; }
+    emit_stderr("[BACKEND] legacy fallback: ");
+    emit_stderr_len(u8_slice_ptr(fn.name), u8_slice_len(fn.name));
+    emit_stderr(" (");
+    emit_stderr(reason);
+    emit_stderr(")\n");
+    return 0;
+}
+
 func emit_functions(program: *AstProgram, used_names: *Vec<*NameInfo>, use_ssa: u64, ssa_ctx: *SSAContext) -> u64 {
     var strict_ssa: u64 = opt_get_backend_mode() == BACKEND_SSA;
     for (var i: u64 = 0; i < program.funcs_vec.len(); i++) {
@@ -1785,7 +1921,7 @@ func emit_functions(program: *AstProgram, used_names: *Vec<*NameInfo>, use_ssa: 
         if (generic_template_fn(fn) != 0) {
             continue;
         }
-        if (used_names != 0 && used_has_resolved_name(used_names, fn.name) == 0 && codegen_force_emit_generated_func(fn.name) == 0) {
+        if (used_names != 0 && used_has_resolved_name(used_names, fn.name) == 0) {
             continue;
         }
         var force_non_ssa_codegen: u64 = func_has_codegen_annotation(fn);
@@ -1819,10 +1955,20 @@ func emit_functions(program: *AstProgram, used_names: *Vec<*NameInfo>, use_ssa: 
                     diag_force_stop_pass();
                     break;
                 } else {
+                    if (is_supported_func(fn, program.globals_vec) == 0) {
+                        emit_backend_fallback_report(fn, "unsupported SSA construct");
+                    } else if (is_build_ok(fn.name) == 0) {
+                        emit_backend_fallback_report(fn, "SSA construction failed");
+                    } else {
+                        emit_backend_fallback_report(fn, "register allocation failed");
+                    }
                     emit_func(fn);
                 }
             }
         } else {
+            if (use_ssa != 0 && force_non_ssa_codegen != 0) {
+                emit_backend_fallback_report(fn, "legacy-only annotation");
+            }
             emit_func(fn);
         }
         if (diag_should_stop_pass() != 0) { break; }
@@ -1856,6 +2002,8 @@ func program_with_sigs(prog: *AstProgram, sigs: *Vec<*AstFunc>) -> u64 {
     }
 
     var ssa_ctx: *SSAContext = build_ssa_pipeline(program, use_ssa, used_names);
+    defer ssa_context_release_aux(ssa_ctx);
+    if (diag_has_errors() != 0) { return 0; }
     if (ssa_ctx == 0) {
         if (backend_mode == BACKEND_SSA) {
             diag_emit_error_tag("backend", "ssa", "strict SSA backend pipeline failed");
@@ -1878,7 +2026,7 @@ func program_with_sigs(prog: *AstProgram, sigs: *Vec<*AstFunc>) -> u64 {
     emit_windows_runtime_externs();
     emit_functions(program, used_names, use_ssa, ssa_ctx);
     if (diag_has_errors() != 0) { return 0; }
-    emit_entry(has_runtime_init);
+    emit_entry(program, has_runtime_init);
     emit_trace_runtime();
     
     globals_emit_data();
@@ -1887,6 +2035,20 @@ func program_with_sigs(prog: *AstProgram, sigs: *Vec<*AstFunc>) -> u64 {
     globals_emit_bss();
     timings_add_codegen(timings_elapsed_ms(codegen_started));
     return 0;
+}
+
+// Run the backend-independent semantic gate used by contract-style outputs.
+// AST-only views intentionally stop after parsing/lowering; every output that
+// claims a compilable contract must build and type-check all SSA-supported
+// functions before it writes its payload.
+func validate_program_semantics(prog: *AstProgram) -> u64 {
+    if (prog == 0) { return 0; }
+    typeinfo_set_structs(prog.structs_vec);
+    typeinfo_set_funcs(prog.funcs_vec);
+    var semantic_ctx: *SSAContext = build_program(prog);
+    ssa_context_release_aux(semantic_ctx);
+    if (diag_has_errors() != 0) { return 0; }
+    return 1;
 }
 
 func program_with_sigs_ir(prog: *AstProgram, sigs: *Vec<*AstFunc>) -> u64 {
@@ -1907,6 +2069,7 @@ func program_with_sigs_ir(prog: *AstProgram, sigs: *Vec<*AstFunc>) -> u64 {
         }
         lower_phi(ssa_ctx_ptr3);
         dump_ssa(ssa_ctx_ptr3, 0);
+        ssa_context_release_aux(ssa_ctx_ptr3);
     } else if (ir_mode == IR_MACHINE) {
         var ssa_ctx_machine: *SSAContext = build_program(prog);
         to_ssa(ssa_ctx_machine);
@@ -1916,6 +2079,7 @@ func program_with_sigs_ir(prog: *AstProgram, sigs: *Vec<*AstFunc>) -> u64 {
         lower_phi(ssa_ctx_machine);
         lower_phys(ssa_ctx_machine);
         dump_machine_ir(ssa_ctx_machine);
+        ssa_context_release_aux(ssa_ctx_machine);
     } else {
         var ssa_ctx_ptr: *SSAContext = build_program(prog);
         to_ssa(ssa_ctx_ptr);
@@ -1923,6 +2087,7 @@ func program_with_sigs_ir(prog: *AstProgram, sigs: *Vec<*AstFunc>) -> u64 {
             optimize_ssa(ssa_ctx_ptr);
         }
         dump_ssa(ssa_ctx_ptr, 1);
+        ssa_context_release_aux(ssa_ctx_ptr);
     }
 
     return 0;
@@ -1946,6 +2111,7 @@ func program_with_sigs_ir_json(prog: *AstProgram, sigs: *Vec<*AstFunc>) -> u64 {
         }
         lower_phi(ssa_ctx_ptr3);
         dump_ssa_json(ssa_ctx_ptr3, 0, "ir");
+        ssa_context_release_aux(ssa_ctx_ptr3);
     } else if (ir_mode == IR_MACHINE) {
         var ssa_ctx_machine: *SSAContext = build_program(prog);
         to_ssa(ssa_ctx_machine);
@@ -1955,6 +2121,7 @@ func program_with_sigs_ir_json(prog: *AstProgram, sigs: *Vec<*AstFunc>) -> u64 {
         lower_phi(ssa_ctx_machine);
         lower_phys(ssa_ctx_machine);
         dump_ssa_json(ssa_ctx_machine, 0, "machine-ir");
+        ssa_context_release_aux(ssa_ctx_machine);
     } else {
         var ssa_ctx_ptr: *SSAContext = build_program(prog);
         to_ssa(ssa_ctx_ptr);
@@ -1962,6 +2129,7 @@ func program_with_sigs_ir_json(prog: *AstProgram, sigs: *Vec<*AstFunc>) -> u64 {
             optimize_ssa(ssa_ctx_ptr);
         }
         dump_ssa_json(ssa_ctx_ptr, 1, "ssa");
+        ssa_context_release_aux(ssa_ctx_ptr);
     }
 
     return 0;
