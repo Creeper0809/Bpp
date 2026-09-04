@@ -569,10 +569,10 @@ $workerScript = {
         if ($compilerTimingFile -and -not $expectCompileFail) {
             $args += @("--timings-json", $compilerTimingFile)
         }
-        $args += @("-asm", $Case.Path)
+        $args += @("-asm", "--output", $asmFile, $Case.Path)
 
         $compileResult = Invoke-BppLimitedProcess -FilePath $Config.CompilerPath -ArgumentList $args `
-            -TimeoutMs $Config.CompilerTimeoutMs -StdoutPath $asmFile -StderrPath $errFile `
+            -TimeoutMs $Config.CompilerTimeoutMs -StderrPath $errFile `
             -WorkingDirectory $Config.RootDir -MemoryLimitBytes $Config.MemoryLimitBytes
 
         if ($compileResult.ExitCode -ne 0) {

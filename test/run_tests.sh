@@ -692,7 +692,7 @@ run_matrix_case() {
     local compile_start_ms
     local compile_end_ms
     compile_start_ms="$(now_ms)"
-    $COMPILER $opt_flag $ir_flag "${compiler_extra_args[@]}" -asm "$test_file" > "$asm_file" 2>"$err_file"
+    $COMPILER $opt_flag $ir_flag "${compiler_extra_args[@]}" -asm --output "$asm_file" "$test_file" > /dev/null 2>"$err_file"
     compile_exit="$?"
     compile_end_ms="$(now_ms)"
     compile_ms=$((compile_end_ms - compile_start_ms))

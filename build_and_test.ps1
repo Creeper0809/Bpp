@@ -10,6 +10,7 @@ param(
     [UInt64]$MemoryLimitBytes = 4294967296,
     [ValidateRange(0, 64)][int]$TestJobs = 0,
     [string]$TimingJsonPath = "",
+    [switch]$CompilerIsCurrentStage0,
     [switch]$ToolchainOnly,
     [switch]$SkipTests
 )
@@ -213,20 +214,31 @@ function Invoke-CompileToAsm {
         [string]$AsmFile,
         [string]$ErrorFile,
         [int]$TimeoutMs,
-        [UInt64]$ProcessMemoryLimitBytes
+        [UInt64]$ProcessMemoryLimitBytes,
+        [switch]$DirectOutput
     )
 
     if (Test-Path $AsmFile) { Remove-Item $AsmFile -Force }
     if (Test-Path $ErrorFile) { Remove-Item $ErrorFile -Force }
 
-    $result = Invoke-BppLimitedProcess `
-        -FilePath $Compiler `
-        -ArgumentList @("--target", "windows-x86_64", "-asm", $SourceFile) `
-        -TimeoutMs $TimeoutMs `
-        -StdoutPath $AsmFile `
-        -StderrPath $ErrorFile `
-        -WorkingDirectory $RootDir `
-        -MemoryLimitBytes $ProcessMemoryLimitBytes
+    $compilerArgs = @("--target", "windows-x86_64", "-asm")
+    if ($DirectOutput) {
+        $compilerArgs += @("--output", $AsmFile)
+    }
+    $compilerArgs += $SourceFile
+
+    $processArgs = @{
+        FilePath = $Compiler
+        ArgumentList = $compilerArgs
+        TimeoutMs = $TimeoutMs
+        StderrPath = $ErrorFile
+        WorkingDirectory = $RootDir
+        MemoryLimitBytes = $ProcessMemoryLimitBytes
+    }
+    if (-not $DirectOutput) {
+        $processArgs.StdoutPath = $AsmFile
+    }
+    $result = Invoke-BppLimitedProcess @processArgs
     return $result.ExitCode
 }
 
@@ -240,7 +252,8 @@ function Invoke-StageBuild {
         [string]$Nasm,
         [string]$Linker,
         [int]$TimeoutMs,
-        [UInt64]$ProcessMemoryLimitBytes
+        [UInt64]$ProcessMemoryLimitBytes,
+        [switch]$DirectOutput
     )
 
     $asmFile = Join-Path $BuildDir "${StageName}.asm"
@@ -255,7 +268,8 @@ function Invoke-StageBuild {
         -AsmFile $asmFile `
         -ErrorFile $errFile `
         -TimeoutMs $TimeoutMs `
-        -ProcessMemoryLimitBytes $ProcessMemoryLimitBytes
+        -ProcessMemoryLimitBytes $ProcessMemoryLimitBytes `
+        -DirectOutput:$DirectOutput
     if ($compileCode -ne 0) {
         $errText = if (Test-Path $errFile) { Get-Content $errFile -Raw } else { "" }
         throw "Compiler failed while building ${StageName}.asm (exit=$compileCode)`n$errText"
@@ -357,6 +371,10 @@ Provide a Windows bootstrap compiler, or publish the cross-bootstrap artifact fi
     }
 }
 
+if ($CompilerIsCurrentStage0 -and -not $CompilerPathWasExplicit) {
+    throw "CompilerIsCurrentStage0 requires an explicit -CompilerPath"
+}
+
 Write-Host "[INFO] Compiler: $CompilerPath"
 
 $SourceFile = Join-Path $ScriptDir "src\main.bpp"
@@ -374,16 +392,21 @@ $Stage1Name = "${Version}_stage1"
 $Stage2Name = "${Version}_stage2"
 
 Write-Host "[INFO] Building Windows hosted compiler stages"
-$Stage0Compiler = Invoke-StageBuild `
-    -Compiler $CompilerPath `
-    -SourceFile $SourceFile `
-    -StageName $Stage0Name `
-    -BuildDir $BuildDir `
-    -BinDir $BinDir `
-    -Nasm $ResolvedNasm `
-    -Linker $ResolvedLinker `
-    -TimeoutMs $CompilerTimeoutMs `
-    -ProcessMemoryLimitBytes $MemoryLimitBytes
+if ($CompilerIsCurrentStage0) {
+    $Stage0Compiler = (Resolve-Path -LiteralPath $CompilerPath).Path
+    Write-Host "[INFO] Reusing verified current-source Stage0: $Stage0Compiler"
+} else {
+    $Stage0Compiler = Invoke-StageBuild `
+        -Compiler $CompilerPath `
+        -SourceFile $SourceFile `
+        -StageName $Stage0Name `
+        -BuildDir $BuildDir `
+        -BinDir $BinDir `
+        -Nasm $ResolvedNasm `
+        -Linker $ResolvedLinker `
+        -TimeoutMs $CompilerTimeoutMs `
+        -ProcessMemoryLimitBytes $MemoryLimitBytes
+}
 
 $Stage1Compiler = Invoke-StageBuild `
     -Compiler $Stage0Compiler `
@@ -394,7 +417,8 @@ $Stage1Compiler = Invoke-StageBuild `
     -Nasm $ResolvedNasm `
     -Linker $ResolvedLinker `
     -TimeoutMs $CompilerTimeoutMs `
-    -ProcessMemoryLimitBytes $MemoryLimitBytes
+    -ProcessMemoryLimitBytes $MemoryLimitBytes `
+    -DirectOutput
 
 $Stage2Compiler = Invoke-StageBuild `
     -Compiler $Stage1Compiler `
@@ -405,7 +429,8 @@ $Stage2Compiler = Invoke-StageBuild `
     -Nasm $ResolvedNasm `
     -Linker $ResolvedLinker `
     -TimeoutMs $CompilerTimeoutMs `
-    -ProcessMemoryLimitBytes $MemoryLimitBytes
+    -ProcessMemoryLimitBytes $MemoryLimitBytes `
+    -DirectOutput
 
 $Stage1Hash = (Get-FileHash -LiteralPath $Stage1Compiler -Algorithm SHA256).Hash
 $Stage2Hash = (Get-FileHash -LiteralPath $Stage2Compiler -Algorithm SHA256).Hash
