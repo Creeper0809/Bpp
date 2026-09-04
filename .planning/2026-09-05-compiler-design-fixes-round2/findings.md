@@ -51,3 +51,43 @@
 - Cycle-validation state must be keyed by definition identity, not short type name. An index-aligned state vector is both bootstrap-safe and correct for equal names from different modules.
 - The language contract validates a zero-argument entry function, so Windows entry assembly should not retain `std_os__os_main_args` solely for an obsolete test expectation. The regression now asserts the 48-byte aligned entry frame and absence of the unused helper call.
 - Final local evidence: Windows self-host reproducibility passed and the complete native suite passed 767/767 under a 4 GiB process limit in 266.9 seconds. The single LLVM-only fixture is explicitly unsupported by the Windows native runner; no WSL distribution is installed for the Linux runner.
+
+## Completion audit evidence (both review rounds)
+- The original review's type-compatibility bypass is covered by five negative cases in `85_type_compatibility_invariants_fail.bpp`: scalar width coincidence, unrelated pointers, nominal structs, arguments, and returns.
+- Original module-prefix collision, O1 AST reachability gaps, duplicate functions/cyclic inheritance, strict-SSA fallback, unstable SSA serialization, context lifecycle, and `--views` contract each have dedicated numbered regression fixtures (86 through 93).
+- The round-two additions have dedicated fixtures for large legacy frames (94), 700-level inheritance (95), parse-only AST semantics (96), strict SSA with normal prelude (97), fallback reporting (98), typed deterministic auxiliary IDs (99), duplicate declaration namespaces (fail 91), and semantic output gates (fail 92).
+- The test files retain both positive and negative assertions; no case count was reduced to obtain the green result.
+- Current source confirms collision-free module prefixes by escaping literal underscores as `__u` while canonical path separators remain `_`; this distinguishes `a/b` from `a_b` without changing separator ABI spelling.
+- Current structural validation is iterative and definition-indexed, and all duplicate declaration namespaces emit tagged diagnostics before later passes.
+- Current O1 reachability explicitly handles slice, ternary, try, and do-while AST forms that were missing in the original report.
+- Completion audit found one residual implementation defect: the main compiler paths use the sound `typeinfo_is_assignable`, but the now-unused legacy `check_type_compat` API still accepts unrelated same-width scalar kinds and cannot represent nominal struct identity. It must be made conservative or removed before the original type-safety finding is fully closed.
+- The residual helper is now conservative: exact scalar/pointer descriptors can match, same-width different kinds cannot, and nominal/container/function categories are rejected because the legacy signature lacks enough identity information. A direct four-mode regression was added as test 100.
+- Source evidence confirms round-two backend work is present: strategy budgets choose graph versus interval allocation instead of correctness cutoffs; strict SSA diagnoses fallback; auto fallback is reportable; and auxiliary payloads use typed one-based IDs resolved through a context-owned table with explicit release.
+- Source evidence confirms session state and diagnostics are selected through explicit `CompilerCtx` APIs, and compile-capable non-AST outputs invoke the semantic gate before writing their payload.
+
+### Requirement-by-requirement verdict
+| ID | Required implementation invariant | Authoritative source evidence | Regression evidence | Verdict |
+|---|---|---|---|---|
+| O1 | Types are nominal/structural by descriptor, never accepted by byte width | `typeinfo_is_assignable`; conservative legacy `check_type_compat`; initializer/assignment/argument/return gates | fail 85 plus success 100, all four modes | proven |
+| O2 | Module mangling is collision-free for separators versus underscores | underscore escape in `module_util_module_prefix_from_id` | success 86, all four modes | proven |
+| O3 | O1 reachability visits all AST call positions | complete call collector plus shared walker | success 87 ternary/do-while/slice cases, all modes | proven |
+| O4 | Cyclic inheritance diagnoses without recursive overflow | iterative definition-indexed dependency resolution | fail 86 case 207 and success 95 depth 700 | proven |
+| O5 | Duplicate functions are rejected before label emission | `validate_program_duplicate_functions` | fail 86 case 206 | proven |
+| O6 | Strict SSA never silently mixes backends; auto decisions are observable | strict rejection branches and `--backend-report` | fail 89 and success 98 | proven |
+| O7 | Serializable SSA contains stable typed auxiliary IDs, not process pointers | `aux_kind`, `aux_id`, owning `SSAAuxTable`, resolver and cleanup | success 90 and 99 deterministic output | proven |
+| O8 | Compiler sessions own independent state and diagnostics | active `CompilerCtx*`, new/activate/reset/release/destroy APIs | success 91 lifecycle and isolation assertions | proven |
+| O9 | `--views` validates names and emits only selected implemented views | parsed view mask and exact unified JSON dispatch | fail 90 plus success 92/93 | proven |
+| R1 | Legacy frames cover actual generated and declared storage | final `Symtab.stack_offset` drives forward frame-size equate | success 94 with 4096-byte local, O0/O1 | proven |
+| R2 | Globals, constants, structs, fields and traits have deterministic duplicate checks | global validators plus file-scoped struct-name tracking | fail 91 cases 211-214 and existing trait checks | proven |
+| R3 | Windows hosted compile/assemble/link/run observes the ABI | 48-byte aligned entry frame and process wrapper | always-on default-pipeline smoke in every Windows suite run | proven |
+| R4 | Deep valid inheritance and virtual ancestry are iterative | iterative structural validation and explicit vdispatch stacks | success 95 depth 700 | proven |
+| R5 | Compile-capable outputs perform semantic validation before emission | `main_output_requires_semantic_gate` and `validate_program_semantics` | fail 92; AST-only success 96 | proven |
+| R6 | SSA allocation scales beyond former fixed cutoffs and exposes policy fallback | budget-selected graph/interval allocators, dynamic spilling, strict/auto policy | success 97 and 98; fail 89 | proven |
+| R7 | Context reset/recompile is real session ownership | context-owned tables, diagnostics and teardown | success 91 | proven |
+| R8 | SSA auxiliary lifetime is explicit and deterministic | owned table registration/resolution/release | success 90 and 99 | proven |
+| R9 | Shared AST traversal is exhaustive and unknown kinds diagnose | exhaustive expression/statement matches with diagnostic defaults | success 87 and full language matrix | proven |
+
+- Final post-audit suite artifact reports 771/771 passed, 0 failed, 1 Windows-hosted LLVM-only skip, 266.0 seconds under a 4 GiB process limit.
+- Current self-hosted Stage1 and Stage2 SHA-256 values are identical: `2BBEA772A9AAB08839159B6CE717B683F6BDEB1D887D55ABD38D6D214E13AF7D`.
+- Querying the final timing manifest by requirement fixture found 70/70 mapped cases passed (including 20 type-invariant, 8 symbol/inheritance, 12 reachability, and all focused round-two cases); the manifest contains zero failed cases overall.
+- Static residue checks find no former 256-vreg/900-instruction cutoff and no raw call-info pointer encoding in SSA operands. The only `check_type_compat` callers are the new direct regression; production decisions exclusively use the richer descriptor API.

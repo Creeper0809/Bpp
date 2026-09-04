@@ -4,7 +4,7 @@
 Fix all nine remaining compiler implementation/design problems identified by the 2026-09-05 re-audit, add regression coverage, run the complete relevant test matrix, and integrate the verified work into `dev` without disturbing pre-existing user changes.
 
 ## Current Phase
-Complete
+Phase 7: Completion audit
 
 ## Requirements
 1. Derive legacy stack reservation from actual local storage and prevent out-of-frame accesses.
@@ -64,6 +64,13 @@ Complete
 - [x] Review diff for unintended behavior and preserve user-owned changes.
 - [x] Commit, merge into `dev`, and remove the completed work branch.
 - **Status:** complete
+
+### Phase 7: Completion audit across both design-review rounds
+- [x] Map the original nine findings and the round-two nine findings to current source invariants.
+- [x] Confirm regression coverage for every mapped requirement on current `dev`.
+- [ ] Revalidate self-host identity, complete-suite results, branch integration, and preservation of user-owned changes.
+- [ ] Record authoritative evidence and close the active goal only if every requirement is proven.
+- **Status:** in progress
 
 ## Constraints
 - Do not overwrite, stage, or normalize the pre-existing `src/std/io.bpp` line-ending-only change.
