@@ -544,11 +544,15 @@ $workerScript = {
         if ($expectedExitRaw) { [void][int]::TryParse($expectedExitRaw, [ref]$expectedExit) }
         $expectCompileFail = Read-Bool $lines '^//\s*Expect compile fail:\s*(.+)$'
         $compileOnly = Read-Bool $lines '^//\s*Compile only:\s*(.+)$'
+        $expectDeterministicCompilerOutput = Read-Bool $lines '^//\s*Expect deterministic compiler output:\s*(.+)$'
+        $compilerOutputMode = Read-One $lines '^//\s*Compiler output mode:\s*(.+)$'
+        if (-not $compilerOutputMode) { $compilerOutputMode = "-asm" }
         $compilerArgs = @((Read-One $lines '^//\s*Compiler args:\s*(.+)$') -split '\s+' | Where-Object { $_ })
         $stdinText = [System.Text.RegularExpressions.Regex]::Unescape((Read-One $lines '^//\s*Stdin:\s*(.+)$'))
         $expectedStdout = [System.Text.RegularExpressions.Regex]::Unescape((Read-One $lines '^//\s*Expect stdout:\s*(.+)$'))
         $expectErrContains = @(Read-Many $lines '^//\s*Expect error contains:\s*(.+)$')
         $expectAsmContains = @(Read-Many $lines '^//\s*Expect asm contains:\s*(.+)$')
+        $expectCompilerOutputExcludes = @(Read-Many $lines '^//\s*Expect compiler output excludes:\s*(.+)$')
         if ($expectCompileFail -and $Config.StrictFailDiagnostics -and $expectErrContains.Count -eq 0) {
             throw "Missing '// Expect error contains:' directive"
         }
@@ -569,7 +573,7 @@ $workerScript = {
         if ($compilerTimingFile -and -not $expectCompileFail) {
             $args += @("--timings-json", $compilerTimingFile)
         }
-        $args += @("-asm", $Case.Path)
+        $args += @($compilerOutputMode, $Case.Path)
 
         $compileResult = Invoke-BppLimitedProcess -FilePath $Config.CompilerPath -ArgumentList $args `
             -TimeoutMs $Config.CompilerTimeoutMs -StdoutPath $asmFile -StderrPath $errFile `
@@ -594,11 +598,37 @@ $workerScript = {
         } elseif ($expectCompileFail) {
             $caseOk = $false; $status = "FAIL (unexpected compile success)"
         } else {
+            if ($expectDeterministicCompilerOutput) {
+                $repeatOutputFile = "$asmFile.repeat"
+                $repeatErrorFile = "$errFile.repeat"
+                foreach ($path in @($repeatOutputFile, $repeatErrorFile)) {
+                    if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
+                }
+                $repeatResult = Invoke-BppLimitedProcess -FilePath $Config.CompilerPath -ArgumentList $args `
+                    -TimeoutMs $Config.CompilerTimeoutMs -StdoutPath $repeatOutputFile -StderrPath $repeatErrorFile `
+                    -WorkingDirectory $Config.RootDir -MemoryLimitBytes $Config.MemoryLimitBytes
+                if ($repeatResult.ExitCode -ne 0) {
+                    $caseOk = $false; $status = "FAIL (determinism rerun)"
+                } else {
+                    $firstHash = (Get-FileHash -LiteralPath $asmFile -Algorithm SHA256).Hash
+                    $repeatHash = (Get-FileHash -LiteralPath $repeatOutputFile -Algorithm SHA256).Hash
+                    if ($firstHash -ne $repeatHash) {
+                        $caseOk = $false; $status = "FAIL (nondeterministic compiler output)"
+                    }
+                }
+            }
             if ($expectAsmContains.Count -gt 0) {
                 $asmText = Get-Content -LiteralPath $asmFile -Raw
                 $missingAsm = @($expectAsmContains | Where-Object { $asmText.IndexOf($_, [System.StringComparison]::Ordinal) -lt 0 })
                 if ($missingAsm.Count -gt 0) {
                     $caseOk = $false; $status = "FAIL (asm mismatch: $($missingAsm[0]))"
+                }
+            }
+            if ($expectCompilerOutputExcludes.Count -gt 0) {
+                $compilerOutputText = Get-Content -LiteralPath $asmFile -Raw
+                $unexpectedOutput = @($expectCompilerOutputExcludes | Where-Object { $compilerOutputText.IndexOf($_, [System.StringComparison]::Ordinal) -ge 0 })
+                if ($unexpectedOutput.Count -gt 0) {
+                    $caseOk = $false; $status = "FAIL (compiler output unexpectedly contains: $($unexpectedOutput[0]))"
                 }
             }
 

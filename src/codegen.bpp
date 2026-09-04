@@ -244,6 +244,10 @@ func collect_calls_in_expr(node: *AstNode, used: *Vec<*NameInfo>, flags_ptr: u64
     nref.node = node;
     match (kind) {
         case AST_CALL: return collect_calls_in_call(nref.call, used, flags_ptr);
+        case AST_GENERIC_CALL:
+            return collect_calls_in_args_vec(nref.generic_call.args_vec, used, flags_ptr);
+        case AST_STATIC_GENERIC_CALL:
+            return collect_calls_in_args_vec(nref.static_generic_call.args_vec, used, flags_ptr);
         case AST_CALL_PTR: return collect_calls_in_call_ptr(nref.call_ptr, used, flags_ptr);
         case AST_METHOD_CALL: return collect_calls_in_method_call(nref.method_call, used, flags_ptr);
         case AST_SAFE_METHOD_CALL: return collect_calls_in_method_call(nref.method_call, used, flags_ptr);
@@ -256,6 +260,7 @@ func collect_calls_in_expr(node: *AstNode, used: *Vec<*NameInfo>, flags_ptr: u64
         case AST_SAFE_INDEX:
             return collect_calls_in_index(nref.index_expr, used, flags_ptr);
         case AST_CAST: return collect_calls_in_expr(nref.cast_expr.expr, used, flags_ptr);
+        case AST_SIZEOF_EXPR: return collect_calls_in_expr(nref.sizeof_expr.expr, used, flags_ptr);
         case AST_MEMBER_ACCESS: return collect_calls_in_expr(nref.member_access.object, used, flags_ptr);
         case AST_SAFE_MEMBER_ACCESS: return collect_calls_in_expr(nref.member_access.object, used, flags_ptr);
         case AST_ASSIGN:
@@ -264,8 +269,19 @@ func collect_calls_in_expr(node: *AstNode, used: *Vec<*NameInfo>, flags_ptr: u64
             return 0;
         case AST_NEW: return collect_calls_in_new(nref.new_expr, used, flags_ptr);
         case AST_STACK_CTOR: return collect_calls_in_stack_ctor(nref.stack_ctor, used, flags_ptr);
+        case AST_SLICE:
+            collect_calls_in_expr(nref.slice_expr.ptr_expr, used, flags_ptr);
+            return collect_calls_in_expr(nref.slice_expr.len_expr, used, flags_ptr);
+        case AST_TERNARY:
+            collect_calls_in_expr(nref.ternary_expr.cond, used, flags_ptr);
+            collect_calls_in_expr(nref.ternary_expr.then_expr, used, flags_ptr);
+            return collect_calls_in_expr(nref.ternary_expr.else_expr, used, flags_ptr);
+        case AST_TRY:
+            return collect_calls_in_expr(nref.try_expr.operand, used, flags_ptr);
         case AST_STRUCT_LITERAL:
             return collect_calls_in_args_vec(nref.struct_lit.values_vec, used, flags_ptr);
+        case AST_GENERIC_STRUCT_LITERAL:
+            return collect_calls_in_args_vec(nref.generic_struct_lit.values_vec, used, flags_ptr);
     }
     return 0;
 }
@@ -302,12 +318,12 @@ func collect_calls_in_for(fr: *AstFor, used: *Vec<*NameInfo>, flags_ptr: u64) ->
 
 func collect_calls_in_match_stmt(sw: *AstSwitch, used: *Vec<*NameInfo>, flags_ptr: u64) -> u64 {
     collect_calls_in_expr(sw.expr, used, flags_ptr);
-    var cases: *Vec<*AstCase> = sw.cases_vec;
+    var cases: *Vec<*AstNode> = sw.cases_vec;
     var has_string_case: u64 = 0;
     if (cases != 0) {
         var n5: u64 = cases.len();
         for (var c: u64 = 0; c < n5; c++) {
-            var cs: *AstCase = cases.get(c);
+            var cs: *AstCase = (*AstCase)cases.get(c);
             if (cs.is_default == 0) {
                 if (ast_kind(cs.value) == AST_STRING) {
                     has_string_case = 1;
@@ -358,11 +374,25 @@ func collect_calls_in_stmt(node: *AstNode, used: *Vec<*NameInfo>, flags_ptr: u64
             return collect_calls_in_stmt(nref.defer_stmt.stmt, used, flags_ptr);
         case AST_IF: return collect_calls_in_if(nref.if_stmt, used, flags_ptr);
         case AST_WHILE: return collect_calls_in_while(nref.while_stmt, used, flags_ptr);
+        case AST_DO_WHILE:
+            collect_calls_in_stmt(nref.do_while_stmt.body, used, flags_ptr);
+            return collect_calls_in_expr(nref.do_while_stmt.cond, used, flags_ptr);
         case AST_FOR: return collect_calls_in_for(nref.for_stmt, used, flags_ptr);
         case AST_SWITCH:
         case AST_MATCH:
             return collect_calls_in_match_stmt(nref.switch_stmt, used, flags_ptr);
         case AST_BLOCK: return collect_calls_in_block(nref.block_stmt, used, flags_ptr);
+        case AST_THROW_STMT:
+            return collect_calls_in_expr(((*AstThrowStmt)node).expr, used, flags_ptr);
+        case AST_TRY_STMT:
+            var tr: *AstTryStmt = (*AstTryStmt)node;
+            collect_calls_in_stmt(tr.try_block, used, flags_ptr);
+            collect_calls_in_stmt(tr.catch_block, used, flags_ptr);
+            return collect_calls_in_stmt(tr.finally_block, used, flags_ptr);
+        case AST_CASE:
+            var cs: *AstCase = nref.case_stmt;
+            if (cs.is_default == 0) { collect_calls_in_expr(cs.value, used, flags_ptr); }
+            return collect_calls_in_stmt(cs.body, used, flags_ptr);
     }
     return 0;
 }
@@ -534,11 +564,11 @@ func codegen_stmt_has_gc_runtime_need(node: *AstNode) -> u64 {
         case AST_SWITCH:
         case AST_MATCH:
             if (codegen_expr_has_gc_runtime_need(nref.switch_stmt.expr) != 0) { return 1; }
-            var cases: *Vec<*AstCase> = nref.switch_stmt.cases_vec;
+            var cases: *Vec<*AstNode> = nref.switch_stmt.cases_vec;
             if (cases == 0) { return 0; }
             var cn: u64 = cases.len();
             for (var ci: u64 = 0; ci < cn; ci++) {
-                var cs: *AstCase = cases.get(ci);
+                var cs: *AstCase = (*AstCase)cases.get(ci);
                 if (cs == 0) { continue; }
                 if (cs.is_default == 0 && codegen_expr_has_gc_runtime_need(cs.value) != 0) { return 1; }
                 if (codegen_stmt_has_gc_runtime_need(cs.body) != 0) { return 1; }
@@ -1474,7 +1504,7 @@ func stmt_has_feature(node: *AstNode, feature: u64) -> u64 {
         case AST_SWITCH:
         case AST_MATCH:
             if (expr_has_feature(nref.switch_stmt.expr, feature) != 0) { return true; }
-            var cases: *Vec<*AstCase> = nref.switch_stmt.cases_vec;
+            var cases: *Vec<*AstNode> = nref.switch_stmt.cases_vec;
             var cn: u64 = 0;
             if (cases != 0) { cn = cases.len(); }
             for (var i: u64 = 0; i < cn; i++) {
@@ -1561,6 +1591,7 @@ func build_ssa_pipeline(program: *AstProgram, use_ssa: u64, used_names: *Vec<*Na
     var phase_started: u64 = timings_now_ms();
     var ssa_detail_started: u64 = timings_profile_start();
     var ssa_ctx_ptr: *SSAContext = build_program_used(program, used_names);
+    if (ssa_ctx_ptr == 0) { return 0; }
     timings_add_ssa_span(1, ssa_detail_started);
     ssa_detail_started = timings_profile_start();
     to_ssa(ssa_ctx_ptr);
@@ -1747,6 +1778,7 @@ func emit_trace_runtime() -> u64 {
 }
 
 func emit_functions(program: *AstProgram, used_names: *Vec<*NameInfo>, use_ssa: u64, ssa_ctx: *SSAContext) -> u64 {
+    var strict_ssa: u64 = opt_get_backend_mode() == BACKEND_SSA;
     for (var i: u64 = 0; i < program.funcs_vec.len(); i++) {
         if (diag_should_stop_pass() != 0) { break; }
         var fn: *AstFunc = program.funcs_vec.get(i);
@@ -1757,6 +1789,12 @@ func emit_functions(program: *AstProgram, used_names: *Vec<*NameInfo>, use_ssa: 
             continue;
         }
         var force_non_ssa_codegen: u64 = func_has_codegen_annotation(fn);
+        if (strict_ssa != 0 && force_non_ssa_codegen != 0) {
+            diag_emit_error_tag("backend", "ssa", "strict SSA backend rejected a legacy-only annotated function");
+            diag_emit_labelled_name("function: ", fn.name);
+            diag_force_stop_pass();
+            break;
+        }
         if (use_ssa != 0 && force_non_ssa_codegen == 0) {
             var ssa_fn_ptr: *SSAFunction = find_ssa_func_by_name(ssa_ctx, fn.name);
             var ssa_ready: u64 = 0;
@@ -1768,7 +1806,21 @@ func emit_functions(program: *AstProgram, used_names: *Vec<*NameInfo>, use_ssa: 
                 ssa_ready != 0) {
                 emit_ssa_func(fn, (u64)ssa_fn_ptr);
             } else {
-                emit_func(fn);
+                if (strict_ssa != 0) {
+                    diag_emit_error_tag("backend", "ssa", "strict SSA backend could not compile function without fallback");
+                    diag_emit_labelled_name("function: ", fn.name);
+                    if (is_supported_func(fn, program.globals_vec) == 0) {
+                        diag_emit_note("function contains an SSA-unsupported construct");
+                    } else if (is_build_ok(fn.name) == 0) {
+                        diag_emit_note("SSA construction failed for this function");
+                    } else {
+                        diag_emit_note("SSA register allocation did not complete");
+                    }
+                    diag_force_stop_pass();
+                    break;
+                } else {
+                    emit_func(fn);
+                }
             }
         } else {
             emit_func(fn);
@@ -1790,23 +1842,35 @@ func program_with_sigs(prog: *AstProgram, sigs: *Vec<*AstFunc>) -> u64 {
 
     // SSA CFG scaffold (no codegen impact unless SSA/opt enabled)
     typeinfo_set_structs(program.structs_vec);
-    typeinfo_set_funcs(sigs);
+    typeinfo_set_funcs(program.funcs_vec);
     var ir_mode: u64 = opt_get_ir_mode();
     var out_mode: u64 = opt_get_output_mode();
     var use_ir: u64 = 0;
     if (ir_mode != IR_NONE) { use_ir = 1; }
     var use_ssa: u64 = 0;
-    if (ir_mode == IR_SSA) { use_ssa = 1; }
+    var backend_mode: u64 = opt_get_backend_mode();
+    if (backend_mode == BACKEND_SSA) {
+        use_ssa = 1;
+    } else if (backend_mode == BACKEND_AUTO && ir_mode == IR_SSA) {
+        use_ssa = 1;
+    }
 
     var ssa_ctx: *SSAContext = build_ssa_pipeline(program, use_ssa, used_names);
-    if (ssa_ctx == 0) { use_ssa = 0; }
+    if (ssa_ctx == 0) {
+        if (backend_mode == BACKEND_SSA) {
+            diag_emit_error_tag("backend", "ssa", "strict SSA backend pipeline failed");
+            diag_force_stop_pass();
+            return 0;
+        }
+        use_ssa = 0;
+    }
 
     var codegen_started: u64 = timings_now_ms();
     init_state();
 
     // Set structs and functions for typeinfo module
     typeinfo_set_structs(program.structs_vec);
-    typeinfo_set_funcs(sigs);
+    typeinfo_set_funcs(program.funcs_vec);
     
 
     init_globals(program);
@@ -1832,7 +1896,7 @@ func program_with_sigs_ir(prog: *AstProgram, sigs: *Vec<*AstFunc>) -> u64 {
     var program: *AstProgram = prog;
 
     typeinfo_set_structs(program.structs_vec);
-    typeinfo_set_funcs(sigs);
+    typeinfo_set_funcs(program.funcs_vec);
 
     var ir_mode: u64 = opt_get_ir_mode();
     var opt_level: u64 = opt_get_level();
@@ -1871,7 +1935,7 @@ func program_with_sigs_ir_json(prog: *AstProgram, sigs: *Vec<*AstFunc>) -> u64 {
     var program: *AstProgram = prog;
 
     typeinfo_set_structs(program.structs_vec);
-    typeinfo_set_funcs(sigs);
+    typeinfo_set_funcs(program.funcs_vec);
 
     var ir_mode: u64 = opt_get_ir_mode();
     var opt_level: u64 = opt_get_level();

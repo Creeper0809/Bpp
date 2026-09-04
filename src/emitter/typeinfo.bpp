@@ -60,6 +60,51 @@ func typeinfo_make_slice(ptr_depth: u64, elem_type_kind: u64, elem_ptr_depth: u6
     return ti;
 }
 
+func typeinfo_from_var_decl(decl: *AstVarDecl) -> *TypeInfo {
+    if (decl == 0) { return 0; }
+    var ti: *TypeInfo = typeinfo_make(decl.type_kind, decl.ptr_depth);
+    ti.is_tagged = decl.is_tagged;
+    ti.struct_name = decl.struct_name;
+    ti.tag_layout = decl.tag_layout;
+    ti.elem_type_kind = decl.elem_type_kind;
+    ti.elem_ptr_depth = decl.elem_ptr_depth;
+    ti.array_len = decl.array_len;
+    ti.array_len_is_param = decl.array_len_is_param;
+    ti.array_len_param = decl.array_len_param;
+    ti.elem_typeinfo = decl.elem_typeinfo;
+    if (decl.type_kind == TYPE_STRUCT && u8_slice_ptr(decl.struct_name) != 0) {
+        ti.struct_def = get_struct_def(decl.struct_name);
+    }
+    return ti;
+}
+
+func typeinfo_from_param(param: *Param) -> *TypeInfo {
+    if (param == 0) { return 0; }
+    var ti: *TypeInfo = typeinfo_make(param.type_kind, param.ptr_depth);
+    ti.is_tagged = param.is_tagged;
+    ti.struct_name = param.struct_name;
+    ti.tag_layout = param.tag_layout;
+    ti.elem_type_kind = param.elem_type_kind;
+    ti.elem_ptr_depth = param.elem_ptr_depth;
+    ti.array_len = param.array_len;
+    ti.array_len_is_param = param.array_len_is_param;
+    ti.array_len_param = param.array_len_param;
+    ti.elem_typeinfo = param.elem_typeinfo;
+    return ti;
+}
+
+// Variadic parameters are stored inside the callee as a pointer to their
+// contiguous argument pack. Their public call-signature type is the element
+// type that appeared after `...`, one pointer level shallower than that ABI
+// storage view.
+func typeinfo_from_call_param(param: *Param) -> *TypeInfo {
+    var ti: *TypeInfo = typeinfo_from_param(param);
+    if (ti != 0 && param != 0 && param.is_variadic != 0 && ti.ptr_depth > 0) {
+        ti.ptr_depth = ti.ptr_depth - 1;
+    }
+    return ti;
+}
+
 func typeinfo_resolve_struct_defs_recursive(ti: *TypeInfo) -> u64 {
     if (ti == 0) { return 0; }
     if (ti.type_kind == TYPE_STRUCT && ti.struct_def == 0 && u8_slice_ptr(ti.struct_name) != 0) {
@@ -246,6 +291,10 @@ func typeinfo_find_func_with_ctx(ctx: *TypeInfoCtx, name: []u8) -> *AstFunc {
             return fn;
         }
     }
+    // The signature view can omit imported bodies. The compiler-wide symbol
+    // index is authoritative for calls in the merged program.
+    var merged_fn: *AstFunc = sym_get_func(slice(name.ptr, name.len));
+    if (merged_fn != 0) { return merged_fn; }
     return 0;
 }
 
@@ -281,7 +330,11 @@ func typeinfo_from_func_decl(fn: *AstFunc) -> *TypeInfo {
         var n: u64 = fn.params_vec.len();
         for (var i: u64 = 0; i < n; i++) {
             var p: *Param = fn.params_vec.get(i);
-            var pti: *TypeInfo = typeinfo_make(p.type_kind, p.ptr_depth);
+            var signature_depth: u64 = p.ptr_depth;
+            if (p.is_variadic != 0 && signature_depth > 0) {
+                signature_depth = signature_depth - 1;
+            }
+            var pti: *TypeInfo = typeinfo_make(p.type_kind, signature_depth);
             pti.is_tagged = p.is_tagged;
             pti.struct_name = p.struct_name;
             pti.tag_layout = p.tag_layout;
@@ -552,16 +605,44 @@ func typeinfo_can_implicit_integer_widen(src_ti: *TypeInfo, dst_ti: *TypeInfo) -
     return 0;
 }
 
+func typeinfo_names_equal_resolved(lhs: []u8, rhs: []u8) -> u64 {
+    if (str_eq(lhs, rhs) != 0) { return 1; }
+    var lhs_resolved: *NameInfo = resolve_name(lhs);
+    var rhs_resolved: *NameInfo = resolve_name(rhs);
+    var lhs_name: []u8 = lhs;
+    var rhs_name: []u8 = rhs;
+    if (lhs_resolved != 0) { lhs_name = slice(lhs_resolved.ptr, lhs_resolved.len); }
+    if (rhs_resolved != 0) { rhs_name = slice(rhs_resolved.ptr, rhs_resolved.len); }
+    return str_eq(lhs_name, rhs_name);
+}
+
+func typeinfo_name_has_suffix(name: []u8, suffix: []u8) -> u64 {
+    if (name.ptr == 0 || suffix.ptr == 0 || name.len < suffix.len) { return 0; }
+    return str_eq(slice(name.ptr + name.len - suffix.len, suffix.len), suffix);
+}
+
+func typeinfo_ast_node_pointer_upcast(src_ti: *TypeInfo, dst_ti: *TypeInfo) -> u64 {
+    if (src_ti == 0 || dst_ti == 0 || src_ti.ptr_depth == 0 || src_ti.ptr_depth != dst_ti.ptr_depth) { return 0; }
+    if (src_ti.type_kind != TYPE_STRUCT || dst_ti.type_kind != TYPE_STRUCT) { return 0; }
+    if (typeinfo_name_has_suffix(dst_ti.struct_name, slice("AstNode", 7)) == 0) { return 0; }
+    if (typeinfo_name_has_suffix(src_ti.struct_name, slice("AstNode", 7)) != 0) { return 1; }
+    var name: []u8 = src_ti.struct_name;
+    for (var i: u64 = 0; i + 3 <= name.len; i++) {
+        if (name[i] == 65 && name[i + 1] == 115 && name[i + 2] == 116) { return 1; }
+    }
+    return 0;
+}
+
 func typeinfo_equal(lhs: *TypeInfo, rhs: *TypeInfo) -> u64 {
     if (lhs == 0 || rhs == 0) { return 0; }
     if (lhs.type_kind != rhs.type_kind) { return 0; }
     if (lhs.ptr_depth != rhs.ptr_depth) { return 0; }
     if (lhs.is_tagged != rhs.is_tagged) { return 0; }
     if (lhs.is_tagged != 0) {
-        if (!str_eq(lhs.tag_layout, rhs.tag_layout)) { return 0; }
+        if (typeinfo_names_equal_resolved(lhs.tag_layout, rhs.tag_layout) == 0) { return 0; }
     }
     if (lhs.type_kind == TYPE_STRUCT || lhs.type_kind == TYPE_TRAIT || lhs.type_kind == TYPE_GENERIC) {
-        if (!str_eq(lhs.struct_name, rhs.struct_name)) { return 0; }
+        if (typeinfo_names_equal_resolved(lhs.struct_name, rhs.struct_name) == 0) { return 0; }
     }
     if (lhs.type_kind == TYPE_ARRAY || lhs.type_kind == TYPE_SLICE) {
         if (lhs.type_kind == TYPE_ARRAY && lhs.array_len != rhs.array_len) { return 0; }
@@ -572,7 +653,7 @@ func typeinfo_equal(lhs: *TypeInfo, rhs: *TypeInfo) -> u64 {
             if (lhs.elem_type_kind != rhs.elem_type_kind) { return 0; }
             if (lhs.elem_ptr_depth != rhs.elem_ptr_depth) { return 0; }
             if (lhs.elem_type_kind == TYPE_STRUCT || lhs.elem_type_kind == TYPE_TRAIT || lhs.elem_type_kind == TYPE_GENERIC) {
-                if (!str_eq(lhs.struct_name, rhs.struct_name)) { return 0; }
+                if (typeinfo_names_equal_resolved(lhs.struct_name, rhs.struct_name) == 0) { return 0; }
             }
         }
     }
@@ -596,9 +677,36 @@ func typeinfo_equal(lhs: *TypeInfo, rhs: *TypeInfo) -> u64 {
     return 1;
 }
 
-// Assignment-style compatibility:
-// - Primitive/pointer compatibility reuses existing check_type_compat behavior.
-// - Function types use explicit variance rules.
+func typeinfo_sequence_element_equal(lhs: *TypeInfo, rhs: *TypeInfo) -> u64 {
+    if (lhs == 0 || rhs == 0) { return 0; }
+    var lhs_kind: u64 = lhs.elem_type_kind;
+    var lhs_depth: u64 = lhs.elem_ptr_depth;
+    var lhs_name: []u8 = lhs.struct_name;
+    if (lhs.elem_typeinfo != 0) {
+        lhs_kind = lhs.elem_typeinfo.type_kind;
+        lhs_depth = lhs.elem_typeinfo.ptr_depth;
+        lhs_name = lhs.elem_typeinfo.struct_name;
+    }
+    var rhs_kind: u64 = rhs.elem_type_kind;
+    var rhs_depth: u64 = rhs.elem_ptr_depth;
+    var rhs_name: []u8 = rhs.struct_name;
+    if (rhs.elem_typeinfo != 0) {
+        rhs_kind = rhs.elem_typeinfo.type_kind;
+        rhs_depth = rhs.elem_typeinfo.ptr_depth;
+        rhs_name = rhs.elem_typeinfo.struct_name;
+    }
+    if (lhs_kind != rhs_kind || lhs_depth != rhs_depth) { return 0; }
+    if (lhs_kind == TYPE_STRUCT || lhs_kind == TYPE_TRAIT || lhs_kind == TYPE_GENERIC) {
+        return typeinfo_names_equal_resolved(lhs_name, rhs_name);
+    }
+    return 1;
+}
+
+// Assignment-style compatibility is nominal for aggregates and exact for
+// pointer pointee types. Integer-to-integer conversions retain the language's
+// existing machine-integer truncation/sign behavior; float and integer domains
+// never become compatible merely because their storage widths match.
+// Function types use explicit variance rules.
 func typeinfo_is_assignable(src_ti: *TypeInfo, dst_ti: *TypeInfo) -> u64 {
     if (src_ti == 0 || dst_ti == 0) { return 0; }
     if (src_ti.type_kind == TYPE_NULL && src_ti.ptr_depth == 0) {
@@ -610,14 +718,207 @@ func typeinfo_is_assignable(src_ti: *TypeInfo, dst_ti: *TypeInfo) -> u64 {
         if (src_ti.type_kind == TYPE_NULL && src_ti.ptr_depth == 0) { return 1; }
         return 0;
     }
+    // A generic placeholder that survives into a generated specialization is
+    // not a concrete nominal type. Its binding was already validated by the
+    // monomorphizer, so only two explicitly named generic placeholders need a
+    // name comparison here.
+    if (src_ti.type_kind == TYPE_GENERIC || dst_ti.type_kind == TYPE_GENERIC) {
+        if (src_ti.type_kind == TYPE_GENERIC && dst_ti.type_kind == TYPE_GENERIC &&
+            src_ti.struct_name.ptr != 0 && dst_ti.struct_name.ptr != 0) {
+            return typeinfo_names_equal_resolved(src_ti.struct_name, dst_ti.struct_name);
+        }
+        return 1;
+    }
+    // Function and closure values are represented as one-word handles by the
+    // low-level language surface. Typed func-to-func assignments still take
+    // the signature path below.
+    if (src_ti.type_kind == TYPE_FUNC && dst_ti.ptr_depth == 0 &&
+        (dst_ti.type_kind == TYPE_U64 || dst_ti.type_kind == TYPE_I64)) { return 1; }
+    if (dst_ti.type_kind == TYPE_FUNC && src_ti.ptr_depth == 0 &&
+        (src_ti.type_kind == TYPE_U64 || src_ti.type_kind == TYPE_I64)) { return 1; }
     if (src_ti.type_kind == TYPE_FUNC || dst_ti.type_kind == TYPE_FUNC) {
         return typeinfo_func_assignable(src_ti, dst_ti);
     }
+    // Number is the language's dynamic numeric carrier used at generic
+    // boundaries. This conversion is intentional and distinct from allowing
+    // unrelated same-sized structs or float/integer bit reinterpretation.
+    if (typeinfo_is_number_struct(src_ti) != 0 && dst_ti.ptr_depth == 0 &&
+        (typeinfo_kind_integer_width(dst_ti.type_kind) != 0 || dst_ti.type_kind == TYPE_F64)) { return 1; }
+    if (typeinfo_is_number_struct(dst_ti) != 0 && src_ti.ptr_depth == 0 &&
+        (typeinfo_kind_integer_width(src_ti.type_kind) != 0 || src_ti.type_kind == TYPE_F64)) { return 1; }
+    // Raw addresses are part of the current low-level ABI and may cross the
+    // u64/i64 boundary. Pointer-to-pointer assignments remain nominal below.
+    if (src_ti.ptr_depth > 0 && dst_ti.ptr_depth == 0 &&
+        (dst_ti.type_kind == TYPE_U64 || dst_ti.type_kind == TYPE_I64)) { return 1; }
+    if (dst_ti.ptr_depth > 0 && src_ti.ptr_depth == 0 &&
+        (src_ti.type_kind == TYPE_U64 || src_ti.type_kind == TYPE_I64)) { return 1; }
+    // The compiler's AST is an explicit tagged-node hierarchy represented by
+    // concrete Ast* structs with AstNode as their common pointer view.
+    if (typeinfo_ast_node_pointer_upcast(src_ti, dst_ti) != 0) { return 1; }
+    if (src_ti.ptr_depth != dst_ti.ptr_depth) { return 0; }
+    if (src_ti.ptr_depth == 0 &&
+        (typeinfo_kind_is_unsigned_integer(src_ti.type_kind) != 0 || typeinfo_kind_is_signed_integer(src_ti.type_kind) != 0) &&
+        (typeinfo_kind_is_unsigned_integer(dst_ti.type_kind) != 0 || typeinfo_kind_is_signed_integer(dst_ti.type_kind) != 0)) { return 1; }
     if (typeinfo_can_implicit_integer_widen(src_ti, dst_ti) != 0) { return 1; }
-    var mismatch: u64 = check_type_compat(src_ti.type_kind, src_ti.ptr_depth, src_ti.is_tagged, src_ti.tag_layout, dst_ti.type_kind, dst_ti.ptr_depth, dst_ti.is_tagged, dst_ti.tag_layout);
-    if (mismatch != 0) { return 0; }
-    if (src_ti.type_kind == TYPE_ARRAY || dst_ti.type_kind == TYPE_ARRAY || src_ti.type_kind == TYPE_SLICE || dst_ti.type_kind == TYPE_SLICE) {
-        return typeinfo_equal(src_ti, dst_ti);
+    if (src_ti.type_kind != dst_ti.type_kind) { return 0; }
+    if (src_ti.is_tagged != dst_ti.is_tagged) { return 0; }
+    if (src_ti.is_tagged != 0 && typeinfo_names_equal_resolved(src_ti.tag_layout, dst_ti.tag_layout) == 0) { return 0; }
+    if (src_ti.type_kind == TYPE_STRUCT || src_ti.type_kind == TYPE_TRAIT || src_ti.type_kind == TYPE_GENERIC) {
+        if (typeinfo_names_equal_resolved(src_ti.struct_name, dst_ti.struct_name) != 0) { return 1; }
+        if (src_ti.type_kind == TYPE_STRUCT && src_ti.ptr_depth > 0) {
+            var distance: u64 = sym_struct_distance_to_ancestor(src_ti.struct_name, dst_ti.struct_name);
+            if (distance != COMPILER_INHERIT_DIST_NOT_FOUND) { return 1; }
+        }
+        return 0;
+    }
+    if (src_ti.type_kind == TYPE_ARRAY || src_ti.type_kind == TYPE_SLICE) {
+        // AstFunc currently records only the outer sequence return kind. Treat
+        // a missing element descriptor as unknown, not as a concrete mismatch.
+        if ((src_ti.elem_typeinfo == 0 && src_ti.elem_type_kind == 0) ||
+            (dst_ti.elem_typeinfo == 0 && dst_ti.elem_type_kind == 0)) { return 1; }
+        if (src_ti.type_kind == TYPE_ARRAY && src_ti.array_len != dst_ti.array_len) { return 0; }
+        return typeinfo_sequence_element_equal(src_ti, dst_ti);
+    }
+    return 1;
+}
+
+func typeinfo_expr_is_integer_constant(expr: *AstNode) -> u64 {
+    if (expr == 0) { return 0; }
+    var kind: u64 = ast_kind(expr);
+    if (kind == AST_LITERAL) { return 1; }
+    if (kind == AST_IDENT) {
+        var ident: *AstIdent = (*AstIdent)expr;
+        var found: *ConstResult = (*ConstResult)sym_find_const(ident.name);
+        if (found != 0 && found.found != 0) { return 1; }
+        var resolved: *NameInfo = resolve_name(ident.name);
+        if (resolved != 0) {
+            found = (*ConstResult)sym_find_const(slice(resolved.ptr, resolved.len));
+            if (found != 0 && found.found != 0) { return 1; }
+        }
+        return 0;
+    }
+    if (kind == AST_MEMBER_ACCESS) {
+        var member: *AstMemberAccess = (*AstMemberAccess)expr;
+        if (ast_kind(member.object) != AST_IDENT) { return 0; }
+        var scope: *AstIdent = (*AstIdent)member.object;
+        var scoped: *ConstResult = (*ConstResult)sym_find_scoped_const(scope.name, member.member);
+        if (scoped != 0 && scoped.found != 0) { return 1; }
+        return 0;
+    }
+    if (kind == AST_CAST) {
+        var cast: *AstCast = (*AstCast)expr;
+        if (cast.target_ptr_depth != 0) { return 0; }
+        if (typeinfo_kind_is_unsigned_integer(cast.target_type) == 0 &&
+            typeinfo_kind_is_signed_integer(cast.target_type) == 0 && cast.target_type != TYPE_BOOL) { return 0; }
+        return typeinfo_expr_is_integer_constant(cast.expr);
+    }
+    if (kind == AST_UNARY) {
+        return typeinfo_expr_is_integer_constant(((*AstUnary)expr).operand);
+    }
+    if (kind == AST_BINARY) {
+        var binary: *AstBinary = (*AstBinary)expr;
+        if (typeinfo_expr_is_integer_constant(binary.left) == 0) { return 0; }
+        return typeinfo_expr_is_integer_constant(binary.right);
+    }
+    if (kind == AST_TERNARY) {
+        var ternary: *AstTernary = (*AstTernary)expr;
+        if (typeinfo_expr_is_integer_constant(ternary.cond) == 0) { return 0; }
+        if (typeinfo_expr_is_integer_constant(ternary.then_expr) == 0) { return 0; }
+        return typeinfo_expr_is_integer_constant(ternary.else_expr);
+    }
+    return 0;
+}
+
+func typeinfo_expr_is_zero_literal(expr: *AstNode) -> u64 {
+    if (expr == 0) { return 0; }
+    var kind: u64 = ast_kind(expr);
+    if (kind == AST_LITERAL) {
+        return ((*AstLiteral)expr).value == 0;
+    }
+    if (kind == AST_CAST) {
+        return typeinfo_expr_is_zero_literal(((*AstCast)expr).expr);
+    }
+    return 0;
+}
+
+func typeinfo_expr_is_assignable(expr: *AstNode, src_ti: *TypeInfo, dst_ti: *TypeInfo) -> u64 {
+    if (typeinfo_is_assignable(src_ti, dst_ti) != 0) { return 1; }
+    if (expr == 0 || dst_ti == 0) { return 0; }
+    var kind: u64 = ast_kind(expr);
+    // Fixed arrays decay to a pointer to their first element at call and
+    // assignment boundaries. Compare the complete nested element descriptor
+    // so `[N]T` cannot decay to an unrelated `*U` merely by size.
+    if (src_ti != 0 && src_ti.ptr_depth == 0 && src_ti.type_kind == TYPE_ARRAY && dst_ti.ptr_depth > 0) {
+        var array_elem: *TypeInfo = typeinfo_elem_type_from_container(src_ti);
+        var pointer_elem: *TypeInfo = typeinfo_clone_with_depth(dst_ti, dst_ti.ptr_depth - 1);
+        if (array_elem != 0 && pointer_elem != 0 && typeinfo_is_assignable(array_elem, pointer_elem) != 0) {
+            return 1;
+        }
+    }
+    if (dst_ti.ptr_depth == 0 && typeinfo_expr_is_integer_constant(expr) != 0) {
+        if (dst_ti.type_kind == TYPE_BOOL || typeinfo_kind_is_unsigned_integer(dst_ti.type_kind) != 0 || typeinfo_kind_is_signed_integer(dst_ti.type_kind) != 0) {
+            return 1;
+        }
+    }
+    if (kind == AST_LITERAL && dst_ti.ptr_depth > 0) {
+        var lit: *AstLiteral = (*AstLiteral)expr;
+        if (lit.value == 0) { return 1; }
+    }
+    if (kind == AST_FLOAT && dst_ti.ptr_depth == 0 && dst_ti.type_kind == TYPE_F64) { return 1; }
+    // `slice(0, 0)` is the language's context-typed empty slice literal. Its
+    // fallback u8 element type must not defeat the declared destination type.
+    if (kind == AST_SLICE && dst_ti.ptr_depth == 0 && dst_ti.type_kind == TYPE_SLICE) {
+        var empty_slice: *AstSlice = (*AstSlice)expr;
+        if (typeinfo_expr_is_zero_literal(empty_slice.ptr_expr) != 0 &&
+            typeinfo_expr_is_zero_literal(empty_slice.len_expr) != 0) { return 1; }
+    }
+    return 0;
+}
+
+func typeinfo_func_pointer_variadic_arg_assignable(expr: *AstNode, actual: *TypeInfo, expected: *TypeInfo) -> u64 {
+    if (actual == 0 || expected == 0) { return 0; }
+    // Preserve the language's legacy bool/integer result convention generally,
+    // but a typed variadic pack has a concrete element type and must not accept
+    // a boolean constant as an integer element implicitly.
+    if (actual.type_kind == TYPE_BOOL && expected.type_kind != TYPE_BOOL) { return 0; }
+    return typeinfo_expr_is_assignable(expr, actual, expected);
+}
+
+func typeinfo_validate_call_arguments(args: *Vec<*AstNode>, fn: *AstFunc, symtab: *Symtab, phase: u64) -> u64 {
+    if (fn == 0 || fn.params_vec == 0 || args == 0) { return 1; }
+    var nargs: u64 = args.len();
+    var nparams: u64 = fn.params_vec.len();
+    var offset: u64 = 0;
+    if (nparams > 0) {
+        var first: *Param = fn.params_vec.get(0);
+        if (first != 0 && str_eq(first.name, slice("self", 4)) != 0 && nargs + 1 <= nparams) { offset = 1; }
+    }
+    for (var i: u64 = 0; i < nargs; i++) {
+        var param_index: u64 = i + offset;
+        if (param_index >= nparams) {
+            if (nparams == 0) { return 1; }
+            var last: *Param = fn.params_vec.get(nparams - 1);
+            if (last == 0 || last.is_variadic == 0) { return 1; }
+            param_index = nparams - 1;
+        }
+        var param: *Param = fn.params_vec.get(param_index);
+        if (param == 0) { continue; }
+        var arg: *AstNode = args.get(i);
+        var actual: *TypeInfo = get_expr_type_with_symtab(arg, symtab);
+        var expected: *TypeInfo = typeinfo_from_call_param(param);
+        if (actual != 0 && expected != 0 && typeinfo_expr_is_assignable(arg, actual, expected) == 0) {
+            diag_emit_error_tag(phase, "call", "argument type mismatch");
+            diag_emit_labelled_name("function: ", fn.name);
+            diag_emit_labelled_u64("index: ", i);
+            diag_emit_labelled_u64("expected type: ", expected.type_kind);
+            diag_emit_labelled_u64("actual type: ", actual.type_kind);
+            diag_emit_labelled_u64("expected pointer depth: ", expected.ptr_depth);
+            diag_emit_labelled_u64("actual pointer depth: ", actual.ptr_depth);
+            diag_emit_labelled_u64("expected element type: ", expected.elem_type_kind);
+            diag_emit_labelled_u64("actual element type: ", actual.elem_type_kind);
+            diag_force_stop_pass();
+            return 0;
+        }
     }
     return 1;
 }
@@ -628,10 +929,9 @@ func typeinfo_is_assignable(src_ti: *TypeInfo, dst_ti: *TypeInfo) -> u64 {
 func typeinfo_func_assignable(src_ti: *TypeInfo, dst_ti: *TypeInfo) -> u64 {
     if (src_ti == 0 || dst_ti == 0) { return 0; }
     if (src_ti.type_kind != TYPE_FUNC || dst_ti.type_kind != TYPE_FUNC) { return 0; }
-    if (src_ti.ptr_depth != dst_ti.ptr_depth) { return 0; }
     if (src_ti.is_tagged != dst_ti.is_tagged) { return 0; }
     if (src_ti.is_tagged != 0) {
-        if (!str_eq(src_ti.tag_layout, dst_ti.tag_layout)) { return 0; }
+        if (typeinfo_names_equal_resolved(src_ti.tag_layout, dst_ti.tag_layout) == 0) { return 0; }
     }
 
     var fs: *TypeInfo = typeinfo_func_signature(src_ti);
@@ -649,11 +949,14 @@ func typeinfo_func_assignable(src_ti: *TypeInfo, dst_ti: *TypeInfo) -> u64 {
     for (var i: u64 = 0; i < fn; i++) {
         var from_param: *TypeInfo = fs.fn_params_vec.get(i);
         var to_param: *TypeInfo = ts.fn_params_vec.get(i);
+        if (from_param == 0 || to_param == 0) { return 0; }
+        if (from_param.ptr_depth != to_param.ptr_depth) { return 0; }
         if (typeinfo_is_assignable(to_param, from_param) == 0) { return 0; }
     }
 
     if ((fs.fn_ret_typeinfo == 0) != (ts.fn_ret_typeinfo == 0)) { return 0; }
     if (fs.fn_ret_typeinfo != 0) {
+        if (fs.fn_ret_typeinfo.ptr_depth != ts.fn_ret_typeinfo.ptr_depth) { return 0; }
         if (typeinfo_is_assignable(fs.fn_ret_typeinfo, ts.fn_ret_typeinfo) == 0) { return 0; }
     }
     return 1;
@@ -808,6 +1111,7 @@ func _typeinfo_struct_size_internal(struct_info: *AstStructDef, depth: u64) -> u
         diag_emit_error_tag("typecheck", "inheritance", "Inheritance depth exceeded");
         diag_emit_help("check for cyclic inheritance or an unexpectedly deep parent chain");
         diag_error("TypeInfo error");
+        return 0;
     }
     if (struct_info.is_union == 1) {
         if ((struct_info.parents_vec != 0 && struct_info.parents_vec.len() > 0) ||
@@ -859,6 +1163,7 @@ func _typeinfo_find_parent_offset(struct_info: *AstStructDef, target: []u8, base
         diag_emit_error_tag("typecheck", "inheritance", "Inheritance depth exceeded");
         diag_emit_help("check for cyclic inheritance or an unexpectedly deep parent chain");
         diag_error("TypeInfo error");
+        return 0;
     }
     if (str_eq(struct_info.name, slice(target.ptr, target.len))) {
         *out_offset = base_offset;
@@ -976,6 +1281,7 @@ func _typeinfo_struct_find_field_internal(struct_info: *AstStructDef, field: []u
         diag_emit_error_tag("typecheck", "inheritance", "Inheritance depth exceeded");
         diag_emit_help("check for cyclic inheritance or an unexpectedly deep parent chain");
         diag_error("TypeInfo error");
+        return 0;
     }
     if (struct_info.is_union == 1) {
         return _typeinfo_struct_find_field_local(struct_info, slice(field.ptr, field.len), 0, out_offset, out_desc);
@@ -1476,6 +1782,7 @@ func typeinfo_from_cast_expr(cast_node: *AstCast) -> *TypeInfo {
         var struct_def: *AstStructDef = get_struct_def(cast_node.struct_name);
         var rs: *TypeInfo = typeinfo_make_struct(cast_node.target_ptr_depth, cast_node.struct_name, struct_def);
         rs.is_tagged = cast_node.target_is_tagged;
+        rs.tag_layout = cast_node.tag_layout;
         return rs;
     }
     var rb: *TypeInfo = typeinfo_make(cast_node.target_type, cast_node.target_ptr_depth);
@@ -1522,11 +1829,9 @@ func typeinfo_from_index_expr(index: *AstIndex, symtab: *Symtab) -> *TypeInfo {
 func typeinfo_from_slice_expr(slice: *AstSlice, symtab: *Symtab) -> *TypeInfo {
     var pt: *TypeInfo = get_expr_type_with_symtab(slice.ptr_expr, symtab);
     if (pt != 0 && pt.ptr_depth > 0) {
-        if (pt.type_kind == TYPE_STRUCT) {
-            return typeinfo_make_slice(0, TYPE_STRUCT, pt.ptr_depth - 1, pt.struct_name, pt.struct_def);
-        }
-        var out: *TypeInfo = typeinfo_make_slice(0, pt.type_kind, pt.ptr_depth - 1, pt.struct_name, 0);
-        out.elem_typeinfo = pt.elem_typeinfo;
+        var elem: *TypeInfo = typeinfo_clone_with_depth(pt, pt.ptr_depth - 1);
+        var out: *TypeInfo = typeinfo_make_slice(0, elem.type_kind, elem.ptr_depth, elem.struct_name, elem.struct_def);
+        out.elem_typeinfo = elem;
         return out;
     }
     return typeinfo_make_slice(0, TYPE_U8, 0, slice(0, 0), 0);
@@ -1651,6 +1956,31 @@ func typeinfo_from_binary_expr(binary: *AstBinary, symtab: *Symtab) -> *TypeInfo
             return typeinfo_clone_with_depth(right_ti, right_ti.ptr_depth);
         }
     }
+    if (op == TOKEN_PLUS || op == TOKEN_MINUS || op == TOKEN_STAR || op == TOKEN_SLASH ||
+        op == TOKEN_PERCENT || op == TOKEN_AMPERSAND || op == TOKEN_PIPE || op == TOKEN_CARET ||
+        op == TOKEN_LSHIFT || op == TOKEN_RSHIFT) {
+        // Integer literals and constants are untyped until their surrounding
+        // expression supplies a concrete scalar type. Preserve the typed side
+        // instead of collapsing every integer expression to the I64 fallback.
+        var left_constant: u64 = typeinfo_expr_is_integer_constant(binary.left);
+        var right_constant: u64 = typeinfo_expr_is_integer_constant(binary.right);
+        if (left_ti_f != 0 && left_ti_f.ptr_depth == 0 && left_constant == 0 &&
+            (typeinfo_kind_is_unsigned_integer(left_ti_f.type_kind) != 0 || typeinfo_kind_is_signed_integer(left_ti_f.type_kind) != 0)) {
+            return typeinfo_clone(left_ti_f);
+        }
+        if (right_ti_f != 0 && right_ti_f.ptr_depth == 0 && right_constant == 0 &&
+            (typeinfo_kind_is_unsigned_integer(right_ti_f.type_kind) != 0 || typeinfo_kind_is_signed_integer(right_ti_f.type_kind) != 0)) {
+            return typeinfo_clone(right_ti_f);
+        }
+        if (left_ti_f != 0 && left_ti_f.ptr_depth == 0 &&
+            (typeinfo_kind_is_unsigned_integer(left_ti_f.type_kind) != 0 || typeinfo_kind_is_signed_integer(left_ti_f.type_kind) != 0)) {
+            return typeinfo_clone(left_ti_f);
+        }
+        if (right_ti_f != 0 && right_ti_f.ptr_depth == 0 &&
+            (typeinfo_kind_is_unsigned_integer(right_ti_f.type_kind) != 0 || typeinfo_kind_is_signed_integer(right_ti_f.type_kind) != 0)) {
+            return typeinfo_clone(right_ti_f);
+        }
+    }
     return 0;
 }
 
@@ -1699,13 +2029,17 @@ func get_expr_type_with_symtab(node: *AstNode, symtab: *Symtab) -> *TypeInfo {
         if (call_closure == 0 && (u8_slice_ptr(resolved_call_name) != u8_slice_ptr(call_name) || u8_slice_len(resolved_call_name) != u8_slice_len(call_name))) {
             call_closure = closure_handle_is(resolved_call_name);
         }
-        if (call_closure != 0 || local_call_ti != 0) {
+        if (call_closure != 0 || (local_call_ti != 0 && local_call_ti.type_kind == TYPE_FUNC)) {
             var callee_ident_cp: *AstNode = ast_ident(call_name);
             var call_ptr_cp: *AstCallPtr = ast_call_ptr(callee_ident_cp, nref.call.args_vec);
             return typeinfo_from_call_ptr_expr(call_ptr_cp, symtab);
         }
 
-        var fn_call: *AstFunc = typeinfo_find_func(nref.call.name);
+        var fn_call: *AstFunc = sym_get_func(resolved_call_name);
+        if (fn_call == 0) { fn_call = typeinfo_find_func(resolved_call_name); }
+        if (fn_call == 0 && (u8_slice_ptr(resolved_call_name) != u8_slice_ptr(call_name) || u8_slice_len(resolved_call_name) != u8_slice_len(call_name))) {
+            fn_call = typeinfo_find_func(call_name);
+        }
         if (fn_call == 0 && nref.call.origin == AST_CALL_ORIGIN_MEMBER_LOWERED) {
             fn_call = sym_get_impl_method_func(resolved_call_name);
             if (fn_call == 0 && (u8_slice_ptr(resolved_call_name) != u8_slice_ptr(call_name) || u8_slice_len(resolved_call_name) != u8_slice_len(call_name))) {
@@ -1753,7 +2087,9 @@ func get_expr_type_with_symtab(node: *AstNode, symtab: *Symtab) -> *TypeInfo {
     if (kind == AST_TERNARY) { return typeinfo_from_ternary_expr(nref.ternary_expr, symtab); }
     if (kind == AST_SAFE_MEMBER_ACCESS) { return typeinfo_safe_member_access_type(nref.member_access, symtab); }
     if (kind == AST_STRUCT_LITERAL) {
-        return typeinfo_make_struct(0, slice(0, 0), nref.struct_lit.struct_def);
+        var literal_name: []u8 = slice(0, 0);
+        if (nref.struct_lit.struct_def != 0) { literal_name = nref.struct_lit.struct_def.name; }
+        return typeinfo_make_struct(0, literal_name, nref.struct_lit.struct_def);
     }
 
     if (kind == AST_BINARY) {

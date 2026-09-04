@@ -646,6 +646,9 @@ run_matrix_case() {
     local expect_asm_file="${14}"
     local compile_only="${15}"
     local expect_asm_count_file="${16:-}"
+    local compiler_output_mode="${17:--asm}"
+    local expect_deterministic_output="${18:-0}"
+    local expect_output_excludes_file="${19:-}"
 
     local case_tag="[$case_num] Testing $test_label ($mode $opt)"
     local case_pass=0
@@ -692,7 +695,7 @@ run_matrix_case() {
     local compile_start_ms
     local compile_end_ms
     compile_start_ms="$(now_ms)"
-    $COMPILER $opt_flag $ir_flag "${compiler_extra_args[@]}" -asm "$test_file" > "$asm_file" 2>"$err_file"
+    $COMPILER $opt_flag $ir_flag "${compiler_extra_args[@]}" "$compiler_output_mode" "$test_file" > "$asm_file" 2>"$err_file"
     compile_exit="$?"
     compile_end_ms="$(now_ms)"
     compile_ms=$((compile_end_ms - compile_start_ms))
@@ -733,6 +736,21 @@ run_matrix_case() {
             case_status="FAIL (compile exit=$compile_exit)"
         fi
     else
+        if [ "$expect_deterministic_output" -eq 1 ]; then
+            local repeat_file="${asm_file}.repeat"
+            local repeat_err="${err_file}.repeat"
+            rm -f "$repeat_file" "$repeat_err"
+            $COMPILER $opt_flag $ir_flag "${compiler_extra_args[@]}" "$compiler_output_mode" "$test_file" > "$repeat_file" 2>"$repeat_err"
+            local repeat_exit="$?"
+            if [ "$repeat_exit" -ne 0 ]; then
+                case_fail=1
+                case_status="FAIL (determinism rerun exit=$repeat_exit)"
+            elif ! cmp -s "$asm_file" "$repeat_file"; then
+                case_fail=1
+                case_status="FAIL (nondeterministic compiler output)"
+            fi
+            rm -f "$repeat_file" "$repeat_err"
+        fi
         local missing_asm_pat=""
         if [ -n "$expect_asm_file" ] && [ -f "$expect_asm_file" ]; then
             while IFS= read -r pat || [ -n "$pat" ]; do
@@ -785,6 +803,22 @@ run_matrix_case() {
             if [ -n "$asm_count_fail" ]; then
                 case_fail=1
                 case_status="FAIL (asm count limit: $asm_count_fail)"
+            fi
+        fi
+        if [ "$case_fail" -eq 0 ] && [ -n "$expect_output_excludes_file" ] && [ -f "$expect_output_excludes_file" ]; then
+            local unexpected_output_pat=""
+            while IFS= read -r pat || [ -n "$pat" ]; do
+                if [ -z "$pat" ]; then
+                    continue
+                fi
+                if grep -Fq "$pat" "$asm_file"; then
+                    unexpected_output_pat="$pat"
+                    break
+                fi
+            done < "$expect_output_excludes_file"
+            if [ -n "$unexpected_output_pat" ]; then
+                case_fail=1
+                case_status="FAIL (compiler output unexpectedly contains: $unexpected_output_pat)"
             fi
         fi
         if [ "$case_fail" -eq 0 ] && [ "$expect_compile_fail" -eq 1 ]; then
@@ -1386,7 +1420,7 @@ for TEST_FILE in "${TEST_FILES[@]}"; do
             continue
         fi
     fi
-CONTENT_HASH=$(awk '{if ($0 !~ /^\/\/ (Covers:|Mode:|Opt:|Compiler args:|Compile only:|LLVM Build:|LLVM Only:|Expect exit code:|Expect compile fail:|Expect error contains:|Expect asm contains:|Expect asm count <=:|Expect llvm metadata contains:|Expect stdout:|Stdin:)/) print}' "$TEST_FILE" | md5sum | awk '{print $1}')
+CONTENT_HASH=$(awk '{if ($0 !~ /^\/\/ (Covers:|Mode:|Opt:|Compiler args:|Compiler output mode:|Expect deterministic compiler output:|Expect compiler output excludes:|Compile only:|LLVM Build:|LLVM Only:|Expect exit code:|Expect compile fail:|Expect error contains:|Expect asm contains:|Expect asm count <=:|Expect llvm metadata contains:|Expect stdout:|Stdin:)/) print}' "$TEST_FILE" | md5sum | awk '{print $1}')
     if [ -n "${SEEN_HASH[$CONTENT_HASH]}" ]; then
         if [ "$TEST_QUIET" -eq 0 ]; then
             echo "[SKIP] Duplicate content: $TEST_LABEL (same as ${SEEN_HASH[$CONTENT_HASH]})"
@@ -1426,6 +1460,22 @@ CONTENT_HASH=$(awk '{if ($0 !~ /^\/\/ (Covers:|Mode:|Opt:|Compiler args:|Compile
     if [ ! -s "$COMPILER_ARGS_FILE" ]; then
         rm -f "$COMPILER_ARGS_FILE"
         COMPILER_ARGS_FILE=""
+    fi
+    COMPILER_OUTPUT_MODE=$(grep -m1 -E '^// Compiler output mode:' "$TEST_FILE" | sed -E 's|^// Compiler output mode:[[:space:]]*||' || true)
+    if [ -z "$COMPILER_OUTPUT_MODE" ]; then
+        COMPILER_OUTPUT_MODE="-asm"
+    fi
+    EXPECT_DETERMINISTIC_OUTPUT_RAW=$(grep -m1 -E '^// Expect deterministic compiler output:' "$TEST_FILE" | awk -F': ' '{print $2}' | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]' || true)
+    EXPECT_DETERMINISTIC_OUTPUT=0
+    if [ "$EXPECT_DETERMINISTIC_OUTPUT_RAW" = "1" ] || [ "$EXPECT_DETERMINISTIC_OUTPUT_RAW" = "true" ] || [ "$EXPECT_DETERMINISTIC_OUTPUT_RAW" = "yes" ]; then
+        EXPECT_DETERMINISTIC_OUTPUT=1
+    fi
+    EXPECT_OUTPUT_EXCLUDES_FILE="$JOBS_DIR/${RUN_TAG}_${TEST_NAME}.output_excludes"
+    rm -f "$EXPECT_OUTPUT_EXCLUDES_FILE"
+    grep -E '^// Expect compiler output excludes:' "$TEST_FILE" | sed -E 's|^// Expect compiler output excludes:[[:space:]]*||' > "$EXPECT_OUTPUT_EXCLUDES_FILE" || true
+    if [ ! -s "$EXPECT_OUTPUT_EXCLUDES_FILE" ]; then
+        rm -f "$EXPECT_OUTPUT_EXCLUDES_FILE"
+        EXPECT_OUTPUT_EXCLUDES_FILE=""
     fi
     EXPECT_ASM_FILE="$JOBS_DIR/${RUN_TAG}_${TEST_NAME}.asm_expect"
     rm -f "$EXPECT_ASM_FILE"
@@ -1511,7 +1561,7 @@ CONTENT_HASH=$(awk '{if ($0 !~ /^\/\/ (Covers:|Mode:|Opt:|Compiler args:|Compile
                 RESULT_FILE="$JOBS_DIR/${RUN_TAG}_case_${TOTAL}.result"
                 CASE_RESULT_FILES+=("$RESULT_FILE")
                 RESULT_LABEL["$RESULT_FILE"]="[$TOTAL] Testing $TEST_LABEL ($MODE $OPT)"
-                launch_job_with_limit run_matrix_case "$TOTAL" "$TEST_FILE" "$TEST_NAME" "$TEST_LABEL" "$MODE" "$OPT" "$EXPECTED" "$EXPECT_COMPILE_FAIL" "$EXPECT_ERROR_FILE" "$EXPECT_STDOUT_FILE" "$STDIN_FILE" "$RESULT_FILE" "$COMPILER_ARGS_FILE" "$EXPECT_ASM_FILE" "$COMPILE_ONLY" "$EXPECT_ASM_COUNT_FILE"
+                launch_job_with_limit run_matrix_case "$TOTAL" "$TEST_FILE" "$TEST_NAME" "$TEST_LABEL" "$MODE" "$OPT" "$EXPECTED" "$EXPECT_COMPILE_FAIL" "$EXPECT_ERROR_FILE" "$EXPECT_STDOUT_FILE" "$STDIN_FILE" "$RESULT_FILE" "$COMPILER_ARGS_FILE" "$EXPECT_ASM_FILE" "$COMPILE_ONLY" "$EXPECT_ASM_COUNT_FILE" "$COMPILER_OUTPUT_MODE" "$EXPECT_DETERMINISTIC_OUTPUT" "$EXPECT_OUTPUT_EXCLUDES_FILE"
             done
         done
 
@@ -1533,7 +1583,7 @@ CONTENT_HASH=$(awk '{if ($0 !~ /^\/\/ (Covers:|Mode:|Opt:|Compiler args:|Compile
                     RESULT_FILE="$JOBS_DIR/${RUN_TAG}_case_${TOTAL}.result"
                     CASE_RESULT_FILES+=("$RESULT_FILE")
                     RESULT_LABEL["$RESULT_FILE"]="[$TOTAL] Testing $TEST_LABEL ($MODE $OPT)"
-                    launch_job_with_limit run_matrix_case "$TOTAL" "$TEST_FILE" "$TEST_NAME" "$TEST_LABEL" "$MODE" "$OPT" "$EXPECTED" "$EXPECT_COMPILE_FAIL" "$EXPECT_ERROR_FILE" "$EXPECT_STDOUT_FILE" "$STDIN_FILE" "$RESULT_FILE" "$COMPILER_ARGS_FILE" "$EXPECT_ASM_FILE" "$COMPILE_ONLY" "$EXPECT_ASM_COUNT_FILE"
+                    launch_job_with_limit run_matrix_case "$TOTAL" "$TEST_FILE" "$TEST_NAME" "$TEST_LABEL" "$MODE" "$OPT" "$EXPECTED" "$EXPECT_COMPILE_FAIL" "$EXPECT_ERROR_FILE" "$EXPECT_STDOUT_FILE" "$STDIN_FILE" "$RESULT_FILE" "$COMPILER_ARGS_FILE" "$EXPECT_ASM_FILE" "$COMPILE_ONLY" "$EXPECT_ASM_COUNT_FILE" "$COMPILER_OUTPUT_MODE" "$EXPECT_DETERMINISTIC_OUTPUT" "$EXPECT_OUTPUT_EXCLUDES_FILE"
                 done
             done
         fi
