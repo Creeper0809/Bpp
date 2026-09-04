@@ -283,7 +283,7 @@ func emit_call_name_raw(ctx: *BuilderCtx, name: []u8, arg_regs: *Vec<u64>, dst: 
     var info: *SSACallInfo = make_call_info(slice(name.ptr, name.len), arg_regs, ret_type, ret_ptr_depth, ret_struct_size);
     var extra_opr: u64 = 0;
     if (extra_dst != 0) { extra_opr = operand_reg(extra_dst); }
-    var call_ptr: *SSAInstruction = create_inst(ctx.ssa_ctx, SSA_OP_CALL, dst, operand_const((u64)info), extra_opr);
+    var call_ptr: *SSAInstruction = ssa_inst_set_aux(create_inst(ctx.ssa_ctx, SSA_OP_CALL, dst, 0, extra_opr), SSA_AUX_CALL, (u64)info);
     append_inst(ctx.cur_block, call_ptr);
     return dst;
 }
@@ -293,7 +293,7 @@ func emit_call_ptr_raw(ctx: *BuilderCtx, callee_reg: u64, arg_regs: *Vec<u64>, d
     var info: *SSACallPtrInfo = make_call_ptr_info(callee_reg, arg_regs, ret_type, ret_ptr_depth, ret_struct_size);
     var extra_opr: u64 = 0;
     if (extra_dst != 0) { extra_opr = operand_reg(extra_dst); }
-    var call_ptr: *SSAInstruction = create_inst(ctx.ssa_ctx, SSA_OP_CALL_PTR, dst, operand_const((u64)info), extra_opr);
+    var call_ptr: *SSAInstruction = ssa_inst_set_aux(create_inst(ctx.ssa_ctx, SSA_OP_CALL_PTR, dst, 0, extra_opr), SSA_AUX_CALL_PTR, (u64)info);
     append_inst(ctx.cur_block, call_ptr);
     return dst;
 }
@@ -396,7 +396,7 @@ func resolve_constructor_call(struct_slice: []u8, args: *Vec<*AstNode>, symtab: 
             resolved.fn = fn_ctor;
             var owner_map: *NameInfo = sym_get_impl_method_owner(slice(name_info.ptr, name_info.len));
             if (owner_map != 0) {
-                resolved.owner = owner_map;
+                resolved.owner = slice(owner_map.ptr, owner_map.len);
             } else {
                 resolved.owner = fn_ctor.impl_owner;
             }
@@ -1894,7 +1894,7 @@ func scan_addr_taken_stmt(ctx: *BuilderCtx, stmt: u64) -> u64 {
         case AST_MATCH:
             var sw: *AstSwitch = nref.switch_stmt;
             scan_addr_taken_expr(ctx, sw.expr);
-            var cases: *Vec<*AstCase> = sw.cases_vec;
+            var cases: *Vec<*AstNode> = sw.cases_vec;
             if (cases != 0) {
                 var cn: u64 = cases.len();
                 for (var ci: u64 = 0; ci < cn; ci++) {
@@ -2457,7 +2457,7 @@ func new_lea_local(ctx: *BuilderCtx, offset: u64) -> u64 {
 func new_lea_global(ctx: *BuilderCtx, name: []u8) -> u64 {
     var info: *PtrLen = new PtrLen{name.ptr, name.len};
     var reg_id: u64 = new_reg(ctx);
-    var inst_ptr: *SSAInstruction = create_inst(ctx.ssa_ctx, SSA_OP_LEA_GLOBAL, reg_id, operand_const((u64)info), 0);
+    var inst_ptr: *SSAInstruction = ssa_inst_set_aux(create_inst(ctx.ssa_ctx, SSA_OP_LEA_GLOBAL, reg_id, 0, 0), SSA_AUX_TEXT, (u64)info);
     append_inst(ctx.cur_block, inst_ptr);
     return reg_id;
 }
@@ -2465,7 +2465,7 @@ func new_lea_global(ctx: *BuilderCtx, name: []u8) -> u64 {
 func new_lea_func(ctx: *BuilderCtx, name: []u8) -> u64 {
     var info: *PtrLen = new PtrLen{name.ptr, name.len};
     var reg_id: u64 = new_reg(ctx);
-    var inst_ptr: *SSAInstruction = create_inst(ctx.ssa_ctx, SSA_OP_LEA_FUNC, reg_id, operand_const((u64)info), 0);
+    var inst_ptr: *SSAInstruction = ssa_inst_set_aux(create_inst(ctx.ssa_ctx, SSA_OP_LEA_FUNC, reg_id, 0, 0), SSA_AUX_TEXT, (u64)info);
     append_inst(ctx.cur_block, inst_ptr);
     return reg_id;
 }
@@ -3238,6 +3238,13 @@ func find_callable_func_any(raw: []u8, resolved: []u8) -> *AstFunc {
     return fn;
 }
 
+func builder_call_name_is_typed_func_value(ctx: *BuilderCtx, name: []u8) -> u64 {
+    if (ctx == 0 || ctx.symtab == 0 || name.ptr == 0 || name.len == 0) { return 0; }
+    var ti: *TypeInfo = symtab_get_type(ctx.symtab, name);
+    if (ti == 0 || ti.type_kind != TYPE_FUNC) { return 0; }
+    return 1;
+}
+
 func builder_direct_call_result_type(ctx: *BuilderCtx, call: *AstCall) -> *TypeInfo {
     if (ctx == 0 || call == 0) { return 0; }
     var ret_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)call, ctx.symtab);
@@ -3421,11 +3428,22 @@ func emit_call(ctx: *BuilderCtx, call: *AstCall, dst: u64, extra_dst: u64) -> u6
     var small_number_reg: u64 = builder_try_emit_number_small_ctor(ctx, call, dst);
     if (small_number_reg != 0) { return small_number_reg; }
 
+    if (builder_call_name_is_typed_func_value(ctx, name) != 0) {
+        var typed_callee: *AstNode = ast_ident(name);
+        var typed_cp: *AstCallPtr = ast_call_ptr(typed_callee, call.args_vec);
+        return emit_call_ptr(ctx, typed_cp, dst, extra_dst);
+    }
+
     var fn_call: *AstFunc = find_callable_func_any(name, slice(resolved_name.ptr, resolved_name.len));
     if (fn_call == 0 && sym_func_exists(name) == 0 && sym_func_exists(slice(resolved_name.ptr, resolved_name.len)) == 0) {
         var callee: *AstNode = ast_ident(name);
         var cp: *AstCallPtr = ast_call_ptr(callee, call.args_vec);
         return emit_call_ptr(ctx, cp, dst, extra_dst);
+    }
+
+    if (typeinfo_validate_call_arguments(call.args_vec, fn_call, ctx.symtab, "ssa") == 0) {
+        ctx.build_failed = 1;
+        return 0;
     }
 
     var args: *Vec<*AstNode> = call.args_vec;
@@ -3445,7 +3463,7 @@ func emit_call(ctx: *BuilderCtx, call: *AstCall, dst: u64, extra_dst: u64) -> u6
 
     var extra_opr: u64 = 0;
     if (extra_dst != 0) { extra_opr = operand_reg(extra_dst); }
-    var call_ptr: *SSAInstruction = create_inst(ctx.ssa_ctx, SSA_OP_CALL, dst, operand_const((u64)info), extra_opr);
+    var call_ptr: *SSAInstruction = ssa_inst_set_aux(create_inst(ctx.ssa_ctx, SSA_OP_CALL, dst, 0, extra_opr), SSA_AUX_CALL, (u64)info);
     append_inst(ctx.cur_block, call_ptr);
     return dst;
 }
@@ -3454,6 +3472,11 @@ func emit_call_sret_value(ctx: *BuilderCtx, call: *AstCall, addr_reg: u64) -> u6
     if (addr_reg == 0) { return 0; }
     var name: []u8 = call.name;
     var resolved_name: *PtrLen = resolve_symbol_name(name);
+    if (builder_call_name_is_typed_func_value(ctx, name) != 0) {
+        var typed_callee: *AstNode = ast_ident(name);
+        var typed_cp: *AstCallPtr = ast_call_ptr(typed_callee, call.args_vec);
+        return emit_call_ptr_sret(ctx, typed_cp, addr_reg);
+    }
     var fn_call: *AstFunc = find_callable_func_any(name, slice(resolved_name.ptr, resolved_name.len));
     if (fn_call == 0 && sym_func_exists(name) == 0 && sym_func_exists(slice(resolved_name.ptr, resolved_name.len)) == 0) {
         var callee: *AstNode = ast_ident(name);
@@ -3476,7 +3499,7 @@ func emit_call_sret_value(ctx: *BuilderCtx, call: *AstCall, addr_reg: u64) -> u6
         direct_name = fn_call.name;
     }
     var info: *SSACallInfo = make_call_info(slice(direct_name.ptr, direct_name.len), arg_regs, ret_meta.ret_type, ret_meta.ret_ptr_depth, ret_meta.ret_struct_size);
-    var call_ptr: *SSAInstruction = create_inst(ctx.ssa_ctx, SSA_OP_CALL, 0, operand_const((u64)info), 0);
+    var call_ptr: *SSAInstruction = ssa_inst_set_aux(create_inst(ctx.ssa_ctx, SSA_OP_CALL, 0, 0, 0), SSA_AUX_CALL, (u64)info);
     append_inst(ctx.cur_block, call_ptr);
     return 0;
 }
@@ -3484,6 +3507,11 @@ func emit_call_sret_value(ctx: *BuilderCtx, call: *AstCall, addr_reg: u64) -> u6
 func emit_call_slice_store(ctx: *BuilderCtx, call: *AstCall, addr_reg: u64) -> u64 {
     var name: []u8 = call.name;
     var resolved_name: *PtrLen = resolve_symbol_name(name);
+    if (builder_call_name_is_typed_func_value(ctx, name) != 0) {
+        var typed_callee: *AstNode = ast_ident(name);
+        var typed_cp: *AstCallPtr = ast_call_ptr(typed_callee, call.args_vec);
+        return emit_call_ptr_slice_store(ctx, typed_cp, addr_reg);
+    }
     var fn_call: *AstFunc = find_callable_func_any(name, slice(resolved_name.ptr, resolved_name.len));
     if (fn_call == 0 && sym_func_exists(name) == 0 && sym_func_exists(slice(resolved_name.ptr, resolved_name.len)) == 0) {
         var callee: *AstNode = ast_ident(name);
@@ -3505,7 +3533,7 @@ func emit_call_slice_store(ctx: *BuilderCtx, call: *AstCall, addr_reg: u64) -> u
         direct_name = fn_call.name;
     }
     var info: *SSACallSliceStoreInfo = make_call_slice_store_info(0, slice(direct_name.ptr, direct_name.len), 0, arg_regs, ret_meta.ret_type, ret_meta.ret_ptr_depth);
-    var call_ptr: *SSAInstruction = create_inst(ctx.ssa_ctx, SSA_OP_CALL_SLICE_STORE, 0, operand_const((u64)info), operand_reg(addr_reg));
+    var call_ptr: *SSAInstruction = ssa_inst_set_aux(create_inst(ctx.ssa_ctx, SSA_OP_CALL_SLICE_STORE, 0, 0, operand_reg(addr_reg)), SSA_AUX_CALL_SLICE_STORE, (u64)info);
     append_inst(ctx.cur_block, call_ptr);
     return 0;
 }
@@ -4198,7 +4226,7 @@ func emit_method_call_value(ctx: *BuilderCtx, mc: *AstMethodCall, dst: u64, extr
 
     var extra_opr2: u64 = 0;
     if (extra_dst != 0) { extra_opr2 = operand_reg(extra_dst); }
-    var call_ptr2: *SSAInstruction = create_inst(ctx.ssa_ctx, SSA_OP_CALL, dst, operand_const((u64)info), extra_opr2);
+    var call_ptr2: *SSAInstruction = ssa_inst_set_aux(create_inst(ctx.ssa_ctx, SSA_OP_CALL, dst, 0, extra_opr2), SSA_AUX_CALL, (u64)info);
     append_inst(ctx.cur_block, call_ptr2);
     return dst;
 }
@@ -4234,7 +4262,7 @@ func emit_method_call_sret(ctx: *BuilderCtx, mc: *AstMethodCall, addr_reg: u64) 
 
     var ret_meta: BuilderCallRetMeta = call_ret_meta(ctx, (u64)mc, TYPE_STRUCT, 0);
     var info: *SSACallInfo = make_call_info(prepared.resolved, arg_regs, ret_meta.ret_type, ret_meta.ret_ptr_depth, ret_meta.ret_struct_size);
-    var call_ptr2: *SSAInstruction = create_inst(ctx.ssa_ctx, SSA_OP_CALL, 0, operand_const((u64)info), 0);
+    var call_ptr2: *SSAInstruction = ssa_inst_set_aux(create_inst(ctx.ssa_ctx, SSA_OP_CALL, 0, 0, 0), SSA_AUX_CALL, (u64)info);
     append_inst(ctx.cur_block, call_ptr2);
     return 0;
 }
@@ -4254,7 +4282,7 @@ func emit_method_call_slice_store(ctx: *BuilderCtx, mc: *AstMethodCall, addr_reg
         var callee_reg_v: u64 = virtual_dispatch_callee_reg(ctx, prepared.recv_addr, prepared.virtual_recv_offset, prepared.virtual_method_index);
         var ret_meta_v: BuilderCallRetMeta = call_ret_meta(ctx, (u64)mc, TYPE_I64, 0);
         var info_v: *SSACallSliceStoreInfo = make_call_slice_store_info(1, slice(0, 0), callee_reg_v, arg_regs_v, ret_meta_v.ret_type, ret_meta_v.ret_ptr_depth);
-        var call_ptr_v: *SSAInstruction = create_inst(ctx.ssa_ctx, SSA_OP_CALL_SLICE_STORE, 0, operand_const((u64)info_v), operand_reg(addr_reg));
+        var call_ptr_v: *SSAInstruction = ssa_inst_set_aux(create_inst(ctx.ssa_ctx, SSA_OP_CALL_SLICE_STORE, 0, 0, operand_reg(addr_reg)), SSA_AUX_CALL_SLICE_STORE, (u64)info_v);
         append_inst(ctx.cur_block, call_ptr_v);
         return 0;
     }
@@ -4270,7 +4298,7 @@ func emit_method_call_slice_store(ctx: *BuilderCtx, mc: *AstMethodCall, addr_reg
 
     var ret_meta: BuilderCallRetMeta = call_ret_meta(ctx, (u64)mc, TYPE_I64, 0);
     var info: *SSACallSliceStoreInfo = make_call_slice_store_info(0, prepared.resolved, 0, arg_regs, ret_meta.ret_type, ret_meta.ret_ptr_depth);
-    var call_ptr2: *SSAInstruction = create_inst(ctx.ssa_ctx, SSA_OP_CALL_SLICE_STORE, 0, operand_const((u64)info), operand_reg(addr_reg));
+    var call_ptr2: *SSAInstruction = ssa_inst_set_aux(create_inst(ctx.ssa_ctx, SSA_OP_CALL_SLICE_STORE, 0, 0, operand_reg(addr_reg)), SSA_AUX_CALL_SLICE_STORE, (u64)info);
     append_inst(ctx.cur_block, call_ptr2);
     return 0;
 }
@@ -4300,14 +4328,14 @@ func emit_lambda_closure_call(ctx: *BuilderCtx, cp: *AstCallPtr, dst: u64, extra
     var fn_reg: u64 = unpacked.ptr_reg;
     var env_reg: u64 = unpacked.len_reg;
 
-    var args: *Vec<u64> = cp.args_vec;
-    var arg_regs: *Vec<u64> = make_call_arg_regs(ctx, args, call_prefix_one(env_reg));
+    var args: *Vec<*AstNode> = cp.args_vec;
+    var arg_regs: *Vec<u64> = make_call_arg_regs_nodes(ctx, args, call_prefix_one(env_reg));
     var ret_meta: BuilderCallRetMeta = call_ret_meta(ctx, (u64)cp, TYPE_I64, 0);
     var info: *SSACallPtrInfo = make_call_ptr_info(fn_reg, arg_regs, ret_meta.ret_type, ret_meta.ret_ptr_depth, ret_meta.ret_struct_size);
 
     var extra_opr: u64 = 0;
     if (extra_dst != 0) { extra_opr = operand_reg(extra_dst); }
-    var call_ptr: *SSAInstruction = create_inst(ctx.ssa_ctx, SSA_OP_CALL_PTR, dst, operand_const((u64)info), extra_opr);
+    var call_ptr: *SSAInstruction = ssa_inst_set_aux(create_inst(ctx.ssa_ctx, SSA_OP_CALL_PTR, dst, 0, extra_opr), SSA_AUX_CALL_PTR, (u64)info);
     append_inst(ctx.cur_block, call_ptr);
     return dst;
 }
@@ -4319,11 +4347,11 @@ func emit_lambda_closure_call_sret(ctx: *BuilderCtx, cp: *AstCallPtr, addr_reg: 
     var fn_reg: u64 = unpacked.ptr_reg;
     var env_reg: u64 = unpacked.len_reg;
 
-    var args: *Vec<u64> = cp.args_vec;
-    var arg_regs: *Vec<u64> = make_call_arg_regs(ctx, args, call_prefix_two(addr_reg, env_reg));
+    var args: *Vec<*AstNode> = cp.args_vec;
+    var arg_regs: *Vec<u64> = make_call_arg_regs_nodes(ctx, args, call_prefix_two(addr_reg, env_reg));
     var ret_meta: BuilderCallRetMeta = call_ret_meta(ctx, (u64)cp, TYPE_STRUCT, 0);
     var info: *SSACallPtrInfo = make_call_ptr_info(fn_reg, arg_regs, ret_meta.ret_type, ret_meta.ret_ptr_depth, ret_meta.ret_struct_size);
-    var call_ptr: *SSAInstruction = create_inst(ctx.ssa_ctx, SSA_OP_CALL_PTR, 0, operand_const((u64)info), 0);
+    var call_ptr: *SSAInstruction = ssa_inst_set_aux(create_inst(ctx.ssa_ctx, SSA_OP_CALL_PTR, 0, 0, 0), SSA_AUX_CALL_PTR, (u64)info);
     append_inst(ctx.cur_block, call_ptr);
     return 0;
 }
@@ -4334,11 +4362,11 @@ func emit_lambda_closure_call_slice_store(ctx: *BuilderCtx, cp: *AstCallPtr, add
     var fn_reg: u64 = unpacked.ptr_reg;
     var env_reg: u64 = unpacked.len_reg;
 
-    var args: *Vec<u64> = cp.args_vec;
-    var arg_regs: *Vec<u64> = make_call_arg_regs(ctx, args, call_prefix_one(env_reg));
+    var args: *Vec<*AstNode> = cp.args_vec;
+    var arg_regs: *Vec<u64> = make_call_arg_regs_nodes(ctx, args, call_prefix_one(env_reg));
     var ret_meta: BuilderCallRetMeta = call_ret_meta(ctx, (u64)cp, TYPE_I64, 0);
     var info: *SSACallSliceStoreInfo = make_call_slice_store_info(1, slice(0, 0), fn_reg, arg_regs, ret_meta.ret_type, ret_meta.ret_ptr_depth);
-    var call_ptr: *SSAInstruction = create_inst(ctx.ssa_ctx, SSA_OP_CALL_SLICE_STORE, 0, operand_const((u64)info), operand_reg(addr_reg));
+    var call_ptr: *SSAInstruction = ssa_inst_set_aux(create_inst(ctx.ssa_ctx, SSA_OP_CALL_SLICE_STORE, 0, 0, operand_reg(addr_reg)), SSA_AUX_CALL_SLICE_STORE, (u64)info);
     append_inst(ctx.cur_block, call_ptr);
     return 0;
 }
@@ -4377,7 +4405,7 @@ func emit_call_ptr(ctx: *BuilderCtx, cp: *AstCallPtr, dst: u64, extra_dst: u64) 
                 diag_error("SSA build error");
             }
             var mismatch: u64 = 0;
-            if (typeinfo_is_assignable(actual_ti, expected_ti) == 0) {
+            if (typeinfo_expr_is_assignable(cp.args_vec.get(i_sig), actual_ti, expected_ti) == 0) {
                 mismatch = 1;
             }
             if (mismatch != 0) {
@@ -4396,7 +4424,7 @@ func emit_call_ptr(ctx: *BuilderCtx, cp: *AstCallPtr, dst: u64, extra_dst: u64) 
                     diag_error("SSA build error");
                 }
                 var mismatch2: u64 = 0;
-                if (typeinfo_is_assignable(actual_rest_ti, rest_ti) == 0) {
+                if (typeinfo_func_pointer_variadic_arg_assignable(cp.args_vec.get(ri), actual_rest_ti, rest_ti) == 0) {
                     mismatch2 = 1;
                 }
                 if (mismatch2 != 0) {
@@ -4412,8 +4440,8 @@ func emit_call_ptr(ctx: *BuilderCtx, cp: *AstCallPtr, dst: u64, extra_dst: u64) 
         return emit_lambda_closure_call(ctx, cp, dst, extra_dst);
     }
 
-    var args: *Vec<u64> = cp.args_vec;
-    var arg_regs: *Vec<u64> = make_call_arg_regs(ctx, args, call_prefix_none());
+    var args: *Vec<*AstNode> = cp.args_vec;
+    var arg_regs: *Vec<u64> = make_call_arg_regs_nodes(ctx, args, call_prefix_none());
 
     var callee_reg: u64 = call_ptr_callee_reg(ctx, cp.callee);
 
@@ -4422,7 +4450,7 @@ func emit_call_ptr(ctx: *BuilderCtx, cp: *AstCallPtr, dst: u64, extra_dst: u64) 
 
     var extra_opr3: u64 = 0;
     if (extra_dst != 0) { extra_opr3 = operand_reg(extra_dst); }
-    var call_ptr: *SSAInstruction = create_inst(ctx.ssa_ctx, SSA_OP_CALL_PTR, dst, operand_const((u64)info), extra_opr3);
+    var call_ptr: *SSAInstruction = ssa_inst_set_aux(create_inst(ctx.ssa_ctx, SSA_OP_CALL_PTR, dst, 0, extra_opr3), SSA_AUX_CALL_PTR, (u64)info);
     append_inst(ctx.cur_block, call_ptr);
     return dst;
 }
@@ -4433,12 +4461,12 @@ func emit_call_ptr_sret(ctx: *BuilderCtx, cp: *AstCallPtr, addr_reg: u64) -> u64
         return emit_lambda_closure_call_sret(ctx, cp, addr_reg);
     }
     var callee_reg: u64 = build_expr(ctx, cp.callee);
-    var args: *Vec<u64> = cp.args_vec;
-    var arg_regs: *Vec<u64> = make_call_arg_regs(ctx, args, call_prefix_one(addr_reg));
+    var args: *Vec<*AstNode> = cp.args_vec;
+    var arg_regs: *Vec<u64> = make_call_arg_regs_nodes(ctx, args, call_prefix_one(addr_reg));
 
     var ret_meta: BuilderCallRetMeta = call_ret_meta(ctx, (u64)cp, TYPE_STRUCT, 0);
     var info: *SSACallPtrInfo = make_call_ptr_info(callee_reg, arg_regs, ret_meta.ret_type, ret_meta.ret_ptr_depth, ret_meta.ret_struct_size);
-    var call_ptr: *SSAInstruction = create_inst(ctx.ssa_ctx, SSA_OP_CALL_PTR, 0, operand_const((u64)info), 0);
+    var call_ptr: *SSAInstruction = ssa_inst_set_aux(create_inst(ctx.ssa_ctx, SSA_OP_CALL_PTR, 0, 0, 0), SSA_AUX_CALL_PTR, (u64)info);
     append_inst(ctx.cur_block, call_ptr);
     return 0;
 }
@@ -4447,14 +4475,14 @@ func emit_call_ptr_slice_store(ctx: *BuilderCtx, cp: *AstCallPtr, addr_reg: u64)
     if (closure_expr_is_lambda_handle(ctx, cp.callee) != 0) {
         return emit_lambda_closure_call_slice_store(ctx, cp, addr_reg);
     }
-    var args: *Vec<u64> = cp.args_vec;
-    var arg_regs: *Vec<u64> = make_call_arg_regs(ctx, args, call_prefix_none());
+    var args: *Vec<*AstNode> = cp.args_vec;
+    var arg_regs: *Vec<u64> = make_call_arg_regs_nodes(ctx, args, call_prefix_none());
 
     var callee_reg: u64 = call_ptr_callee_reg(ctx, cp.callee);
 
     var ret_meta: BuilderCallRetMeta = call_ret_meta(ctx, (u64)cp, TYPE_I64, 0);
     var info: *SSACallSliceStoreInfo = make_call_slice_store_info(1, slice(0, 0), callee_reg, arg_regs, ret_meta.ret_type, ret_meta.ret_ptr_depth);
-    var call_ptr: *SSAInstruction = create_inst(ctx.ssa_ctx, SSA_OP_CALL_SLICE_STORE, 0, operand_const((u64)info), operand_reg(addr_reg));
+    var call_ptr: *SSAInstruction = ssa_inst_set_aux(create_inst(ctx.ssa_ctx, SSA_OP_CALL_SLICE_STORE, 0, 0, operand_reg(addr_reg)), SSA_AUX_CALL_SLICE_STORE, (u64)info);
     append_inst(ctx.cur_block, call_ptr);
     return 0;
 }
@@ -6525,7 +6553,14 @@ func ssa_return_is_zero_literal(expr: u64) -> u64 {
 
 func ssa_return_emit_type_mismatch() -> u64 {
     if (ssa_builder_diag_suppressed() != 0) { return 0; }
-    emit_stderr("[ERROR] return type mismatch\n");
+    emit_stderr("[ERROR] return type mismatch in ");
+    var current_name: []u8 = current_func_name_current();
+    if (current_name.ptr != 0 && current_name.len != 0) {
+        emit_stderr_len(current_name.ptr, current_name.len);
+    } else {
+        emit_stderr("<function>");
+    }
+    emit_stderr("\n");
     diag_error("SSA build error");
     return 0;
 }
@@ -6539,46 +6574,10 @@ func ssa_return_validate_expr(ctx: *BuilderCtx, expr: u64) -> u64 {
 
     var actual_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)expr, ctx.symtab);
     if (actual_ti == 0) { return 1; }
-    if (ssa_return_is_strict_value_type(ret_type, ret_ptr_depth) == 0) { return 1; }
     if (ssa_return_is_zero_literal(expr) != 0) { return 1; }
-    if (ast_kind((*AstNode)expr) == AST_LITERAL) {
-        if (ret_ptr_depth == 0 &&
-            (ret_type == TYPE_BOOL || ret_type == TYPE_U8 || ret_type == TYPE_I8 ||
-             ret_type == TYPE_U16 || ret_type == TYPE_I16 || ret_type == TYPE_U32 ||
-             ret_type == TYPE_I32 || ret_type == TYPE_U64 || ret_type == TYPE_I64)) {
-            return 1;
-        }
-    }
-    if (ast_kind((*AstNode)expr) == AST_FLOAT && ret_ptr_depth == 0 && ret_type == TYPE_F64) {
-        return 1;
-    }
-
-    if (ret_type == TYPE_STRUCT || ret_type == TYPE_TRAIT || ret_type == TYPE_GENERIC) {
-        if (actual_ti.type_kind != ret_type || actual_ti.ptr_depth != ret_ptr_depth) {
-            ssa_return_emit_type_mismatch();
-            return 0;
-        }
-        if (u8_slice_ptr(ret_struct_name) != 0 && u8_slice_len(ret_struct_name) != 0 &&
-            u8_slice_ptr(actual_ti.struct_name) != 0 && u8_slice_len(actual_ti.struct_name) != 0 &&
-            str_eq(actual_ti.struct_name, ret_struct_name) == 0) {
-            ssa_return_emit_type_mismatch();
-            return 0;
-        }
-        return 1;
-    }
-
-    if (ret_type == TYPE_ARRAY || ret_type == TYPE_SLICE) {
-        if (actual_ti.type_kind != ret_type || actual_ti.ptr_depth != ret_ptr_depth) {
-            ssa_return_emit_type_mismatch();
-            return 0;
-        }
-        return 1;
-    }
-
-    if (actual_ti.type_kind == ret_type && actual_ti.ptr_depth == ret_ptr_depth) {
-        return 1;
-    }
-
+    var expected_ti: *TypeInfo = typeinfo_make(ret_type, ret_ptr_depth);
+    expected_ti.struct_name = ret_struct_name;
+    if (typeinfo_expr_is_assignable((*AstNode)expr, actual_ti, expected_ti) != 0) { return 1; }
     ssa_return_emit_type_mismatch();
     return 0;
 }
@@ -6587,7 +6586,7 @@ func expr_float(ctx: *BuilderCtx, node: u64) -> u64 {
     var fl: *AstFloat = (*AstFloat)node;
     var info: *PtrLen = new PtrLen{u8_slice_ptr(fl.str), u8_slice_len(fl.str)};
     var reg_id: u64 = new_reg(ctx);
-    var inst_ptr: *SSAInstruction = create_inst(ctx.ssa_ctx, SSA_OP_FCONST, reg_id, operand_const((u64)info), 0);
+    var inst_ptr: *SSAInstruction = ssa_inst_set_aux(create_inst(ctx.ssa_ctx, SSA_OP_FCONST, reg_id, 0, 0), SSA_AUX_TEXT, (u64)info);
     append_inst(ctx.cur_block, inst_ptr);
     return reg_id;
 }
@@ -6596,7 +6595,7 @@ func expr_string(ctx: *BuilderCtx, node: u64) -> u64 {
     var s: *AstString = (*AstString)node;
     var info: *PtrLen = new PtrLen{u8_slice_ptr(s.str), u8_slice_len(s.str)};
     var reg_id: u64 = new_reg(ctx);
-    var inst_ptr: *SSAInstruction = create_inst(ctx.ssa_ctx, SSA_OP_LEA_STR, reg_id, operand_const((u64)info), 0);
+    var inst_ptr: *SSAInstruction = ssa_inst_set_aux(create_inst(ctx.ssa_ctx, SSA_OP_LEA_STR, reg_id, 0, 0), SSA_AUX_TEXT, (u64)info);
     append_inst(ctx.cur_block, inst_ptr);
     return reg_id;
 }
@@ -6701,7 +6700,7 @@ func emit_trap_ud2(ctx: *BuilderCtx) -> u64 {
     text_vec.push(100); // 'd'
     text_vec.push(50);  // '2'
     text_vec.push(10);  // '\n'
-    var inst_ptr: *SSAInstruction = create_inst(ctx.ssa_ctx, SSA_OP_ASM, 0, operand_const((u64)text_vec), 0);
+    var inst_ptr: *SSAInstruction = ssa_inst_set_aux(create_inst(ctx.ssa_ctx, SSA_OP_ASM, 0, 0, 0), SSA_AUX_ASM, (u64)text_vec);
     append_inst(ctx.cur_block, inst_ptr);
     return 0;
 }
@@ -7043,11 +7042,11 @@ func build_block(ctx: *BuilderCtx, block_node: u64) -> u64 {
     defer pop_trace();
     if (block_node == 0) { return 0; }
     var blk: *AstBlock = (*AstBlock)block_node;
-    var stmts: *Vec<u64> = blk.stmts_vec;
+    var stmts: *Vec<*AstNode> = blk.stmts_vec;
     defer_mark_block_begin(ctx);
     var n: u64 = stmts.len();
     for (var i: u64 = 0; i < n; i++) {
-        var stmt: u64 = stmts.get(i);
+        var stmt: *AstNode = stmts.get(i);
         build_stmt(ctx, stmt);
     }
     defer_mark_block_end(ctx);
@@ -7114,7 +7113,7 @@ func build_match_stmt(ctx: *BuilderCtx, node: u64) -> u64 {
     push_trace("build_match_stmt", "ssa_builder.b", __LINE__);
     defer pop_trace();
     var sw: *AstSwitch = (*AstSwitch)node;
-    var cases: *Vec<u64> = sw.cases_vec;
+    var cases: *Vec<*AstNode> = sw.cases_vec;
     var count: u64 = 0;
     if (cases != 0) { count = cases.len(); }
 
@@ -7134,8 +7133,7 @@ func build_match_stmt(ctx: *BuilderCtx, node: u64) -> u64 {
     var default_bb: *SSABlock = exit_bb;
 
     for (var i: u64 = 0; i < count; i++) {
-        var c_ptr: u64 = cases.get(i);
-        var c: *AstCase = (*AstCase)c_ptr;
+        var c: *AstCase = (*AstCase)cases.get(i);
         var case_bb: *SSABlock = create_block(ctx.ssa_ctx, ctx.cur_func);
         case_blocks.push(case_bb);
         case_nodes.push(c);
@@ -7638,6 +7636,30 @@ func stmt_var_decl_try_gc_rooted_new_slot(ctx: *BuilderCtx, vd: *AstVarDecl, var
 
 func stmt_var_decl(ctx: *BuilderCtx, node: u64) -> u64 {
     var vd: *AstVarDecl = (*AstVarDecl)node;
+    if (vd.init_expr != 0) {
+        var init_ti: *TypeInfo = get_expr_type_with_symtab(vd.init_expr, ctx.symtab);
+        var decl_ti: *TypeInfo = typeinfo_from_var_decl(vd);
+        if (init_ti != 0 && decl_ti != 0 && typeinfo_expr_is_assignable(vd.init_expr, init_ti, decl_ti) == 0) {
+            diag_emit_error_tag("ssa", "initializer", "variable initializer type mismatch");
+            diag_emit_labelled_name("function: ", current_func_name_current());
+            diag_emit_labelled_name("variable: ", vd.name);
+            diag_emit_labelled_u64("expected type: ", decl_ti.type_kind);
+            diag_emit_labelled_u64("actual type: ", init_ti.type_kind);
+            diag_emit_labelled_u64("expected pointer depth: ", decl_ti.ptr_depth);
+            diag_emit_labelled_u64("actual pointer depth: ", init_ti.ptr_depth);
+            if (ast_kind(vd.init_expr) == AST_CALL) {
+                var failed_call: *AstCall = (*AstCall)vd.init_expr;
+                diag_emit_labelled_name("call: ", failed_call.name);
+                var failed_resolved: *NameInfo = resolve_name(failed_call.name);
+                if (failed_resolved != 0) {
+                    diag_emit_labelled_name("resolved call: ", slice(failed_resolved.ptr, failed_resolved.len));
+                }
+            }
+            diag_error("SSA build error");
+            ctx.build_failed = 1;
+            return 0;
+        }
+    }
     var var_id: u64 = get_var_id(ctx, vd.name);
     symtab_add_local(ctx, vd);
     var local_struct_is_single_word: u64 = 0;
@@ -8037,6 +8059,20 @@ func stmt_assign(ctx: *BuilderCtx, node: u64) -> u64 {
             build_expr(ctx, (*AstNode)property_setter_call);
             return 0;
         }
+    }
+    var assign_target_ti: *TypeInfo = get_expr_type_with_symtab(asn.target, ctx.symtab);
+    var assign_value_ti: *TypeInfo = get_expr_type_with_symtab(asn.value, ctx.symtab);
+    if (assign_target_ti != 0 && assign_value_ti != 0 &&
+        typeinfo_expr_is_assignable(asn.value, assign_value_ti, assign_target_ti) == 0) {
+        diag_emit_error_tag("ssa", "assignment", "assignment type mismatch");
+        diag_emit_labelled_name("function: ", current_func_name_current());
+        diag_emit_labelled_u64("expected type: ", assign_target_ti.type_kind);
+        diag_emit_labelled_u64("actual type: ", assign_value_ti.type_kind);
+        diag_emit_labelled_u64("expected pointer depth: ", assign_target_ti.ptr_depth);
+        diag_emit_labelled_u64("actual pointer depth: ", assign_value_ti.ptr_depth);
+        diag_error("SSA build error");
+        ctx.build_failed = 1;
+        return 0;
     }
     // NOTE: operator []= dispatch is temporarily disabled in SSA assignment lowering.
     var target_meta: BuilderAssignTargetMeta = assign_load_target_struct_meta(ctx, asn, target_kind);
@@ -8842,7 +8878,7 @@ func stmt_dispatch_structural(ctx: *BuilderCtx, node: u64, kind: u64) -> Builder
     if (kind == AST_ASM) {
         var a: *AstAsm = (*AstAsm)node;
         var lowered_text: *Vec<u64> = ssa_asm_clone_with_current_aliases(a.text_vec);
-        var inst_ptr: *SSAInstruction = create_inst(ctx.ssa_ctx, SSA_OP_ASM, 0, operand_const(lowered_text), 0);
+        var inst_ptr: *SSAInstruction = ssa_inst_set_aux(create_inst(ctx.ssa_ctx, SSA_OP_ASM, 0, 0, 0), SSA_AUX_ASM, (u64)lowered_text);
         append_inst(ctx.cur_block, inst_ptr);
         result.matched = 1;
         return result;

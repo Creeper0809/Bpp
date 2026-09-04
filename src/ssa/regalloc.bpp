@@ -9,6 +9,7 @@ import std.vec;
 import std.mem;
 import ssa.datastruct;
 import ssa.core;
+import compiler.timings;
 
 const SSA_REGALLOC_DEBUG = 0;
 const SSA_REGALLOC_RELEASE_SCRATCH = 0;
@@ -227,7 +228,7 @@ func calc_max_reg(fn: *SSAFunction) -> u64 {
                 }
             }
             if (op == SSA_OP_CALL || op == SSA_OP_CALL_PTR || op == SSA_OP_CALL_SLICE_STORE) {
-                max_update_from_call(&max_id, operand_value(cur.src1), op);
+                max_update_from_call(&max_id, ssa_inst_aux_ptr(cur), op);
             }
             if (op == SSA_OP_PHI) {
                 cur = cur.next;
@@ -313,7 +314,7 @@ func build_use_def(fn: *SSAFunction, max_reg: u64, use_arr: u64, def_arr: u64, a
             }
 
             if (op == SSA_OP_CALL || op == SSA_OP_CALL_PTR || op == SSA_OP_CALL_SLICE_STORE) {
-                use_add_call_operands(use, def, operand_value(cur.src1), op, max_reg);
+                use_add_call_operands(use, def, ssa_inst_aux_ptr(cur), op, max_reg);
             }
 
             if (!(op == SSA_OP_CALL || op == SSA_OP_CALL_PTR)) {
@@ -530,6 +531,7 @@ func live_mark_call_operands(live: u64, info_ptr: u64, op: u64, nregs: u64) -> u
 }
 
 func interference_build(fn: *SSAFunction, max_reg: u64, arena: *BppScratchArena) -> u64 {
+    var interference_started: u64 = timings_profile_start();
     var nregs: u64 = max_reg + 1;
     var adj: u64 = bpp_scratch_arena_alloc(arena, nregs * sizeof(u64));
     var adj_u64: *u64 = (*u64)adj;
@@ -541,7 +543,9 @@ func interference_build(fn: *SSAFunction, max_reg: u64, arena: *BppScratchArena)
     var bcount: u64 = slice_len(blocks);
     var live_in: u64 = bpp_scratch_arena_alloc(arena, bcount * sizeof(u64));
     var live_out: u64 = bpp_scratch_arena_alloc(arena, bcount * sizeof(u64));
+    var liveness_started: u64 = timings_profile_start();
     liveness(fn, max_reg, live_in, live_out, arena);
+    timings_add_regalloc_span(2, liveness_started);
     var live_in_u64: *u64 = (*u64)live_in;
     var live_out_u64: *u64 = (*u64)live_out;
 
@@ -593,7 +597,7 @@ func interference_build(fn: *SSAFunction, max_reg: u64, arena: *BppScratchArena)
             }
 
             if (op == SSA_OP_CALL || op == SSA_OP_CALL_PTR || op == SSA_OP_CALL_SLICE_STORE) {
-                interference_mark_call_operands(adj_u64, operand_value(inst.src1), op, nregs);
+                interference_mark_call_operands(adj_u64, ssa_inst_aux_ptr(inst), op, nregs);
             }
 
             if (op == SSA_OP_RET || op == SSA_OP_RET_SLICE_HEAP) {
@@ -619,7 +623,7 @@ func interference_build(fn: *SSAFunction, max_reg: u64, arena: *BppScratchArena)
             }
             if (op != SSA_OP_NOP && op != SSA_OP_PHI) {
                 if (op == SSA_OP_CALL || op == SSA_OP_CALL_PTR || op == SSA_OP_CALL_SLICE_STORE) {
-                    live_mark_call_operands(live, operand_value(inst.src1), op, nregs);
+                    live_mark_call_operands(live, ssa_inst_aux_ptr(inst), op, nregs);
                 }
                 if (!operand_is_const(inst.src1)) {
                     var r1b: u64 = operand_value(inst.src1);
@@ -644,6 +648,7 @@ func interference_build(fn: *SSAFunction, max_reg: u64, arena: *BppScratchArena)
         bitset_free_array(live_in, bcount);
         bitset_free_array(live_out, bcount);
     }
+    timings_add_regalloc_span(3, interference_started);
     return adj;
 }
 
@@ -750,7 +755,7 @@ func regalloc_scan_intervals(fn: *SSAFunction, max_reg: u64, start_u64: *u64, en
             }
 
             if (op == SSA_OP_CALL || op == SSA_OP_CALL_PTR || op == SSA_OP_CALL_SLICE_STORE) {
-                regalloc_interval_note_call(start_u64, end_u64, use_u64, operand_value(cur.src1), op, pos, max_reg);
+                regalloc_interval_note_call(start_u64, end_u64, use_u64, ssa_inst_aux_ptr(cur), op, pos, max_reg);
                 if (op == SSA_OP_CALL_SLICE_STORE) {
                     regalloc_interval_note_operand(start_u64, end_u64, use_u64, cur.src2, pos, max_reg);
                 }
@@ -842,7 +847,7 @@ func regalloc_interval_better(degree: u64, width: u64, uses: u64, defs: u64, rem
     return 0;
 }
 
-func regalloc_select_uncolored(colors_vec: *Vec<u64>, adj_u64: *u64, max_reg: u64, start_u64: *u64, end_u64: *u64, use_u64: *u64, def_u64: *u64, remat_u64: *u64) -> u64 {
+func regalloc_select_uncolored(colors_vec: *Vec<u64>, degree_u64: *u64, max_reg: u64, start_u64: *u64, end_u64: *u64, use_u64: *u64, def_u64: *u64, remat_u64: *u64) -> u64 {
     var best: u64 = 0;
     var best_degree: u64 = 0;
     var best_width: u64 = 0;
@@ -851,7 +856,7 @@ func regalloc_select_uncolored(colors_vec: *Vec<u64>, adj_u64: *u64, max_reg: u6
     var best_remat: u64 = 0;
     for (var r: u64 = 1; r <= max_reg; r++) {
         if (colors_vec.get(r) != 0) { continue; }
-        var degree: u64 = regalloc_degree(adj_u64, r, max_reg);
+        var degree: u64 = degree_u64[r];
         var width: u64 = regalloc_interval_width(start_u64, end_u64, r);
         var uses: u64 = use_u64[r];
         var defs: u64 = def_u64[r];
@@ -868,8 +873,8 @@ func regalloc_select_uncolored(colors_vec: *Vec<u64>, adj_u64: *u64, max_reg: u6
     return best;
 }
 
-func regalloc_copy_partner(fn: *SSAFunction, reg: u64, adj_u64: *u64, max_reg: u64) -> u64 {
-    if (fn == 0 || reg == 0 || adj_u64 == 0) { return 0; }
+func regalloc_build_copy_partners(fn: *SSAFunction, adj_u64: *u64, max_reg: u64, partner_u64: *u64) -> u64 {
+    if (fn == 0 || adj_u64 == 0 || partner_u64 == 0) { return 0; }
     var blocks: []*SSABlock = fn.blocks;
     var bcount: u64 = slice_len(blocks);
     for (var bi: u64 = 0; bi < bcount; bi++) {
@@ -879,8 +884,12 @@ func regalloc_copy_partner(fn: *SSAFunction, reg: u64, adj_u64: *u64, max_reg: u
         while (cur != 0) {
             if (op_of(cur) == SSA_OP_COPY && cur.dest != 0 && cur.src1 != 0 && operand_is_const(cur.src1) == 0) {
                 var src: u64 = operand_value(cur.src1);
-                if (cur.dest == reg && src != 0 && src <= max_reg && bitset_test(adj_u64[reg], src) == 0) { return src; }
-                if (src == reg && cur.dest <= max_reg && bitset_test(adj_u64[reg], cur.dest) == 0) { return cur.dest; }
+                if (cur.dest <= max_reg && partner_u64[cur.dest] == 0 && src != 0 && src <= max_reg && bitset_test(adj_u64[cur.dest], src) == 0) {
+                    partner_u64[cur.dest] = src;
+                }
+                if (src != 0 && src <= max_reg && partner_u64[src] == 0 && cur.dest <= max_reg && bitset_test(adj_u64[src], cur.dest) == 0) {
+                    partner_u64[src] = cur.dest;
+                }
             }
             cur = cur.next;
         }
@@ -888,8 +897,8 @@ func regalloc_copy_partner(fn: *SSAFunction, reg: u64, adj_u64: *u64, max_reg: u
     return 0;
 }
 
-func regalloc_preferred_copy_color(fn: *SSAFunction, reg: u64, colors_vec: *Vec<u64>, used_vec: *Vec<u64>, adj_u64: *u64, max_reg: u64, k: u64) -> u64 {
-    var partner: u64 = regalloc_copy_partner(fn, reg, adj_u64, max_reg);
+func regalloc_preferred_copy_color(reg: u64, colors_vec: *Vec<u64>, used_vec: *Vec<u64>, partner_u64: *u64, k: u64) -> u64 {
+    var partner: u64 = partner_u64[reg];
     if (partner == 0) { return 0; }
     var c: u64 = colors_vec.get(partner);
     if (c == 0 || c > k) { return 0; }
@@ -933,6 +942,7 @@ func color_fn(fn: *SSAFunction, k: u64, arena: *BppScratchArena) -> *Vec<u64> {
     var max_reg: u64 = calc_max_reg(fn);
     if (max_reg == 0) { return 0; }
 
+    var analysis_started: u64 = timings_profile_start();
     var interval_bytes: u64 = (max_reg + 1) * sizeof(u64);
     var start_u64: *u64 = (*u64)bpp_scratch_arena_alloc_zero(arena, interval_bytes);
     var end_u64: *u64 = (*u64)bpp_scratch_arena_alloc_zero(arena, interval_bytes);
@@ -943,9 +953,16 @@ func color_fn(fn: *SSAFunction, k: u64, arena: *BppScratchArena) -> *Vec<u64> {
     var call_live_u64: *u64 = (*u64)bpp_scratch_arena_alloc_zero(arena, interval_bytes);
     var xmm_u64: *u64 = (*u64)bpp_scratch_arena_alloc_zero(arena, interval_bytes);
     regalloc_scan_constraints(fn, max_reg, start_u64, end_u64, call_live_u64, xmm_u64);
+    timings_add_regalloc_span(1, analysis_started);
 
     var adj: u64 = interference_build(fn, max_reg, arena);
     var adj_u64: *u64 = (*u64)adj;
+    var degree_u64: *u64 = (*u64)bpp_scratch_arena_alloc_zero(arena, interval_bytes);
+    for (var degree_reg: u64 = 1; degree_reg <= max_reg; degree_reg++) {
+        degree_u64[degree_reg] = regalloc_degree(adj_u64, degree_reg, max_reg);
+    }
+    var partner_u64: *u64 = (*u64)bpp_scratch_arena_alloc_zero(arena, interval_bytes);
+    regalloc_build_copy_partners(fn, adj_u64, max_reg, partner_u64);
     var colors_vec: *Vec<u64> = vec_new_scratch<u64>(arena, max_reg + 1);
     for (var i: u64 = 0; i <= max_reg; i++) {
         colors_vec.push_scratch(0, arena);
@@ -955,8 +972,9 @@ func color_fn(fn: *SSAFunction, k: u64, arena: *BppScratchArena) -> *Vec<u64> {
         used_vec.push_scratch(0, arena);
     }
 
+    var selection_started: u64 = timings_profile_start();
     for (var pick_iter: u64 = 1; pick_iter <= max_reg; pick_iter++) {
-        var r: u64 = regalloc_select_uncolored(colors_vec, adj_u64, max_reg, start_u64, end_u64, use_u64, def_u64, remat_u64);
+        var r: u64 = regalloc_select_uncolored(colors_vec, degree_u64, max_reg, start_u64, end_u64, use_u64, def_u64, remat_u64);
         if (r == 0) { break; }
         for (var j: u64 = 0; j <= k; j++) {
             used_vec.set(j, 0);
@@ -970,11 +988,12 @@ func color_fn(fn: *SSAFunction, k: u64, arena: *BppScratchArena) -> *Vec<u64> {
             }
         }
 
-        var preferred: u64 = regalloc_preferred_copy_color(fn, r, colors_vec, used_vec, adj_u64, max_reg, k);
+        var preferred: u64 = regalloc_preferred_copy_color(r, colors_vec, used_vec, partner_u64, k);
         var color: u64 = regalloc_pick_color_for_reg(r, k, used_vec, preferred, call_live_u64, xmm_u64);
         if (color > k) { color = 0; }
         colors_vec.set(r, color);
     }
+    timings_add_regalloc_span(4, selection_started);
 
     if (SSA_REGALLOC_DEBUG != 0) {
         println("[DEBUG] color_fn: done", 36);
@@ -1239,7 +1258,7 @@ func regalloc_inst_sources_use_reg(inst: *SSAInstruction, reg: u64) -> u64 {
     if (inst == 0 || reg == 0) { return 0; }
     var op: u64 = op_of(inst);
     if (op == SSA_OP_CALL || op == SSA_OP_CALL_PTR || op == SSA_OP_CALL_SLICE_STORE) {
-        if (regalloc_call_uses_reg(op, operand_value(inst.src1), reg) != 0) { return 1; }
+        if (regalloc_call_uses_reg(op, ssa_inst_aux_ptr(inst), reg) != 0) { return 1; }
     }
     if (regalloc_operand_uses_reg(inst.src1, reg) != 0) { return 1; }
     if (regalloc_operand_uses_reg(inst.src2, reg) != 0) { return 1; }
@@ -1259,7 +1278,7 @@ func regalloc_replace_inst_sources(ctx: *SSAContext, block: *SSABlock, inst: *SS
 
     var op: u64 = op_of(inst);
     if (op == SSA_OP_CALL || op == SSA_OP_CALL_PTR || op == SSA_OP_CALL_SLICE_STORE) {
-        regalloc_replace_call_reg(op, operand_value(inst.src1), reg, tmp);
+        regalloc_replace_call_reg(op, ssa_inst_aux_ptr(inst), reg, tmp);
     }
     regalloc_replace_operand_reg(&inst.src1, reg, tmp);
     regalloc_replace_operand_reg(&inst.src2, reg, tmp);
@@ -1439,13 +1458,17 @@ func map_fn_once(fn: *SSAFunction, k: u64, arena: *BppScratchArena) -> u64 {
 
 func map_fn(ctx: *SSAContext, fn: *SSAFunction, k: u64, arena: *BppScratchArena) -> u64 {
     if (fn == 0) { return 0; }
+    var map_started: u64 = timings_profile_start();
     var initial_max_reg: u64 = calc_max_reg(fn);
     if (regalloc_should_skip_graph_allocator(fn, initial_max_reg) != 0) {
         regalloc_mark_graph_allocator_skipped(fn, initial_max_reg);
+        timings_add_regalloc_span(5, map_started);
         return 0;
     }
     if (initial_max_reg > SSA_REGALLOC_SPILL_REWRITE_MAX_REG_BUDGET) {
-        return map_fn_once(fn, k, arena);
+        var direct_map: u64 = map_fn_once(fn, k, arena);
+        timings_add_regalloc_span(5, map_started);
+        return direct_map;
     }
     var next_spill_slot: u64 = regalloc_max_pseudo_var_id(fn);
     if (initial_max_reg > next_spill_slot) { next_spill_slot = initial_max_reg; }
@@ -1459,7 +1482,10 @@ func map_fn(ctx: *SSAContext, fn: *SSAFunction, k: u64, arena: *BppScratchArena)
         var attempt_mark: BppScratchArenaMark;
         if (arena != 0) { bpp_scratch_arena_mark_into(arena, &attempt_mark); }
         var map: u64 = map_fn_once(fn, k, arena);
-        if (fn.regalloc_failed == 0 && fn.regalloc_done != 0) { return map; }
+        if (fn.regalloc_failed == 0 && fn.regalloc_done != 0) {
+            timings_add_regalloc_span(5, map_started);
+            return map;
+        }
 
         var max_reg: u64 = calc_max_reg(fn);
         var colors: *Vec<u64> = color_fn(fn, k, arena);
@@ -1472,10 +1498,13 @@ func map_fn(ctx: *SSAContext, fn: *SSAFunction, k: u64, arena: *BppScratchArena)
         var interval_end: u64 = 0;
         regalloc_interval_for_reg(fn, max_reg, spill_reg, arena, &interval_start, &interval_end);
         var spill_slot: u64 = regalloc_pick_spill_slot(slot_ids, slot_start, slot_end, &slot_count, &next_spill_slot, interval_start, interval_end, slot_cap);
+        var spill_started: u64 = timings_profile_start();
         if (regalloc_spill_one(ctx, fn, spill_reg, spill_slot) == 0) {
+            timings_add_regalloc_span(6, spill_started);
             if (arena != 0) { bpp_scratch_arena_rewind(arena, &attempt_mark); }
             break;
         }
+        timings_add_regalloc_span(6, spill_started);
         if (arena != 0) { bpp_scratch_arena_rewind(arena, &attempt_mark); }
         fn.regalloc_failed = 0;
         fn.regalloc_done = 0;
@@ -1484,6 +1513,7 @@ func map_fn(ctx: *SSAContext, fn: *SSAFunction, k: u64, arena: *BppScratchArena)
     fn.regalloc_done = 0;
     fn.reg_map_data = 0;
     fn.reg_map_len = 0;
+    timings_add_regalloc_span(5, map_started);
     return 0;
 }
 
@@ -1506,7 +1536,9 @@ func run(ctx: *SSAContext, k: u64) -> u64 {
         }
         map_fn(ctx, fn, k, arena_ptr);
         if (fn.regalloc_failed == 0 && fn.regalloc_done != 0) {
+            var apply_started: u64 = timings_profile_start();
             apply_fn(fn);
+            timings_add_regalloc_span(7, apply_started);
             regalloc_map_free(fn.reg_map_data, arena_ptr);
         }
         fn.reg_map_data = 0;
@@ -1658,7 +1690,7 @@ func apply_fn(fn: *SSAFunction) -> u64 {
                 }
             }
             if (op2 == SSA_OP_CALL || op2 == SSA_OP_CALL_PTR || op2 == SSA_OP_CALL_SLICE_STORE) {
-                remap_call_operands(op2, operand_value(cur.src1), map_u64, map_len);
+                remap_call_operands(op2, ssa_inst_aux_ptr(cur), map_u64, map_len);
             }
             remap_operand_in_place(&cur.src1, map_u64, map_len);
             remap_operand_in_place(&cur.src2, map_u64, map_len);

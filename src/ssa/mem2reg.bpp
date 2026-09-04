@@ -12,6 +12,7 @@ import std.mem;
 import ssa.datastruct;
 import ssa.core;
 import ssa.mem2reg_df;
+import compiler.timings;
 
 const MEM2REG_DEBUG = 0;
 const MEM2REG_RELEASE_SCRATCH = 0;
@@ -230,23 +231,49 @@ func insert_phi_nodes(ctx: *SSAContext, fn: *SSAFunction, max_var: u64, next_reg
     if (max_var == 0) { return 0; }
 
     var total_blocks: u64 = max_block_id(fn) + 1;
+    var var_slots: u64 = max_var + 1;
+    var defs_by_var: u64 = bpp_scratch_arena_alloc_zero(arena, var_slots * sizeof(u64));
+    var defs_by_var_u64: *u64 = (*u64)defs_by_var;
+    var def_seen: u64 = bpp_scratch_arena_alloc_zero(arena, var_slots * sizeof(u64));
+    var def_seen_u64: *u64 = (*u64)def_seen;
+    var blocks: []*SSABlock = fn.blocks;
+    var block_count: u64 = slice_len(blocks);
+    for (var bi: u64 = 0; bi < block_count; bi++) {
+        var block: *SSABlock = blocks[bi];
+        var block_stamp: u64 = bi + 1;
+        var inst: *SSAInstruction = block.inst_head;
+        while (inst != 0) {
+            if (op_of(inst) == SSA_OP_STORE) {
+                var stored_var: u64 = operand_value(inst.src1);
+                if (stored_var != 0 && stored_var <= max_var && def_seen_u64[stored_var] != block_stamp) {
+                    var var_defs: *Vec<*SSABlock> = (*Vec<*SSABlock>)defs_by_var_u64[stored_var];
+                    if (var_defs == 0) {
+                        var_defs = vec_new_scratch<*SSABlock>(arena, 4);
+                        defs_by_var_u64[stored_var] = (u64)var_defs;
+                    }
+                    var_defs.push_scratch(block, arena);
+                    def_seen_u64[stored_var] = block_stamp;
+                }
+            }
+            inst = inst.next;
+        }
+    }
+    var def_mark: u64 = bpp_scratch_arena_alloc_zero(arena, total_blocks * sizeof(u64));
+    var phi_mark: u64 = bpp_scratch_arena_alloc_zero(arena, total_blocks * sizeof(u64));
+    var def_mark_u64: *u64 = (*u64)def_mark;
+    var phi_mark_u64: *u64 = (*u64)phi_mark;
 
     for (var v: u64 = 1; v <= max_var; v++) {
         var scratch_mark: BppScratchArenaMark;
         bpp_scratch_arena_mark_into(arena, &scratch_mark);
-        var defs: *Vec<*SSABlock> = collect_def_blocks(fn, v, arena);
-        var def_mark: u64 = bpp_scratch_arena_alloc_zero(arena, total_blocks * sizeof(u64));
-        zero_u64(def_mark, total_blocks);
-        var phi_mark: u64 = bpp_scratch_arena_alloc_zero(arena, total_blocks * sizeof(u64));
-        zero_u64(phi_mark, total_blocks);
-        var def_mark_u64: *u64 = (*u64)def_mark;
-        var phi_mark_u64: *u64 = (*u64)phi_mark;
+        var defs: *Vec<*SSABlock> = (*Vec<*SSABlock>)defs_by_var_u64[v];
 
         var wlist: *Vec<*SSABlock> = vec_new_scratch<*SSABlock>(arena, 4);
-        var dcount: u64 = defs.len();
+        var dcount: u64 = 0;
+        if (defs != 0) { dcount = defs.len(); }
         for (var i: u64 = 0; i < dcount; i++) {
             var b: *SSABlock = defs.get(i);
-            def_mark_u64[b.id] = 1;
+            def_mark_u64[b.id] = v;
             wlist.push_scratch(b, arena);
         }
 
@@ -257,29 +284,39 @@ func insert_phi_nodes(ctx: *SSAContext, fn: *SSAFunction, max_var: u64, next_reg
             var dflen: u64 = slice_len(df);
             for (var j: u64 = 0; j < dflen; j++) {
                 var y: *SSABlock = df[j];
-                if (phi_mark_u64[y.id] == 0) {
+                if (phi_mark_u64[y.id] != v) {
                     var reg_id: u64 = *next_reg_ptr;
                     *next_reg_ptr = reg_id + 1;
                     var phi_ptr: *SSAInstruction = create_inst(ctx, SSA_OP_PHI, reg_id, 0, operand_const(v));
                     append_phi(y, phi_ptr);
-                    phi_mark_u64[y.id] = 1;
+                    phi_mark_u64[y.id] = v;
 
-                    if (def_mark_u64[y.id] == 0) {
-                        def_mark_u64[y.id] = 1;
+                    if (def_mark_u64[y.id] != v) {
+                        def_mark_u64[y.id] = v;
                         wlist.push_scratch(y, arena);
                     }
                 }
             }
         }
         if (MEM2REG_RELEASE_SCRATCH != 0) {
-            defs.release_buffer();
             wlist.release_buffer();
-            free((u64)defs);
             free((u64)wlist);
-            free(def_mark);
-            free(phi_mark);
         }
         bpp_scratch_arena_rewind(arena, &scratch_mark);
+    }
+
+    if (MEM2REG_RELEASE_SCRATCH != 0) {
+        for (var release_var: u64 = 1; release_var <= max_var; release_var++) {
+            var release_defs: *Vec<*SSABlock> = (*Vec<*SSABlock>)defs_by_var_u64[release_var];
+            if (release_defs != 0) {
+                release_defs.release_buffer();
+                free((u64)release_defs);
+            }
+        }
+        free(defs_by_var);
+        free(def_seen);
+        free(def_mark);
+        free(phi_mark);
     }
 
     return 0;
@@ -380,7 +417,7 @@ func rename_block_insts(block: *SSABlock, max_var: u64, stack_arr_u64: *u64, reg
         }
 
         if (op == SSA_OP_CALL || op == SSA_OP_CALL_PTR || op == SSA_OP_CALL_SLICE_STORE) {
-            rewrite_call(op, operand_value(cur.src1), reg_map_val_u64, reg_map_set_u64, reg_map_cap);
+            rewrite_call(op, ssa_inst_aux_ptr(cur), reg_map_val_u64, reg_map_set_u64, reg_map_cap);
         }
 
         if (op == SSA_OP_LOAD) {
@@ -670,26 +707,34 @@ func run(ctx: *SSAContext) -> u64 {
             bpp_scratch_arena_init(&rename_arena_store, 0);
             rename_arena = &rename_arena_store;
         }
+        var subphase_started: u64 = timings_profile_start();
         compute_idom(ctx, fn, idom_arena);
+        timings_add_ssa_span(3, subphase_started);
         if (idom_arena != 0) { bpp_scratch_arena_reset(idom_arena); }
         if (MEM2REG_DEBUG != 0) {
             println("[DEBUG] mem2reg_run: idom", 38);
         }
+        subphase_started = timings_profile_start();
         compute_df(fn);
+        timings_add_ssa_span(4, subphase_started);
         if (MEM2REG_DEBUG != 0) {
             println("[DEBUG] mem2reg_run: df", 35);
         }
 
         var max_var: u64 = max_var_id(fn);
         var next_reg: u64 = max_reg_id(fn) + 1;
+        subphase_started = timings_profile_start();
         insert_phi_nodes(ctx, fn, max_var, &next_reg, phi_arena);
+        timings_add_ssa_span(5, subphase_started);
         if (phi_arena != 0) { bpp_scratch_arena_reset(phi_arena); }
         if (MEM2REG_DEBUG != 0) {
             println("[DEBUG] mem2reg_run: phi", 36);
         }
 
         var max_reg2: u64 = next_reg;
+        subphase_started = timings_profile_start();
         rename_registers(fn, max_var, max_reg2, rename_arena);
+        timings_add_ssa_span(6, subphase_started);
         if (rename_arena != 0) { bpp_scratch_arena_reset(rename_arena); }
         if (MEM2REG_DEBUG != 0) {
             println("[DEBUG] mem2reg_run: rename", 39);

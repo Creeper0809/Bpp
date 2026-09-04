@@ -255,7 +255,7 @@ func emit_defer_emit_to_loop_marker() -> u64 {
 
 func emit_block(node: u64) -> u64 {
     var block: *AstBlock = (*AstBlock)node;
-    var stmts: *Vec<u64> = block.stmts_vec;
+    var stmts: *Vec<*AstNode> = block.stmts_vec;
     var len: u64 = stmts.len();
     emit_defer_mark_block_begin();
     for(var i: u64 = 0; i < len;i++){
@@ -485,7 +485,7 @@ func emit_return_emit_epilogue() -> u64 {
 
 func emit_return_struct_large_from_literal(expr: u64, struct_size: u64) -> u64 {
     var lit2: *AstStructLiteral = (*AstStructLiteral)expr;
-    var values2: *Vec<u64> = lit2.values_vec;
+    var values2: *Vec<*AstNode> = lit2.values_vec;
     var vcount2: u64 = 0;
     if (values2 != 0) { vcount2 = values2.len(); }
     var off: u64 = 0;
@@ -784,15 +784,27 @@ func emit_return_emit_typeinfo_desc(ti: *TypeInfo) -> u64 {
 }
 
 func emit_return_report_type_error(expected_type: u64, expected_ptr_depth: u64, expected_struct: []u8, actual_ti: *TypeInfo, detail: u64) -> u64 {
-    emit_stderr("[ERROR] return type mismatch");
+    emit_stderr("[ERROR] return type mismatch in ");
+    var current_name: []u8 = current_func_name_current();
+    if (current_name.ptr != 0 && current_name.len != 0) {
+        emit_stderr_len(current_name.ptr, current_name.len);
+    } else {
+        emit_stderr("<function>");
+    }
     if (detail != 0) {
         emit_stderr(": ");
         emit_stderr(detail);
     }
     emit_stderr(" (expected ");
     emit_return_emit_type_desc(expected_type, expected_ptr_depth, slice(expected_struct.ptr, expected_struct.len));
+    emit_stderr("#");
+    emit_u64_stderr(expected_type);
     emit_stderr(", got ");
     emit_return_emit_typeinfo_desc(actual_ti);
+    if (actual_ti != 0) {
+        emit_stderr("#");
+        emit_u64_stderr(actual_ti.type_kind);
+    }
     emit_stderr(")\n");
     diag_force_stop_pass();
     return 0;
@@ -827,29 +839,10 @@ func emit_return_validate_expr(expr: u64, symtab: *Symtab) -> u64 {
     var actual_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)expr, symtab);
     if (actual_ti == 0) { return 1; }
 
-    var expected_strict: u64 = emit_return_is_strict_value_type(ret_type, ret_ptr_depth);
-    if (expected_strict == 0) { return 1; }
     if (emit_return_is_zero_literal(expr) != 0) { return 1; }
-
-    if (ret_type == TYPE_STRUCT || ret_type == TYPE_TRAIT || ret_type == TYPE_GENERIC) {
-        if (actual_ti.type_kind != ret_type || actual_ti.ptr_depth != ret_ptr_depth) {
-            return emit_return_report_type_error(ret_type, ret_ptr_depth, ret_struct_name, actual_ti, 0);
-        }
-        if (u8_slice_ptr(ret_struct_name) != 0 && u8_slice_len(ret_struct_name) != 0 &&
-            u8_slice_ptr(actual_ti.struct_name) != 0 && u8_slice_len(actual_ti.struct_name) != 0 &&
-            str_eq(actual_ti.struct_name, ret_struct_name) == 0) {
-            return emit_return_report_type_error(ret_type, ret_ptr_depth, ret_struct_name, actual_ti, 0);
-        }
-        return 1;
-    }
-
-    if (ret_type == TYPE_ARRAY || ret_type == TYPE_SLICE) {
-        if (actual_ti.type_kind != ret_type || actual_ti.ptr_depth != ret_ptr_depth) {
-            return emit_return_report_type_error(ret_type, ret_ptr_depth, ret_struct_name, actual_ti, 0);
-        }
-        return 1;
-    }
-
+    var expected_ti: *TypeInfo = typeinfo_make(ret_type, ret_ptr_depth);
+    expected_ti.struct_name = ret_struct_name;
+    if (typeinfo_expr_is_assignable((*AstNode)expr, actual_ti, expected_ti) != 0) { return 1; }
     return emit_return_report_type_error(ret_type, ret_ptr_depth, ret_struct_name, actual_ti, 0);
 }
 
@@ -958,10 +951,25 @@ func emit_var_decl_try_ctor_or_sret_init(init: u64, init_kind: u64, spec: *CgDec
 }
 
 func emit_var_decl_check_init_compat(decl: *AstVarDecl, init: u64, type_kind: u64, ptr_depth: u64, symtab: *Symtab) -> u64 {
-    if (type_kind == 0) { return 0; }
+    if (type_kind == 0) { return 1; }
     var it_info: *TypeInfo = get_expr_type_with_symtab((*AstNode)init, symtab);
-    if (it_info == 0) { return 0; }
-    check_type_compat(it_info.type_kind, it_info.ptr_depth, it_info.is_tagged, it_info.tag_layout, type_kind, ptr_depth, decl.is_tagged, decl.tag_layout);
+    if (it_info == 0) { return 1; }
+    var expected_ti: *TypeInfo = typeinfo_from_var_decl(decl);
+    if (typeinfo_expr_is_assignable((*AstNode)init, it_info, expected_ti) != 0) { return 1; }
+    diag_emit_error_tag("typecheck", "initializer", "variable initializer type mismatch");
+    diag_emit_labelled_name("function: ", current_func_name_current());
+    diag_emit_labelled_name("variable: ", decl.name);
+    diag_emit_labelled_u64("expected type: ", expected_ti.type_kind);
+    diag_emit_labelled_u64("actual type: ", it_info.type_kind);
+    diag_emit_labelled_u64("expected pointer depth: ", expected_ti.ptr_depth);
+    diag_emit_labelled_u64("actual pointer depth: ", it_info.ptr_depth);
+    diag_emit_labelled_u64("expected tagged: ", expected_ti.is_tagged);
+    diag_emit_labelled_u64("actual tagged: ", it_info.is_tagged);
+    diag_emit_labelled_name("expected name: ", expected_ti.struct_name);
+    diag_emit_labelled_name("actual name: ", it_info.struct_name);
+    diag_emit_labelled_name("expected tag layout: ", expected_ti.tag_layout);
+    diag_emit_labelled_name("actual tag layout: ", it_info.tag_layout);
+    diag_force_stop_pass();
     return 0;
 }
 
@@ -1234,11 +1242,11 @@ func emit_var_decl_try_gc_rooted_new_init(decl: *AstVarDecl, init: u64, spec: *C
 func emit_var_decl_init_value(decl: *AstVarDecl, init: u64, spec: *CgDeclTypeSpec, offset: u64, symtab: *Symtab) -> u64 {
     var init_kind: u64 = ast_kind(init);
 
+    if (emit_var_decl_check_init_compat(decl, init, spec.type_kind, spec.ptr_depth, symtab) == 0) { return 1; }
     if (emit_var_decl_try_number_storage_init(init, spec, offset, symtab) != 0) { return 1; }
     if (emit_var_decl_try_array_copy_init(init, spec, offset, symtab) != 0) { return 1; }
     if (emit_var_decl_try_gc_rooted_new_init(decl, init, spec, offset, symtab) != 0) { return 1; }
     if (emit_var_decl_try_ctor_or_sret_init(init, init_kind, spec, offset, symtab) != 0) { return 1; }
-    emit_var_decl_check_init_compat(decl, init, spec.type_kind, spec.ptr_depth, symtab);
     if (emit_var_decl_try_slice_init(init, init_kind, spec, offset) != 0) { return 1; }
     if (emit_var_decl_try_struct_copy_init(init, init_kind, spec, offset, symtab) != 0) { return 1; }
 
@@ -1395,7 +1403,7 @@ func emit_var_decl_stmt(node: u64, symtab: *Symtab, g_structs_vec: *Vec<*AstStru
 
 func emit_struct_literal_init(init: u64, offset: u64) -> u64 {
     var lit: *AstStructLiteral = (*AstStructLiteral)init;
-    var values: *Vec<u64> = lit.values_vec;
+    var values: *Vec<*AstNode> = lit.values_vec;
     var num_values: u64 = values.len();
     var fields: *Vec<*FieldDesc> = lit.struct_def.fields_vec;
     var num_fields: u64 = fields.len();
@@ -1457,7 +1465,7 @@ func emit_struct_literal_init(init: u64, offset: u64) -> u64 {
             continue;
         }
 
-        var value_expr: u64 = values.get(value_index);
+        var value_expr: *AstNode = values.get(value_index);
         if (field.type_kind == TYPE_SLICE && field.ptr_depth == 0) {
             var total_slice_offset: u64 = offset + field_offset;
             if (ast_kind(value_expr) == AST_SLICE) {
@@ -1687,19 +1695,6 @@ func emit_assign_try_member_packed_special(target: u64, value: u64, symtab: *Sym
 
     if (emit_assign_try_member_tagged_layout(obj, slice(member_ptr, member_len), ot, value) != 0) { return 1; }
     if (emit_assign_try_member_packed_struct(obj, slice(member_ptr, member_len), ot, value) != 0) { return 1; }
-    return 0;
-}
-
-func emit_assign_update_ident_ptr_type(target: u64, target_kind: u64, value: u64, symtab: *Symtab) -> u64 {
-    if (target_kind != AST_IDENT) { return 0; }
-
-    var ident: *AstIdent = (*AstIdent)target;
-    var name: []u8 = ident.name;
-    var target_type: *TypeInfo = symtab_get_type(symtab, name);
-    var value_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)value, symtab);
-    if (target_type == 0 || value_ti == 0) { return 0; }
-    if (value_ti.ptr_depth == 0) { return 0; }
-    symtab_update_type(symtab, name, value_ti.type_kind, value_ti.ptr_depth);
     return 0;
 }
 
@@ -2008,8 +2003,6 @@ func emit_assign_stmt(node: u64, symtab: *Symtab) -> u64 {
     if (emit_assign_try_member_packed_special(target, value, symtab) != 0) {
         return;
     }
-    emit_assign_update_ident_ptr_type(target, target_kind, value, symtab);
-
     var target_type_info: *TypeInfo = 0;
     if (target_kind == AST_IDENT) {
         var ident3: *AstIdent = (*AstIdent)target;
@@ -2019,6 +2012,17 @@ func emit_assign_stmt(node: u64, symtab: *Symtab) -> u64 {
         target_type_info = get_expr_type_with_symtab((*AstNode)target, symtab);
     }
     var value_type_info: *TypeInfo = get_expr_type_with_symtab((*AstNode)value, symtab);
+    if (target_type_info != 0 && value_type_info != 0 &&
+        typeinfo_expr_is_assignable((*AstNode)value, value_type_info, target_type_info) == 0) {
+        diag_emit_error_tag("typecheck", "assignment", "assignment type mismatch");
+        diag_emit_labelled_name("function: ", current_func_name_current());
+        diag_emit_labelled_u64("expected type: ", target_type_info.type_kind);
+        diag_emit_labelled_u64("actual type: ", value_type_info.type_kind);
+        diag_emit_labelled_u64("expected pointer depth: ", target_type_info.ptr_depth);
+        diag_emit_labelled_u64("actual pointer depth: ", value_type_info.ptr_depth);
+        diag_force_stop_pass();
+        return 0;
+    }
 
     if (emit_assign_try_slice_copy(target, target_kind, value, value_kind, symtab) != 0) {
         return;
@@ -2411,7 +2415,7 @@ func emit_for_stmt(node: u64) -> u64 {
 func emit_match_stmt(node: u64) -> u64 {
     var match_stmt: *AstSwitch = (*AstSwitch)node;
     var expr: u64 = match_stmt.expr;
-    var cases: *Vec<u64> = match_stmt.cases_vec;
+    var cases: *Vec<*AstNode> = match_stmt.cases_vec;
     
     // Evaluate match expression once
     emit_expr(expr);
@@ -2435,7 +2439,7 @@ func emit_match_stmt(node: u64) -> u64 {
     
     // Count non-default cases and find min/max values
     for (var i: u64 = 0; i < num_cases; i++) {
-        var case_node: u64 = cases.get(i);
+        var case_node: *AstNode = cases.get(i);
         var case_stmt: *AstCase = (*AstCase)case_node;
         
         if (case_stmt.is_default == 0) {
@@ -2521,7 +2525,7 @@ func emit_match_emit_int_compare(value: u64, case_label: u64) -> u64 {
     return 0;
 }
 
-func emit_match_emit_case_bodies(cases: *Vec<u64>, case_labels: *Vec<u64>) -> u64 {
+func emit_match_emit_case_bodies(cases: *Vec<*AstNode>, case_labels: *Vec<u64>) -> u64 {
     var num_cases: u64 = cases.len();
     for (var i: u64 = 0; i < num_cases; i++) {
         var case_stmt: *AstCase = (*AstCase)cases.get(i);
@@ -2531,7 +2535,7 @@ func emit_match_emit_case_bodies(cases: *Vec<u64>, case_labels: *Vec<u64>) -> u6
     return 0;
 }
 
-func emit_match_linear(cases: *Vec<u64>, end_label: u64, has_default: u64) -> u64 {
+func emit_match_linear(cases: *Vec<*AstNode>, end_label: u64, has_default: u64) -> u64 {
     emitln("    push rax    ; match value");
 
     var num_cases: u64 = cases.len();
@@ -2567,7 +2571,7 @@ func emit_match_linear(cases: *Vec<u64>, end_label: u64, has_default: u64) -> u6
 }
 
 // Jump table match dispatch for dense integer ranges.
-func emit_match_jump_table(cases: *Vec<u64>, min_val: i64, max_val: i64, end_label: u64, has_default: u64) -> u64 {
+func emit_match_jump_table(cases: *Vec<*AstNode>, min_val: i64, max_val: i64, end_label: u64, has_default: u64) -> u64 {
     var num_cases: u64 = cases.len();
     var range: i64 = max_val - min_val + 1;
     var range_u64: u64 = (u64)range;
@@ -2585,7 +2589,7 @@ func emit_match_jump_table(cases: *Vec<u64>, min_val: i64, max_val: i64, end_lab
     
     // First pass: create labels and build value.label mapping
     for (var i: u64 = 0; i < num_cases; i++) {
-        var case_node: u64 = cases.get(i);
+        var case_node: *AstNode = cases.get(i);
         var case_stmt: *AstCase = (*AstCase)case_node;
         var case_label: u64 = new_label();
         case_labels.push(case_label);
@@ -2650,7 +2654,7 @@ func emit_match_jump_table(cases: *Vec<u64>, min_val: i64, max_val: i64, end_lab
     
     // Second pass: generate case bodies
     for (var i: u64 = 0; i < num_cases; i++) {
-        var case_node: u64 = cases.get(i);
+        var case_node: *AstNode = cases.get(i);
         var case_stmt: *AstCase = (*AstCase)case_node;
         var body: u64 = case_stmt.body;
         var case_label: u64 = case_labels.get(i);

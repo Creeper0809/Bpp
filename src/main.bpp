@@ -13,6 +13,7 @@ import compiler.generic.engine;
 import compiler.loader;
 import compiler.runtime_api;
 import compiler.pass_runner;
+import compiler.validation;
 import compiler.annotations;
 import compiler.ast_dump;
 import compiler.timings;
@@ -134,7 +135,7 @@ impl MainLLVMPaths {
 }
 
 func main_print_usage() -> u64 {
-    emit("Usage: bppc [-O0|-O1|-O2|-O3|-Os] [-dump-ast|-dump-ast-graph|-dump-ast-json|-dump-ir|-dump-ir-json|-dump-ssa|-dump-ssa-json|-dump-machine-ir|-dump-machine-ir-json|-dump-llvm-contract|-dump-llvm-proto|-dump-llvm-ll|-llvm-build|-asm|--emit-source-map|--emit-json|--opt-report] [--views <ast,ir,ssa,asm>] [--ast-func <name>] [--ast-module <module>] [--ast-no-std] [--target <linux-x86_64|windows-x86_64>] [--timings-json <path>] [--symbolic-report] [--strict-std-complexity-summary] <source.bpp>\n");
+    emit("Usage: bppc [-O0|-O1|-O2|-O3|-Os] [-dump-ast|-dump-ast-graph|-dump-ast-json|-dump-ir|-dump-ir-json|-dump-ssa|-dump-ssa-json|-dump-machine-ir|-dump-machine-ir-json|-dump-llvm-contract|-dump-llvm-proto|-dump-llvm-ll|-llvm-build|-asm|--emit-source-map|--emit-json|--opt-report] [--backend <auto|legacy|ssa>] [--views <ast,ir,ssa,asm>] [--ast-func <name>] [--ast-module <module>] [--ast-no-std] [--target <linux-x86_64|windows-x86_64>] [--timings-json <path>] [--symbolic-report] [--strict-std-complexity-summary] <source.bpp>\n");
     return 0;
 }
 
@@ -156,6 +157,56 @@ func main_parse_target_or_report(value: u64, value_len: u64) -> u64 {
     emit_stderr("\n");
     main_emit_supported_targets();
     return 0;
+}
+
+func main_parse_backend_or_report(value: u64, value_len: u64) -> u64 {
+    if (str_eq(slice(value, value_len), slice("auto", 4)) != 0) { return BACKEND_AUTO + 1; }
+    if (str_eq(slice(value, value_len), slice("legacy", 6)) != 0) { return BACKEND_LEGACY + 1; }
+    if (str_eq(slice(value, value_len), slice("ssa", 3)) != 0) { return BACKEND_SSA + 1; }
+    emit_stderr("[ERROR] unsupported backend: ");
+    emit_stderr_len(value, value_len);
+    emit_stderr("\n[ERROR] supported backends: auto, legacy, ssa\n");
+    return 0;
+}
+
+func main_parse_views_or_report(value: u64, value_len: u64) -> u64 {
+    if (value_len == 0) {
+        emit_stderr("[ERROR] empty --views value\n");
+        emit_stderr("[ERROR] supported views: ast, ir, ssa, asm\n");
+        return 0;
+    }
+    if (str_eq(slice(value, value_len), slice("all", 3)) != 0) {
+        return UNIFIED_VIEW_ALL;
+    }
+
+    var mask: u64 = 0;
+    var start: u64 = 0;
+    var bytes: *u8 = (*u8)value;
+    for (var i: u64 = 0; i <= value_len; i++) {
+        if (i != value_len && bytes[i] != 44) { continue; }
+        if (i == start) {
+            emit_stderr("[ERROR] empty name in --views\n");
+            emit_stderr("[ERROR] supported views: ast, ir, ssa, asm\n");
+            return 0;
+        }
+        var part: []u8 = slice(value + start, i - start);
+        if (str_eq(part, slice("ast", 3)) != 0) {
+            mask = mask | UNIFIED_VIEW_AST;
+        } else if (str_eq(part, slice("ir", 2)) != 0) {
+            mask = mask | UNIFIED_VIEW_IR;
+        } else if (str_eq(part, slice("ssa", 3)) != 0) {
+            mask = mask | UNIFIED_VIEW_SSA;
+        } else if (str_eq(part, slice("asm", 3)) != 0) {
+            mask = mask | UNIFIED_VIEW_ASM;
+        } else {
+            emit_stderr("[ERROR] unsupported view: ");
+            emit_stderr_len(part.ptr, part.len);
+            emit_stderr("\n[ERROR] supported views: ast, ir, ssa, asm\n");
+            return 0;
+        }
+        start = i + 1;
+    }
+    return mask;
 }
 
 func main_parse_cli(argc: u64, argv_ptr: *u64) -> MainCliParseResult {
@@ -180,6 +231,25 @@ func main_parse_cli(argc: u64, argv_ptr: *u64) -> MainCliParseResult {
         var arg: u64 = argv_ptr[i];
         var arg_len: u64 = str_len(arg);
 
+        if (str_eq(slice(arg, arg_len), slice("--backend", str_len("--backend")))) {
+            if (i + 1 >= argc) {
+                emit_stderr("[ERROR] missing value for --backend\n");
+                return result;
+            }
+            i = i + 1;
+            var backend_arg: u64 = argv_ptr[i];
+            var backend_len: u64 = str_len(backend_arg);
+            var parsed_backend: u64 = main_parse_backend_or_report(backend_arg, backend_len);
+            if (parsed_backend == 0) { return result; }
+            opt_set_backend_mode(parsed_backend - 1);
+            continue;
+        }
+        if (main_has_prefix(arg, arg_len, "--backend=", 10) != 0) {
+            var parsed_backend2: u64 = main_parse_backend_or_report(arg + 10, arg_len - 10);
+            if (parsed_backend2 == 0) { return result; }
+            opt_set_backend_mode(parsed_backend2 - 1);
+            continue;
+        }
         if (str_eq(slice(arg, arg_len), slice("-O1", str_len("-O1")))) {
             opt_set_level(1);
             continue;
@@ -332,9 +402,16 @@ func main_parse_cli(argc: u64, argv_ptr: *u64) -> MainCliParseResult {
                 return result;
             }
             i = i + 1;
+            var views_arg: u64 = argv_ptr[i];
+            var views_mask: u64 = main_parse_views_or_report(views_arg, str_len(views_arg));
+            if (views_mask == 0) { return result; }
+            opt_set_unified_views(views_mask);
             continue;
         }
         if (main_has_prefix(arg, arg_len, "--views=", 8) != 0) {
+            var views_mask2: u64 = main_parse_views_or_report(arg + 8, arg_len - 8);
+            if (views_mask2 == 0) { return result; }
+            opt_set_unified_views(views_mask2);
             continue;
         }
         if (str_eq(slice(arg, arg_len), slice("--source-map-user-only", str_len("--source-map-user-only")))) {
@@ -420,6 +497,10 @@ func main_parse_cli(argc: u64, argv_ptr: *u64) -> MainCliParseResult {
     }
 
     if (filename == 0) { return result; }
+    if (opt_unified_views_explicit() != 0 && opt_get_output_mode() != OUT_UNIFIED_JSON) {
+        emit_stderr("[ERROR] --views requires --emit-json\n");
+        return result;
+    }
     result.ok = 1;
     result.filename = filename;
     return result;
@@ -444,6 +525,14 @@ func main_run_compile_pipeline(filename: u64, filename_len: u64) -> *AstProgram 
     }
     timings_add_parse(timings_elapsed_ms(phase_started));
 
+    if (bootstrap_errors == 0) {
+        diag_reset();
+        if (validate_program_structure_with_ctx(cctx) != 0 || diag_has_errors() != 0) {
+            emit_stderr("[ERROR] invalid program structure\n");
+            return 0;
+        }
+    }
+
     var passes: *Vec<u64> = default_passes_with_ctx(cctx);
 
     var pass_count: u64 = passes.len();
@@ -460,6 +549,7 @@ func main_run_compile_pipeline(filename: u64, filename_len: u64) -> *AstProgram 
             break;
         }
         var pass_ms: u64 = timings_elapsed_ms(phase_started);
+        timings_add_pass(pass_id, pass_ms);
         if (pass_id == COMPILER_PASS_VALIDATE_DIRECT_IMPL_CALLS ||
             pass_id == COMPILER_PASS_VALIDATE_IMPL_OVERRIDES ||
             pass_id == COMPILER_PASS_FINALIZE_ABST_METHODS ||
@@ -545,9 +635,11 @@ func main_emit_asm_file(asm_path: u64, merged_prog: *AstProgram) -> u64 {
     }
     var fd: u64 = (u64)fd_i;
     io_set_output_fd(fd);
+    io_set_emit_buffering(1);
 
     diag_reset();
     program_with_sigs(merged_prog, get_func_sigs());
+    io_set_emit_buffering(0);
     if (diag_has_errors() != 0) {
         io_set_output_fd(0);
         sys_close(fd);
@@ -929,42 +1021,72 @@ func main_emit_source_map_stdout(merged_prog: *AstProgram) -> u64 {
 }
 
 func main_emit_unified_json_stdout(merged_prog: *AstProgram, ast_filter: *AstDumpFilter, source_file: u64, source_file_len: u64) -> u64 {
-    emit("{\"schemaVersion\":1,\"sourceRangeSemantics\":{\"endColumn\":\"exclusive\",\"columnEncoding\":\"byte\",\"offsetEncoding\":\"byte\"},\"views\":{\"ast\":");
-    ast_dump_program_json_filtered(merged_prog, ast_filter);
+    emit("{\"schemaVersion\":1,\"sourceRangeSemantics\":{\"endColumn\":\"exclusive\",\"columnEncoding\":\"byte\",\"offsetEncoding\":\"byte\"},\"views\":{");
+    var views: u64 = opt_get_unified_views();
+    var wrote_view: u64 = 0;
 
-    emit(",\"ssa\":");
+    if ((views & UNIFIED_VIEW_AST) != 0) {
+        emit("\"ast\":");
+        ast_dump_program_json_filtered(merged_prog, ast_filter);
+        wrote_view = 1;
+    }
+
     var old_ir_mode: u64 = opt_get_ir_mode();
-    opt_set_ir_mode(IR_SSA);
-    diag_reset();
-    program_with_sigs_ir_json(merged_prog, get_func_sigs());
-    opt_set_ir_mode(old_ir_mode);
-    if (diag_has_errors() != 0) {
-        emit_stderr("[ERROR] unified JSON SSA generation failed (");
-        emit_u64_stderr(diag_count());
-        emit_stderr(" error(s))\n");
-        return 1;
+    if ((views & UNIFIED_VIEW_IR) != 0) {
+        if (wrote_view != 0) { emit(","); }
+        emit("\"ir\":");
+        opt_set_ir_mode(IR_3ADDR);
+        diag_reset();
+        program_with_sigs_ir_json(merged_prog, get_func_sigs());
+        opt_set_ir_mode(old_ir_mode);
+        if (diag_has_errors() != 0) {
+            emit_stderr("[ERROR] unified JSON IR generation failed (");
+            emit_u64_stderr(diag_count());
+            emit_stderr(" error(s))\n");
+            return 1;
+        }
+        wrote_view = 1;
     }
 
-    emit(",\"asm\":");
-    diag_reset();
-    if (opt_source_map_user_only() != 0) {
-        if (opt_source_map_file_ptr() != 0) {
-            asm_source_capture_set_filter_file(opt_source_map_file_ptr(), opt_source_map_file_len());
-        } else {
-            asm_source_capture_set_filter_file(source_file, source_file_len);
+    if ((views & UNIFIED_VIEW_SSA) != 0) {
+        if (wrote_view != 0) { emit(","); }
+        emit("\"ssa\":");
+        opt_set_ir_mode(IR_SSA);
+        diag_reset();
+        program_with_sigs_ir_json(merged_prog, get_func_sigs());
+        opt_set_ir_mode(old_ir_mode);
+        if (diag_has_errors() != 0) {
+            emit_stderr("[ERROR] unified JSON SSA generation failed (");
+            emit_u64_stderr(diag_count());
+            emit_stderr(" error(s))\n");
+            return 1;
         }
+        wrote_view = 1;
     }
-    asm_source_capture_start(1);
-    program_with_sigs(merged_prog, get_func_sigs());
-    asm_source_capture_stop();
-    asm_source_capture_clear_filter();
-    if (diag_has_errors() != 0) {
-        emit_stderr("[ERROR] unified JSON ASM generation failed (");
-        emit_u64_stderr(diag_count());
-        emit_stderr(" error(s))\n");
-        return 1;
+
+    if ((views & UNIFIED_VIEW_ASM) != 0) {
+        if (wrote_view != 0) { emit(","); }
+        emit("\"asm\":");
+        diag_reset();
+        if (opt_source_map_user_only() != 0) {
+            if (opt_source_map_file_ptr() != 0) {
+                asm_source_capture_set_filter_file(opt_source_map_file_ptr(), opt_source_map_file_len());
+            } else {
+                asm_source_capture_set_filter_file(source_file, source_file_len);
+            }
+        }
+        asm_source_capture_start(1);
+        program_with_sigs(merged_prog, get_func_sigs());
+        asm_source_capture_stop();
+        asm_source_capture_clear_filter();
+        if (diag_has_errors() != 0) {
+            emit_stderr("[ERROR] unified JSON ASM generation failed (");
+            emit_u64_stderr(diag_count());
+            emit_stderr(" error(s))\n");
+            return 1;
+        }
+        asm_source_capture_dump_json();
     }
-    asm_source_capture_dump_json();
     emit("}}\n");
     return 0;
 }
@@ -1126,7 +1248,9 @@ func main(argc: u64, argv: u64) -> u64 {
             break;
         case OUT_ASM:
             diag_reset();
+            io_set_emit_buffering(1);
             program_with_sigs(merged_prog, get_func_sigs());
+            io_set_emit_buffering(0);
             if (diag_has_errors() != 0) {
                 emit_stderr("[ERROR] ASM generation failed (");
                 emit_u64_stderr(diag_count());
