@@ -2,7 +2,7 @@
 name: CI
 on:
   push:
-    branches: ["**"]
+    branches: ["main", "dev"]
   pull_request:
   workflow_dispatch:
     inputs:
@@ -16,7 +16,7 @@ on:
         default: false
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event.pull_request.head.ref || github.ref_name }}
   cancel-in-progress: true
 
 jobs:
@@ -28,7 +28,7 @@ jobs:
       - name: Install Linux dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y nasm binutils coreutils binutils-mingw-w64-x86-64 mingw-w64-x86-64-dev
+          sudo apt-get install -y nasm binutils coreutils
 
       - name: Self-host Linux compiler
         env:
@@ -41,19 +41,6 @@ jobs:
           chmod +x build_and_test.sh test/run_tests.sh
           bash build_and_test.sh
 
-      - name: Cross-build Windows bootstrap seed
-        run: |
-          chmod +x tools/build_windows_bootstrap.sh
-          tools/build_windows_bootstrap.sh "$PWD/build/windows-ci-seed/bpp-windows-seed.exe"
-
-      - name: Upload Windows bootstrap seed
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-cross-bootstrap
-          path: build/windows-ci-seed/bpp-windows-seed.exe
-          if-no-files-found: error
-          retention-days: 1
-
       - name: Upload verified Linux compiler
         uses: actions/upload-artifact@v4
         with:
@@ -65,8 +52,35 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  windows-seed:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cross-bootstrap dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nasm binutils coreutils binutils-mingw-w64-x86-64 mingw-w64-x86-64-dev
+
+      - name: Cross-build Windows bootstrap seed
+        run: |
+          chmod +x bin/stage1 tools/build_windows_bootstrap.sh
+          tools/build_windows_bootstrap.sh "$PWD/build/windows-ci-seed/bpp-windows-seed.exe"
+
+      - name: Upload Windows bootstrap seed
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-cross-bootstrap
+          path: build/windows-ci-seed/bpp-windows-seed.exe
+          if-no-files-found: error
+          retention-days: 1
+
   linux-validation:
     needs: linux-bootstrap
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -92,9 +106,38 @@ jobs:
           COMPILE_FAIL_SINGLE_VARIANT: "0"
           STRESS_RUNS: "0"
           STABILITY_RUNS: "0"
+          TEST_SHARD_COUNT: "4"
+          TEST_SHARD_INDEX: ${{ matrix.shard }}
+          TEST_RESULT_JSON: build/test-results/linux-shard-${{ matrix.shard }}.json
         run: |
           chmod +x bin/stage1 test/run_tests.sh
           bash test/run_tests.sh bin/stage1
+
+      - name: Upload Linux shard result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-test-shard-${{ matrix.shard }}
+          path: build/test-results/linux-shard-${{ matrix.shard }}.json
+          if-no-files-found: error
+          retention-days: 14
+
+  linux-integration:
+    needs: linux-bootstrap
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nasm binutils coreutils clang
+
+      - name: Download verified Linux compiler
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-selfhost-compiler
+          path: .
 
       - name: Focused LLVM smoke tests (Linux)
         env:
@@ -106,7 +149,9 @@ jobs:
           TEST_PROGRESS: "1"
           STRESS_RUNS: "0"
           STABILITY_RUNS: "0"
-        run: bash test/run_tests.sh bin/stage1
+        run: |
+          chmod +x bin/stage1 test/run_tests.sh test/run_regression.sh
+          bash test/run_tests.sh bin/stage1
 
       - name: Diagnostics + manifest regression (Linux)
         run: |
@@ -120,8 +165,8 @@ jobs:
           cmake --install build-linux --prefix "$PWD/.local"
           ./.local/bin/bpp test/source/01_generics.bpp
 
-  windows:
-    needs: linux-bootstrap
+  windows-selfhost:
+    needs: windows-seed
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -157,7 +202,7 @@ jobs:
         run: |
           ./build_and_test.ps1 -ToolchainOnly -NasmPath "$env:BPP_NASM_EXECUTABLE" -LinkerPath "$env:BPP_LINKER_EXECUTABLE"
 
-      - name: Full Windows self-host and compiler tests
+      - name: Windows deterministic self-host
         shell: pwsh
         run: |
           $compilerExe = (Resolve-Path "build/windows-ci-seed/bpp-windows-seed.exe").Path
@@ -165,25 +210,101 @@ jobs:
             -CompilerPath $compilerExe `
             -NasmPath "$env:BPP_NASM_EXECUTABLE" `
             -LinkerPath "$env:BPP_LINKER_EXECUTABLE" `
-            -TestJobs 4 `
-            -TimingJsonPath "build/timings/windows-tests.json"
+            -SkipTests
+
+      - name: Upload verified Windows compiler
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-selfhost-compiler
+          path: bin/v13_stage1.exe
+          if-no-files-found: error
+          retention-days: 1
+
+  windows-validation:
+    needs: windows-selfhost
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download verified Windows compiler
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-selfhost-compiler
+          path: bin
+
+      - name: Setup MSVC developer command prompt
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Configure toolchain with CMake
+        run: |
+          cmake -S . -B build-win -DBPP_BOOTSTRAP_NASM=ON -DBPP_BOOTSTRAP_COMPILER=OFF
+
+      - name: Export resolved toolchain paths
+        shell: pwsh
+        run: |
+          Get-Content build-win/bpp_toolchain.env | ForEach-Object {
+            if ($_ -match '^(.*?)=(.*)$') {
+              "$($matches[1])=$($matches[2])" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            }
+          }
+
+      - name: Full Windows compiler tests (shard ${{ matrix.shard }}/4)
+        shell: pwsh
+        run: |
+          ./test/run_tests.ps1 `
+            -CompilerPath "bin/v13_stage1.exe" `
+            -NasmPath "$env:BPP_NASM_EXECUTABLE" `
+            -LinkerPath "$env:BPP_LINKER_EXECUTABLE" `
+            -Jobs 4 `
+            -ShardCount 4 `
+            -ShardIndex ${{ matrix.shard }} `
+            -TimingJsonPath "build/timings/windows-tests-${{ matrix.shard }}.json" `
+            -Quiet
 
       - name: Publish Windows timing summary
         if: always()
         shell: pwsh
         run: |
           ./tools/write_windows_timing_summary.ps1 `
-            -TimingJsonPath "build/timings/windows-tests.json" `
-            -Title "Windows CI verification timing"
+            -TimingJsonPath "build/timings/windows-tests-${{ matrix.shard }}.json" `
+            -Title "Windows CI shard ${{ matrix.shard }}/4 timing"
 
       - name: Upload Windows timing data
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: windows-verification-timings
+          name: windows-verification-timings-${{ matrix.shard }}
           path: build/timings
           if-no-files-found: warn
           retention-days: 14
+
+  validation-gate:
+    if: always()
+    needs:
+      - linux-bootstrap
+      - windows-seed
+      - linux-validation
+      - linux-integration
+      - windows-selfhost
+      - windows-validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every bootstrap and validation job
+        env:
+          LINUX_BOOTSTRAP: ${{ needs.linux-bootstrap.result }}
+          WINDOWS_SEED: ${{ needs.windows-seed.result }}
+          LINUX_VALIDATION: ${{ needs.linux-validation.result }}
+          LINUX_INTEGRATION: ${{ needs.linux-integration.result }}
+          WINDOWS_SELFHOST: ${{ needs.windows-selfhost.result }}
+          WINDOWS_VALIDATION: ${{ needs.windows-validation.result }}
+        run: |
+          for result in "$LINUX_BOOTSTRAP" "$WINDOWS_SEED" "$LINUX_VALIDATION" "$LINUX_INTEGRATION" "$WINDOWS_SELFHOST" "$WINDOWS_VALIDATION"; do
+            test "$result" = success
+          done
 
   performance:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.full_benchmarks }}

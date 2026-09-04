@@ -153,6 +153,9 @@ COMPILE_FAIL_SINGLE_VARIANT=${COMPILE_FAIL_SINGLE_VARIANT:-}
 TEST_SUITE_CASE_LIMIT=${TEST_SUITE_CASE_LIMIT:-}
 STRICT_FAIL_DIAGNOSTICS=${STRICT_FAIL_DIAGNOSTICS:-1}
 TEST_TIMEOUT_SEC=${TEST_TIMEOUT_SEC:-15}
+TEST_SHARD_COUNT=${TEST_SHARD_COUNT:-1}
+TEST_SHARD_INDEX=${TEST_SHARD_INDEX:-0}
+TEST_RESULT_JSON=${TEST_RESULT_JSON:-}
 TEST_FAST_IO_MIN_SHM_KB=${BPP_TEST_FAST_IO_MIN_SHM_KB:-262144}
 FAST_IO_ACTIVE=0
 NASM_BIN="${BPP_NASM_EXECUTABLE:-nasm}"
@@ -167,6 +170,26 @@ case "$TEST_SKIP_LLVM_BUILD" in
     1|true|yes) TEST_SKIP_LLVM_BUILD=1 ;;
     *) TEST_SKIP_LLVM_BUILD=0 ;;
 esac
+
+if ! [[ "$TEST_SHARD_COUNT" =~ ^[0-9]+$ ]] || [ "$TEST_SHARD_COUNT" -lt 1 ]; then
+    echo "Error: TEST_SHARD_COUNT must be a positive integer: $TEST_SHARD_COUNT"
+    exit 1
+fi
+if ! [[ "$TEST_SHARD_INDEX" =~ ^[0-9]+$ ]] || [ "$TEST_SHARD_INDEX" -ge "$TEST_SHARD_COUNT" ]; then
+    echo "Error: TEST_SHARD_INDEX must be in [0, TEST_SHARD_COUNT): $TEST_SHARD_INDEX/$TEST_SHARD_COUNT"
+    exit 1
+fi
+
+case_in_current_shard() {
+    if [ "$TEST_SHARD_COUNT" -eq 1 ]; then
+        return 0
+    fi
+    local case_id="$1"
+    local hash_prefix
+    hash_prefix="$(printf '%s' "$case_id" | md5sum | awk '{print substr($1, 1, 8)}')"
+    local shard_value=$((16#$hash_prefix % TEST_SHARD_COUNT))
+    [ "$shard_value" -eq "$TEST_SHARD_INDEX" ]
+}
 TEST_PROGRESS="$(echo "$TEST_PROGRESS" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
 case "$TEST_PROGRESS" in
     1|true|yes) TEST_PROGRESS=1 ;;
@@ -534,6 +557,7 @@ if [ "$TEST_QUIET" -eq 0 ]; then
     echo "[INFO] Mode filter: $GLOBAL_MODES_CSV"
     echo "[INFO] Opt filter: $GLOBAL_OPTS_CSV"
     echo "[INFO] Name filter: ${TEST_NAME_FILTER:-<none>}"
+    echo "[INFO] Shard: $TEST_SHARD_INDEX/$TEST_SHARD_COUNT"
     echo "[INFO] Skip LLVM build tests: $TEST_SKIP_LLVM_BUILD"
     echo "[INFO] Compile-fail single variant: $COMPILE_FAIL_SINGLE_VARIANT"
     echo "[INFO] Strict fail diagnostics: $STRICT_FAIL_DIAGNOSTICS"
@@ -1480,6 +1504,9 @@ CONTENT_HASH=$(awk '{if ($0 !~ /^\/\/ (Covers:|Mode:|Opt:|Compiler args:|Compile
                     continue
                 fi
                 VARIANT_COUNT=$((VARIANT_COUNT + 1))
+                if ! case_in_current_shard "$TEST_NAME|$MODE|$OPT"; then
+                    continue
+                fi
                 TOTAL=$((TOTAL + 1))
                 RESULT_FILE="$JOBS_DIR/${RUN_TAG}_case_${TOTAL}.result"
                 CASE_RESULT_FILES+=("$RESULT_FILE")
@@ -1499,6 +1526,9 @@ CONTENT_HASH=$(awk '{if ($0 !~ /^\/\/ (Covers:|Mode:|Opt:|Compiler args:|Compile
                         continue
                     fi
                     VARIANT_COUNT=$((VARIANT_COUNT + 1))
+                    if ! case_in_current_shard "$TEST_NAME|$MODE|$OPT"; then
+                        continue
+                    fi
                     TOTAL=$((TOTAL + 1))
                     RESULT_FILE="$JOBS_DIR/${RUN_TAG}_case_${TOTAL}.result"
                     CASE_RESULT_FILES+=("$RESULT_FILE")
@@ -1517,11 +1547,13 @@ CONTENT_HASH=$(awk '{if ($0 !~ /^\/\/ (Covers:|Mode:|Opt:|Compiler args:|Compile
     fi
 
     if [ "$LLVM_BUILD" -eq 1 ]; then
-        TOTAL=$((TOTAL + 1))
-        RESULT_FILE="$JOBS_DIR/${RUN_TAG}_llvm_${TOTAL}.result"
-        LLVM_RESULT_FILES+=("$RESULT_FILE")
-        RESULT_LABEL["$RESULT_FILE"]="[$TOTAL] LLVM $TEST_LABEL"
-        launch_job_with_limit run_llvm_case "$TOTAL" "$TEST_FILE" "$TEST_NAME" "$TEST_LABEL" "$EXPECTED" "$RESULT_FILE" "$STDIN_FILE" "$EXPECT_STDOUT_FILE" "$COMPILER_ARGS_FILE" "$COMPILE_ONLY" "$EXPECT_LLVM_METADATA_FILE"
+        if case_in_current_shard "$TEST_NAME|llvm"; then
+            TOTAL=$((TOTAL + 1))
+            RESULT_FILE="$JOBS_DIR/${RUN_TAG}_llvm_${TOTAL}.result"
+            LLVM_RESULT_FILES+=("$RESULT_FILE")
+            RESULT_LABEL["$RESULT_FILE"]="[$TOTAL] LLVM $TEST_LABEL"
+            launch_job_with_limit run_llvm_case "$TOTAL" "$TEST_FILE" "$TEST_NAME" "$TEST_LABEL" "$EXPECTED" "$RESULT_FILE" "$STDIN_FILE" "$EXPECT_STDOUT_FILE" "$COMPILER_ARGS_FILE" "$COMPILE_ONLY" "$EXPECT_LLVM_METADATA_FILE"
+        fi
     fi
 done
 
@@ -1595,8 +1627,11 @@ if [ -n "$IR_TEST_FILES" ]; then
 fi
 
 for TEST_FILE in $IR_TEST_FILES; do
-    TOTAL=$((TOTAL + 1))
     TEST_NAME=$(basename "$TEST_FILE" .bpp)
+    if ! case_in_current_shard "$TEST_NAME|ir"; then
+        continue
+    fi
+    TOTAL=$((TOTAL + 1))
     RESULT_FILE="$JOBS_DIR/${RUN_TAG}_ir_${TOTAL}.result"
     IR_RESULT_FILES+=("$RESULT_FILE")
     RESULT_LABEL["$RESULT_FILE"]="[$TOTAL] IR $TEST_NAME"
@@ -1639,6 +1674,13 @@ echo -e "LLVM skipped: ${YELLOW}$LLVM_SKIPPED${NC}"
 echo -e "Stress: ${GREEN}$STRESS_PASSED${NC} passed, ${RED}$STRESS_FAILED${NC} failed"
 echo -e "Stability: ${GREEN}$STABILITY_PASSED${NC} passed, ${RED}$STABILITY_FAILED${NC} failed"
 echo ""
+
+if [ -n "$TEST_RESULT_JSON" ]; then
+    mkdir -p "$(dirname "$TEST_RESULT_JSON")"
+    printf '{"schemaVersion":1,"shardCount":%d,"shardIndex":%d,"total":%d,"passed":%d,"failed":%d,"llvmSkipped":%d}\n' \
+        "$TEST_SHARD_COUNT" "$TEST_SHARD_INDEX" "$TOTAL" "$PASSED" "$FAILED" "$LLVM_SKIPPED" > "$TEST_RESULT_JSON"
+    echo "[INFO] Result JSON: $TEST_RESULT_JSON"
+fi
 
 if [ $FAILED -eq 0 ]; then
     if [ "$KEEP_TEST_ARTIFACTS" -eq 0 ]; then
