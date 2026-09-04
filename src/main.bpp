@@ -15,6 +15,7 @@ import compiler.runtime_api;
 import compiler.pass_runner;
 import compiler.annotations;
 import compiler.ast_dump;
+import compiler.timings;
 import llvm.contract_adapter;
 import types;
 import codegen;
@@ -36,6 +37,7 @@ struct MainCliParseResult {
     public ast_filter_func_name: []u8;
     public ast_filter_module_name: []u8;
     public ast_filter_no_std: u64;
+    public timings_json_path: []u8;
 }
 struct MainOutputPaths { public asm_path: u64; public obj_path: u64; public exe_path: u64; }
 struct MainLLVMPaths { public ll_path: u64; public obj_path: u64; public exe_path: u64; }
@@ -132,7 +134,7 @@ impl MainLLVMPaths {
 }
 
 func main_print_usage() -> u64 {
-    emit("Usage: bppc [-O0|-O1|-O2|-O3|-Os] [-dump-ast|-dump-ast-graph|-dump-ast-json|-dump-ir|-dump-ir-json|-dump-ssa|-dump-ssa-json|-dump-machine-ir|-dump-machine-ir-json|-dump-llvm-contract|-dump-llvm-proto|-dump-llvm-ll|-llvm-build|-asm|--emit-source-map|--emit-json|--opt-report] [--views <ast,ir,ssa,asm>] [--ast-func <name>] [--ast-module <module>] [--ast-no-std] [--target <linux-x86_64|windows-x86_64>] [--symbolic-report] [--strict-std-complexity-summary] <source.bpp>\n");
+    emit("Usage: bppc [-O0|-O1|-O2|-O3|-Os] [-dump-ast|-dump-ast-graph|-dump-ast-json|-dump-ir|-dump-ir-json|-dump-ssa|-dump-ssa-json|-dump-machine-ir|-dump-machine-ir-json|-dump-llvm-contract|-dump-llvm-proto|-dump-llvm-ll|-llvm-build|-asm|--emit-source-map|--emit-json|--opt-report] [--views <ast,ir,ssa,asm>] [--ast-func <name>] [--ast-module <module>] [--ast-no-std] [--target <linux-x86_64|windows-x86_64>] [--timings-json <path>] [--symbolic-report] [--strict-std-complexity-summary] <source.bpp>\n");
     return 0;
 }
 
@@ -164,6 +166,7 @@ func main_parse_cli(argc: u64, argv_ptr: *u64) -> MainCliParseResult {
     result.ast_filter_func_name = slice(0, 0);
     result.ast_filter_module_name = slice(0, 0);
     result.ast_filter_no_std = 0;
+    result.timings_json_path = slice(0, 0);
 
     // Default flags (avoid uninitialized globals affecting codegen)
     opt_init_defaults();
@@ -377,6 +380,23 @@ func main_parse_cli(argc: u64, argv_ptr: *u64) -> MainCliParseResult {
             result.target_override = parsed_target2;
             continue;
         }
+        if (str_eq(slice(arg, arg_len), slice("--timings-json", str_len("--timings-json")))) {
+            if (i + 1 >= argc) {
+                emit_stderr("[ERROR] missing value for --timings-json\n");
+                return result;
+            }
+            i = i + 1;
+            var timings_path_ptr: u64 = argv_ptr[i];
+            var timings_path_len: u64 = str_len(timings_path_ptr);
+            var timings_path: []u8 = slice(timings_path_ptr, timings_path_len);
+            result.timings_json_path = timings_path;
+            continue;
+        }
+        if (main_has_prefix(arg, arg_len, "--timings-json=", 15) != 0) {
+            var timings_eq_path: []u8 = slice(arg + 15, arg_len - 15);
+            result.timings_json_path = timings_eq_path;
+            continue;
+        }
         if (str_eq(slice(arg, arg_len), slice("--symbolic-report", str_len("--symbolic-report")))) {
             annotation_set_symbolic_report_enabled(1);
             continue;
@@ -408,17 +428,21 @@ func main_parse_cli(argc: u64, argv_ptr: *u64) -> MainCliParseResult {
 func main_run_compile_pipeline(filename: u64, filename_len: u64) -> *AstProgram {
     var cctx: *CompilerCtx = compiler_ctx_current();
     var bootstrap_errors: u64 = 0;
+    var phase_started: u64 = timings_now_ms();
     if (!load_std_prelude_with_ctx(cctx)) {
         emit_stderr("[ERROR] failed to load std prelude\n");
         bootstrap_errors = bootstrap_errors + 1;
     }
+    timings_add_preprocess(timings_elapsed_ms(phase_started));
 
+    phase_started = timings_now_ms();
     if (!load_module_with_ctx(cctx, filename, filename_len)) {
         emit_stderr("[ERROR] failed to load module: ");
         emit_stderr_len(filename, filename_len);
         emit_stderr("\n");
         bootstrap_errors = bootstrap_errors + 1;
     }
+    timings_add_parse(timings_elapsed_ms(phase_started));
 
     var passes: *Vec<u64> = default_passes_with_ctx(cctx);
 
@@ -426,6 +450,7 @@ func main_run_compile_pipeline(filename: u64, filename_len: u64) -> *AstProgram 
     var total_pipeline_errors: u64 = 0;
     for (var i: u64 = 0; i < pass_count; i++) {
         var pass_id: u64 = passes.get(i);
+        phase_started = timings_now_ms();
         diag_reset();
         if (run_pass_with_ctx(cctx, pass_id) != 0) {
             emit_stderr("[ERROR] compiler pipeline failed at pass: ");
@@ -433,6 +458,17 @@ func main_run_compile_pipeline(filename: u64, filename_len: u64) -> *AstProgram 
             emit_stderr("\n");
             total_pipeline_errors = total_pipeline_errors + 1;
             break;
+        }
+        var pass_ms: u64 = timings_elapsed_ms(phase_started);
+        if (pass_id == COMPILER_PASS_VALIDATE_DIRECT_IMPL_CALLS ||
+            pass_id == COMPILER_PASS_VALIDATE_IMPL_OVERRIDES ||
+            pass_id == COMPILER_PASS_FINALIZE_ABST_METHODS ||
+            pass_id == COMPILER_PASS_FINALIZE_TRAITS ||
+            pass_id == COMPILER_PASS_APPLY_ANNOTATIONS ||
+            pass_id == COMPILER_PASS_VALIDATE_CONTRACT_PRESERVATION) {
+            timings_add_validation(pass_ms);
+        } else {
+            timings_add_lowering(pass_ms);
         }
         if (diag_has_errors() != 0) {
             emit_stderr("[ERROR] compiler pipeline diagnostics in pass: ");
@@ -947,6 +983,10 @@ func main(argc: u64, argv: u64) -> u64 {
         main_print_usage();
         return 1;
     }
+    if (cli.timings_json_path.ptr != 0) {
+        timings_enable(cli.timings_json_path);
+    }
+    defer timings_write_json();
     var filename: u64 = cli.filename;
 
     var filename_len: u64 = str_len(filename);

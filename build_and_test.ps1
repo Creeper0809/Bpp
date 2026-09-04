@@ -8,6 +8,8 @@ param(
     [string]$BootstrapReleaseTag = "",
     [int]$CompilerTimeoutMs = 600000,
     [UInt64]$MemoryLimitBytes = 4294967296,
+    [ValidateRange(0, 64)][int]$TestJobs = 0,
+    [string]$TimingJsonPath = "",
     [switch]$ToolchainOnly,
     [switch]$SkipTests
 )
@@ -426,10 +428,14 @@ if (-not (Test-Path $TestRunner)) {
     throw "Windows test runner not found: $TestRunner"
 }
 
-& $TestRunner `
-    -CompilerPath $Stage1Compiler `
-    -NasmPath $ResolvedNasm `
-    -LinkerPath $ResolvedLinker `
-    -CompilerTimeoutMs $CompilerTimeoutMs `
-    -MemoryLimitBytes $MemoryLimitBytes
+$testRunnerArgs = @{
+    CompilerPath = $Stage1Compiler
+    NasmPath = $ResolvedNasm
+    LinkerPath = $ResolvedLinker
+    CompilerTimeoutMs = $CompilerTimeoutMs
+    MemoryLimitBytes = $MemoryLimitBytes
+}
+if ($PSBoundParameters.ContainsKey("TestJobs")) { $testRunnerArgs.Jobs = $TestJobs }
+if ($TimingJsonPath) { $testRunnerArgs.TimingJsonPath = $TimingJsonPath }
+& $TestRunner @testRunnerArgs
 exit $LASTEXITCODE

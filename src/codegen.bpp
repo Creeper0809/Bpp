@@ -21,6 +21,7 @@ import compiler.symbol_runtime;
 import compiler.annotations;
 import compiler.runtime_api;
 import compiler.ast_lowering;
+import compiler.timings;
 import llvm.contract_adapter;
 import ssa.datastruct;
 import ssa;
@@ -48,6 +49,9 @@ const CG_USED_HAS_METHOD_CALL = 2;
 const CG_USED_HAS_FUNC_ADDR = 4;
 var g_cg_trace_runtime_needed: u64 = 0;
 var g_collect_used_symtab: *HashMap<u64, *TypeInfo>;
+var g_used_name_membership: *HashMap<u64, u64> = 0;
+var g_used_func_index: *HashMap<u64, *AstFunc> = 0;
+var g_used_closure_cursor: u64 = 0;
 
 func used_mark_flag(flags_ptr: u64, mask: u64) -> u64 {
     *(flags_ptr) = *(flags_ptr) | mask;
@@ -56,6 +60,9 @@ func used_mark_flag(flags_ptr: u64, mask: u64) -> u64 {
 
 func used_has_name(used: *Vec<*NameInfo>, name: []u8) -> u64 {
     if (used == 0) { return false; }
+    if (g_used_name_membership != 0) {
+        return g_used_name_membership.get(slice(name.ptr, name.len)) != 0;
+    }
     var n: u64 = used.len();
     for (var i: u64 = 0; i < n; i++) {
         var info: *NameInfo = used.get(i);
@@ -100,6 +107,9 @@ func used_add_name(used: *Vec<*NameInfo>, name: []u8) -> u64 {
     if (used_has_name(used, name) != 0) { return false; }
     var info: *NameInfo = new NameInfo{name.ptr, name.len};
     used.push(info);
+    if (g_used_name_membership != 0) {
+        g_used_name_membership.put(slice(name.ptr, name.len), 1);
+    }
     return true;
 }
 
@@ -149,9 +159,9 @@ func collect_calls_in_method_call(mc: *AstMethodCall, used: *Vec<*NameInfo>, fla
             var arg_count_hint: u64 = 0;
             if (mc.args_vec != 0) { arg_count_hint = mc.args_vec.len(); }
             var arg_types: *Vec<*TypeInfo> = generic_collect_call_arg_types(mc.args_vec, g_collect_used_symtab);
-            var method_res: CompilerMethodResolveResult = sym_resolve_method_overload_with_count_fallback(recv_ti.struct_name, mc.method, arg_types, arg_count_hint);
-            if (method_res.found != 0 && method_res.fn != 0) {
-                used_add_resolved_name(used, method_res.fn.name);
+            var method_target: *AstFunc = lower_resolve_method_call_edge(recv_ti, mc.method, arg_types, arg_count_hint);
+            if (method_target != 0) {
+                used_add_resolved_name(used, method_target.name);
                 resolved = 1;
             } else {
                 var fallback_name: *NameInfo = build_method_name(recv_ti.struct_name, mc.method);
@@ -615,19 +625,34 @@ func collect_trait_vtable_impl_func_names(used: *Vec<*NameInfo>) -> u64 {
 }
 
 func collect_used_func_closure(funcs: *Vec<*AstFunc>, used: *Vec<*NameInfo>, flags_ptr: u64) -> u64 {
+    if (funcs == 0 || used == 0 || g_used_func_index == 0) { return 0; }
+    // used is insertion ordered. Processing it with a cursor turns the old
+    // whole-program fixed-point scan into a deterministic work queue.
+    while (g_used_closure_cursor < used.len()) {
+        var info: *NameInfo = used.get(g_used_closure_cursor);
+        g_used_closure_cursor = g_used_closure_cursor + 1;
+        if (info == 0) { continue; }
+        var fn: *AstFunc = g_used_func_index.get(slice(info.ptr, info.len));
+        if (fn == 0) { continue; }
+        set_current_module_for_func(fn.name);
+        collect_calls_in_func(fn, used, flags_ptr);
+    }
+    return 0;
+}
+
+func collect_build_func_index(funcs: *Vec<*AstFunc>) -> u64 {
+    g_used_func_index = new HashMap<u64, *AstFunc>{0, 0, 0};
+    g_used_func_index.ensure_capacity(256);
+    g_used_closure_cursor = 0;
     if (funcs == 0) { return 0; }
-    var changed: u64 = 1;
-    while (changed != 0) {
-        changed = 0;
-        var n: u64 = funcs.len();
-        for (var i: u64 = 0; i < n; i++) {
-            var fn: *AstFunc = funcs.get(i);
-            if (used_has_resolved_name(used, fn.name) != 0) {
-                set_current_module_for_func(fn.name);
-                var before: u64 = used.len();
-                collect_calls_in_func(fn, used, flags_ptr);
-                if (used.len() != before) { changed = 1; }
-            }
+    var n: u64 = funcs.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var fn: *AstFunc = funcs.get(i);
+        if (fn == 0) { continue; }
+        g_used_func_index.put(slice(fn.name.ptr, fn.name.len), fn);
+        var resolved: *NameInfo = resolve_name(slice(fn.name.ptr, fn.name.len));
+        if (resolved != 0) {
+            g_used_func_index.put(slice(resolved.ptr, resolved.len), fn);
         }
     }
     return 0;
@@ -637,6 +662,7 @@ func collect_used_func_names(program: *AstProgram, used: *Vec<*NameInfo>, flags_
     if (program == 0) { return 0; }
     var funcs: *Vec<*AstFunc> = program.funcs_vec;
     if (funcs == 0) { return 0; }
+    collect_build_func_index(funcs);
 
     var entry_ptr: u64 = entry_func_ptr();
     var entry_len: u64 = entry_func_len();
@@ -651,7 +677,13 @@ func collect_used_func_names(program: *AstProgram, used: *Vec<*NameInfo>, flags_
     var seed_n: u64 = funcs.len();
     for (var si: u64 = 0; si < seed_n; si++) {
         var seed_fn: *AstFunc = funcs.get(si);
-        if (seed_fn == 0 || seed_fn.annotations_vec == 0) { continue; }
+        if (seed_fn == 0) { continue; }
+        // Operator calls are created by the lowering pass. Seed their bodies
+        // before closure so calls made by an operator remain reachable too.
+        if (codegen_name_contains(seed_fn.name, slice("__op_", str_len("__op_"))) != 0) {
+            used_add_resolved_name(used, seed_fn.name);
+        }
+        if (seed_fn.annotations_vec == 0) { continue; }
         if (annotation_count_name(seed_fn.annotations_vec, slice("used", str_len("used"))) != 0) {
             used_add_name(used, seed_fn.name);
         }
@@ -1307,29 +1339,18 @@ func program_has_runtime_global_init(program: *AstProgram) -> u64 {
 
 func collect_used_names(program: *AstProgram, has_runtime_init: u64) -> *Vec<*NameInfo> {
     if (opt_get_level() < 1) { return 0; }
-    // Overload calls and some calls inside overload bodies receive their final
-    // targets during lowering, after the AST reachability walk. Until that
-    // lowered call graph is available, function-level DCE is not sound for a
-    // program containing operator overloads. Keep O1's other optimizations but
-    // conservatively retain all functions in this case.
-    if (program != 0 && program.funcs_vec != 0) {
-        var op_funcs: *Vec<*AstFunc> = program.funcs_vec;
-        var op_count: u64 = op_funcs.len();
-        for (var op_i: u64 = 0; op_i < op_count; op_i++) {
-            var op_fn: *AstFunc = op_funcs.get(op_i);
-            if (op_fn != 0 && codegen_name_contains(op_fn.name, slice("__op_", str_len("__op_"))) != 0) {
-                return 0;
-            }
-        }
-    }
     var used_names: *Vec<*NameInfo> = new Vec<*NameInfo>{heap_alloc((64) * sizeof(*NameInfo)), 0, (64)};
+    g_used_name_membership = new HashMap<u64, u64>{0, 0, 0};
+    g_used_name_membership.ensure_capacity(256);
     var used_flags: u64 = 0;
     collect_used_func_names(program, used_names, &used_flags);
     if ((used_flags & (CG_USED_HAS_CALL_PTR | CG_USED_HAS_FUNC_ADDR)) != 0) {
         return 0;
     }
     if (has_runtime_init != 0) {
-        used_add_resolved_name(used_names, slice((u64)"__global_init", 13));
+        if (used_add_resolved_name(used_names, slice((u64)"__global_init", 13)) != 0) {
+            collect_used_func_closure(program.funcs_vec, used_names, &used_flags);
+        }
     }
     return used_names;
 }
@@ -1337,6 +1358,7 @@ func collect_used_names(program: *AstProgram, has_runtime_init: u64) -> *Vec<*Na
 func codegen_force_emit_generated_func(name: []u8) -> u64 {
     if (codegen_name_has_prefix(name, slice("__thunk_", str_len("__thunk_"))) != 0) { return 1; }
     if (codegen_name_has_suffix(name, slice("_destructor", str_len("_destructor"))) != 0) { return 1; }
+    if (codegen_name_contains(name, slice("__op_", str_len("__op_"))) != 0) { return 1; }
     return 0;
 }
 
@@ -1536,46 +1558,61 @@ func program_has_float(program: *AstProgram) -> u64 {
 
 func build_ssa_pipeline(program: *AstProgram, use_ssa: u64, used_names: *Vec<*NameInfo>) -> *SSAContext {
     if (use_ssa == 0) { return 0; }
+    var phase_started: u64 = timings_now_ms();
     var ssa_ctx_ptr: *SSAContext = build_program_used(program, used_names);
     to_ssa(ssa_ctx_ptr);
+    timings_add_ssa(timings_elapsed_ms(phase_started));
     if (CODEGEN_DEBUG != 0) {
         println("[DEBUG] codegen: mem2reg", 25);
     }
     if (opt_get_level() >= 1) {
+        phase_started = timings_now_ms();
         optimize_ssa(ssa_ctx_ptr);
+        timings_add_opt(timings_elapsed_ms(phase_started));
         if (CODEGEN_DEBUG != 0) {
             println("[DEBUG] codegen: opt_o1", 25);
         }
     }
+    phase_started = timings_now_ms();
     lower_phi(ssa_ctx_ptr);
     if (CODEGEN_DEBUG != 0) {
         println("[DEBUG] codegen: destroy", 25);
     }
     lower_phys(ssa_ctx_ptr);
+    timings_add_lowering(timings_elapsed_ms(phase_started));
     if (CODEGEN_DEBUG != 0) {
         println("[DEBUG] codegen: lower_phys", 27);
     }
     var regalloc_gpr_count: u64 = 8;
     if (opt_get_level() >= 1) { regalloc_gpr_count = 12; }
+    phase_started = timings_now_ms();
     allocate_regs(ssa_ctx_ptr, regalloc_gpr_count);
+    timings_add_regalloc(timings_elapsed_ms(phase_started));
     if (CODEGEN_DEBUG != 0) {
         println("[DEBUG] codegen: regalloc", 26);
     }
+    phase_started = timings_now_ms();
     if (validate_contract_preservation_ssa(ssa_ctx_ptr) != 0) {
+        timings_add_validation(timings_elapsed_ms(phase_started));
         return 0;
     }
     if (annotation_validate_complexity_preservation_ssa(ssa_ctx_ptr) == 0) {
+        timings_add_validation(timings_elapsed_ms(phase_started));
         return 0;
     }
     if (annotation_validate_lowered_contract_boundary(program, ssa_ctx_ptr) != 0) {
+        timings_add_validation(timings_elapsed_ms(phase_started));
         return 0;
     }
     if (annotation_validate_post_llvm_contract_metadata_scaffold(program) == 0) {
+        timings_add_validation(timings_elapsed_ms(phase_started));
         return 0;
     }
     if (annotation_validate_llvm_contract_adapter_scaffold(program) == 0) {
+        timings_add_validation(timings_elapsed_ms(phase_started));
         return 0;
     }
+    timings_add_validation(timings_elapsed_ms(phase_started));
     if (CODEGEN_DEBUG != 0) {
         annotation_dump_backend_contract_envelope_stderr(program);
         annotation_dump_llvm_contract_adapter_stderr(program);
@@ -1585,6 +1622,9 @@ func build_ssa_pipeline(program: *AstProgram, use_ssa: u64, used_names: *Vec<*Na
 
 func find_ssa_func_by_name(ssa_ctx: *SSAContext, name: []u8) -> *SSAFunction {
     if (ssa_ctx == 0) { return 0; }
+    if (ssa_ctx.funcs_by_name != 0) {
+        return ssa_ctx.funcs_by_name.get(slice(name.ptr, name.len));
+    }
     var funcs: []*SSAFunction = ssa_ctx.funcs;
     var n: u64 = slice_len(funcs);
     for (var i: u64 = 0; i < n; i++) {
@@ -1613,6 +1653,7 @@ func emit_windows_runtime_externs() -> u64 {
     if (compiler_target() != COMPILER_TARGET_WINDOWS_X86_64) { return 0; }
     emitln("default rel");
     emitln("extern GetStdHandle");
+    emitln("extern GetTickCount64");
     emitln("extern ReadFile");
     emitln("extern WriteFile");
     emitln("extern CreateFileA");
@@ -1756,6 +1797,7 @@ func program_with_sigs(prog: *AstProgram, sigs: *Vec<*AstFunc>) -> u64 {
     var ssa_ctx: *SSAContext = build_ssa_pipeline(program, use_ssa, used_names);
     if (ssa_ctx == 0) { use_ssa = 0; }
 
+    var codegen_started: u64 = timings_now_ms();
     init_state();
 
     // Set structs and functions for typeinfo module
@@ -1775,6 +1817,7 @@ func program_with_sigs(prog: *AstProgram, sigs: *Vec<*AstFunc>) -> u64 {
     string_emit_data();
     float_emit_data();
     globals_emit_bss();
+    timings_add_codegen(timings_elapsed_ms(codegen_started));
     return 0;
 }
 

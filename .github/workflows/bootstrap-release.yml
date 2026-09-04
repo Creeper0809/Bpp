@@ -39,7 +39,7 @@ jobs:
           echo "linux_sdk_asset=bpp-$version-linux-x86_64.tar.gz" >> "$GITHUB_OUTPUT"
           echo "windows_asset=bpp-bootstrap-$version-windows-x86_64.exe" >> "$GITHUB_OUTPUT"
 
-  linux-bootstrap:
+  bootstrap-seeds:
     needs: prepare
     runs-on: ubuntu-latest
     steps:
@@ -50,8 +50,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y nasm binutils coreutils binutils-mingw-w64-x86-64 mingw-w64-x86-64-dev
 
-      - name: Full build and test Linux bootstrap compiler
+      - name: Self-host Linux compiler and verify Stage 1 equals Stage 2
         env:
+          BUILD_SKIP_TESTS: "1"
           TEST_JOBS: "4"
           TEST_PROGRESS: "1"
           TEST_QUIET: "1"
@@ -59,6 +60,62 @@ jobs:
           chmod +x build_and_test.sh test/run_tests.sh
           cmake -S . -B build-linux
           cmake --build build-linux --target bpp-selfhost
+
+      - name: Cross-build initial Windows bootstrap seed
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x tools/build_windows_bootstrap.sh
+          tools/build_windows_bootstrap.sh "${{ needs.prepare.outputs.windows_asset }}"
+
+      - name: Upload Windows cross-bootstrap seed
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-cross-bootstrap
+          path: ${{ needs.prepare.outputs.windows_asset }}
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload verified Linux compiler
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-selfhost-compiler
+          path: bin/stage1
+          if-no-files-found: error
+          retention-days: 1
+
+  linux-validation:
+    needs:
+      - prepare
+      - bootstrap-seeds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nasm binutils coreutils clang
+
+      - name: Download verified Linux compiler
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-selfhost-compiler
+          path: .
+
+      - name: Run full Linux compiler tests
+        env:
+          TEST_PROFILE: full
+          TEST_JOBS: "4"
+          TEST_PROGRESS: "1"
+          TEST_QUIET: "1"
+          TEST_SKIP_LLVM_BUILD: "1"
+          COMPILE_FAIL_SINGLE_VARIANT: "0"
+          STRESS_RUNS: "0"
+          STABILITY_RUNS: "0"
+        run: |
+          chmod +x bin/stage1 test/run_tests.sh
+          bash test/run_tests.sh bin/stage1
 
       - name: Package Linux bootstrap asset
         shell: bash
@@ -80,21 +137,6 @@ jobs:
           BPP_PACKAGE_OUT_DIR="$PWD" tools/package_linux_release.sh
           test -f "${{ needs.prepare.outputs.linux_sdk_asset }}"
           test -f "${{ needs.prepare.outputs.linux_sdk_asset }}.sha256"
-
-      - name: Cross-build initial Windows bootstrap seed
-        shell: bash
-        run: |
-          set -euo pipefail
-          chmod +x tools/build_windows_bootstrap.sh
-          tools/build_windows_bootstrap.sh "${{ needs.prepare.outputs.windows_asset }}"
-
-      - name: Upload Windows cross-bootstrap seed
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-cross-bootstrap
-          path: ${{ needs.prepare.outputs.windows_asset }}
-          if-no-files-found: error
-          retention-days: 1
 
       - name: Smoke test Linux SDK package
         shell: bash
@@ -139,7 +181,7 @@ jobs:
   windows-bootstrap:
     needs:
       - prepare
-      - linux-bootstrap
+      - bootstrap-seeds
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -177,7 +219,26 @@ jobs:
           ./build_and_test.ps1 `
             -CompilerPath $seed `
             -NasmPath "$env:BPP_NASM_EXECUTABLE" `
-            -LinkerPath "$env:BPP_LINKER_EXECUTABLE"
+            -LinkerPath "$env:BPP_LINKER_EXECUTABLE" `
+            -TestJobs 4 `
+            -TimingJsonPath "build/timings/windows-tests.json"
+
+      - name: Publish Windows timing summary
+        if: always()
+        shell: pwsh
+        run: |
+          ./tools/write_windows_timing_summary.ps1 `
+            -TimingJsonPath "build/timings/windows-tests.json" `
+            -Title "Windows release verification timing"
+
+      - name: Upload Windows timing data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-release-verification-timings
+          path: build/timings
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Package Windows bootstrap asset
         shell: pwsh
@@ -202,9 +263,9 @@ jobs:
   publish-release:
     needs:
       - prepare
-      - linux-bootstrap
+      - linux-validation
       - windows-bootstrap
-    if: needs.linux-bootstrap.result == 'success' && needs.windows-bootstrap.result == 'success'
+    if: needs.linux-validation.result == 'success' && needs.windows-bootstrap.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - name: Download Linux bootstrap artifact
