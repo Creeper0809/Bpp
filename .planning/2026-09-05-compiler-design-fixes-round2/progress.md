@@ -59,6 +59,22 @@
 - Full 4 GiB-limited Windows verification completed: self-host Stage1 equals Stage2, 767/767 tests passed, 0 failed, and 1 LLVM-only case was skipped by the Windows runner in 266.9 seconds.
 - `git diff --check` passed. WSL has no usable installed distribution on this host, so the Linux shell runner was not locally available.
 
+## 2026-09-05 completion audit continuation
+- Classified the preceding goal turn as progress: it changed compiler sources, added regressions, produced a green full-suite artifact, merged into `dev`, and deleted the feature branch.
+- Confirmed authoritative repository state at audit start: `dev` at merge commit `ce6611b`; only the pre-existing `src/std/io.bpp` metadata change and user-owned untracked files remain outside the commit.
+- Expanded the final audit scope to both review rounds (the original nine findings plus the round-two nine findings) so completion is not inferred from the most recent plan alone.
+- Source inspection found that all call sites migrated to `typeinfo_is_assignable`, yet the obsolete `check_type_compat` implementation still preserves the original same-size compatibility bug as a callable API. Completion remains open pending a conservative fix and direct regression.
+- Created `codex/compiler-completion-audit` from `dev`, made the legacy helper reject under-specified nominal/container/function categories and same-width different scalar kinds, and added `100_legacy_type_compat_api_success.bpp` for direct API coverage in all four normal backend/optimization combinations.
+- Rebuilt the compiler from the current self-hosted stage under the 4 GiB limit (6.28 s compiler time, 630,366,208-byte peak working set).
+- Focused type-safety verification passed 24/24: the original five negative invariants across four modes plus the new direct legacy-API regression across four modes.
+- Full post-audit verification passed: self-host Stage1 equals Stage2 and the expanded suite passed 771/771 with 0 failures in 266.0 seconds under the 4 GiB limit; the Windows runner explicitly skipped its single unsupported LLVM-only fixture.
+- Independently hashed `bin/v13_stage1.exe` and `bin/v13_stage2.exe`; both are `2BBEA772A9AAB08839159B6CE717B683F6BDEB1D887D55ABD38D6D214E13AF7D`.
+- Queried the final timing manifest for every dedicated original/round-two fixture: all 70 mapped variants passed and the full manifest has zero failures.
+- Static residue searches confirmed the old SSA fixed cutoffs and raw auxiliary-pointer operand encoding are absent; the legacy compatibility helper is now exercised only by its direct conservative API test.
+- Committed the completion-audit fix as `8d8276d`, merged it into local `dev`, and deleted `codex/compiler-completion-audit` after integration.
+- Rechecked the worktree after integration: only the pre-existing `src/std/io.bpp` metadata change and user-owned untracked planning/report/artifact files remain; none were staged or modified by this work.
+- Closed the 18-item implementation/design matrix with direct source evidence and 70/70 mapped regression variants inside the green 771/771 complete Windows suite.
+
 ## Errors
 - PowerShell parsed GCC's `-Wl,-e,...` argument as a comma expression. The retry will pass GCC arguments through an explicit array.
 - The explicit GCC argument-array retry linked successfully; no further action required.

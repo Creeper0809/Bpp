@@ -65,6 +65,13 @@ Complete
 - [x] Commit, merge into `dev`, and remove the completed work branch.
 - **Status:** complete
 
+### Phase 7: Completion audit across both design-review rounds
+- [x] Map the original nine findings and the round-two nine findings to current source invariants.
+- [x] Confirm regression coverage for every mapped requirement on current `dev`.
+- [x] Revalidate self-host identity, complete-suite results, branch integration, and preservation of user-owned changes.
+- [x] Record authoritative evidence and close the active goal only if every requirement is proven.
+- **Status:** complete
+
 ## Constraints
 - Do not overwrite, stage, or normalize the pre-existing `src/std/io.bpp` line-ending-only change.
 - Preserve the user's root planning/report files and `docs/보고서.md`.
