@@ -562,7 +562,13 @@ $workerScript = {
         }
         if ($Case.Mode -eq "ssa") { $args += "-dump-ssa" }
         if ($compilerArgs.Count -gt 0) { $args += $compilerArgs }
-        if ($compilerTimingFile) { $args += @("--timings-json", $compilerTimingFile) }
+        # On hosted Windows runners the compiler's deferred timing writer can
+        # fault while unwinding an expected diagnostic. The runner still records
+        # wall/CPU/memory metrics for these cases, so only request compiler phase
+        # timing for compilations that are expected to succeed.
+        if ($compilerTimingFile -and -not $expectCompileFail) {
+            $args += @("--timings-json", $compilerTimingFile)
+        }
         $args += @("-asm", $Case.Path)
 
         $compileResult = Invoke-BppLimitedProcess -FilePath $Config.CompilerPath -ArgumentList $args `
