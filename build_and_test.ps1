@@ -213,31 +213,20 @@ function Invoke-CompileToAsm {
         [string]$AsmFile,
         [string]$ErrorFile,
         [int]$TimeoutMs,
-        [UInt64]$ProcessMemoryLimitBytes,
-        [switch]$DirectOutput
+        [UInt64]$ProcessMemoryLimitBytes
     )
 
     if (Test-Path $AsmFile) { Remove-Item $AsmFile -Force }
     if (Test-Path $ErrorFile) { Remove-Item $ErrorFile -Force }
 
-    $compilerArgs = @("--target", "windows-x86_64", "-asm")
-    if ($DirectOutput) {
-        $compilerArgs += @("--output", $AsmFile)
-    }
-    $compilerArgs += $SourceFile
-
-    $processArgs = @{
-        FilePath = $Compiler
-        ArgumentList = $compilerArgs
-        TimeoutMs = $TimeoutMs
-        StderrPath = $ErrorFile
-        WorkingDirectory = $RootDir
-        MemoryLimitBytes = $ProcessMemoryLimitBytes
-    }
-    if (-not $DirectOutput) {
-        $processArgs.StdoutPath = $AsmFile
-    }
-    $result = Invoke-BppLimitedProcess @processArgs
+    $result = Invoke-BppLimitedProcess `
+        -FilePath $Compiler `
+        -ArgumentList @("--target", "windows-x86_64", "-asm", $SourceFile) `
+        -TimeoutMs $TimeoutMs `
+        -StdoutPath $AsmFile `
+        -StderrPath $ErrorFile `
+        -WorkingDirectory $RootDir `
+        -MemoryLimitBytes $ProcessMemoryLimitBytes
     return $result.ExitCode
 }
 
@@ -251,8 +240,7 @@ function Invoke-StageBuild {
         [string]$Nasm,
         [string]$Linker,
         [int]$TimeoutMs,
-        [UInt64]$ProcessMemoryLimitBytes,
-        [switch]$DirectOutput
+        [UInt64]$ProcessMemoryLimitBytes
     )
 
     $asmFile = Join-Path $BuildDir "${StageName}.asm"
@@ -267,8 +255,7 @@ function Invoke-StageBuild {
         -AsmFile $asmFile `
         -ErrorFile $errFile `
         -TimeoutMs $TimeoutMs `
-        -ProcessMemoryLimitBytes $ProcessMemoryLimitBytes `
-        -DirectOutput:$DirectOutput
+        -ProcessMemoryLimitBytes $ProcessMemoryLimitBytes
     if ($compileCode -ne 0) {
         $errText = if (Test-Path $errFile) { Get-Content $errFile -Raw } else { "" }
         throw "Compiler failed while building ${StageName}.asm (exit=$compileCode)`n$errText"
@@ -407,8 +394,7 @@ $Stage1Compiler = Invoke-StageBuild `
     -Nasm $ResolvedNasm `
     -Linker $ResolvedLinker `
     -TimeoutMs $CompilerTimeoutMs `
-    -ProcessMemoryLimitBytes $MemoryLimitBytes `
-    -DirectOutput
+    -ProcessMemoryLimitBytes $MemoryLimitBytes
 
 $Stage2Compiler = Invoke-StageBuild `
     -Compiler $Stage1Compiler `
@@ -419,8 +405,7 @@ $Stage2Compiler = Invoke-StageBuild `
     -Nasm $ResolvedNasm `
     -Linker $ResolvedLinker `
     -TimeoutMs $CompilerTimeoutMs `
-    -ProcessMemoryLimitBytes $MemoryLimitBytes `
-    -DirectOutput
+    -ProcessMemoryLimitBytes $MemoryLimitBytes
 
 $Stage1Hash = (Get-FileHash -LiteralPath $Stage1Compiler -Algorithm SHA256).Hash
 $Stage2Hash = (Get-FileHash -LiteralPath $Stage2Compiler -Algorithm SHA256).Hash

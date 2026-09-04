@@ -551,7 +551,7 @@ echo ""
 
 # Step 2: 셀프 호스팅 (1단계)
 echo "[2/6] Self-Hosting Stage 1..."
-./bin/${VERSION}_stage0 -asm --output "${STAGE1_ASM}" "${SRC_FILE}"
+./bin/${VERSION}_stage0 -asm "${SRC_FILE}" > "${STAGE1_ASM}"
 assemble_nasm_obj "${STAGE1_ASM}" "build/${VERSION}_stage1.o"
 "${LINKER_BIN}" build/${VERSION}_stage1.o -o bin/${VERSION}_stage1
 STAGE1_USABLE=1
@@ -574,7 +574,7 @@ STAGE2_PID=""
 STAGE2_DONE=0
 
 run_stage2_verify() {
-    ./bin/${VERSION}_stage1 -asm --output "${STAGE2_ASM}" "${SRC_FILE}"
+    ./bin/${VERSION}_stage1 -asm "${SRC_FILE}" > "${STAGE2_ASM}"
     echo "Stage 2 Build Completed"
     echo ""
 
