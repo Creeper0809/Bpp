@@ -10,7 +10,6 @@ param(
     [UInt64]$MemoryLimitBytes = 4294967296,
     [ValidateRange(0, 64)][int]$TestJobs = 0,
     [string]$TimingJsonPath = "",
-    [switch]$CompilerIsCurrentStage0,
     [switch]$ToolchainOnly,
     [switch]$SkipTests
 )
@@ -371,10 +370,6 @@ Provide a Windows bootstrap compiler, or publish the cross-bootstrap artifact fi
     }
 }
 
-if ($CompilerIsCurrentStage0 -and -not $CompilerPathWasExplicit) {
-    throw "CompilerIsCurrentStage0 requires an explicit -CompilerPath"
-}
-
 Write-Host "[INFO] Compiler: $CompilerPath"
 
 $SourceFile = Join-Path $ScriptDir "src\main.bpp"
@@ -392,21 +387,16 @@ $Stage1Name = "${Version}_stage1"
 $Stage2Name = "${Version}_stage2"
 
 Write-Host "[INFO] Building Windows hosted compiler stages"
-if ($CompilerIsCurrentStage0) {
-    $Stage0Compiler = (Resolve-Path -LiteralPath $CompilerPath).Path
-    Write-Host "[INFO] Reusing verified current-source Stage0: $Stage0Compiler"
-} else {
-    $Stage0Compiler = Invoke-StageBuild `
-        -Compiler $CompilerPath `
-        -SourceFile $SourceFile `
-        -StageName $Stage0Name `
-        -BuildDir $BuildDir `
-        -BinDir $BinDir `
-        -Nasm $ResolvedNasm `
-        -Linker $ResolvedLinker `
-        -TimeoutMs $CompilerTimeoutMs `
-        -ProcessMemoryLimitBytes $MemoryLimitBytes
-}
+$Stage0Compiler = Invoke-StageBuild `
+    -Compiler $CompilerPath `
+    -SourceFile $SourceFile `
+    -StageName $Stage0Name `
+    -BuildDir $BuildDir `
+    -BinDir $BinDir `
+    -Nasm $ResolvedNasm `
+    -Linker $ResolvedLinker `
+    -TimeoutMs $CompilerTimeoutMs `
+    -ProcessMemoryLimitBytes $MemoryLimitBytes
 
 $Stage1Compiler = Invoke-StageBuild `
     -Compiler $Stage0Compiler `
