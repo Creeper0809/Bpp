@@ -67,6 +67,52 @@ function Invoke-Link {
     return $result.ExitCode
 }
 
+function Invoke-DefaultPipelineSmoke {
+    param(
+        [string]$Compiler,
+        [string]$Nasm,
+        [string]$Linker,
+        [string]$OutputDirectory
+    )
+
+    # Exercise the compiler's own CreateProcess-based assemble/link/run path.
+    # The regular test workers invoke those tools themselves and therefore
+    # cannot detect a broken hosted process launcher.
+    $Compiler = (Resolve-Path -LiteralPath $Compiler).Path
+    $Nasm = (Resolve-Path -LiteralPath $Nasm).Path
+    $Linker = (Resolve-Path -LiteralPath $Linker).Path
+    $sourcePath = Join-Path $OutputDirectory "default_pipeline_smoke.bpp"
+    $manifestPath = Join-Path $OutputDirectory "bpp.toml"
+    $stdoutPath = Join-Path $OutputDirectory "default_pipeline_smoke.stdout"
+    $stderrPath = Join-Path $OutputDirectory "default_pipeline_smoke.stderr"
+    $exePath = Join-Path $OutputDirectory "default_pipeline_smoke.exe"
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($sourcePath, "func main() -> u64 {`n    return 0;`n}`n", $utf8)
+    [System.IO.File]::WriteAllLines($manifestPath, @(
+        "std_root=../../src",
+        "nasm_path=$Nasm",
+        "ld_path=$Linker"
+    ), $utf8)
+
+    $result = Invoke-BppLimitedProcess `
+        -FilePath $Compiler `
+        -ArgumentList @("default_pipeline_smoke.bpp") `
+        -TimeoutMs $CompilerTimeoutMs `
+        -StdoutPath $stdoutPath `
+        -StderrPath $stderrPath `
+        -WorkingDirectory $OutputDirectory `
+        -MemoryLimitBytes $MemoryLimitBytes
+    if ($result.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $exePath)) {
+        $detail = if (Test-Path -LiteralPath $stderrPath) {
+            $rawDetail = Get-Content -LiteralPath $stderrPath -Raw
+            if ($null -eq $rawDetail -or $rawDetail.Length -eq 0) { "no diagnostic" } else { $rawDetail.Trim() }
+        } else {
+            "no diagnostic"
+        }
+        throw "Compiler default assemble/link/run pipeline failed (exit=$($result.ExitCode)): $detail"
+    }
+}
+
 function Read-DirectiveValue {
     param(
         [string[]]$Lines,
@@ -334,6 +380,12 @@ $ResultDir = Join-Path $RootDir "build\test_results_win"
 New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
 New-Item -ItemType Directory -Force -Path $ResultDir | Out-Null
 
+Invoke-DefaultPipelineSmoke `
+    -Compiler $CompilerPath `
+    -Nasm $NasmPath `
+    -Linker $LinkerPath `
+    -OutputDirectory $BuildDir
+
 $TestDirs = @(
     (Join-Path $RootDir "test\source"),
     (Join-Path $RootDir "test\source_fail")
@@ -598,6 +650,13 @@ $workerScript = {
         } elseif ($expectCompileFail) {
             $caseOk = $false; $status = "FAIL (unexpected compile success)"
         } else {
+            if ($expectErrContains.Count -gt 0) {
+                $errText = if (Test-Path -LiteralPath $errFile) { Get-Content -LiteralPath $errFile -Raw } else { "" }
+                $missing = @($expectErrContains | Where-Object { $errText.IndexOf($_, [System.StringComparison]::Ordinal) -lt 0 })
+                if ($missing.Count -gt 0) {
+                    $caseOk = $false; $status = "FAIL (compiler stderr mismatch: $($missing[0]))"
+                }
+            }
             if ($expectDeterministicCompilerOutput) {
                 $repeatOutputFile = "$asmFile.repeat"
                 $repeatErrorFile = "$errFile.repeat"

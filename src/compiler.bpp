@@ -224,6 +224,8 @@ struct CompilerCtx {
     // existing canonical-field layout remains stable during bootstrap.
     public initialized: u64;
     public generation: u64;
+    public diag_count: u64;
+    public diag_limit_reached: u64;
 }
 
 impl CompilerCtx {
@@ -233,24 +235,33 @@ impl CompilerCtx {
     }
 }
 
-var g_compiler_ctx: CompilerCtx;
-var g_compiler_diag_count: u64 = 0;
-var g_compiler_diag_limit_reached: u64 = 0;
+var g_compiler_default_ctx: CompilerCtx;
+var g_compiler_ctx: *CompilerCtx = 0;
 
 func compiler_ctx_current() -> *CompilerCtx {
-    return &g_compiler_ctx;
+    if (g_compiler_ctx == 0) { g_compiler_ctx = &g_compiler_default_ctx; }
+    return g_compiler_ctx;
 }
 
 func compiler_ctx_is_active(ctx: *CompilerCtx) -> u64 {
     if (ctx == 0) { return 0; }
-    if ((u64)ctx == (u64)&g_compiler_ctx && ctx.initialized != 0) { return 1; }
+    if ((u64)ctx == (u64)compiler_ctx_current() && ctx.initialized != 0) { return 1; }
     return 0;
 }
 
-func compiler_ctx_generation() -> u64 {
-    return g_compiler_ctx.generation;
+func compiler_ctx_activate(ctx: *CompilerCtx) -> *CompilerCtx {
+    var previous: *CompilerCtx = compiler_ctx_current();
+    if (ctx != 0) { g_compiler_ctx = ctx; }
+    return previous;
 }
 
+func compiler_ctx_generation() -> u64 {
+    return compiler_ctx_current().generation;
+}
+
+// Vec and HashMap both use the same owned-buffer header layout. Keeping the
+// layout adapter here avoids asking the bootstrap compiler to instantiate
+// deeply nested generic teardown helpers.
 func compiler_ctx_release_container(value: u64) -> u64 {
     if (value == 0) { return 0; }
     var raw: *u64 = (*u64)value;
@@ -311,9 +322,8 @@ func compiler_ctx_release_source_cache(value: *HashMap<u64, *NameInfo>) -> u64 {
 
 func compiler_ctx_release_state(ctx: *CompilerCtx) -> u64 {
     if (ctx == 0 || ctx.initialized == 0) { return 0; }
-    if ((u64)ctx != (u64)&g_compiler_ctx) { return 0; }
 
-    ast_source_span_reset();
+    if ((u64)ctx == (u64)g_compiler_ctx) { ast_source_span_reset(); }
 
     // Alias-only subcontexts never own their referenced tables.
     if (ctx.module_ctx != 0) { heap_free((u64)ctx.module_ctx); }
@@ -389,11 +399,12 @@ func compiler_ctx_release_state(ctx: *CompilerCtx) -> u64 {
     return 0;
 }
 
-func compiler_ctx_reset_state() -> u64 {
+func compiler_ctx_reset_active_state() -> u64 {
+    compiler_ctx_current();
     var next_generation: u64 = g_compiler_ctx.generation + 1;
-    compiler_ctx_release_state(&g_compiler_ctx);
-    g_compiler_diag_count = 0;
-    g_compiler_diag_limit_reached = 0;
+    compiler_ctx_release_state(g_compiler_ctx);
+    g_compiler_ctx.diag_count = 0;
+    g_compiler_ctx.diag_limit_reached = 0;
 
     // Module and symbol tables
     g_compiler_ctx.loaded_modules = new HashMap<u64, u64>{0, 0, 0};
@@ -568,6 +579,36 @@ func compiler_ctx_reset_state() -> u64 {
     g_compiler_ctx.generation = next_generation;
 
     return 0;
+}
+
+func compiler_ctx_reset_state_with_ctx(ctx: *CompilerCtx) -> u64 {
+    if (ctx == 0) { return 0; }
+    var previous: *CompilerCtx = compiler_ctx_activate(ctx);
+    compiler_ctx_reset_active_state();
+    compiler_ctx_activate(previous);
+    return 1;
+}
+
+func compiler_ctx_reset_state() -> u64 {
+    return compiler_ctx_reset_active_state();
+}
+
+func compiler_ctx_new() -> *CompilerCtx {
+    var ctx: *CompilerCtx = new CompilerCtx{};
+    compiler_ctx_reset_state_with_ctx(ctx);
+    return ctx;
+}
+
+func compiler_ctx_destroy(ctx: *CompilerCtx) -> u64 {
+    if (ctx == 0) { return 0; }
+    if ((u64)ctx == (u64)&g_compiler_default_ctx) {
+        return compiler_ctx_release_state(ctx);
+    }
+    var was_active: u64 = (u64)ctx == (u64)g_compiler_ctx;
+    compiler_ctx_release_state(ctx);
+    if (was_active != 0) { g_compiler_ctx = &g_compiler_default_ctx; }
+    heap_free((u64)ctx);
+    return 1;
 }
 
 const PRELUDE_MODULE_COUNT = 9;
@@ -1233,7 +1274,11 @@ func ast_walker_walk_expr(walker: *CompilerAstWalker, expr: *AstNode) -> *AstNod
 
     var kind: u64 = ast_kind(expr);
     match (kind) {
+        case AST_LITERAL:
         case AST_IDENT:
+        case AST_STRING:
+        case AST_SIZEOF:
+        case AST_FLOAT:
         case AST_SUPER:
             return expr;
         case AST_CALL:
@@ -1302,6 +1347,16 @@ func ast_walker_walk_expr(walker: *CompilerAstWalker, expr: *AstNode) -> *AstNod
             bin.right = ast_walker_walk_expr(walker, bin.right);
             if (walker.mode == COMPILER_AST_WALK_LOWER_PARSE_SUGAR) {
                 return lower_parse_sugar_binary_operator(bin);
+            }
+            return expr;
+        case AST_ASSIGN:
+            var expr_assign: *AstAssign = (*AstAssign)expr;
+            expr_assign.target = ast_walker_walk_expr(walker, expr_assign.target);
+            expr_assign.value = ast_walker_walk_expr(walker, expr_assign.value);
+            if (walker.mode == COMPILER_AST_WALK_LOWER_PARSE_SUGAR && expr_assign.target != 0 && expr_assign.value != 0) {
+                var expr_lhs_ti: *TypeInfo = generic_infer_expr_type(expr_assign.target, g_lower_parse_sugar_symtab);
+                var expr_lowered_value: *AstNode = lower_parse_sugar_expr_for_type(expr_assign.value, expr_lhs_ti);
+                if (expr_lowered_value != expr_assign.value) { expr_assign.value = expr_lowered_value; }
             }
             return expr;
         case AST_UNARY:
@@ -1413,6 +1468,12 @@ func ast_walker_walk_expr(walker: *CompilerAstWalker, expr: *AstNode) -> *AstNod
             sl.ptr_expr = ast_walker_walk_expr(walker, sl.ptr_expr);
             sl.len_expr = ast_walker_walk_expr(walker, sl.len_expr);
             return expr;
+        case AST_TERNARY:
+            var ternary: *AstTernary = (*AstTernary)expr;
+            ternary.cond = ast_walker_walk_expr(walker, ternary.cond);
+            ternary.then_expr = ast_walker_walk_expr(walker, ternary.then_expr);
+            ternary.else_expr = ast_walker_walk_expr(walker, ternary.else_expr);
+            return expr;
         case AST_TRY:
             var tr: *AstTry = (*AstTry)expr;
             tr.operand = ast_walker_walk_expr(walker, tr.operand);
@@ -1435,6 +1496,9 @@ func ast_walker_walk_expr(walker: *CompilerAstWalker, expr: *AstNode) -> *AstNod
             ast_walker_walk_args(walker, sc.ctor_args_vec);
             return expr;
         default:
+            diag_emit_error_tag("compiler", "ast-walker", "unhandled expression node kind");
+            diag_emit_labelled_u64("kind: ", kind);
+            diag_note_error();
             return expr;
     }
 }
@@ -1474,6 +1538,8 @@ func ast_walker_walk_stmt(walker: *CompilerAstWalker, stmt: *AstNode) -> u64 {
                 lower_var_decl_register_typeinfo(vd, vd_ti);
             }
             break;
+        case AST_CONST_DECL:
+            break;
         case AST_ASSIGN:
             var asn: *AstAssign = (*AstAssign)stmt;
             asn.target = ast_walker_walk_expr(walker, asn.target);
@@ -1502,6 +1568,11 @@ func ast_walker_walk_stmt(walker: *CompilerAstWalker, stmt: *AstNode) -> u64 {
             var wl: *AstWhile = (*AstWhile)stmt;
             wl.cond = ast_walker_walk_expr(walker, wl.cond);
             ast_walker_walk_stmt(walker, wl.body);
+            break;
+        case AST_DO_WHILE:
+            var dw: *AstDoWhile = (*AstDoWhile)stmt;
+            ast_walker_walk_stmt(walker, dw.body);
+            dw.cond = ast_walker_walk_expr(walker, dw.cond);
             break;
         case AST_FOR:
             var fr: *AstFor = (*AstFor)stmt;
@@ -1539,11 +1610,33 @@ func ast_walker_walk_stmt(walker: *CompilerAstWalker, stmt: *AstNode) -> u64 {
             var df: *AstDefer = (*AstDefer)stmt;
             ast_walker_walk_stmt(walker, df.stmt);
             break;
+        case AST_TRY_STMT:
+            var ts: *AstTryStmt = (*AstTryStmt)stmt;
+            ast_walker_walk_stmt(walker, ts.try_block);
+            ast_walker_walk_stmt(walker, ts.catch_block);
+            ast_walker_walk_stmt(walker, ts.finally_block);
+            break;
+        case AST_THROW_STMT:
+            var th: *AstThrowStmt = (*AstThrowStmt)stmt;
+            th.expr = ast_walker_walk_expr(walker, th.expr);
+            break;
+        case AST_NEW:
+        case AST_STACK_CTOR:
+            ast_walker_walk_expr(walker, stmt);
+            break;
         case AST_DELETE:
             var dl: *AstDelete = (*AstDelete)stmt;
             dl.expr = ast_walker_walk_expr(walker, dl.expr);
             break;
+        case AST_BREAK:
+        case AST_CONTINUE:
+        case AST_ASM:
+        case AST_ALIAS:
+            break;
         default:
+            diag_emit_error_tag("compiler", "ast-walker", "unhandled statement node kind");
+            diag_emit_labelled_u64("kind: ", kind);
+            diag_note_error();
             break;
     }
     return 0;
