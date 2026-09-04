@@ -26,6 +26,8 @@ func token_kind_name(kind: u64) -> u64 {
         case TOKEN_EOF: return "EOF";
         case TOKEN_NUMBER: return "number";
         case TOKEN_FLOAT: return "float";
+        case TOKEN_IMAG_NUMBER: return "imaginary number";
+        case TOKEN_IMAG_FLOAT: return "imaginary float";
         case TOKEN_IDENTIFIER: return "identifier";
         case TOKEN_STRING: return "string";
         case TOKEN_LPAREN: return "'('";
@@ -400,7 +402,7 @@ func payload_find_field_desc(struct_def: *AstStructDef, field: []u8) -> *FieldDe
     var n: u64 = struct_def.fields_vec.len();
     for (var i: u64 = 0; i < n; i++) {
         var field_desc: *FieldDesc = struct_def.fields_vec.get(i);
-        if (str_eq(slice(field_desc.name_ptr, field_desc.name_len), slice(field.ptr, field.len)) != 0) {
+        if (str_eq(field_desc.name, slice(field.ptr, field.len)) != 0) {
             return field_desc;
         }
     }
@@ -409,29 +411,19 @@ func payload_find_field_desc(struct_def: *AstStructDef, field: []u8) -> *FieldDe
 
 func payload_build_binding_decl(name: []u8, field_expr: *AstNode, field_desc: *FieldDesc) -> *AstVarDecl {
     if (field_desc == 0) {
-        return new AstVarDecl{AST_VAR_DECL, name.ptr, name.len, TYPE_U64, 0, 0, field_expr, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+        return ast_var_decl(name, TYPE_U64, 0, field_expr);
     }
-    return new AstVarDecl{
-        AST_VAR_DECL,
-        name.ptr,
-        name.len,
-        field_desc.type_kind,
-        field_desc.ptr_depth,
-        field_desc.is_tagged,
-        field_expr,
-        field_desc.struct_name_ptr,
-        field_desc.struct_name_len,
-        field_desc.tag_layout_ptr,
-        field_desc.tag_layout_len,
-        field_desc.elem_type_kind,
-        field_desc.elem_ptr_depth,
-        field_desc.array_len,
-        0,
-        0,
-        0,
-        field_desc.elem_typeinfo,
-        0
-    };
+    var decl: *AstVarDecl = ast_var_decl(name, field_desc.type_kind, field_desc.ptr_depth, field_expr);
+    decl.is_tagged = field_desc.is_tagged;
+    decl.struct_name = field_desc.struct_name;
+    decl.tag_layout = field_desc.tag_layout;
+    decl.elem_type_kind = field_desc.elem_type_kind;
+    decl.elem_ptr_depth = field_desc.elem_ptr_depth;
+    decl.array_len = field_desc.array_len;
+    decl.array_len_is_param = 0;
+    decl.array_len_param = slice(0, 0);
+    decl.elem_typeinfo = field_desc.elem_typeinfo;
+    return decl;
 }
 
 // Parser structure: [tokens_vec, cur]
@@ -458,27 +450,9 @@ func new_parser(tokens: *Vec<*Token>) -> *Parser {
 
 func clone_param_for_local_scope(src: *Param) -> *Param {
     if (src == 0) { return 0; }
-    return new Param{
-        src.name_ptr,
-        src.name_len,
-        src.type_kind,
-        src.ptr_depth,
-        src.is_tagged,
-        src.struct_name_ptr,
-        src.struct_name_len,
-        src.tag_layout_ptr,
-        src.tag_layout_len,
-        src.elem_type_kind,
-        src.elem_ptr_depth,
-        src.array_len,
-        src.array_len_is_param,
-        src.array_len_param_ptr,
-        src.array_len_param_len,
-        src.elem_typeinfo,
-        src.is_variadic,
-        src.has_default,
-        src.default_expr
-    };
+    var out: *Param = new Param{};
+    out.copy_from_param(src);
+    return out;
 }
 
 func push_function_param_scope(p: *Parser, params: *Vec<*Param>) -> u64 {
@@ -520,7 +494,7 @@ func current_function_has_param_name(p: *Parser, name: []u8) -> u64 {
     for (var i: u64 = 0; i < n; i++) {
         var param: *Param = params.get(i);
         if (param == 0) { continue; }
-        if (str_eq(slice(param.name_ptr, param.name_len), slice(name.ptr, name.len)) != 0) {
+        if (str_eq(param.name, slice(name.ptr, name.len)) != 0) {
             return 1;
         }
     }
@@ -537,7 +511,7 @@ func current_function_find_param(p: *Parser, name: []u8) -> *Param {
     for (var i: u64 = 0; i < n; i++) {
         var param: *Param = params.get(i);
         if (param == 0) { continue; }
-        if (str_eq(slice(param.name_ptr, param.name_len), slice(name.ptr, name.len)) != 0) {
+        if (str_eq(param.name, slice(name.ptr, name.len)) != 0) {
             return param;
         }
     }
@@ -555,7 +529,7 @@ func current_function_find_symbol(p: *Parser, name: []u8) -> *Param {
                 i = i - 1;
                 var local_param: *Param = locals.get(i);
                 if (local_param == 0) { continue; }
-                if (str_eq(slice(local_param.name_ptr, local_param.name_len), slice(name.ptr, name.len)) != 0) {
+                if (str_eq(local_param.name, slice(name.ptr, name.len)) != 0) {
                     return local_param;
                 }
             }
@@ -571,27 +545,22 @@ func register_local_decl(p: *Parser, decl: *AstVarDecl) -> u64 {
     var locals: *Vec<*Param> = p.fn_local_scope_stack.get(top_idx);
     if (locals == 0) { return 0; }
 
-    var out: *Param = new Param{
-        decl.name_ptr,
-        decl.name_len,
-        decl.type_kind,
-        decl.ptr_depth,
-        decl.is_tagged,
-        decl.struct_name_ptr,
-        decl.struct_name_len,
-        decl.tag_layout_ptr,
-        decl.tag_layout_len,
-        decl.elem_type_kind,
-        decl.elem_ptr_depth,
-        decl.array_len,
-        decl.array_len_is_param,
-        decl.array_len_param_ptr,
-        decl.array_len_param_len,
-        decl.elem_typeinfo,
-        0,
-        0,
-        0
-    };
+    var out: *Param = new Param{};
+    out.name = decl.name;
+    out.type_kind = decl.type_kind;
+    out.ptr_depth = decl.ptr_depth;
+    out.is_tagged = decl.is_tagged;
+    out.struct_name = decl.struct_name;
+    out.tag_layout = decl.tag_layout;
+    out.elem_type_kind = decl.elem_type_kind;
+    out.elem_ptr_depth = decl.elem_ptr_depth;
+    out.array_len = decl.array_len;
+    out.array_len_is_param = decl.array_len_is_param;
+    out.array_len_param = decl.array_len_param;
+    out.elem_typeinfo = decl.elem_typeinfo;
+    out.is_variadic = 0;
+    out.has_default = 0;
+    out.default_expr = 0;
     locals.push(out);
     return 0;
 }

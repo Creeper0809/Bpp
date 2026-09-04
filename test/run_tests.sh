@@ -139,7 +139,10 @@ RESULTS_DIR_BASE="build/test_results"
 LLVM_ARTIFACT_DIR_BASE="build/${VERSION}_llvm"
 
 TEST_FAST_IO=${TEST_FAST_IO:-0}
+TEST_SKIP_LLVM_BUILD=${TEST_SKIP_LLVM_BUILD:-0}
 TEST_QUIET=${TEST_QUIET:-0}
+TEST_PROGRESS=${TEST_PROGRESS:-1}
+TEST_TIMING=${TEST_TIMING:-0}
 KEEP_TEST_ARTIFACTS=${KEEP_TEST_ARTIFACTS:-1}
 TEST_JOBS=${TEST_JOBS:-0}
 TEST_PROFILE=${TEST_PROFILE:-full}
@@ -150,16 +153,115 @@ COMPILE_FAIL_SINGLE_VARIANT=${COMPILE_FAIL_SINGLE_VARIANT:-}
 TEST_SUITE_CASE_LIMIT=${TEST_SUITE_CASE_LIMIT:-}
 STRICT_FAIL_DIAGNOSTICS=${STRICT_FAIL_DIAGNOSTICS:-1}
 TEST_TIMEOUT_SEC=${TEST_TIMEOUT_SEC:-15}
+TEST_SHARD_COUNT=${TEST_SHARD_COUNT:-1}
+TEST_SHARD_INDEX=${TEST_SHARD_INDEX:-0}
+TEST_RESULT_JSON=${TEST_RESULT_JSON:-}
+TEST_FAST_IO_MIN_SHM_KB=${BPP_TEST_FAST_IO_MIN_SHM_KB:-262144}
 FAST_IO_ACTIVE=0
+NASM_BIN="${BPP_NASM_EXECUTABLE:-nasm}"
+read -r -a NASM_FLAGS <<< "${BPP_NASM_FLAGS:--f elf64 -O1}"
+NASM_SPLIT="${BPP_NASM_SPLIT:-auto}"
+read -r -a NASM_SPLIT_FLAGS <<< "${BPP_NASM_SPLIT_FLAGS:--f elf64 -O1}"
+NASM_SPLIT_LINES="${BPP_NASM_SPLIT_LINES:-60000}"
+NASM_SPLIT_THRESHOLD_LINES="${BPP_NASM_SPLIT_THRESHOLD_LINES:-120000}"
+
+TEST_SKIP_LLVM_BUILD="$(echo "$TEST_SKIP_LLVM_BUILD" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+case "$TEST_SKIP_LLVM_BUILD" in
+    1|true|yes) TEST_SKIP_LLVM_BUILD=1 ;;
+    *) TEST_SKIP_LLVM_BUILD=0 ;;
+esac
+
+if ! [[ "$TEST_SHARD_COUNT" =~ ^[0-9]+$ ]] || [ "$TEST_SHARD_COUNT" -lt 1 ]; then
+    echo "Error: TEST_SHARD_COUNT must be a positive integer: $TEST_SHARD_COUNT"
+    exit 1
+fi
+if ! [[ "$TEST_SHARD_INDEX" =~ ^[0-9]+$ ]] || [ "$TEST_SHARD_INDEX" -ge "$TEST_SHARD_COUNT" ]; then
+    echo "Error: TEST_SHARD_INDEX must be in [0, TEST_SHARD_COUNT): $TEST_SHARD_INDEX/$TEST_SHARD_COUNT"
+    exit 1
+fi
+
+case_in_current_shard() {
+    if [ "$TEST_SHARD_COUNT" -eq 1 ]; then
+        return 0
+    fi
+    local case_id="$1"
+    local hash_prefix
+    hash_prefix="$(printf '%s' "$case_id" | md5sum | awk '{print substr($1, 1, 8)}')"
+    local shard_value=$((16#$hash_prefix % TEST_SHARD_COUNT))
+    [ "$shard_value" -eq "$TEST_SHARD_INDEX" ]
+}
+TEST_PROGRESS="$(echo "$TEST_PROGRESS" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+case "$TEST_PROGRESS" in
+    1|true|yes) TEST_PROGRESS=1 ;;
+    *) TEST_PROGRESS=0 ;;
+esac
+TEST_TIMING="$(echo "$TEST_TIMING" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+case "$TEST_TIMING" in
+    1|true|yes) TEST_TIMING=1 ;;
+    *) TEST_TIMING=0 ;;
+esac
+
+now_ms() {
+    date +%s%3N
+}
+
+shm_available_kb() {
+    if [ ! -d "/dev/shm" ] || [ ! -w "/dev/shm" ]; then
+        return 1
+    fi
+    df -Pk /dev/shm 2>/dev/null | awk 'NR==2 {print $4}'
+}
+
+compiler_clang_available() {
+    [ -x "/usr/bin/clang" ] || [ -x "/usr/local/bin/clang" ] || [ -x "/bin/clang" ]
+}
+
+assemble_nasm_obj() {
+    local asm_file="$1"
+    local obj_file="$2"
+    local asm_lines=0
+    asm_lines="$(wc -l < "$asm_file" | tr -d '[:space:]')"
+    if [ "$NASM_SPLIT" != "0" ] && [ -x "$ROOT_DIR/tools/nasm_split_assemble.sh" ] && [ "$asm_lines" -ge "$NASM_SPLIT_THRESHOLD_LINES" ]; then
+        BPP_NASM_EXECUTABLE="$NASM_BIN" \
+        BPP_LINKER_EXECUTABLE="${BPP_LINKER_EXECUTABLE:-ld}" \
+        BPP_NASM_SPLIT_LINES="$NASM_SPLIT_LINES" \
+            "$ROOT_DIR/tools/nasm_split_assemble.sh" "$asm_file" "$obj_file" "${NASM_SPLIT_FLAGS[@]}"
+    else
+        "$NASM_BIN" "${NASM_FLAGS[@]}" "$asm_file" -o "$obj_file"
+    fi
+}
+
+selected_tests_need_llvm_build() {
+    local test_file test_name test_label llvm_build_raw
+    for test_file in "${TEST_FILES[@]}"; do
+        test_name="$(basename "$test_file" .bpp)"
+        test_label="${TEST_DISPLAY_NAME[$test_file]:-$test_name}"
+        if [ -n "$TEST_NAME_FILTER" ]; then
+            if [[ ! "$test_label" =~ $TEST_NAME_FILTER ]] && [[ ! "$test_name" =~ $TEST_NAME_FILTER ]]; then
+                continue
+            fi
+        fi
+        llvm_build_raw="$(grep -m1 -E '^// LLVM Build:' "$test_file" | awk -F': ' '{print $2}' | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]' || true)"
+        if [ "$llvm_build_raw" = "1" ] || [ "$llvm_build_raw" = "true" ] || [ "$llvm_build_raw" = "yes" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
 
 BUILD_DIR="$BUILD_DIR_BASE"
 RESULTS_DIR="$RESULTS_DIR_BASE"
-if [ "$TEST_FAST_IO" -eq 1 ] && [ -d "/dev/shm" ] && [ -w "/dev/shm" ]; then
-    WORK_DIR="$(mktemp -d "/dev/shm/bpp_${VERSION}_tests_XXXXXX")"
-    BUILD_DIR="$WORK_DIR/${VERSION}_tests"
-    RESULTS_DIR="$WORK_DIR/test_results"
-    FAST_IO_ACTIVE=1
-    trap 'rm -rf "$WORK_DIR"' EXIT
+if [ "$TEST_FAST_IO" -eq 1 ]; then
+    SHM_AVAIL_KB="$(shm_available_kb || true)"
+    if [ -n "$SHM_AVAIL_KB" ] && [ "$SHM_AVAIL_KB" -ge "$TEST_FAST_IO_MIN_SHM_KB" ]; then
+        WORK_DIR="$(mktemp -d "/dev/shm/bpp_${VERSION}_tests_XXXXXX")"
+        BUILD_DIR="$WORK_DIR/${VERSION}_tests"
+        RESULTS_DIR="$WORK_DIR/test_results"
+        FAST_IO_ACTIVE=1
+        trap 'rm -rf "$WORK_DIR"' EXIT
+    else
+        echo "[WARN] TEST_FAST_IO disabled: /dev/shm has ${SHM_AVAIL_KB:-0} KB available (< ${TEST_FAST_IO_MIN_SHM_KB} KB)."
+    fi
 fi
 
 persist_result_file() {
@@ -169,6 +271,15 @@ persist_result_file() {
         mkdir -p "$(dirname "$dst")"
         cp "$src" "$dst"
     fi
+}
+
+print_failure_diagnostics() {
+    local diagnostic_file="$1"
+    if [ -z "$diagnostic_file" ] || [ ! -s "$diagnostic_file" ]; then
+        return
+    fi
+    echo "  diagnostics: $diagnostic_file"
+    tail -n 40 "$diagnostic_file" | sed 's/^/    /'
 }
 
 cleanup_llvm_build_artifacts() {
@@ -311,12 +422,15 @@ normalize_modes_csv() {
 
 normalize_opts_csv() {
     local raw
-    raw="$(echo "$1" | tr '[:lower:]' '[:upper:]' | tr -d '[:space:]')"
+    raw="$(echo "$1" | tr '[:lower:]' '[:upper:]' | tr '|' ',' | tr -d '[:space:]')"
     case "$raw" in
-        ""|"BOTH"|"ALL")
+        ""|"BOTH")
             echo "O0,O1"
             ;;
-        "O0"|"O1")
+        "ALL")
+            echo "O0,O1,O2,O3,OS"
+            ;;
+        "O0"|"O1"|"O2"|"O3"|"OS")
             echo "$raw"
             ;;
         "O0,O1"|"O1,O0")
@@ -326,7 +440,7 @@ normalize_opts_csv() {
             local out=""
             IFS=',' read -r -a parts <<< "$raw"
             for p in "${parts[@]}"; do
-                if [ "$p" != "O0" ] && [ "$p" != "O1" ]; then
+                if [ "$p" != "O0" ] && [ "$p" != "O1" ] && [ "$p" != "O2" ] && [ "$p" != "O3" ] && [ "$p" != "OS" ]; then
                     continue
                 fi
                 if [[ ",$out," != *",$p,"* ]]; then
@@ -367,6 +481,7 @@ mkdir -p "$RESULTS_DIR_BASE"
 TOTAL=0
 PASSED=0
 FAILED=0
+LLVM_SKIPPED=0
 
 # Resolve profile defaults first, then normalize filters.
 if [ -z "$TEST_MODE_FILTER" ]; then
@@ -424,6 +539,7 @@ STABILITY_FAILED=0
 # De-dup by content (ignore directive headers)
 declare -A SEEN_HASH
 declare -A TEST_DISPLAY_NAME
+declare -A RESULT_LABEL
 
 echo "========================================"
 echo "${VERSION} Compiler Test Suite"
@@ -441,12 +557,16 @@ if [ "$TEST_QUIET" -eq 0 ]; then
     echo "[INFO] Mode filter: $GLOBAL_MODES_CSV"
     echo "[INFO] Opt filter: $GLOBAL_OPTS_CSV"
     echo "[INFO] Name filter: ${TEST_NAME_FILTER:-<none>}"
+    echo "[INFO] Shard: $TEST_SHARD_INDEX/$TEST_SHARD_COUNT"
+    echo "[INFO] Skip LLVM build tests: $TEST_SKIP_LLVM_BUILD"
     echo "[INFO] Compile-fail single variant: $COMPILE_FAIL_SINGLE_VARIANT"
     echo "[INFO] Strict fail diagnostics: $STRICT_FAIL_DIAGNOSTICS"
     echo "[INFO] Suite case limit: $TEST_SUITE_CASE_LIMIT (0=all)"
     echo "[INFO] Runtime timeout: ${TEST_TIMEOUT_SEC}s"
     echo "[INFO] Stress runs: $STRESS_RUNS"
     echo "[INFO] Stability runs: $STABILITY_RUNS"
+    echo "[INFO] Progress: $TEST_PROGRESS"
+    echo "[INFO] Timing: $TEST_TIMING"
     echo ""
 fi
 
@@ -463,11 +583,49 @@ LLVM_ARTIFACT_DIR="$ROOT_DIR/$LLVM_ARTIFACT_DIR_BASE/$RUN_TAG"
 mkdir -p "$SUITE_CASES_DIR"
 mkdir -p "$LLVM_ARTIFACT_DIR"
 
+ACTIVE_JOBS=0
+
+print_progress_start() {
+    if [ "$TEST_PROGRESS" -eq 0 ]; then
+        return 0
+    fi
+
+    local runner="$1"
+    shift
+    local case_num="$1"
+    case "$runner" in
+        run_matrix_case)
+            local test_label="$4"
+            local mode="$5"
+            local opt="$6"
+            echo "[$case_num] RUN Testing $test_label ($mode $opt) active=$((ACTIVE_JOBS + 1))/$TEST_JOBS"
+            ;;
+        run_llvm_case)
+            local test_label="$4"
+            echo "[$case_num] RUN LLVM $test_label active=$((ACTIVE_JOBS + 1))/$TEST_JOBS"
+            ;;
+        run_ir_case)
+            local test_name="$3"
+            echo "[$case_num] RUN IR $test_name active=$((ACTIVE_JOBS + 1))/$TEST_JOBS"
+            ;;
+    esac
+}
+
 launch_job_with_limit() {
-    while [ "$(jobs -rp | wc -l)" -ge "$TEST_JOBS" ]; do
+    while [ "$ACTIVE_JOBS" -ge "$TEST_JOBS" ]; do
         wait -n || true
+        ACTIVE_JOBS=$((ACTIVE_JOBS - 1))
     done
+    print_progress_start "$@"
     "$@" &
+    ACTIVE_JOBS=$((ACTIVE_JOBS + 1))
+}
+
+wait_for_launched_jobs() {
+    while [ "$ACTIVE_JOBS" -gt 0 ]; do
+        wait -n || true
+        ACTIVE_JOBS=$((ACTIVE_JOBS - 1))
+    done
 }
 
 run_matrix_case() {
@@ -487,6 +645,7 @@ run_matrix_case() {
     local compiler_args_file="${13}"
     local expect_asm_file="${14}"
     local compile_only="${15}"
+    local expect_asm_count_file="${16:-}"
 
     local case_tag="[$case_num] Testing $test_label ($mode $opt)"
     local case_pass=0
@@ -496,6 +655,12 @@ run_matrix_case() {
     local case_stability_pass=0
     local case_stability_fail=0
     local case_status="PASS"
+    local case_start_ms
+    local compile_ms=0
+    local assemble_ms=0
+    local link_ms=0
+    local run_ms=0
+    case_start_ms="$(now_ms)"
 
     local asm_file="$BUILD_DIR/${test_id}.${mode}.${opt}.asm"
     local obj_file="$BUILD_DIR/${test_id}.${mode}.${opt}.o"
@@ -512,17 +677,25 @@ run_matrix_case() {
         ir_flag="-dump-ssa"
     fi
     local opt_flag=""
-    if [ "$opt" = "O1" ]; then
-        opt_flag="-O1"
-    fi
+    case "$opt" in
+        O1) opt_flag="-O1" ;;
+        O2) opt_flag="-O2" ;;
+        O3) opt_flag="-O3" ;;
+        OS) opt_flag="-Os" ;;
+    esac
 
     local compile_exit=0
     local -a compiler_extra_args=()
     if [ -n "$compiler_args_file" ] && [ -f "$compiler_args_file" ]; then
         read -r -a compiler_extra_args < "$compiler_args_file"
     fi
+    local compile_start_ms
+    local compile_end_ms
+    compile_start_ms="$(now_ms)"
     $COMPILER $opt_flag $ir_flag "${compiler_extra_args[@]}" -asm "$test_file" > "$asm_file" 2>"$err_file"
     compile_exit="$?"
+    compile_end_ms="$(now_ms)"
+    compile_ms=$((compile_end_ms - compile_start_ms))
 
     if [ "$compile_exit" -ne 0 ]; then
         persist_result_file "$err_file" "$err_file_persist"
@@ -575,136 +748,208 @@ run_matrix_case() {
         if [ -n "$missing_asm_pat" ]; then
             case_fail=1
             case_status="FAIL (asm mismatch: $missing_asm_pat)"
-        elif [ "$expect_compile_fail" -eq 1 ]; then
+        else
+            local asm_count_fail=""
+            if [ -n "$expect_asm_count_file" ] && [ -f "$expect_asm_count_file" ]; then
+                while IFS='|' read -r pat max_count || [ -n "$pat" ]; do
+                    if [ -z "$pat" ]; then
+                        continue
+                    fi
+                    max_count="$(echo "$max_count" | tr -d '[:space:]')"
+                    if [ -z "$max_count" ]; then
+                        asm_count_fail="$pat|<missing max>"
+                        break
+                    fi
+                    local actual_count
+                    local count_pat="$pat"
+                    local scope_label=""
+                    if [[ "$count_pat" == scope=*";"* ]]; then
+                        scope_label="${count_pat#scope=}"
+                        scope_label="${scope_label%%;*}"
+                        count_pat="${count_pat#*;}"
+                        actual_count="$(awk -v scope="$scope_label" -v pat="$count_pat" '
+                            $0 == scope { in_scope = 1; next }
+                            in_scope != 0 && $0 ~ /^[A-Za-z_][A-Za-z0-9_]*:/ { exit }
+                            in_scope != 0 && index($0, pat) > 0 { count++ }
+                            END { print count + 0 }
+                        ' "$asm_file" | tr -d '[:space:]')"
+                    else
+                        actual_count="$(grep -F "$count_pat" "$asm_file" | wc -l | tr -d '[:space:]')"
+                    fi
+                    if [ "$actual_count" -gt "$max_count" ]; then
+                        asm_count_fail="$pat count=$actual_count max=$max_count"
+                        break
+                    fi
+                done < "$expect_asm_count_file"
+            fi
+            if [ -n "$asm_count_fail" ]; then
+                case_fail=1
+                case_status="FAIL (asm count limit: $asm_count_fail)"
+            fi
+        fi
+        if [ "$case_fail" -eq 0 ] && [ "$expect_compile_fail" -eq 1 ]; then
             case_fail=1
             case_status="FAIL (unexpected compile success)"
-        elif [ "$compile_only" = "1" ]; then
+        elif [ "$case_fail" -eq 0 ] && [ "$compile_only" = "1" ]; then
             case_pass=1
             case_status="PASS (compile only)"
-        elif ! nasm -f elf64 -O1 "$asm_file" -o "$obj_file" 2>"$err_file"; then
-            persist_result_file "$err_file" "$err_file_persist"
-            case_fail=1
-            case_status="FAIL (assemble)"
-        elif ! ld "$obj_file" -o "$bin_file" 2>>"$err_file"; then
-            persist_result_file "$err_file" "$err_file_persist"
-            case_fail=1
-            case_status="FAIL (link)"
-        else
-            local expect_stdout=0
-            local exit_code=0
-            if [ -n "$expect_stdout_file" ] && [ -f "$expect_stdout_file" ]; then
-                expect_stdout=1
-                run_binary_capture_split "$bin_file" "$stdin_file" "$out_file" "$err_file"
-                exit_code="$?"
-            else
-                run_binary_silent "$bin_file" "$stdin_file"
-                exit_code="$?"
-            fi
-            if [ "$exit_code" -eq "$expected" ]; then
-                if [ "$expect_stdout" -eq 1 ] && ! cmp -s "$out_file" "$expect_stdout_file"; then
-                    persist_result_file "$out_file" "$out_file_persist"
-                    persist_result_file "$err_file" "$err_file_persist"
-                    case_fail=1
-                    case_status="FAIL (stdout mismatch)"
-                else
-                    case_pass=1
-                fi
-
-                if [ "$case_fail" -eq 0 ] && [ "$STRESS_RUNS" -gt 0 ]; then
-                    local stress_ok=1
-                    local i=0
-                    local stress_exit=0
-                    local stress_reason="exit"
-                    for ((i=1; i<=STRESS_RUNS; i++)); do
-                        if [ "$expect_stdout" -eq 1 ]; then
-                            run_binary_capture_split "$bin_file" "$stdin_file" "$out_file" "$err_file"
-                            stress_exit="$?"
-                            if [ "$stress_exit" -eq "$expected" ] && ! cmp -s "$out_file" "$expect_stdout_file"; then
-                                stress_reason="stdout"
-                                stress_ok=0
-                                break
-                            fi
-                        else
-                            run_binary_silent "$bin_file" "$stdin_file"
-                            stress_exit="$?"
-                        fi
-                        if [ "$stress_exit" -ne "$expected" ]; then
-                            stress_reason="exit"
-                            stress_ok=0
-                            break
-                        fi
-                    done
-                    if [ "$stress_ok" -eq 1 ]; then
-                        case_stress_pass=1
-                    else
-                        if [ "$expect_stdout" -eq 1 ]; then
-                            persist_result_file "$out_file" "$out_file_persist"
-                            persist_result_file "$err_file" "$err_file_persist"
-                        fi
-                        case_stress_fail=1
-                        case_fail=$((case_fail + 1))
-                        if [ "$stress_reason" = "stdout" ]; then
-                            case_status="STRESS FAIL (run=$i, stdout mismatch)"
-                        else
-                            case_status="STRESS FAIL (run=$i, exit=$stress_exit, expect=$expected)"
-                        fi
-                    fi
-                fi
-
-                if [ "$case_stress_fail" -eq 0 ] && [ "$STABILITY_RUNS" -gt 0 ]; then
-                    local stability_ok=1
-                    local j=0
-                    local stability_exit=0
-                    local stability_reason="exit"
-                    for ((j=1; j<=STABILITY_RUNS; j++)); do
-                        if [ "$expect_stdout" -eq 1 ]; then
-                            run_binary_capture_split "$bin_file" "$stdin_file" "$out_file" "$err_file"
-                            stability_exit="$?"
-                            if [ "$stability_exit" -eq "$expected" ] && ! cmp -s "$out_file" "$expect_stdout_file"; then
-                                stability_reason="stdout"
-                                stability_ok=0
-                                break
-                            fi
-                        else
-                            run_binary_silent "$bin_file" "$stdin_file"
-                            stability_exit="$?"
-                        fi
-                        if [ "$stability_exit" -ne "$expected" ]; then
-                            stability_reason="exit"
-                            stability_ok=0
-                            break
-                        fi
-                    done
-                    if [ "$stability_ok" -eq 1 ]; then
-                        case_stability_pass=1
-                    else
-                        if [ "$expect_stdout" -eq 1 ]; then
-                            persist_result_file "$out_file" "$out_file_persist"
-                            persist_result_file "$err_file" "$err_file_persist"
-                        fi
-                        case_stability_fail=1
-                        case_fail=$((case_fail + 1))
-                        if [ "$stability_reason" = "stdout" ]; then
-                            case_status="STABILITY FAIL (run=$j, stdout mismatch)"
-                        else
-                            case_status="STABILITY FAIL (run=$j, exit=$stability_exit, expect=$expected)"
-                        fi
-                    fi
-                fi
-            else
-                if [ "$expect_stdout" -eq 0 ]; then
-                    run_binary_capture_all "$bin_file" "$stdin_file" "$out_file"
-                fi
-                persist_result_file "$out_file" "$out_file_persist"
+        elif [ "$case_fail" -eq 0 ]; then
+            local assemble_start_ms
+            local assemble_end_ms
+            local assemble_exit=0
+            assemble_start_ms="$(now_ms)"
+            assemble_nasm_obj "$asm_file" "$obj_file" 2>"$err_file"
+            assemble_exit="$?"
+            assemble_end_ms="$(now_ms)"
+            assemble_ms=$((assemble_end_ms - assemble_start_ms))
+            if [ "$assemble_exit" -ne 0 ]; then
                 persist_result_file "$err_file" "$err_file_persist"
                 case_fail=1
-                case_status="FAIL (exit=$exit_code, expect=$expected)"
+                case_status="FAIL (assemble)"
+            else
+                local link_start_ms
+                local link_end_ms
+                local link_exit=0
+                link_start_ms="$(now_ms)"
+                ld "$obj_file" -o "$bin_file" 2>>"$err_file"
+                link_exit="$?"
+                link_end_ms="$(now_ms)"
+                link_ms=$((link_end_ms - link_start_ms))
+                if [ "$link_exit" -ne 0 ]; then
+                    persist_result_file "$err_file" "$err_file_persist"
+                    case_fail=1
+                    case_status="FAIL (link)"
+                else
+                    local expect_stdout=0
+                    local exit_code=0
+                    local run_start_ms
+                    local run_end_ms
+                    run_start_ms="$(now_ms)"
+                    if [ -n "$expect_stdout_file" ] && [ -f "$expect_stdout_file" ]; then
+                        expect_stdout=1
+                        run_binary_capture_split "$bin_file" "$stdin_file" "$out_file" "$err_file"
+                        exit_code="$?"
+                    else
+                        run_binary_silent "$bin_file" "$stdin_file"
+                        exit_code="$?"
+                    fi
+                    run_end_ms="$(now_ms)"
+                    run_ms=$((run_end_ms - run_start_ms))
+                    if [ "$exit_code" -eq "$expected" ]; then
+                        if [ "$expect_stdout" -eq 1 ] && ! cmp -s "$out_file" "$expect_stdout_file"; then
+                            persist_result_file "$out_file" "$out_file_persist"
+                            persist_result_file "$err_file" "$err_file_persist"
+                            case_fail=1
+                            case_status="FAIL (stdout mismatch)"
+                        else
+                            case_pass=1
+                        fi
+
+                        if [ "$case_fail" -eq 0 ] && [ "$STRESS_RUNS" -gt 0 ]; then
+                            local stress_ok=1
+                            local i=0
+                            local stress_exit=0
+                            local stress_reason="exit"
+                            for ((i=1; i<=STRESS_RUNS; i++)); do
+                                if [ "$expect_stdout" -eq 1 ]; then
+                                    run_binary_capture_split "$bin_file" "$stdin_file" "$out_file" "$err_file"
+                                    stress_exit="$?"
+                                    if [ "$stress_exit" -eq "$expected" ] && ! cmp -s "$out_file" "$expect_stdout_file"; then
+                                        stress_reason="stdout"
+                                        stress_ok=0
+                                        break
+                                    fi
+                                else
+                                    run_binary_silent "$bin_file" "$stdin_file"
+                                    stress_exit="$?"
+                                fi
+                                if [ "$stress_exit" -ne "$expected" ]; then
+                                    stress_reason="exit"
+                                    stress_ok=0
+                                    break
+                                fi
+                            done
+                            if [ "$stress_ok" -eq 1 ]; then
+                                case_stress_pass=1
+                            else
+                                if [ "$expect_stdout" -eq 1 ]; then
+                                    persist_result_file "$out_file" "$out_file_persist"
+                                    persist_result_file "$err_file" "$err_file_persist"
+                                fi
+                                case_stress_fail=1
+                                case_fail=$((case_fail + 1))
+                                if [ "$stress_reason" = "stdout" ]; then
+                                    case_status="STRESS FAIL (run=$i, stdout mismatch)"
+                                else
+                                    case_status="STRESS FAIL (run=$i, exit=$stress_exit, expect=$expected)"
+                                fi
+                            fi
+                        fi
+
+                        if [ "$case_stress_fail" -eq 0 ] && [ "$STABILITY_RUNS" -gt 0 ]; then
+                            local stability_ok=1
+                            local j=0
+                            local stability_exit=0
+                            local stability_reason="exit"
+                            for ((j=1; j<=STABILITY_RUNS; j++)); do
+                                if [ "$expect_stdout" -eq 1 ]; then
+                                    run_binary_capture_split "$bin_file" "$stdin_file" "$out_file" "$err_file"
+                                    stability_exit="$?"
+                                    if [ "$stability_exit" -eq "$expected" ] && ! cmp -s "$out_file" "$expect_stdout_file"; then
+                                        stability_reason="stdout"
+                                        stability_ok=0
+                                        break
+                                    fi
+                                else
+                                    run_binary_silent "$bin_file" "$stdin_file"
+                                    stability_exit="$?"
+                                fi
+                                if [ "$stability_exit" -ne "$expected" ]; then
+                                    stability_reason="exit"
+                                    stability_ok=0
+                                    break
+                                fi
+                            done
+                            if [ "$stability_ok" -eq 1 ]; then
+                                case_stability_pass=1
+                            else
+                                if [ "$expect_stdout" -eq 1 ]; then
+                                    persist_result_file "$out_file" "$out_file_persist"
+                                    persist_result_file "$err_file" "$err_file_persist"
+                                fi
+                                case_stability_fail=1
+                                case_fail=$((case_fail + 1))
+                                if [ "$stability_reason" = "stdout" ]; then
+                                    case_status="STABILITY FAIL (run=$j, stdout mismatch)"
+                                else
+                                    case_status="STABILITY FAIL (run=$j, exit=$stability_exit, expect=$expected)"
+                                fi
+                            fi
+                        fi
+                    else
+                        if [ "$expect_stdout" -eq 0 ]; then
+                            run_binary_capture_all "$bin_file" "$stdin_file" "$out_file"
+                        fi
+                        persist_result_file "$out_file" "$out_file_persist"
+                        persist_result_file "$err_file" "$err_file_persist"
+                        case_fail=1
+                        case_status="FAIL (exit=$exit_code, expect=$expected)"
+                    fi
+                fi
             fi
         fi
     fi
 
     if [ "$KEEP_TEST_ARTIFACTS" -eq 0 ]; then
         rm -f "$asm_file" "$obj_file" "$bin_file" "$out_file" "$err_file"
+    fi
+
+    local case_end_ms
+    local case_time_ms=0
+    case_end_ms="$(now_ms)"
+    case_time_ms=$((case_end_ms - case_start_ms))
+    if [ "$TEST_TIMING" -eq 1 ]; then
+        case_status="$case_status time=${case_time_ms}ms compile=${compile_ms}ms asm=${assemble_ms}ms link=${link_ms}ms run=${run_ms}ms"
     fi
 
     {
@@ -716,6 +961,7 @@ run_matrix_case() {
         echo "CASE_STRESS_FAIL=$case_stress_fail"
         echo "CASE_STABILITY_PASS=$case_stability_pass"
         echo "CASE_STABILITY_FAIL=$case_stability_fail"
+        printf 'CASE_ERROR_FILE=%q\n' "$err_file_persist"
     } > "$result_file"
     return 0
 }
@@ -805,6 +1051,11 @@ run_ir_case() {
 
     local ssa_out="$RESULTS_DIR/${test_name}.ssa.ir"
     local addr_out="$RESULTS_DIR/${test_name}.3addr.ir"
+    local machine_out="$RESULTS_DIR/${test_name}.machine.ir"
+    local ssa_json_out="$RESULTS_DIR/${test_name}.ssa.json"
+    local ssa_json_o1_out="$RESULTS_DIR/${test_name}.ssa.o1.json"
+    local addr_json_out="$RESULTS_DIR/${test_name}.3addr.json"
+    local unified_json_out="$RESULTS_DIR/${test_name}.unified.json"
     local err_file="$RESULTS_DIR/${test_name}.ir.err"
     local err_file_persist="$RESULTS_DIR_BASE/${test_name}.ir.err"
     rm -f "$err_file"
@@ -841,12 +1092,80 @@ run_ir_case() {
             case_fail=1
             case_status="FAIL (3addr has phi)"
         else
-            case_pass=1
+            local machine_exit=0
+            $COMPILER -O1 -dump-machine-ir "$test_file" > "$machine_out" 2>>"$err_file"
+            machine_exit="$?"
+            if [ "$machine_exit" -ne 0 ]; then
+                persist_result_file "$err_file" "$err_file_persist"
+                case_fail=1
+                if [ "$machine_exit" -ge 128 ]; then
+                    local sig3=$((machine_exit - 128))
+                    case_status="FAIL (machine ir dump crash: signal $sig3, exit=$machine_exit)"
+                else
+                    case_status="FAIL (machine ir dump exit=$machine_exit)"
+                fi
+            elif ! grep -q "bpp.machine_ir.stage=pre-regalloc" "$machine_out"; then
+                case_fail=1
+                case_status="FAIL (machine ir missing header)"
+            elif grep -q " = phi" "$machine_out"; then
+                case_fail=1
+                case_status="FAIL (machine ir still has phi)"
+            else
+                local ssa_json_exit=0
+                $COMPILER -dump-ssa-json --source-map-user-only "$test_file" > "$ssa_json_out" 2>>"$err_file"
+                ssa_json_exit="$?"
+                if [ "$ssa_json_exit" -ne 0 ]; then
+                    persist_result_file "$err_file" "$err_file_persist"
+                    case_fail=1
+                    case_status="FAIL (ssa json exit=$ssa_json_exit)"
+                elif ! grep -q '"schemaVersion":1' "$ssa_json_out" || ! grep -q '"sourceRanges":' "$ssa_json_out" || ! grep -q '"astNodeIds":' "$ssa_json_out" || ! grep -q '"generatedReason":' "$ssa_json_out"; then
+                    case_fail=1
+                    case_status="FAIL (ssa json missing source map fields)"
+                else
+                    local ssa_json_o1_exit=0
+                    $COMPILER -O1 -dump-ssa-json --source-map-user-only "$test_file" > "$ssa_json_o1_out" 2>>"$err_file"
+                    ssa_json_o1_exit="$?"
+                    if [ "$ssa_json_o1_exit" -ne 0 ]; then
+                        persist_result_file "$err_file" "$err_file_persist"
+                        case_fail=1
+                        case_status="FAIL (ssa json O1 exit=$ssa_json_o1_exit)"
+                    elif ! grep -q '"schemaVersion":1' "$ssa_json_o1_out" || ! grep -q '"sourceRanges":' "$ssa_json_o1_out"; then
+                        case_fail=1
+                        case_status="FAIL (ssa json O1 missing source ranges)"
+                    else
+                        local addr_json_exit=0
+                        $COMPILER -dump-ir-json --source-map-user-only "$test_file" > "$addr_json_out" 2>>"$err_file"
+                        addr_json_exit="$?"
+                        if [ "$addr_json_exit" -ne 0 ]; then
+                            persist_result_file "$err_file" "$err_file_persist"
+                            case_fail=1
+                            case_status="FAIL (3addr json exit=$addr_json_exit)"
+                        elif ! grep -q '"stage":"ir"' "$addr_json_out" || ! grep -q '"sourceRanges":' "$addr_json_out"; then
+                            case_fail=1
+                            case_status="FAIL (3addr json missing source map fields)"
+                        else
+                            local unified_json_exit=0
+                            $COMPILER --emit-json --views ast,ir,ssa,asm --source-map-user-only --ast-no-std "$test_file" > "$unified_json_out" 2>>"$err_file"
+                            unified_json_exit="$?"
+                            if [ "$unified_json_exit" -ne 0 ]; then
+                                persist_result_file "$err_file" "$err_file_persist"
+                                case_fail=1
+                                case_status="FAIL (unified json exit=$unified_json_exit)"
+                            elif ! grep -q '"views":{"ast":' "$unified_json_out" || ! grep -q '"ssa":' "$unified_json_out" || ! grep -q '"asm":' "$unified_json_out" || ! grep -q '"sourceRangeSemantics"' "$unified_json_out"; then
+                                case_fail=1
+                                case_status="FAIL (unified json missing views/source map schema)"
+                            else
+                                case_pass=1
+                            fi
+                        fi
+                    fi
+                fi
+            fi
         fi
     fi
 
     if [ "$KEEP_TEST_ARTIFACTS" -eq 0 ]; then
-        rm -f "$ssa_out" "$addr_out" "$err_file"
+        rm -f "$ssa_out" "$addr_out" "$machine_out" "$err_file"
     fi
 
     {
@@ -957,7 +1276,7 @@ run_llvm_case() {
             fi
         else
             local run_exit
-            run_exit="$(sed -n 's/^\[RUN\] exit=//p' "$out_file" | tail -n 1)"
+            run_exit="$(perl -0ne 'if (/\[RUN\] exit=(-?[0-9]+)/s) { print $1; }' "$out_file" | tail -n 1)"
             local expected_raw="$expected"
             if [ "$expected_raw" -ne 0 ]; then
                 expected_raw=$((expected_raw * 256))
@@ -1053,6 +1372,11 @@ if [ "${#TEST_FILES[@]}" -eq 0 ]; then
     echo "No test files found in $TEST_DIR or $TEST_FAIL_DIR"
     exit 1
 fi
+if [ "$TEST_SKIP_LLVM_BUILD" -eq 0 ] && selected_tests_need_llvm_build && ! compiler_clang_available; then
+    echo "Error: LLVM build tests require clang at /usr/bin/clang, /usr/local/bin/clang, or /bin/clang."
+    echo "       Install clang or filter out tests with '// LLVM Build: true'."
+    exit 1
+fi
 
 for TEST_FILE in "${TEST_FILES[@]}"; do
     TEST_NAME=$(basename "$TEST_FILE" .bpp)
@@ -1062,7 +1386,7 @@ for TEST_FILE in "${TEST_FILES[@]}"; do
             continue
         fi
     fi
-CONTENT_HASH=$(awk '{if ($0 !~ /^\/\/ (Covers:|Mode:|Opt:|Compiler args:|Compile only:|LLVM Build:|LLVM Only:|Expect exit code:|Expect compile fail:|Expect error contains:|Expect asm contains:|Expect llvm metadata contains:|Expect stdout:|Stdin:)/) print}' "$TEST_FILE" | md5sum | awk '{print $1}')
+CONTENT_HASH=$(awk '{if ($0 !~ /^\/\/ (Covers:|Mode:|Opt:|Compiler args:|Compile only:|LLVM Build:|LLVM Only:|Expect exit code:|Expect compile fail:|Expect error contains:|Expect asm contains:|Expect asm count <=:|Expect llvm metadata contains:|Expect stdout:|Stdin:)/) print}' "$TEST_FILE" | md5sum | awk '{print $1}')
     if [ -n "${SEEN_HASH[$CONTENT_HASH]}" ]; then
         if [ "$TEST_QUIET" -eq 0 ]; then
             echo "[SKIP] Duplicate content: $TEST_LABEL (same as ${SEEN_HASH[$CONTENT_HASH]})"
@@ -1110,6 +1434,13 @@ CONTENT_HASH=$(awk '{if ($0 !~ /^\/\/ (Covers:|Mode:|Opt:|Compiler args:|Compile
         rm -f "$EXPECT_ASM_FILE"
         EXPECT_ASM_FILE=""
     fi
+    EXPECT_ASM_COUNT_FILE="$JOBS_DIR/${RUN_TAG}_${TEST_NAME}.asm_count_expect"
+    rm -f "$EXPECT_ASM_COUNT_FILE"
+    grep -E '^// Expect asm count <=:' "$TEST_FILE" | sed -E 's|^// Expect asm count <=:[[:space:]]*||' > "$EXPECT_ASM_COUNT_FILE" || true
+    if [ ! -s "$EXPECT_ASM_COUNT_FILE" ]; then
+        rm -f "$EXPECT_ASM_COUNT_FILE"
+        EXPECT_ASM_COUNT_FILE=""
+    fi
     EXPECT_LLVM_METADATA_FILE="$JOBS_DIR/${RUN_TAG}_${TEST_NAME}.llvm_metadata_expect"
     rm -f "$EXPECT_LLVM_METADATA_FILE"
     grep -E '^// Expect llvm metadata contains:' "$TEST_FILE" | sed -E 's|^// Expect llvm metadata contains:[[:space:]]*||' > "$EXPECT_LLVM_METADATA_FILE" || true
@@ -1131,6 +1462,16 @@ CONTENT_HASH=$(awk '{if ($0 !~ /^\/\/ (Covers:|Mode:|Opt:|Compiler args:|Compile
     LLVM_ONLY=0
     if [ "$LLVM_ONLY_RAW" = "1" ] || [ "$LLVM_ONLY_RAW" = "true" ] || [ "$LLVM_ONLY_RAW" = "yes" ]; then
         LLVM_ONLY=1
+    fi
+    if [ "$LLVM_BUILD" -eq 1 ] && [ "$TEST_SKIP_LLVM_BUILD" -eq 1 ]; then
+        LLVM_SKIPPED=$((LLVM_SKIPPED + 1))
+        LLVM_BUILD=0
+        if [ "$LLVM_ONLY" -eq 1 ]; then
+            if [ "$TEST_QUIET" -eq 0 ]; then
+                echo -e "${YELLOW}[SKIP] LLVM $TEST_LABEL (TEST_SKIP_LLVM_BUILD=1)${NC}"
+            fi
+            continue
+        fi
     fi
     if [ "$LLVM_ONLY" -eq 1 ] && [ "$LLVM_BUILD" -eq 0 ]; then
         echo "Error: '// LLVM Only: true' requires '// LLVM Build: true' for $TEST_LABEL"
@@ -1158,15 +1499,19 @@ CONTENT_HASH=$(awk '{if ($0 !~ /^\/\/ (Covers:|Mode:|Opt:|Compiler args:|Compile
             if ! csv_has "$GLOBAL_MODES_CSV" "$MODE" || ! csv_has "$TEST_MODES_CSV" "$MODE"; then
                 continue
             fi
-            for OPT in O0 O1; do
+            for OPT in O0 O1 O2 O3 OS; do
                 if ! csv_has "$GLOBAL_OPTS_CSV" "$OPT" || ! csv_has "$TEST_OPTS_CSV" "$OPT"; then
                     continue
                 fi
                 VARIANT_COUNT=$((VARIANT_COUNT + 1))
+                if ! case_in_current_shard "$TEST_NAME|$MODE|$OPT"; then
+                    continue
+                fi
                 TOTAL=$((TOTAL + 1))
                 RESULT_FILE="$JOBS_DIR/${RUN_TAG}_case_${TOTAL}.result"
                 CASE_RESULT_FILES+=("$RESULT_FILE")
-                launch_job_with_limit run_matrix_case "$TOTAL" "$TEST_FILE" "$TEST_NAME" "$TEST_LABEL" "$MODE" "$OPT" "$EXPECTED" "$EXPECT_COMPILE_FAIL" "$EXPECT_ERROR_FILE" "$EXPECT_STDOUT_FILE" "$STDIN_FILE" "$RESULT_FILE" "$COMPILER_ARGS_FILE" "$EXPECT_ASM_FILE" "$COMPILE_ONLY"
+                RESULT_LABEL["$RESULT_FILE"]="[$TOTAL] Testing $TEST_LABEL ($MODE $OPT)"
+                launch_job_with_limit run_matrix_case "$TOTAL" "$TEST_FILE" "$TEST_NAME" "$TEST_LABEL" "$MODE" "$OPT" "$EXPECTED" "$EXPECT_COMPILE_FAIL" "$EXPECT_ERROR_FILE" "$EXPECT_STDOUT_FILE" "$STDIN_FILE" "$RESULT_FILE" "$COMPILER_ARGS_FILE" "$EXPECT_ASM_FILE" "$COMPILE_ONLY" "$EXPECT_ASM_COUNT_FILE"
             done
         done
 
@@ -1176,15 +1521,19 @@ CONTENT_HASH=$(awk '{if ($0 !~ /^\/\/ (Covers:|Mode:|Opt:|Compiler args:|Compile
                 if ! csv_has "$TEST_MODES_CSV" "$MODE"; then
                     continue
                 fi
-                for OPT in O0 O1; do
+                for OPT in O0 O1 O2 O3 OS; do
                     if ! csv_has "$TEST_OPTS_CSV" "$OPT"; then
                         continue
                     fi
                     VARIANT_COUNT=$((VARIANT_COUNT + 1))
+                    if ! case_in_current_shard "$TEST_NAME|$MODE|$OPT"; then
+                        continue
+                    fi
                     TOTAL=$((TOTAL + 1))
                     RESULT_FILE="$JOBS_DIR/${RUN_TAG}_case_${TOTAL}.result"
                     CASE_RESULT_FILES+=("$RESULT_FILE")
-                    launch_job_with_limit run_matrix_case "$TOTAL" "$TEST_FILE" "$TEST_NAME" "$TEST_LABEL" "$MODE" "$OPT" "$EXPECTED" "$EXPECT_COMPILE_FAIL" "$EXPECT_ERROR_FILE" "$EXPECT_STDOUT_FILE" "$STDIN_FILE" "$RESULT_FILE" "$COMPILER_ARGS_FILE" "$EXPECT_ASM_FILE" "$COMPILE_ONLY"
+                    RESULT_LABEL["$RESULT_FILE"]="[$TOTAL] Testing $TEST_LABEL ($MODE $OPT)"
+                    launch_job_with_limit run_matrix_case "$TOTAL" "$TEST_FILE" "$TEST_NAME" "$TEST_LABEL" "$MODE" "$OPT" "$EXPECTED" "$EXPECT_COMPILE_FAIL" "$EXPECT_ERROR_FILE" "$EXPECT_STDOUT_FILE" "$STDIN_FILE" "$RESULT_FILE" "$COMPILER_ARGS_FILE" "$EXPECT_ASM_FILE" "$COMPILE_ONLY" "$EXPECT_ASM_COUNT_FILE"
                 done
             done
         fi
@@ -1198,18 +1547,22 @@ CONTENT_HASH=$(awk '{if ($0 !~ /^\/\/ (Covers:|Mode:|Opt:|Compiler args:|Compile
     fi
 
     if [ "$LLVM_BUILD" -eq 1 ]; then
-        TOTAL=$((TOTAL + 1))
-        RESULT_FILE="$JOBS_DIR/${RUN_TAG}_llvm_${TOTAL}.result"
-        LLVM_RESULT_FILES+=("$RESULT_FILE")
-        launch_job_with_limit run_llvm_case "$TOTAL" "$TEST_FILE" "$TEST_NAME" "$TEST_LABEL" "$EXPECTED" "$RESULT_FILE" "$STDIN_FILE" "$EXPECT_STDOUT_FILE" "$COMPILER_ARGS_FILE" "$COMPILE_ONLY" "$EXPECT_LLVM_METADATA_FILE"
+        if case_in_current_shard "$TEST_NAME|llvm"; then
+            TOTAL=$((TOTAL + 1))
+            RESULT_FILE="$JOBS_DIR/${RUN_TAG}_llvm_${TOTAL}.result"
+            LLVM_RESULT_FILES+=("$RESULT_FILE")
+            RESULT_LABEL["$RESULT_FILE"]="[$TOTAL] LLVM $TEST_LABEL"
+            launch_job_with_limit run_llvm_case "$TOTAL" "$TEST_FILE" "$TEST_NAME" "$TEST_LABEL" "$EXPECTED" "$RESULT_FILE" "$STDIN_FILE" "$EXPECT_STDOUT_FILE" "$COMPILER_ARGS_FILE" "$COMPILE_ONLY" "$EXPECT_LLVM_METADATA_FILE"
+        fi
     fi
 done
 
-wait || true
+wait_for_launched_jobs
 
 for RESULT_FILE in "${CASE_RESULT_FILES[@]}"; do
     if [ ! -f "$RESULT_FILE" ]; then
         FAILED=$((FAILED + 1))
+        echo -e "${RED}${RESULT_LABEL[$RESULT_FILE]:-$RESULT_FILE} FAIL (missing result file)${NC}"
         continue
     fi
     CASE_TAG=""
@@ -1220,6 +1573,7 @@ for RESULT_FILE in "${CASE_RESULT_FILES[@]}"; do
     CASE_STRESS_FAIL=0
     CASE_STABILITY_PASS=0
     CASE_STABILITY_FAIL=0
+    CASE_ERROR_FILE=""
     source "$RESULT_FILE"
 
     PASSED=$((PASSED + CASE_PASS))
@@ -1229,18 +1583,20 @@ for RESULT_FILE in "${CASE_RESULT_FILES[@]}"; do
     STABILITY_PASSED=$((STABILITY_PASSED + CASE_STABILITY_PASS))
     STABILITY_FAILED=$((STABILITY_FAILED + CASE_STABILITY_FAIL))
 
-    if [ "$TEST_QUIET" -eq 0 ]; then
-        if [ "$CASE_FAIL" -eq 0 ]; then
+    if [ "$CASE_FAIL" -eq 0 ]; then
+        if [ "$TEST_QUIET" -eq 0 ]; then
             echo -e "${GREEN}${CASE_TAG} ${CASE_STATUS}${NC}"
-        else
-            echo -e "${RED}${CASE_TAG} ${CASE_STATUS}${NC}"
         fi
+    else
+        echo -e "${RED}${CASE_TAG} ${CASE_STATUS}${NC}"
+        print_failure_diagnostics "$CASE_ERROR_FILE"
     fi
 done
 
 for RESULT_FILE in "${LLVM_RESULT_FILES[@]}"; do
     if [ ! -f "$RESULT_FILE" ]; then
         FAILED=$((FAILED + 1))
+        echo -e "${RED}${RESULT_LABEL[$RESULT_FILE]:-$RESULT_FILE} FAIL (missing result file)${NC}"
         continue
     fi
     CASE_TAG=""
@@ -1252,12 +1608,12 @@ for RESULT_FILE in "${LLVM_RESULT_FILES[@]}"; do
     PASSED=$((PASSED + CASE_PASS))
     FAILED=$((FAILED + CASE_FAIL))
 
-    if [ "$TEST_QUIET" -eq 0 ]; then
-        if [ "$CASE_FAIL" -eq 0 ]; then
+    if [ "$CASE_FAIL" -eq 0 ]; then
+        if [ "$TEST_QUIET" -eq 0 ]; then
             echo -e "${GREEN}${CASE_TAG} ${CASE_STATUS}${NC}"
-        else
-            echo -e "${RED}${CASE_TAG} ${CASE_STATUS}${NC}"
         fi
+    else
+        echo -e "${RED}${CASE_TAG} ${CASE_STATUS}${NC}"
     fi
 done
 
@@ -1271,18 +1627,23 @@ if [ -n "$IR_TEST_FILES" ]; then
 fi
 
 for TEST_FILE in $IR_TEST_FILES; do
-    TOTAL=$((TOTAL + 1))
     TEST_NAME=$(basename "$TEST_FILE" .bpp)
+    if ! case_in_current_shard "$TEST_NAME|ir"; then
+        continue
+    fi
+    TOTAL=$((TOTAL + 1))
     RESULT_FILE="$JOBS_DIR/${RUN_TAG}_ir_${TOTAL}.result"
     IR_RESULT_FILES+=("$RESULT_FILE")
+    RESULT_LABEL["$RESULT_FILE"]="[$TOTAL] IR $TEST_NAME"
     launch_job_with_limit run_ir_case "$TOTAL" "$TEST_FILE" "$TEST_NAME" "$RESULT_FILE"
 done
 
-wait || true
+wait_for_launched_jobs
 
 for RESULT_FILE in "${IR_RESULT_FILES[@]}"; do
     if [ ! -f "$RESULT_FILE" ]; then
         FAILED=$((FAILED + 1))
+        echo -e "${RED}${RESULT_LABEL[$RESULT_FILE]:-$RESULT_FILE} FAIL (missing result file)${NC}"
         continue
     fi
     CASE_TAG=""
@@ -1293,12 +1654,12 @@ for RESULT_FILE in "${IR_RESULT_FILES[@]}"; do
     PASSED=$((PASSED + CASE_PASS))
     FAILED=$((FAILED + CASE_FAIL))
 
-    if [ "$TEST_QUIET" -eq 0 ]; then
-        if [ "$CASE_FAIL" -eq 0 ]; then
+    if [ "$CASE_FAIL" -eq 0 ]; then
+        if [ "$TEST_QUIET" -eq 0 ]; then
             echo -e "${GREEN}${CASE_TAG} ${CASE_STATUS}${NC}"
-        else
-            echo -e "${RED}${CASE_TAG} ${CASE_STATUS}${NC}"
         fi
+    else
+        echo -e "${RED}${CASE_TAG} ${CASE_STATUS}${NC}"
     fi
 done
 
@@ -1309,9 +1670,17 @@ echo "========================================"
 echo "Total:  $TOTAL"
 echo -e "Passed: ${GREEN}$PASSED${NC}"
 echo -e "Failed: ${RED}$FAILED${NC}"
+echo -e "LLVM skipped: ${YELLOW}$LLVM_SKIPPED${NC}"
 echo -e "Stress: ${GREEN}$STRESS_PASSED${NC} passed, ${RED}$STRESS_FAILED${NC} failed"
 echo -e "Stability: ${GREEN}$STABILITY_PASSED${NC} passed, ${RED}$STABILITY_FAILED${NC} failed"
 echo ""
+
+if [ -n "$TEST_RESULT_JSON" ]; then
+    mkdir -p "$(dirname "$TEST_RESULT_JSON")"
+    printf '{"schemaVersion":1,"shardCount":%d,"shardIndex":%d,"total":%d,"passed":%d,"failed":%d,"llvmSkipped":%d}\n' \
+        "$TEST_SHARD_COUNT" "$TEST_SHARD_INDEX" "$TOTAL" "$PASSED" "$FAILED" "$LLVM_SKIPPED" > "$TEST_RESULT_JSON"
+    echo "[INFO] Result JSON: $TEST_RESULT_JSON"
+fi
 
 if [ $FAILED -eq 0 ]; then
     if [ "$KEEP_TEST_ARTIFACTS" -eq 0 ]; then

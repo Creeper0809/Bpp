@@ -8,11 +8,17 @@
 import std.io;
 import std.util;
 import std.vec;
+import std.mem;
 import ssa.datastruct;
 import ssa.core;
 import ssa.mem2reg_df;
 
 const MEM2REG_DEBUG = 0;
+const MEM2REG_RELEASE_SCRATCH = 0;
+const MEM2REG_USE_SCRATCH_ARENA = 1;
+const MEM2REG_ARENA_IDOM = 1;
+const MEM2REG_ARENA_PHI = 1;
+const MEM2REG_ARENA_RENAME = 1;
 
 func dom_undef() -> u64 {
     push_trace("dom_undef", "ssa_mem2reg.b", __LINE__);
@@ -103,11 +109,11 @@ func dom_intersect(idom: u64, b1: u64, b2: u64, max_steps: u64) -> u64 {
     return n1;
 }
 
-func dom_build_block_map(fn: *SSAFunction) -> u64 {
+func dom_build_block_map(fn: *SSAFunction, arena: *BppScratchArena) -> u64 {
     push_trace("dom_build_block_map", "ssa_mem2reg.b", __LINE__);
     defer pop_trace();
     var total: u64 = max_block_id(fn) + 1;
-    var map: u64 = heap_alloc(total * sizeof(u64));
+    var map: u64 = bpp_scratch_arena_alloc_zero(arena, total * sizeof(u64));
     zero_u64(map, total);
 
     var blocks: []*SSABlock = fn.blocks;
@@ -192,10 +198,10 @@ func max_block_id(fn: *SSAFunction) -> u64 {
     return max_id;
 }
 
-func collect_def_blocks(fn: *SSAFunction, var_id: u64) -> *Vec<*SSABlock> {
+func collect_def_blocks(fn: *SSAFunction, var_id: u64, arena: *BppScratchArena) -> *Vec<*SSABlock> {
     push_trace("collect_def_blocks", "ssa_mem2reg.b", __LINE__);
     defer pop_trace();
-    var defs: *Vec<*SSABlock> = new Vec<*SSABlock>{heap_alloc((4) * sizeof(*SSABlock)), 0, (4)};
+    var defs: *Vec<*SSABlock> = vec_new_scratch<*SSABlock>(arena, 4);
     var blocks: []*SSABlock = fn.blocks;
     var n: u64 = slice_len(blocks);
     for (var i: u64 = 0; i < n; i++) {
@@ -207,7 +213,7 @@ func collect_def_blocks(fn: *SSAFunction, var_id: u64) -> *Vec<*SSABlock> {
             if (op == SSA_OP_STORE) {
                 var v: u64 = operand_value(cur.src1);
                 if (v == var_id) {
-                    defs.push(b);
+                    defs.push_scratch(b, arena);
                     break;
                 }
             }
@@ -218,7 +224,7 @@ func collect_def_blocks(fn: *SSAFunction, var_id: u64) -> *Vec<*SSABlock> {
     return defs;
 }
 
-func insert_phi_nodes(ctx: *SSAContext, fn: *SSAFunction, max_var: u64, next_reg_ptr: *u64) -> u64 {
+func insert_phi_nodes(ctx: *SSAContext, fn: *SSAFunction, max_var: u64, next_reg_ptr: *u64, arena: *BppScratchArena) -> u64 {
     push_trace("insert_phi_nodes", "ssa_mem2reg.b", __LINE__);
     defer pop_trace();
     if (max_var == 0) { return 0; }
@@ -226,20 +232,22 @@ func insert_phi_nodes(ctx: *SSAContext, fn: *SSAFunction, max_var: u64, next_reg
     var total_blocks: u64 = max_block_id(fn) + 1;
 
     for (var v: u64 = 1; v <= max_var; v++) {
-        var defs: *Vec<*SSABlock> = collect_def_blocks(fn, v);
-        var def_mark: u64 = heap_alloc(total_blocks * sizeof(u64));
+        var scratch_mark: BppScratchArenaMark;
+        bpp_scratch_arena_mark_into(arena, &scratch_mark);
+        var defs: *Vec<*SSABlock> = collect_def_blocks(fn, v, arena);
+        var def_mark: u64 = bpp_scratch_arena_alloc_zero(arena, total_blocks * sizeof(u64));
         zero_u64(def_mark, total_blocks);
-        var phi_mark: u64 = heap_alloc(total_blocks * sizeof(u64));
+        var phi_mark: u64 = bpp_scratch_arena_alloc_zero(arena, total_blocks * sizeof(u64));
         zero_u64(phi_mark, total_blocks);
         var def_mark_u64: *u64 = (*u64)def_mark;
         var phi_mark_u64: *u64 = (*u64)phi_mark;
 
-        var wlist: *Vec<*SSABlock> = new Vec<*SSABlock>{heap_alloc((4) * sizeof(*SSABlock)), 0, (4)};
+        var wlist: *Vec<*SSABlock> = vec_new_scratch<*SSABlock>(arena, 4);
         var dcount: u64 = defs.len();
         for (var i: u64 = 0; i < dcount; i++) {
             var b: *SSABlock = defs.get(i);
             def_mark_u64[b.id] = 1;
-            wlist.push(b);
+            wlist.push_scratch(b, arena);
         }
 
         while (wlist.len() > 0) {
@@ -258,11 +266,20 @@ func insert_phi_nodes(ctx: *SSAContext, fn: *SSAFunction, max_var: u64, next_reg
 
                     if (def_mark_u64[y.id] == 0) {
                         def_mark_u64[y.id] = 1;
-                        wlist.push(y);
+                        wlist.push_scratch(y, arena);
                     }
                 }
             }
         }
+        if (MEM2REG_RELEASE_SCRATCH != 0) {
+            defs.release_buffer();
+            wlist.release_buffer();
+            free((u64)defs);
+            free((u64)wlist);
+            free(def_mark);
+            free(phi_mark);
+        }
+        bpp_scratch_arena_rewind(arena, &scratch_mark);
     }
 
     return 0;
@@ -336,21 +353,21 @@ func rewrite_call(op: u64, info_ptr: u64, reg_map_val_u64: *u64, reg_map_set_u64
     return 0;
 }
 
-func push_phi_defs(block: *SSABlock, max_var: u64, stack_arr_u64: *u64, pushed: *Vec<u64>) -> u64 {
+func push_phi_defs(block: *SSABlock, max_var: u64, stack_arr_u64: *u64, pushed: *Vec<u64>, stack_arena: *BppScratchArena, frame_arena: *BppScratchArena) -> u64 {
     var phi: *SSAInstruction = block.phi_head;
     while (phi != 0) {
         var var_id: u64 = operand_value(phi.src2);
         if (var_id <= max_var) {
             var stack: u64 = stack_arr_u64[var_id];
-            ((*Vec<u64>)stack).push(phi.dest);
-            pushed.push(var_id);
+            ((*Vec<u64>)stack).push_scratch(phi.dest, stack_arena);
+            pushed.push_scratch(var_id, frame_arena);
         }
         phi = phi.next;
     }
     return 0;
 }
 
-func rename_block_insts(block: *SSABlock, max_var: u64, stack_arr_u64: *u64, reg_map_val: u64, reg_map_set: u64, reg_map_cap: u64, reg_map_val_u64: *u64, reg_map_set_u64: *u64, pushed: *Vec<u64>) -> u64 {
+func rename_block_insts(block: *SSABlock, max_var: u64, stack_arr_u64: *u64, reg_map_val: u64, reg_map_set: u64, reg_map_cap: u64, reg_map_val_u64: *u64, reg_map_set_u64: *u64, pushed: *Vec<u64>, stack_arena: *BppScratchArena, frame_arena: *BppScratchArena) -> u64 {
     var cur: *SSAInstruction = block.inst_head;
     while (cur != 0) {
         var op: u64 = op_of(cur);
@@ -385,8 +402,8 @@ func rename_block_insts(block: *SSABlock, max_var: u64, stack_arr_u64: *u64, reg
             if (var_id3 <= max_var) {
                 var stack3: u64 = stack_arr_u64[var_id3];
                 var val_reg2: u64 = operand_value(cur.src2);
-                ((*Vec<u64>)stack3).push(val_reg2);
-                pushed.push(var_id3);
+                ((*Vec<u64>)stack3).push_scratch(val_reg2, stack_arena);
+                pushed.push_scratch(var_id3, frame_arena);
             }
             set_op(cur, SSA_OP_NOP);
         }
@@ -416,13 +433,13 @@ func add_phi_args_to_succs(block: *SSABlock, max_var: u64, stack_arr_u64: *u64) 
     return 0;
 }
 
-func rename_children(fn: *SSAFunction, block: *SSABlock, max_var: u64, stack_arr: u64, reg_map_val: u64, reg_map_set: u64, reg_map_cap: u64, child_arr: u64, child_arr_u64: *u64) -> u64 {
+func rename_children(fn: *SSAFunction, block: *SSABlock, max_var: u64, stack_arr: u64, reg_map_val: u64, reg_map_set: u64, reg_map_cap: u64, child_arr: u64, child_arr_u64: *u64, stack_arena: *BppScratchArena, frame_arena: *BppScratchArena) -> u64 {
     var child_vec: *Vec<*SSABlock> = (*Vec<*SSABlock>)child_arr_u64[block.id];
     if (child_vec == 0) { return 0; }
     var ccount: u64 = child_vec.len();
     for (var ci: u64 = 0; ci < ccount; ci++) {
         var child: *SSABlock = child_vec.get(ci);
-        rename_block(fn, child, max_var, stack_arr, reg_map_val, reg_map_set, reg_map_cap, child_arr);
+        rename_block(fn, child, max_var, stack_arr, reg_map_val, reg_map_set, reg_map_cap, child_arr, stack_arena, frame_arena);
     }
     return 0;
 }
@@ -437,45 +454,59 @@ func pop_pushed(stack_arr_u64: *u64, pushed: *Vec<u64>) -> u64 {
     return 0;
 }
 
-func rename_block(fn: *SSAFunction, block: *SSABlock, max_var: u64, stack_arr: u64, reg_map_val: u64, reg_map_set: u64, reg_map_cap: u64, child_arr: u64) -> u64 {
+func rename_block(fn: *SSAFunction, block: *SSABlock, max_var: u64, stack_arr: u64, reg_map_val: u64, reg_map_set: u64, reg_map_cap: u64, child_arr: u64, stack_arena: *BppScratchArena, frame_arena: *BppScratchArena) -> u64 {
     push_trace("rename_block", "ssa_mem2reg.b", __LINE__);
     defer pop_trace();
-    var pushed: *Vec<u64> = new Vec<u64>{heap_alloc((8) * sizeof(u64)), 0, (8)};
+    var scratch_mark: BppScratchArenaMark;
+    bpp_scratch_arena_mark_into(frame_arena, &scratch_mark);
+    var pushed: *Vec<u64> = vec_new_scratch<u64>(frame_arena, 8);
     var stack_arr_u64: *u64 = (*u64)stack_arr;
     var reg_map_val_u64: *u64 = (*u64)reg_map_val;
     var reg_map_set_u64: *u64 = (*u64)reg_map_set;
     var child_arr_u64: *u64 = (*u64)child_arr;
 
-    push_phi_defs(block, max_var, stack_arr_u64, pushed);
-    rename_block_insts(block, max_var, stack_arr_u64, reg_map_val, reg_map_set, reg_map_cap, reg_map_val_u64, reg_map_set_u64, pushed);
+    push_phi_defs(block, max_var, stack_arr_u64, pushed, stack_arena, frame_arena);
+    rename_block_insts(block, max_var, stack_arr_u64, reg_map_val, reg_map_set, reg_map_cap, reg_map_val_u64, reg_map_set_u64, pushed, stack_arena, frame_arena);
     add_phi_args_to_succs(block, max_var, stack_arr_u64);
-    rename_children(fn, block, max_var, stack_arr, reg_map_val, reg_map_set, reg_map_cap, child_arr, child_arr_u64);
+    rename_children(fn, block, max_var, stack_arr, reg_map_val, reg_map_set, reg_map_cap, child_arr, child_arr_u64, stack_arena, frame_arena);
     pop_pushed(stack_arr_u64, pushed);
+    if (MEM2REG_RELEASE_SCRATCH != 0) {
+        pushed.release_buffer();
+        free((u64)pushed);
+    }
+    bpp_scratch_arena_rewind(frame_arena, &scratch_mark);
 
     return 0;
 }
 
-func rename_registers(fn: *SSAFunction, max_var: u64, max_reg: u64) -> u64 {
+func rename_registers(fn: *SSAFunction, max_var: u64, max_reg: u64, arena: *BppScratchArena) -> u64 {
     push_trace("rename_registers", "ssa_mem2reg.b", __LINE__);
     defer pop_trace();
     if (max_var == 0) { return 0; }
 
-    var stack_arr: u64 = heap_alloc((max_var + 1) * sizeof(u64));
+    var frame_arena_store: BppScratchArena;
+    var frame_arena: *BppScratchArena = 0;
+    if (arena != 0) {
+        bpp_scratch_arena_init(&frame_arena_store, 0);
+        frame_arena = &frame_arena_store;
+    }
+
+    var stack_arr: u64 = bpp_scratch_arena_alloc(arena, (max_var + 1) * sizeof(u64));
     var stack_arr_u64: *u64 = (*u64)stack_arr;
     for (var i: u64 = 0; i <= max_var; i++) {
-        var st: *Vec<u64> = new Vec<u64>{heap_alloc((4) * sizeof(u64)), 0, (4)};
+        var st: *Vec<u64> = vec_new_scratch<u64>(arena, 4);
         stack_arr_u64[i] = (u64)st;
     }
 
     var reg_map_cap: u64 = max_reg + 1;
-    var reg_map_val: u64 = heap_alloc(reg_map_cap * sizeof(u64));
-    var reg_map_set: u64 = heap_alloc(reg_map_cap * sizeof(u64));
+    var reg_map_val: u64 = bpp_scratch_arena_alloc_zero(arena, reg_map_cap * sizeof(u64));
+    var reg_map_set: u64 = bpp_scratch_arena_alloc_zero(arena, reg_map_cap * sizeof(u64));
     zero_u64(reg_map_val, reg_map_cap);
     zero_u64(reg_map_set, reg_map_cap);
 
     var max_block_id: u64 = max_block_id(fn);
     var child_cap: u64 = max_block_id + 1;
-    var child_arr: u64 = heap_alloc(child_cap * sizeof(u64));
+    var child_arr: u64 = bpp_scratch_arena_alloc_zero(arena, child_cap * sizeof(u64));
     zero_u64(child_arr, child_cap);
     var child_arr_u64: *u64 = (*u64)child_arr;
 
@@ -487,25 +518,46 @@ func rename_registers(fn: *SSAFunction, max_var: u64, max_reg: u64) -> u64 {
             var pid: u64 = b.dom_parent.id;
             var cv: u64 = child_arr_u64[pid];
             if (cv == 0) {
-                var cv_new: *Vec<*SSABlock> = new Vec<*SSABlock>{heap_alloc((4) * sizeof(*SSABlock)), 0, (4)};
+                var cv_new: *Vec<*SSABlock> = vec_new_scratch<*SSABlock>(arena, 4);
                 cv = (u64)cv_new;
                 child_arr_u64[pid] = cv;
             }
-            ((*Vec<*SSABlock>)cv).push(b);
+            ((*Vec<*SSABlock>)cv).push_scratch(b, arena);
         }
     }
 
-    rename_block(fn, fn.entry, max_var, stack_arr, reg_map_val, reg_map_set, reg_map_cap, child_arr);
+    rename_block(fn, fn.entry, max_var, stack_arr, reg_map_val, reg_map_set, reg_map_cap, child_arr, arena, frame_arena);
+    if (frame_arena != 0) { bpp_scratch_arena_reset(frame_arena); }
+    if (MEM2REG_RELEASE_SCRATCH != 0) {
+        for (var si: u64 = 0; si <= max_var; si++) {
+            var st_free: *Vec<u64> = (*Vec<u64>)stack_arr_u64[si];
+            if (st_free != 0) {
+                st_free.release_buffer();
+                free((u64)st_free);
+            }
+        }
+        for (var ci: u64 = 0; ci < child_cap; ci++) {
+            var child_vec: *Vec<*SSABlock> = (*Vec<*SSABlock>)child_arr_u64[ci];
+            if (child_vec != 0) {
+                child_vec.release_buffer();
+                free((u64)child_vec);
+            }
+        }
+        free(stack_arr);
+        free(reg_map_val);
+        free(reg_map_set);
+        free(child_arr);
+    }
     return 0;
 }
 
-func compute_idom(ctx: *SSAContext, fn: *SSAFunction) -> u64 {
+func compute_idom(ctx: *SSAContext, fn: *SSAFunction, arena: *BppScratchArena) -> u64 {
     push_trace("compute_idom", "ssa_mem2reg.b", __LINE__);
     defer pop_trace();
     if (fn == 0) { return 0; }
 
     var total: u64 = max_block_id(fn) + 1;
-    var idom: u64 = heap_alloc(total * sizeof(u64));
+    var idom: u64 = bpp_scratch_arena_alloc(arena, total * sizeof(u64));
     var undef: u64 = dom_undef();
     var idom_u64: *u64 = (*u64)idom;
     for (var z: u64 = 0; z < total; z++) {
@@ -557,7 +609,7 @@ func compute_idom(ctx: *SSAContext, fn: *SSAFunction) -> u64 {
         }
     }
 
-    var map: u64 = dom_build_block_map(fn);
+    var map: u64 = dom_build_block_map(fn, arena);
     var map_u64: *u64 = (*u64)map;
 
     var blocks2: []*SSABlock = fn.blocks;
@@ -582,6 +634,10 @@ func compute_idom(ctx: *SSAContext, fn: *SSAFunction) -> u64 {
     if (MEM2REG_DEBUG != 0) {
         println("[DEBUG] compute_idom: done", 40);
     }
+    if (MEM2REG_RELEASE_SCRATCH != 0) {
+        free(map);
+        free(idom);
+    }
     return 0;
 }
 
@@ -596,7 +652,26 @@ func run(ctx: *SSAContext) -> u64 {
         if (MEM2REG_DEBUG != 0) {
             println("[DEBUG] mem2reg_run: fn", 31);
         }
-        compute_idom(ctx, fn);
+        var idom_arena_store: BppScratchArena;
+        var phi_arena_store: BppScratchArena;
+        var rename_arena_store: BppScratchArena;
+        var idom_arena: *BppScratchArena = 0;
+        var phi_arena: *BppScratchArena = 0;
+        var rename_arena: *BppScratchArena = 0;
+        if (MEM2REG_USE_SCRATCH_ARENA != 0 && MEM2REG_ARENA_IDOM != 0) {
+            bpp_scratch_arena_init(&idom_arena_store, 0);
+            idom_arena = &idom_arena_store;
+        }
+        if (MEM2REG_USE_SCRATCH_ARENA != 0 && MEM2REG_ARENA_PHI != 0) {
+            bpp_scratch_arena_init(&phi_arena_store, 0);
+            phi_arena = &phi_arena_store;
+        }
+        if (MEM2REG_USE_SCRATCH_ARENA != 0 && MEM2REG_ARENA_RENAME != 0) {
+            bpp_scratch_arena_init(&rename_arena_store, 0);
+            rename_arena = &rename_arena_store;
+        }
+        compute_idom(ctx, fn, idom_arena);
+        if (idom_arena != 0) { bpp_scratch_arena_reset(idom_arena); }
         if (MEM2REG_DEBUG != 0) {
             println("[DEBUG] mem2reg_run: idom", 38);
         }
@@ -607,13 +682,15 @@ func run(ctx: *SSAContext) -> u64 {
 
         var max_var: u64 = max_var_id(fn);
         var next_reg: u64 = max_reg_id(fn) + 1;
-        insert_phi_nodes(ctx, fn, max_var, &next_reg);
+        insert_phi_nodes(ctx, fn, max_var, &next_reg, phi_arena);
+        if (phi_arena != 0) { bpp_scratch_arena_reset(phi_arena); }
         if (MEM2REG_DEBUG != 0) {
             println("[DEBUG] mem2reg_run: phi", 36);
         }
 
         var max_reg2: u64 = next_reg;
-        rename_registers(fn, max_var, max_reg2);
+        rename_registers(fn, max_var, max_reg2, rename_arena);
+        if (rename_arena != 0) { bpp_scratch_arena_reset(rename_arena); }
         if (MEM2REG_DEBUG != 0) {
             println("[DEBUG] mem2reg_run: rename", 39);
         }

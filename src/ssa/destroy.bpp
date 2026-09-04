@@ -4,8 +4,12 @@
 
 import std.vec;
 import std.util;
+import std.mem;
 import ssa.datastruct;
 import ssa.core;
+
+const SSA_DESTROY_RELEASE_SCRATCH = 0;
+const SSA_DESTROY_USE_SCRATCH_ARENA = 1;
 
 func destroy_call_args_len(args_vec: *Vec<u64>, nargs: u64) -> u64 {
     var n: u64 = nargs;
@@ -96,14 +100,16 @@ func destroy_collect_used_regs(fn: *SSAFunction, used: *u64, used_len: u64) -> u
     return 0;
 }
 
-func destroy_prune_dead_phis(fn: *SSAFunction) -> u64 {
+func destroy_prune_dead_phis(fn: *SSAFunction, arena: *BppScratchArena) -> u64 {
     if (fn == 0) { return 0; }
     var changed: u64 = 1;
     while (changed != 0) {
         changed = 0;
         var max_id: u64 = max_reg(fn);
         if (max_id == 0) { return 0; }
-        var used: *u64 = (*u64)heap_alloc((max_id + 1) * sizeof(u64));
+        var scratch_mark: BppScratchArenaMark;
+        bpp_scratch_arena_mark_into(arena, &scratch_mark);
+        var used: *u64 = (*u64)bpp_scratch_arena_alloc_zero(arena, (max_id + 1) * sizeof(u64));
         for (var ui: u64 = 0; ui <= max_id; ui++) {
             used[ui] = 0;
         }
@@ -131,6 +137,10 @@ func destroy_prune_dead_phis(fn: *SSAFunction) -> u64 {
                 phi = next;
             }
         }
+        if (SSA_DESTROY_RELEASE_SCRATCH != 0) {
+            free((u64)used);
+        }
+        bpp_scratch_arena_rewind(arena, &scratch_mark);
     }
     return 0;
 }
@@ -371,13 +381,15 @@ func redirect_terminator_target(block: *SSABlock, old_id: u64, new_id: u64) -> u
     return 0;
 }
 
-func emit_parallel_copies(ctx: *SSAContext, block: *SSABlock, dsts: *Vec<u64>, srcs: *Vec<u64>, next_reg_ptr: *u64, known_ptr: *u64, value_ptr: *u64, known_len: u64) -> u64 {
+func emit_parallel_copies(ctx: *SSAContext, block: *SSABlock, dsts: *Vec<u64>, srcs: *Vec<u64>, next_reg_ptr: *u64, known_ptr: *u64, value_ptr: *u64, known_len: u64, arena: *BppScratchArena) -> u64 {
     var n: u64 = dsts.len();
     if (n == 0) { return 0; }
 
-    var active: *Vec<u64> = new Vec<u64>{heap_alloc((n) * sizeof(u64)), 0, (n)};
+    var scratch_mark: BppScratchArenaMark;
+    bpp_scratch_arena_mark_into(arena, &scratch_mark);
+    var active: *Vec<u64> = vec_new_scratch<u64>(arena, n);
     for (var i0: u64 = 0; i0 < n; i0++) {
-        active.push(1);
+        active.push_scratch(1, arena);
     }
 
     var remain: u64 = n;
@@ -427,15 +439,22 @@ func emit_parallel_copies(ctx: *SSAContext, block: *SSABlock, dsts: *Vec<u64>, s
         emit_copy(ctx, block, tmp, cycle_src, known_ptr, value_ptr, known_len);
         srcs.set(pick, tmp);
     }
+    if (SSA_DESTROY_RELEASE_SCRATCH != 0) {
+        active.release_buffer();
+        free((u64)active);
+    }
+    bpp_scratch_arena_rewind(arena, &scratch_mark);
     return 0;
 }
 
-func process_block(ctx: *SSAContext, fn: *SSAFunction, block: *SSABlock, next_reg_ptr: *u64, known_ptr: *u64, value_ptr: *u64, known_len: u64) -> u64 {
+func process_block(ctx: *SSAContext, fn: *SSAFunction, block: *SSABlock, next_reg_ptr: *u64, known_ptr: *u64, value_ptr: *u64, known_len: u64, arena: *BppScratchArena) -> u64 {
     push_trace("process_block", "ssa_destroy.b", __LINE__);
     defer pop_trace();
     if (block == 0 || block.phi_head == 0) { return 0; }
 
-    var split_edges: *Vec<*SSASplitEdge> = new Vec<*SSASplitEdge>{heap_alloc((4) * sizeof(*SSASplitEdge)), 0, (4)};
+    var scratch_mark: BppScratchArenaMark;
+    bpp_scratch_arena_mark_into(arena, &scratch_mark);
+    var split_edges: *Vec<*SSASplitEdge> = vec_new_scratch<*SSASplitEdge>(arena, 4);
 
     var preds: []*SSABlock = block.preds;
     var pcount: u64 = slice_len(preds);
@@ -457,30 +476,46 @@ func process_block(ctx: *SSAContext, fn: *SSAFunction, block: *SSABlock, next_re
                 replace_pred(block, pred, split);
                 add_pred(split, pred);
                 add_succ(split, block);
-                var edge: *SSASplitEdge = new SSASplitEdge{};
+                var edge: *SSASplitEdge = (*SSASplitEdge)bpp_scratch_arena_alloc_zero(arena, sizeof(SSASplitEdge));
                 edge.pred = pred;
                 edge.dst = block;
                 edge.split = split;
-                split_edges.push(edge);
+                split_edges.push_scratch(edge, arena);
             }
             emit_block = split;
         }
 
-        var dsts: *Vec<u64> = new Vec<u64>{heap_alloc((8) * sizeof(u64)), 0, (8)};
-        var srcs: *Vec<u64> = new Vec<u64>{heap_alloc((8) * sizeof(u64)), 0, (8)};
+        var dsts: *Vec<u64> = vec_new_scratch<u64>(arena, 8);
+        var srcs: *Vec<u64> = vec_new_scratch<u64>(arena, 8);
         var phi: *SSAInstruction = block.phi_head;
         while (phi != 0) {
             var incoming_src: SSADestroyPhiSrc = find_phi_src(phi, pred.id);
             if (incoming_src.found != 0) {
-                dsts.push(phi.dest);
-                srcs.push(incoming_src.src);
+                dsts.push_scratch(phi.dest, arena);
+                srcs.push_scratch(incoming_src.src, arena);
             }
             phi = phi.next;
         }
-        emit_parallel_copies(ctx, emit_block, dsts, srcs, next_reg_ptr, known_ptr, value_ptr, known_len);
+        emit_parallel_copies(ctx, emit_block, dsts, srcs, next_reg_ptr, known_ptr, value_ptr, known_len, arena);
+        if (SSA_DESTROY_RELEASE_SCRATCH != 0) {
+            dsts.release_buffer();
+            srcs.release_buffer();
+            free((u64)dsts);
+            free((u64)srcs);
+        }
     }
 
+    if (SSA_DESTROY_RELEASE_SCRATCH != 0) {
+        var split_count: u64 = split_edges.len();
+        for (var sei: u64 = 0; sei < split_count; sei++) {
+            var edge_free: *SSASplitEdge = split_edges.get(sei);
+            if (edge_free != 0) { free((u64)edge_free); }
+        }
+        split_edges.release_buffer();
+        free((u64)split_edges);
+    }
     block.phi_head = 0;
+    bpp_scratch_arena_rewind(arena, &scratch_mark);
     return 0;
 }
 
@@ -491,12 +526,18 @@ func run(ctx: *SSAContext) -> u64 {
     var funcs: []*SSAFunction = ctx.funcs;
     var n: u64 = slice_len(funcs);
     for (var i: u64 = 0; i < n; i++) {
+        var arena: BppScratchArena;
+        var arena_ptr: *BppScratchArena = 0;
+        if (SSA_DESTROY_USE_SCRATCH_ARENA != 0) {
+            bpp_scratch_arena_init(&arena, 0);
+            arena_ptr = &arena;
+        }
         var fn: *SSAFunction = funcs[i];
-        destroy_prune_dead_phis(fn);
+        destroy_prune_dead_phis(fn, arena_ptr);
         var next_reg: u64 = max_reg(fn) + 1;
         var known_len: u64 = next_reg + 1;
-        var const_known: *u64 = (*u64)heap_alloc(known_len * sizeof(u64));
-        var const_values: *u64 = (*u64)heap_alloc(known_len * sizeof(u64));
+        var const_known: *u64 = (*u64)bpp_scratch_arena_alloc_zero(arena_ptr, known_len * sizeof(u64));
+        var const_values: *u64 = (*u64)bpp_scratch_arena_alloc_zero(arena_ptr, known_len * sizeof(u64));
         for (var zi: u64 = 0; zi < known_len; zi++) {
             const_known[zi] = 0;
             const_values[zi] = 0;
@@ -512,7 +553,14 @@ func run(ctx: *SSAContext) -> u64 {
             var cur_blocks: []*SSABlock = fn.blocks;
             var cur_count: u64 = slice_len(cur_blocks);
             if (bi >= cur_count) { break; }
-            process_block(ctx, fn, cur_blocks[bi], &next_reg, const_known, const_values, known_len);
+            process_block(ctx, fn, cur_blocks[bi], &next_reg, const_known, const_values, known_len, arena_ptr);
+        }
+        if (SSA_DESTROY_RELEASE_SCRATCH != 0) {
+            free((u64)const_known);
+            free((u64)const_values);
+        }
+        if (SSA_DESTROY_USE_SCRATCH_ARENA != 0) {
+            bpp_scratch_arena_reset(&arena);
         }
     }
     return 0;

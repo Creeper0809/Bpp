@@ -5,9 +5,19 @@ import std.io;
 import std.util;
 import std.vec;
 import std.mem;
+import std.hashmap;
 import ssa.datastruct;
 
 var g_ssa_builder_diag_suppressed: u64 = 0;
+var g_ssa_current_source_file_ptr: u64;
+var g_ssa_current_source_file_len: u64;
+var g_ssa_current_source_start_line: u64;
+var g_ssa_current_source_start_col: u64;
+var g_ssa_current_source_end_line: u64;
+var g_ssa_current_source_end_col: u64;
+var g_ssa_current_source_range_id: u64;
+var g_ssa_current_source_start_offset: u64;
+var g_ssa_current_source_end_offset: u64;
 
 func ssa_builder_diag_suppress_set(enabled: u64) -> u64 {
     g_ssa_builder_diag_suppressed = enabled;
@@ -16,6 +26,41 @@ func ssa_builder_diag_suppress_set(enabled: u64) -> u64 {
 
 func ssa_builder_diag_suppressed() -> u64 {
     return g_ssa_builder_diag_suppressed;
+}
+
+func ssa_source_span_set_current_full(file_ptr: u64, file_len: u64, start_line: u64, start_col: u64, end_line: u64, end_col: u64, range_id: u64, start_offset: u64, end_offset: u64) -> u64 {
+    g_ssa_current_source_file_ptr = file_ptr;
+    g_ssa_current_source_file_len = file_len;
+    g_ssa_current_source_start_line = start_line;
+    g_ssa_current_source_start_col = start_col;
+    g_ssa_current_source_end_line = end_line;
+    g_ssa_current_source_end_col = end_col;
+    g_ssa_current_source_range_id = range_id;
+    g_ssa_current_source_start_offset = start_offset;
+    g_ssa_current_source_end_offset = end_offset;
+    return 0;
+}
+
+func ssa_source_span_set_current(file_ptr: u64, file_len: u64, start_line: u64, start_col: u64, end_line: u64, end_col: u64) -> u64 {
+    return ssa_source_span_set_current_full(file_ptr, file_len, start_line, start_col, end_line, end_col, 0, 0, 0);
+}
+
+func ssa_source_span_get_current_full(file_ptr: *u64, file_len: *u64, start_line: *u64, start_col: *u64, end_line: *u64, end_col: *u64, range_id: *u64, start_offset: *u64, end_offset: *u64) -> u64 {
+    if (file_ptr != 0) { file_ptr[0] = g_ssa_current_source_file_ptr; }
+    if (file_len != 0) { file_len[0] = g_ssa_current_source_file_len; }
+    if (start_line != 0) { start_line[0] = g_ssa_current_source_start_line; }
+    if (start_col != 0) { start_col[0] = g_ssa_current_source_start_col; }
+    if (end_line != 0) { end_line[0] = g_ssa_current_source_end_line; }
+    if (end_col != 0) { end_col[0] = g_ssa_current_source_end_col; }
+    if (range_id != 0) { range_id[0] = g_ssa_current_source_range_id; }
+    if (start_offset != 0) { start_offset[0] = g_ssa_current_source_start_offset; }
+    if (end_offset != 0) { end_offset[0] = g_ssa_current_source_end_offset; }
+    if (g_ssa_current_source_file_ptr == 0 || g_ssa_current_source_start_line == 0) { return 0; }
+    return 1;
+}
+
+func ssa_source_span_get_current(file_ptr: *u64, file_len: *u64, start_line: *u64, start_col: *u64, end_line: *u64, end_col: *u64) -> u64 {
+    return ssa_source_span_get_current_full(file_ptr, file_len, start_line, start_col, end_line, end_col, 0, 0, 0);
 }
 
 // ============================================
@@ -89,6 +134,8 @@ func create_context() -> *SSAContext {
     push_trace("create_context", "ssa_core.b", __LINE__);
     defer pop_trace();
     var ctx: *SSAContext = new SSAContext{};
+    ctx.funcs_by_name = new HashMap<u64, *SSAFunction>{0, 0, 0};
+    ctx.funcs_by_name.ensure_capacity(64);
     return ctx;
 }
 
@@ -114,6 +161,15 @@ func create_inst(ctx: *SSAContext, op: u64, dest: u64, src1: u64, src2: u64) -> 
     inst.dest = dest;
     inst.src1 = src1;
     inst.src2 = src2;
+    inst.source_file_ptr = g_ssa_current_source_file_ptr;
+    inst.source_file_len = g_ssa_current_source_file_len;
+    inst.source_start_line = g_ssa_current_source_start_line;
+    inst.source_start_col = g_ssa_current_source_start_col;
+    inst.source_end_line = g_ssa_current_source_end_line;
+    inst.source_end_col = g_ssa_current_source_end_col;
+    inst.source_range_id = g_ssa_current_source_range_id;
+    inst.source_start_offset = g_ssa_current_source_start_offset;
+    inst.source_end_offset = g_ssa_current_source_end_offset;
     return inst;
 }
 
@@ -219,6 +275,12 @@ func set_prev(inst: *SSAInstruction, prev: *SSAInstruction) -> u64 {
     return 0;
 }
 
+func prev_of(inst: *SSAInstruction) -> *SSAInstruction {
+    if (inst == 0) { return 0; }
+    var raw: u64 = ((u64)inst.prev) & SSA_TAGGED_PTR_MASK;
+    return (*SSAInstruction)raw;
+}
+
 func create_phi_arg(val: u64, block_id: u64) -> *SSAPhiArg {
     push_trace("create_phi_arg", "ssa_core.b", __LINE__);
     defer pop_trace();
@@ -262,11 +324,12 @@ func add_phi_arg(inst: *SSAInstruction, val: u64, block_id: u64) -> u64 {
 func operand_const(val: u64) -> u64 {
     push_trace("operand_const", "ssa_core.b", __LINE__);
     defer pop_trace();
-    var mask: u64 = 1;
-    mask = mask << 63;
+    if (val <= SSA_OPR_INLINE_VALUE_MASK) {
+        return SSA_OPR_CONST_MASK | SSA_OPR_INLINE_CONST_MASK | val;
+    }
     var boxed: *u64 = (*u64)heap_alloc(sizeof(u64));
     boxed[0] = val;
-    return ((u64)boxed) | mask;
+    return ((u64)boxed) | SSA_OPR_CONST_MASK;
 }
 
 func operand_reg(id: u64) -> u64 {
@@ -278,20 +341,21 @@ func operand_reg(id: u64) -> u64 {
 func operand_is_const(opr: u64) -> u64 {
     push_trace("operand_is_const", "ssa_core.b", __LINE__);
     defer pop_trace();
-    var mask: u64 = 1;
-    mask = mask << 63;
-    return (opr & mask) != 0;
+    return (opr & SSA_OPR_CONST_MASK) != 0;
 }
 
 func operand_value(opr: u64) -> u64 {
     push_trace("operand_value", "ssa_core.b", __LINE__);
     defer pop_trace();
-    var raw: u64 = opr & SSA_OPR_VALUE_MASK;
     if (operand_is_const(opr) != 0) {
+        if ((opr & SSA_OPR_INLINE_CONST_MASK) != 0) {
+            return opr & SSA_OPR_INLINE_VALUE_MASK;
+        }
+        var raw: u64 = opr & SSA_OPR_VALUE_MASK;
         if (raw == 0) { return 0; }
         return ((*u64)raw)[0];
     }
-    return raw;
+    return opr & SSA_OPR_VALUE_MASK;
 }
 
 struct SSARetSliceHeapInfo {
@@ -427,6 +491,41 @@ func ret_slice_heap_remap_ex(inst_ptr: u64, map: u64, map_len: u64) -> u64 {
     return false;
 }
 
+func ret_slice_heap_uses_reg(inst_ptr: u64, reg: u64) -> u64 {
+    if (g_ret_slice_heap_map_ex == 0 || reg == 0) { return false; }
+    var n: u64 = g_ret_slice_heap_map_ex.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var info_ex: *SSARetSliceHeapInfoEx = g_ret_slice_heap_map_ex.get(i);
+        if (info_ex.inst_ptr == inst_ptr) {
+            if (info_ex.ptr_is_reg != 0 && info_ex.ptr_val == reg) { return true; }
+            if (info_ex.len_is_reg != 0 && info_ex.len_val == reg) { return true; }
+            return false;
+        }
+    }
+    return false;
+}
+
+func ret_slice_heap_remap_single(inst_ptr: u64, old_reg: u64, new_reg: u64) -> u64 {
+    if (g_ret_slice_heap_map_ex == 0 || old_reg == 0 || new_reg == 0) { return false; }
+    var n: u64 = g_ret_slice_heap_map_ex.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var info_ex: *SSARetSliceHeapInfoEx = g_ret_slice_heap_map_ex.get(i);
+        if (info_ex.inst_ptr == inst_ptr) {
+            var changed: u64 = 0;
+            if (info_ex.ptr_is_reg != 0 && info_ex.ptr_val == old_reg) {
+                info_ex.ptr_val = new_reg;
+                changed = 1;
+            }
+            if (info_ex.len_is_reg != 0 && info_ex.len_val == old_reg) {
+                info_ex.len_val = new_reg;
+                changed = 1;
+            }
+            return changed;
+        }
+    }
+    return false;
+}
+
 func add_pred(block: *SSABlock, pred: *SSABlock) -> u64 {
     push_trace("add_pred", "ssa_core.b", __LINE__);
     defer pop_trace();
@@ -495,8 +594,7 @@ func create_function(ctx: *SSAContext, name: []u8) -> *SSAFunction {
     defer pop_trace();
     var f: *SSAFunction = new SSAFunction{};
     f.id = slice_len(ctx.funcs);
-    f.name_ptr = name.ptr;
-    f.name_len = name.len;
+    f.name = slice(name.ptr, name.len);
     f.blocks = slice(0, 0);
     f.blocks_cap = 0;
     f.next_local_block_id = 0;
@@ -506,5 +604,10 @@ func create_function(ctx: *SSAContext, name: []u8) -> *SSAFunction {
     f.regalloc_failed = 0;
     f.regalloc_done = 0;
     push_function(ctx, f);
+    if (ctx.funcs_by_name == 0) {
+        ctx.funcs_by_name = new HashMap<u64, *SSAFunction>{0, 0, 0};
+        ctx.funcs_by_name.ensure_capacity(64);
+    }
+    ctx.funcs_by_name.put(slice(name.ptr, name.len), f);
     return f;
 }

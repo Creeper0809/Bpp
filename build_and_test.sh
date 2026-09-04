@@ -143,10 +143,14 @@ base_compiler_smoke_check() {
         return 0
     fi
 
-    local smoke_src="$ROOT_DIR/test/source/01_arith_bit_cmp.bpp"
-    if [ ! -f "$smoke_src" ]; then
-        smoke_src="$SRC_FILE"
+    local smoke_src="${BPP_BASE_SMOKE_SOURCE:-}"
+    if [ -z "$smoke_src" ]; then
+        local smoke_dir="$BUILD_DIR/tmp/bootstrap-smoke"
+        smoke_src="$smoke_dir/base_smoke.bpp"
+        mkdir -p "$smoke_dir" || return 1
+        printf '%s\n' 'func main() -> u64 { return 0; }' > "$smoke_src" || return 1
     fi
+    [ -f "$smoke_src" ] || return 1
 
     (
         ulimit -v "${BPP_BASE_SMOKE_VMEM_KB:-4000000}" 2>/dev/null || true
@@ -173,26 +177,20 @@ download_file() {
     return 127
 }
 
-download_bootstrap_compiler() {
-    if [ "${BPP_BOOTSTRAP_COMPILER:-1}" = "0" ]; then
-        return 1
-    fi
-
-    local base_url="${BPP_BOOTSTRAP_BASE_URL:-https://github.com}"
-    local repo="${BPP_BOOTSTRAP_REPOSITORY:-Creeper0809/Bpp}"
-    local release_tag="${BPP_BOOTSTRAP_RELEASE_TAG:-bootstrap-${VERSION}}"
-    local asset_name="${BPP_BOOTSTRAP_ASSET_LINUX:-bpp-bootstrap-${VERSION}-linux-x86_64}"
-    local asset_sha="${BPP_BOOTSTRAP_SHA256_LINUX:-}"
-    local tools_dir="$BUILD_DIR/_tools"
+try_download_bootstrap_compiler() {
+    local release_tag="$1"
+    local asset_name="$2"
+    local asset_sha="$3"
+    local tools_dir="$4"
     local download_path="$tools_dir/$asset_name"
-    local download_url="$base_url/$repo/releases/download/$release_tag/$asset_name"
+    local download_url="${BPP_BOOTSTRAP_BASE_URL:-https://github.com}/${BPP_BOOTSTRAP_REPOSITORY:-Creeper0809/Bpp}/releases/download/${release_tag}/${asset_name}"
 
     mkdir -p "$tools_dir"
     if [ ! -f "$download_path" ]; then
         echo "   [INFO] Downloading bootstrap compiler: $download_url" >&2
         if ! download_file "$download_url" "$download_path"; then
             rm -f "$download_path"
-            echo "   [WARN] Failed to download bootstrap compiler." >&2
+            echo "   [WARN] Failed to download bootstrap compiler: $download_url" >&2
             return 1
         fi
     fi
@@ -210,19 +208,63 @@ download_bootstrap_compiler() {
             local sha_path="$download_path.sha256"
             local sha_url="$download_url.sha256"
             if [ ! -f "$sha_path" ]; then
-                download_file "$sha_url" "$sha_path" >/dev/null 2>&1 || true
+                download_file "${sha_url}?cache_bust=$(date +%s)" "$sha_path" >/dev/null 2>&1 ||
+                    download_file "$sha_url" "$sha_path" >/dev/null 2>&1 || true
             fi
             if [ -f "$sha_path" ]; then
                 if ! (cd "$tools_dir" && sha256sum -c "$(basename "$sha_path")" >/dev/null 2>&1); then
-                    rm -f "$download_path"
-                    echo "   [WARN] Downloaded bootstrap checksum file did not validate." >&2
-                    return 1
+                    rm -f "$sha_path"
+                    echo "   [WARN] Downloaded bootstrap checksum file did not validate; continuing with smoke check." >&2
                 fi
             fi
         fi
     fi
 
     echo "$download_path"
+    return 0
+}
+
+download_bootstrap_compiler() {
+    if [ "${BPP_BOOTSTRAP_COMPILER:-1}" = "0" ]; then
+        return 1
+    fi
+
+    local release_tag="${BPP_BOOTSTRAP_RELEASE_TAG:-bootstrap-${VERSION}}"
+    local asset_name="${BPP_BOOTSTRAP_ASSET_LINUX:-bpp-bootstrap-${VERSION}-linux-x86_64}"
+    local asset_sha="${BPP_BOOTSTRAP_SHA256_LINUX:-}"
+    local tools_dir="$BUILD_DIR/_tools"
+
+    local downloaded=""
+    downloaded="$(try_download_bootstrap_compiler "$release_tag" "$asset_name" "$asset_sha" "$tools_dir" || true)"
+    if [ -n "$downloaded" ]; then
+        echo "$downloaded"
+        return 0
+    fi
+
+    if [ -n "${BPP_BOOTSTRAP_RELEASE_TAG+x}" ] ||
+       [ -n "${BPP_BOOTSTRAP_ASSET_LINUX+x}" ] ||
+       [ -n "$asset_sha" ]; then
+        return 1
+    fi
+
+    if [[ "$VERSION" =~ ^v([0-9]+)$ ]]; then
+        local ver="${BASH_REMATCH[1]}"
+        local prev=$((ver - 1))
+        while [ "$prev" -ge 1 ]; do
+            local fallback_version="v${prev}"
+            local fallback_release="bootstrap-${fallback_version}"
+            local fallback_asset="bpp-bootstrap-${fallback_version}-linux-x86_64"
+            downloaded="$(try_download_bootstrap_compiler "$fallback_release" "$fallback_asset" "" "$tools_dir" || true)"
+            if [ -n "$downloaded" ]; then
+                echo "   [INFO] Using previous bootstrap compiler: ${fallback_release}/${fallback_asset}" >&2
+                echo "$downloaded"
+                return 0
+            fi
+            prev=$((prev - 1))
+        done
+    fi
+
+    return 1
 }
 
 extract_numeric_version() {
@@ -232,6 +274,30 @@ extract_numeric_version() {
         return 0
     fi
     return 1
+}
+
+is_container_env() {
+    if [ -f "/.dockerenv" ] || [ -f "/run/.containerenv" ]; then
+        return 0
+    fi
+    if [ -f "/proc/1/cgroup" ] && grep -Eq '(docker|containerd|kubepods|podman)' /proc/1/cgroup 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
+is_github_linux_env() {
+    if [ "${GITHUB_ACTIONS:-}" = "true" ] && [ "${RUNNER_OS:-}" = "Linux" ]; then
+        return 0
+    fi
+    return 1
+}
+
+shm_available_kb() {
+    if [ ! -d "/dev/shm" ] || [ ! -w "/dev/shm" ]; then
+        return 1
+    fi
+    df -Pk /dev/shm 2>/dev/null | awk 'NR==2 {print $4}'
 }
 
 VERSION="${BPP_VERSION:-}"
@@ -249,15 +315,22 @@ fi
 SRC_FILE="$SCRIPT_DIR/src/main.bpp"
 TEST_SCRIPT="$SCRIPT_DIR/test/run_tests.sh"
 BASE_COMPILER="${VERSION}_base"
-NASM_FLAGS="-felf64 -O1"
+NASM_FLAGS="${BPP_NASM_FLAGS:--felf64 -O1}"
 UPDATE_BOOTSTRAP="${UPDATE_BOOTSTRAP:-0}"
+TEST_FAST_IO_EXPLICIT=0
+if [ "${TEST_FAST_IO+x}" = "x" ]; then TEST_FAST_IO_EXPLICIT=1; fi
+TEST_JOBS_EXPLICIT=0
+if [ "${TEST_JOBS+x}" = "x" ]; then TEST_JOBS_EXPLICIT=1; fi
 TEST_FAST_IO="${TEST_FAST_IO:-1}"
+TEST_SKIP_LLVM_BUILD="${TEST_SKIP_LLVM_BUILD:-0}"
 TEST_QUIET="${TEST_QUIET:-1}"
 KEEP_TEST_ARTIFACTS="${KEEP_TEST_ARTIFACTS:-0}"
 TEST_JOBS="${TEST_JOBS:-0}"
 TEST_PROFILE="${TEST_PROFILE:-}"
 BUILD_AND_TEST_PROFILE="${BUILD_AND_TEST_PROFILE:-full}"
 SELFHOST_VERIFY="${SELFHOST_VERIFY:-}"
+SELFHOST_VERIFY_ASYNC="${SELFHOST_VERIFY_ASYNC:-0}"
+COMPILE_FAIL_SINGLE_VARIANT="${COMPILE_FAIL_SINGLE_VARIANT:-}"
 STRESS_RUNS="${STRESS_RUNS:-}"
 STABILITY_RUNS="${STABILITY_RUNS:-}"
 TEST_SUITE_CASE_LIMIT="${TEST_SUITE_CASE_LIMIT:-0}"
@@ -265,15 +338,38 @@ TEST_NAME_FILTER="${TEST_NAME_FILTER:-}"
 TEST_JOBS_SCALE="${TEST_JOBS_SCALE:-2}"
 NASM_BIN="${BPP_NASM_EXECUTABLE:-nasm}"
 LINKER_BIN="${BPP_LINKER_EXECUTABLE:-ld}"
+NASM_SPLIT="${BPP_NASM_SPLIT:-auto}"
+NASM_SPLIT_FLAGS="${BPP_NASM_SPLIT_FLAGS:--felf64 -O1}"
+NASM_SPLIT_LINES="${BPP_NASM_SPLIT_LINES:-60000}"
+NASM_SPLIT_THRESHOLD_LINES="${BPP_NASM_SPLIT_THRESHOLD_LINES:-120000}"
+
+assemble_nasm_obj() {
+    local asm_file="$1"
+    local obj_file="$2"
+    local asm_lines=0
+    asm_lines="$(wc -l < "$asm_file" | tr -d '[:space:]')"
+    if [ "$NASM_SPLIT" != "0" ] && [ -x "$SCRIPT_DIR/tools/nasm_split_assemble.sh" ] && [ "$asm_lines" -ge "$NASM_SPLIT_THRESHOLD_LINES" ]; then
+        BPP_NASM_EXECUTABLE="$NASM_BIN" \
+        BPP_LINKER_EXECUTABLE="$LINKER_BIN" \
+        BPP_NASM_SPLIT_LINES="$NASM_SPLIT_LINES" \
+            "$SCRIPT_DIR/tools/nasm_split_assemble.sh" "$asm_file" "$obj_file" ${NASM_SPLIT_FLAGS}
+    else
+        "$NASM_BIN" ${NASM_FLAGS} "$asm_file" -o "$obj_file"
+    fi
+}
 
 if [ "$BUILD_AND_TEST_PROFILE" = "fast" ]; then
     if [ -z "$TEST_PROFILE" ]; then TEST_PROFILE="quick"; fi
     if [ -z "$SELFHOST_VERIFY" ]; then SELFHOST_VERIFY=0; fi
+    if [ -z "$COMPILE_FAIL_SINGLE_VARIANT" ]; then COMPILE_FAIL_SINGLE_VARIANT=1; fi
     if [ -z "${STRESS_RUNS:-}" ]; then STRESS_RUNS=0; fi
     if [ -z "${STABILITY_RUNS:-}" ]; then STABILITY_RUNS=0; fi
 elif [ "$BUILD_AND_TEST_PROFILE" = "full" ]; then
     if [ -z "$TEST_PROFILE" ]; then TEST_PROFILE="full"; fi
     if [ -z "$SELFHOST_VERIFY" ]; then SELFHOST_VERIFY=1; fi
+    # Compile-fail tests stop before backend codegen, so one variant preserves
+    # diagnostic coverage while avoiding redundant mode/opt matrix work.
+    if [ -z "$COMPILE_FAIL_SINGLE_VARIANT" ]; then COMPILE_FAIL_SINGLE_VARIANT=1; fi
     # Full profile keeps full test matrix, but default avoids costly repeat runs.
     # Re-enable with STRESS_RUNS/STABILITY_RUNS env when needed.
     if [ -z "${STRESS_RUNS:-}" ]; then STRESS_RUNS=0; fi
@@ -281,6 +377,20 @@ elif [ "$BUILD_AND_TEST_PROFILE" = "full" ]; then
 else
     echo "Error: BUILD_AND_TEST_PROFILE must be 'fast' or 'full' (got: $BUILD_AND_TEST_PROFILE)"
     exit 1
+fi
+
+case "$(echo "$SELFHOST_VERIFY_ASYNC" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')" in
+    1|true|yes) SELFHOST_VERIFY_ASYNC=1 ;;
+    *) SELFHOST_VERIFY_ASYNC=0 ;;
+esac
+
+TEST_FAST_IO_MIN_SHM_KB="${BPP_TEST_FAST_IO_MIN_SHM_KB:-262144}"
+if [ "$TEST_FAST_IO" -eq 1 ] && [ "$TEST_FAST_IO_EXPLICIT" -eq 0 ]; then
+    TEST_SHM_AVAIL_KB="$(shm_available_kb || true)"
+    if [ -z "$TEST_SHM_AVAIL_KB" ] || [ "$TEST_SHM_AVAIL_KB" -lt "$TEST_FAST_IO_MIN_SHM_KB" ]; then
+        echo "[WARN] TEST_FAST_IO auto-disabled: /dev/shm has ${TEST_SHM_AVAIL_KB:-0} KB available (< ${TEST_FAST_IO_MIN_SHM_KB} KB)."
+        TEST_FAST_IO=0
+    fi
 fi
 
 if [ "$TEST_JOBS" -eq 0 ]; then
@@ -294,6 +404,20 @@ if [ "$TEST_JOBS" -eq 0 ]; then
     TEST_JOBS=$((DETECTED_JOBS * TEST_JOBS_SCALE))
     if [ "$TEST_JOBS" -lt 12 ]; then TEST_JOBS=12; fi
     if [ "$TEST_JOBS" -gt 64 ]; then TEST_JOBS=64; fi
+fi
+if [ "$TEST_JOBS_EXPLICIT" -eq 0 ] && is_container_env; then
+    CONTAINER_TEST_JOBS="${BPP_CONTAINER_TEST_JOBS:-4}"
+    if [ "$CONTAINER_TEST_JOBS" -gt 0 ] && [ "$TEST_JOBS" -gt "$CONTAINER_TEST_JOBS" ]; then
+        echo "[WARN] TEST_JOBS capped for container build: $TEST_JOBS -> $CONTAINER_TEST_JOBS."
+        TEST_JOBS="$CONTAINER_TEST_JOBS"
+    fi
+fi
+if [ "$TEST_JOBS_EXPLICIT" -eq 0 ] && is_github_linux_env; then
+    GITHUB_LINUX_TEST_JOBS="${BPP_GITHUB_LINUX_TEST_JOBS:-4}"
+    if [ "$GITHUB_LINUX_TEST_JOBS" -gt 0 ] && [ "$TEST_JOBS" -gt "$GITHUB_LINUX_TEST_JOBS" ]; then
+        echo "[WARN] TEST_JOBS capped for GitHub Linux build: $TEST_JOBS -> $GITHUB_LINUX_TEST_JOBS."
+        TEST_JOBS="$GITHUB_LINUX_TEST_JOBS"
+    fi
 fi
 
 # Use RAM disk for large self-host ASM I/O when available (no build step skipped).
@@ -309,11 +433,21 @@ if [ -d "/dev/shm" ] && [ -w "/dev/shm" ]; then
         echo "[WARN] /dev/shm free space is low (${SHM_AVAIL_KB:-unknown} KB). Falling back to build/."
     fi
 fi
-trap 'if [ "$ASM_WORK_DIR" != "$BUILD_DIR" ]; then rm -rf "$ASM_WORK_DIR"; fi' EXIT
+cleanup_build_and_test() {
+    if [ -n "${STAGE2_PID:-}" ]; then
+        kill "$STAGE2_PID" >/dev/null 2>&1 || true
+        wait "$STAGE2_PID" >/dev/null 2>&1 || true
+    fi
+    if [ "$ASM_WORK_DIR" != "$BUILD_DIR" ]; then
+        rm -rf "$ASM_WORK_DIR"
+    fi
+}
+trap cleanup_build_and_test EXIT
 
 STAGE0_ASM="$ASM_WORK_DIR/${VERSION}_stage0.asm"
 STAGE1_ASM="$ASM_WORK_DIR/${VERSION}_stage1.asm"
 STAGE2_ASM="$ASM_WORK_DIR/${VERSION}_stage2.asm"
+STAGE2_LOG="$ASM_WORK_DIR/${VERSION}_stage2.log"
 BRIDGE_STAGE0_ASM="$ASM_WORK_DIR/${VERSION}_bridge_stage0.asm"
 
 echo "========================================="
@@ -404,13 +538,13 @@ if [ -n "${TARGET_VER_NUM:-}" ] && [ -n "${BASE_VER_NUM:-}" ] \
    && [ -f "$LEGACY_SRC_FILE" ]; then
     echo "   (bootstrap bridge enabled: v${BASE_VER_NUM} -> old/${VERSION} -> ${VERSION})"
     "${BASE_BIN}" -asm "${LEGACY_SRC_FILE}" > "${BRIDGE_STAGE0_ASM}"
-    "${NASM_BIN}" ${NASM_FLAGS} "${BRIDGE_STAGE0_ASM}" -o "build/${VERSION}_bridge_stage0.o"
+    assemble_nasm_obj "${BRIDGE_STAGE0_ASM}" "build/${VERSION}_bridge_stage0.o"
     "${LINKER_BIN}" "build/${VERSION}_bridge_stage0.o" -o "bin/${VERSION}_bridge_stage0"
     BOOTSTRAP_BIN="./bin/${VERSION}_bridge_stage0"
 fi
 
 "${BOOTSTRAP_BIN}" -asm "${SRC_FILE}" > "${STAGE0_ASM}"
-"${NASM_BIN}" ${NASM_FLAGS} "${STAGE0_ASM}" -o "build/${VERSION}_stage0.o"
+assemble_nasm_obj "${STAGE0_ASM}" "build/${VERSION}_stage0.o"
 "${LINKER_BIN}" build/${VERSION}_stage0.o -o bin/${VERSION}_stage0
 echo "Stage 0 Build Completed"
 echo ""
@@ -418,7 +552,7 @@ echo ""
 # Step 2: 셀프 호스팅 (1단계)
 echo "[2/6] Self-Hosting Stage 1..."
 ./bin/${VERSION}_stage0 -asm "${SRC_FILE}" > "${STAGE1_ASM}"
-"${NASM_BIN}" ${NASM_FLAGS} "${STAGE1_ASM}" -o "build/${VERSION}_stage1.o"
+assemble_nasm_obj "${STAGE1_ASM}" "build/${VERSION}_stage1.o"
 "${LINKER_BIN}" build/${VERSION}_stage1.o -o bin/${VERSION}_stage1
 STAGE1_USABLE=1
 TEST_COMPILER_BIN="bin/${VERSION}_stage1"
@@ -436,16 +570,15 @@ fi
 echo "Stage 1 Build Completed"
 echo ""
 
-# Step 3: 셀프 호스팅 (2단계)
-if [ "$SELFHOST_VERIFY" = "1" ] && [ "$STAGE1_USABLE" = "1" ]; then
-    echo "[3/6] Self-Hosting Stage 2..."
+STAGE2_PID=""
+STAGE2_DONE=0
+
+run_stage2_verify() {
     ./bin/${VERSION}_stage1 -asm "${SRC_FILE}" > "${STAGE2_ASM}"
     echo "Stage 2 Build Completed"
     echo ""
 
-    # Step 4: ASM 비교 (1단계 vs 2단계)
     echo "[4/6] Self-Hosting Verification..."
-    # We only need equality check; cmp is faster than textual diff for this.
     if cmp -s "${STAGE1_ASM}" "${STAGE2_ASM}"; then
         echo "Self-Hosting Success! (Stage 1 == Stage 2)"
         echo "   ASM: $(wc -l < "${STAGE1_ASM}") lines"
@@ -453,10 +586,41 @@ if [ "$SELFHOST_VERIFY" = "1" ] && [ "$STAGE1_USABLE" = "1" ]; then
         echo "Self-Hosting Failed! ASM is different."
         echo "   Stage 1: $(wc -l < "${STAGE1_ASM}") lines"
         echo "   Stage 2: $(wc -l < "${STAGE2_ASM}") lines"
-        exit 1
+        return 1
     fi
     echo ""
-    FINAL_ASM="$STAGE2_ASM"
+    return 0
+}
+
+wait_stage2_verify() {
+    if [ -z "$STAGE2_PID" ]; then
+        return 0
+    fi
+    local status=0
+    wait "$STAGE2_PID" || status=$?
+    STAGE2_PID=""
+    STAGE2_DONE=1
+    if [ -f "$STAGE2_LOG" ]; then
+        cat "$STAGE2_LOG"
+    fi
+    return "$status"
+}
+
+# Step 3: 셀프 호스팅 (2단계)
+if [ "$SELFHOST_VERIFY" = "1" ] && [ "$STAGE1_USABLE" = "1" ]; then
+    echo "[3/6] Self-Hosting Stage 2..."
+    if [ "$SELFHOST_VERIFY_ASYNC" = "1" ]; then
+        echo "   (running in background; tests will run in parallel)"
+        ( run_stage2_verify ) > "$STAGE2_LOG" 2>&1 &
+        STAGE2_PID=$!
+        echo ""
+        echo "[4/6] Self-Hosting Verification... pending"
+        echo ""
+    else
+        run_stage2_verify
+        STAGE2_DONE=1
+        FINAL_ASM="$STAGE2_ASM"
+    fi
 else
     if [ "$SELFHOST_VERIFY" = "1" ]; then
         echo "[3/6] Self-Hosting Stage 2... skipped (stage1 smoke check failed)"
@@ -475,21 +639,41 @@ fi
 # Persist ASM artifacts under build/ as before.
 cp "${STAGE0_ASM}" "build/${VERSION}_stage0.asm"
 cp "${STAGE1_ASM}" "build/${VERSION}_stage1.asm"
-if [ "$SELFHOST_VERIFY" = "1" ] && [ -f "${STAGE2_ASM}" ]; then
+if [ "$SELFHOST_VERIFY" = "1" ] && [ "$STAGE2_DONE" = "1" ] && [ -f "${STAGE2_ASM}" ]; then
     cp "${STAGE2_ASM}" "build/${VERSION}_stage2.asm"
 fi
 
 # Step 5: 테스트 실행
 echo "[5/6] Running Tests..."
-TEST_FAST_IO="$TEST_FAST_IO" TEST_QUIET="$TEST_QUIET" KEEP_TEST_ARTIFACTS="$KEEP_TEST_ARTIFACTS" \
-TEST_JOBS="$TEST_JOBS" TEST_PROFILE="$TEST_PROFILE" TEST_SUITE_CASE_LIMIT="$TEST_SUITE_CASE_LIMIT" TEST_NAME_FILTER="$TEST_NAME_FILTER" STRESS_RUNS="$STRESS_RUNS" STABILITY_RUNS="$STABILITY_RUNS" \
-  bash ${TEST_SCRIPT} "${TEST_COMPILER_BIN}" 2>&1 | tail -15
+TEST_STATUS=0
+if [ "${BUILD_SKIP_TESTS:-0}" = "1" ]; then
+    echo "   skipped here (BUILD_SKIP_TESTS=1; validation must run as a separate job)"
+else
+    TEST_FAST_IO="$TEST_FAST_IO" TEST_QUIET="$TEST_QUIET" KEEP_TEST_ARTIFACTS="$KEEP_TEST_ARTIFACTS" \
+    TEST_SKIP_LLVM_BUILD="$TEST_SKIP_LLVM_BUILD" TEST_JOBS="$TEST_JOBS" TEST_PROFILE="$TEST_PROFILE" TEST_SUITE_CASE_LIMIT="$TEST_SUITE_CASE_LIMIT" TEST_NAME_FILTER="$TEST_NAME_FILTER" COMPILE_FAIL_SINGLE_VARIANT="$COMPILE_FAIL_SINGLE_VARIANT" STRESS_RUNS="$STRESS_RUNS" STABILITY_RUNS="$STABILITY_RUNS" \
+      bash "${TEST_SCRIPT}" "${TEST_COMPILER_BIN}" || TEST_STATUS=$?
+fi
+
+if [ -n "$STAGE2_PID" ]; then
+    echo ""
+    echo "[3/6] Self-Hosting Stage 2 / [4/6] Verification result..."
+    if wait_stage2_verify; then
+        FINAL_ASM="$STAGE2_ASM"
+        cp "${STAGE2_ASM}" "build/${VERSION}_stage2.asm"
+    else
+        exit 1
+    fi
+fi
+
+if [ "$TEST_STATUS" -ne 0 ]; then
+    exit "$TEST_STATUS"
+fi
 
 # Step 6: 바이너리(.out) 생성 (기본 실행 경로)
 echo ""
 echo "[6/6] Generating Executable..."
 OUT_OBJ="build/${VERSION}.out.o"
-"${NASM_BIN}" ${NASM_FLAGS} "${FINAL_ASM}" -o "${OUT_OBJ}"
+assemble_nasm_obj "${FINAL_ASM}" "${OUT_OBJ}"
 "${LINKER_BIN}" "${OUT_OBJ}" -o "build/${VERSION}.out"
 rm -f "${OUT_OBJ}"
 

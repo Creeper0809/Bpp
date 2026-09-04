@@ -1,34 +1,149 @@
-// Builtin arbitrary-precision signed integer (Number).
-// Tagged storage: small signed 63-bit immediate or pointer to NumberBig.
+// Builtin dynamic numeric value (Number).
+// NaN-boxed storage: non-NaN f64 values are stored directly, while integers
+// and heap payloads live in quiet-NaN payload space.
 // Lifetime is arena-style monotonic allocation.
 
 import std.io;
+import std.mem;
 import std.vec;
 
-const NUMBER_BASE = 1000000000;
+// Limbs are base 2^31. 31 bits keeps a single limb multiply plus carry
+// inside u64 while still making shifts and bitwise operations limb-native.
+const NUMBER_BASE_BITS = 31;
+const NUMBER_BASE = 2147483648;
+const NUMBER_BASE_MASK = 2147483647;
 const NUMBER_MAX_U64 = 18446744073709551615;
 const NUMBER_MAX_I64_U64 = 9223372036854775807;
 const NUMBER_MIN_I64_MAG = 9223372036854775808;
 
-const NUMBER_TAG_SMALL = 1;
-const NUMBER_TAG_MASK = 1;
-const NUMBER_PTR_MASK = 18446744073709551614;
+const NUMBER_BOX_MASK = 9221120237041090560;
+const NUMBER_BOX_BASE = 9221120237041090560;
+const NUMBER_BOX_TAG_MASK = 1970324836974592;
+const NUMBER_BOX_TAG_SHIFT = 48;
+const NUMBER_PTR_MASK = 281474976710655;
+const NUMBER_NAN_EXP_MASK = 9218868437227405312;
+const NUMBER_NAN_MANT_MASK = 4503599627370495;
+const NUMBER_SMALL_SIGN_BIT = 140737488355328;
+const NUMBER_SMALL_SIGN_EXT_MASK = 18446462598732840960;
 
-const NUMBER_SMALL_MAX_U64 = 4611686018427387903;
-const NUMBER_SMALL_MIN_I64 = -4611686018427387904;
-const NUMBER_SMALL_MAX_I64 = 4611686018427387903;
+const NUMBER_BOX_TAG_SMALL = 1;
+const NUMBER_BOX_TAG_BIG = 2;
+const NUMBER_BOX_TAG_REAL = 3;
+const NUMBER_BOX_TAG_COMPLEX = 4;
+const NUMBER_BOX_TAG_EXT = 5;
+const NUMBER_TAG_SMALL = 9221401712017801216;
+
+const NUMBER_EXT_RATIONAL = 1;
+const NUMBER_EXT_DECIMAL = 2;
+const NUMBER_EXT_BIGFLOAT = 3;
+
+const NUMBER_SMALL_MAX_U64 = 140737488355327;
+const NUMBER_SMALL_MIN_I64 = -140737488355328;
+const NUMBER_SMALL_MAX_I64 = 140737488355327;
 
 const NUMBER_BITWISE_AND = 0;
 const NUMBER_BITWISE_OR = 1;
 const NUMBER_BITWISE_XOR = 2;
+const NUMBER_KARATSUBA_THRESHOLD = 24;
+const NUMBER_KARATSUBA_UNBALANCED_FACTOR = 2;
+const NUMBER_TOOM3_THRESHOLD = 72;
+const NUMBER_TOOM3_UNBALANCED_FACTOR = 3;
+const NUMBER_NTT_THRESHOLD = 80;
+const NUMBER_DIV_DC_THRESHOLD = 64;
+const NUMBER_NTT_CHUNK_BITS = 15;
+const NUMBER_NTT_CHUNK_BASE = 32768;
+const NUMBER_NTT_CHUNK_MASK = 32767;
+const NUMBER_NTT_MOD1 = 998244353;
+const NUMBER_NTT_MOD2 = 1004535809;
+const NUMBER_NTT_ROOT = 3;
+const NUMBER_NTT_MAX_LEN = 2097152;
+
+const NUMBER_PROOF_DOMAIN_UNKNOWN = 0;
+const NUMBER_PROOF_DOMAIN_HEAP = 1;
+const NUMBER_PROOF_DOMAIN_ARENA = 2;
+const NUMBER_PROOF_DOMAIN_STACK = 3;
+const NUMBER_PROOF_DOMAIN_STATIC = 4;
+const NUMBER_PROOF_DOMAIN_SLICE = 5;
+const NUMBER_PROOF_DOMAIN_FOREIGN = 6;
+
+const NUMBER_PROOF_CAP_UNKNOWN = 0;
+const NUMBER_PROOF_CAP_OWNED = 1;
+const NUMBER_PROOF_CAP_BORROWED = 2;
+const NUMBER_PROOF_CAP_SHARED = 3;
+const NUMBER_PROOF_CAP_WEAK = 4;
+
+const NUMBER_PROOF_BOUNDS_UNKNOWN = 0;
+const NUMBER_PROOF_BOUNDS_STABLE_LEN = 1;
+const NUMBER_PROOF_BOUNDS_CHECKED = 2;
+
+const NUMBER_PROOF_SHAPE_UNKNOWN = 0;
+const NUMBER_PROOF_SHAPE_EMPTY = 1;
+const NUMBER_PROOF_SHAPE_I64 = 2;
+const NUMBER_PROOF_SHAPE_BIGINT = 3;
+const NUMBER_PROOF_SHAPE_INTEGER = 4;
+const NUMBER_PROOF_SHAPE_F64 = 5;
+const NUMBER_PROOF_SHAPE_COMPLEX = 6;
+const NUMBER_PROOF_SHAPE_EXACT = 7;
+const NUMBER_PROOF_SHAPE_MIXED = 15;
 
 struct Number {
     public bits: u64;
 }
 
+packed struct NumberProofTag {
+    public domain: u3;
+    public capability: u3;
+    public nonnull: u1;
+    public shape: u4;
+    public bounds: u2;
+    public epoch: u3;
+}
+
+struct NumberSlice {
+    public ptr: *tagged(NumberProofTag) Number;
+    public len: u64;
+}
+
 struct NumberBig {
     public sign: i64;
     public digits: *Vec<u32>;
+}
+
+struct NumberReal {
+    public value: f64;
+}
+
+union NumberF64Bits {
+    public f: f64;
+    public u: u64;
+}
+
+struct NumberComplex {
+    public real: Number;
+    public imag: Number;
+}
+
+struct NumberExtHeader {
+    public kind: u64;
+}
+
+struct NumberRational {
+    public kind: u64;
+    public num: Number;
+    public den: Number;
+}
+
+struct NumberDecimal {
+    public kind: u64;
+    public coeff: Number;
+    public scale: u64;
+}
+
+struct NumberBigFloat {
+    public kind: u64;
+    public mant: Number;
+    public exp: i64;
+    public precision: u64;
 }
 
 struct NumberBigDivMod {
@@ -41,1137 +156,2841 @@ struct NumberDivMod {
     public r: Number;
 }
 
+func number_proof_shape_is_integer(shape: u64) -> u64 {
+    if (shape == NUMBER_PROOF_SHAPE_I64) { return 1; }
+    if (shape == NUMBER_PROOF_SHAPE_BIGINT) { return 1; }
+    if (shape == NUMBER_PROOF_SHAPE_INTEGER) { return 1; }
+    return 0;
+}
+
+func number_proof_shape_combine(lhs: u64, rhs: u64) -> u64 {
+    if (lhs == NUMBER_PROOF_SHAPE_UNKNOWN || lhs == NUMBER_PROOF_SHAPE_EMPTY) { return rhs; }
+    if (rhs == NUMBER_PROOF_SHAPE_UNKNOWN || rhs == NUMBER_PROOF_SHAPE_EMPTY) { return lhs; }
+    if (lhs == rhs) { return lhs; }
+    if (number_proof_shape_is_integer(lhs) != 0 && number_proof_shape_is_integer(rhs) != 0) {
+        return NUMBER_PROOF_SHAPE_INTEGER;
+    }
+    return NUMBER_PROOF_SHAPE_MIXED;
+}
+
+func number_proof_shape_to_bpp_shape(shape: u64) -> u64 {
+    if (shape == NUMBER_PROOF_SHAPE_EMPTY) { return BPP_TAG_SHAPE_EMPTY; }
+    if (shape == NUMBER_PROOF_SHAPE_I64) { return BPP_TAG_SHAPE_I64; }
+    if (shape == NUMBER_PROOF_SHAPE_F64) { return BPP_TAG_SHAPE_F64; }
+    if (shape == NUMBER_PROOF_SHAPE_MIXED) { return BPP_TAG_SHAPE_MIXED; }
+    if (shape == NUMBER_PROOF_SHAPE_UNKNOWN) { return BPP_TAG_SHAPE_UNKNOWN; }
+    return BPP_TAG_SHAPE_NUMBER;
+}
+
+func number_proof_domain_to_bpp_storage(domain: u64) -> u64 {
+    if (domain == NUMBER_PROOF_DOMAIN_HEAP) { return BPP_TAG_STORAGE_HEAP; }
+    if (domain == NUMBER_PROOF_DOMAIN_ARENA) { return BPP_TAG_STORAGE_ARENA; }
+    if (domain == NUMBER_PROOF_DOMAIN_STACK) { return BPP_TAG_STORAGE_STACK; }
+    if (domain == NUMBER_PROOF_DOMAIN_STATIC) { return BPP_TAG_STORAGE_STATIC; }
+    if (domain == NUMBER_PROOF_DOMAIN_FOREIGN) { return BPP_TAG_STORAGE_FOREIGN; }
+    return BPP_TAG_STORAGE_HEAP;
+}
+
+func number_proof_cap_to_bpp_ownership(cap: u64) -> u64 {
+    if (cap == NUMBER_PROOF_CAP_OWNED) { return BPP_TAG_OWN_OWNED; }
+    if (cap == NUMBER_PROOF_CAP_BORROWED) { return BPP_TAG_OWN_BORROWED; }
+    if (cap == NUMBER_PROOF_CAP_SHARED) { return BPP_TAG_OWN_SHARED; }
+    if (cap == NUMBER_PROOF_CAP_WEAK) { return BPP_TAG_OWN_WEAK; }
+    return BPP_TAG_OWN_UNKNOWN;
+}
+
+func number_proof_lifecycle_for_domain(domain: u64) -> u64 {
+    if (domain == NUMBER_PROOF_DOMAIN_ARENA) { return BPP_TAG_LIFE_ARENA; }
+    if (domain == NUMBER_PROOF_DOMAIN_STACK) { return BPP_TAG_LIFE_BORROWED; }
+    if (domain == NUMBER_PROOF_DOMAIN_STATIC) { return BPP_TAG_LIFE_IMMORTAL; }
+    if (domain == NUMBER_PROOF_DOMAIN_HEAP) { return BPP_TAG_LIFE_YOUNG; }
+    return BPP_TAG_LIFE_BORROWED;
+}
+
+func number_slice_raw_ptr(p: *tagged(NumberProofTag) Number) -> *Number {
+    return (*Number)(((u64)p) & NUMBER_PTR_MASK);
+}
+
+func number_make_real(v: f64) -> Number {
+    var raw: u64 = number_f64_to_bits(v);
+    if (number_bits_is_nan(raw) == 0) { return Number { raw }; }
+    var real: *NumberReal = new NumberReal{v};
+    return number_box_ptr(NUMBER_BOX_TAG_REAL, (u64)real);
+}
+
+func number_make_complex(real: Number, imag: Number) -> Number {
+    if (imag.signum() == 0) {
+        return Number { real.bits };
+    }
+    var c: *NumberComplex = new NumberComplex{real, imag};
+    return number_box_ptr(NUMBER_BOX_TAG_COMPLEX, (u64)c);
+}
+
+func number_make_ext(ptr: u64) -> Number {
+    if (ptr == 0) { return Number { NUMBER_TAG_SMALL }; }
+    return number_box_ptr(NUMBER_BOX_TAG_EXT, ptr);
+}
+
+func number_f64_to_bits(v: f64) -> u64 {
+    var bits: NumberF64Bits;
+    bits.f = v;
+    return bits.u;
+}
+
+func number_bits_to_f64(v: u64) -> f64 {
+    var bits: NumberF64Bits;
+    bits.u = v;
+    return bits.f;
+}
+
+func number_bits_is_nan(v: u64) -> u64 {
+    if ((v & NUMBER_NAN_EXP_MASK) != NUMBER_NAN_EXP_MASK) { return 0; }
+    return (v & NUMBER_NAN_MANT_MASK) != 0;
+}
+
+func number_bits_is_boxed(v: u64) -> u64 {
+    return (v & NUMBER_BOX_MASK) == NUMBER_BOX_BASE;
+}
+
+func number_box_tag(v: u64) -> u64 {
+    return (v & NUMBER_BOX_TAG_MASK) >> NUMBER_BOX_TAG_SHIFT;
+}
+
+func number_box_ptr(tag: u64, ptr: u64) -> Number {
+    return Number { NUMBER_BOX_BASE | (tag << NUMBER_BOX_TAG_SHIFT) | (ptr & NUMBER_PTR_MASK) };
+}
+
+func number_box_small_i64(v: i64) -> Number {
+    return Number { NUMBER_BOX_BASE | (NUMBER_BOX_TAG_SMALL << NUMBER_BOX_TAG_SHIFT) | (((u64)v) & NUMBER_PTR_MASK) };
+}
+
+func number_box_small_u64(v: u64) -> Number {
+    return Number { NUMBER_BOX_BASE | (NUMBER_BOX_TAG_SMALL << NUMBER_BOX_TAG_SHIFT) | (v & NUMBER_PTR_MASK) };
+}
+
+func number_pow10(scale: u64) -> Number {
+    var out: Number = Number.from_u64(1);
+    for (var i: u64 = 0; i < scale; i = i + 1) {
+        out = out.mul_small(10);
+    }
+    return out;
+}
+
+func number_gcd_values(a0: Number, b0: Number) -> Number {
+    var a: Number = a0.abs_clone();
+    var b: Number = b0.abs_clone();
+    while (b.signum() != 0) {
+        var r: Number = a.mod_values(&b);
+        a = b;
+        b = r.abs_clone();
+    }
+    return a;
+}
+
+func number_make_rational(num0: Number, den0: Number) -> Number {
+    if (num0.is_real() != 0 || den0.is_real() != 0 || num0.is_complex() != 0 || den0.is_complex() != 0) {
+        var rv: f64 = den0.to_f64_lossy();
+        if (rv == 0.0) {
+            panic("Number rational denominator is zero");
+            return Number { NUMBER_TAG_SMALL };
+        }
+        var nv: f64 = num0.to_f64_lossy();
+        var qv: f64 = nv / rv;
+        return number_make_real(qv);
+    }
+
+    var nn: Number = num0.numerator();
+    var nd: Number = num0.denominator();
+    var dn: Number = den0.numerator();
+    var dd: Number = den0.denominator();
+
+    if (dn.signum() == 0) {
+        panic("Number rational denominator is zero");
+        return Number { NUMBER_TAG_SMALL };
+    }
+
+    var left_num: Number = nn.mul_values(&dd);
+    var left_den: Number = nd.mul_values(&dn);
+    var num: Number = left_num;
+    var den: Number = left_den;
+
+    if (den.signum() < 0) {
+        num = num.negated();
+        den = den.negated();
+    }
+    if (num.signum() == 0) {
+        return Number { NUMBER_TAG_SMALL };
+    }
+
+    var g: Number = number_gcd_values(num, den);
+    var one: Number = Number.from_u64(1);
+    if (g.cmp_ptr(&one) != 0) {
+        num = num.div_values(&g);
+        den = den.div_values(&g);
+    }
+    if (den.cmp_ptr(&one) == 0) {
+        return num;
+    }
+
+    var r: *NumberRational = new NumberRational{NUMBER_EXT_RATIONAL, num, den};
+    return number_make_ext((u64)r);
+}
+
+func number_make_decimal(coeff0: Number, scale0: u64) -> Number {
+    if (coeff0.signum() == 0) { return Number { NUMBER_TAG_SMALL }; }
+    var coeff: Number = coeff0;
+    var scale: u64 = scale0;
+    var ten: Number = Number.from_u64(10);
+    while (scale > 0) {
+        var dm: NumberDivMod = coeff.divmod_values_nonzero(&ten);
+        if (dm.r.signum() != 0) { break; }
+        coeff = dm.q;
+        scale = scale - 1;
+    }
+    if (scale == 0) { return coeff; }
+    var d: *NumberDecimal = new NumberDecimal{NUMBER_EXT_DECIMAL, coeff, scale};
+    return number_make_ext((u64)d);
+}
+
+func number_make_bigfloat(mant0: Number, exp0: i64, precision0: u64) -> Number {
+    if (mant0.signum() == 0) { return Number { NUMBER_TAG_SMALL }; }
+    var mant: Number = mant0;
+    var exp: i64 = exp0;
+    var two: Number = Number.from_u64(2);
+    while (mant.mod_small_abs(2) == 0) {
+        mant = mant.div_values(&two);
+        exp = exp + 1;
+    }
+    if (exp >= 0) {
+        var shifted: Number = mant.shl_values((u64)exp);
+        return shifted;
+    }
+    var precision: u64 = precision0;
+    if (precision == 0) { precision = 53; }
+    var bf: *NumberBigFloat = new NumberBigFloat{NUMBER_EXT_BIGFLOAT, mant, exp, precision};
+    return number_make_ext((u64)bf);
+}
+
 impl NumberBig {
     public constructor() {
         self.sign = 0;
         self.digits = 0;
     }
-}
 
-func number_panic_null(api: u64) -> u64 {
-    panic(api);
-    return 0;
-}
-
-func number_panic_number(msg: u64) -> Number {
-    panic(msg);
-    return number_make_zero();
-}
-
-func number_panic_big(msg: u64) -> *NumberBig {
-    panic(msg);
-    return number_big_zero();
-}
-
-func number_panic_u64(msg: u64) -> u64 {
-    panic(msg);
-    return 0;
-}
-
-func number_small_encode(v: i64) -> u64 {
-    return (((u64)v) << 1) | NUMBER_TAG_SMALL;
-}
-
-func number_small_decode(bits: u64) -> i64 {
-    return ((i64)bits) >> 1;
-}
-
-func number_make_small(v: i64) -> Number {
-    return Number { number_small_encode(v) };
-}
-
-func number_make_zero() -> Number {
-    return number_make_small(0);
-}
-
-// Compatibility symbols used by current parser/lowering paths.
-// Keep until all bootstrap stages emit `Number.from_*` calls directly.
-func number_from_i64(v: i64) -> Number {
-    if (number_fits_small_i64(v) != 0) {
-        return number_make_small(v);
+    public static func alloc(sign: i64, cap: u64) -> *NumberBig {
+        var c: u64 = cap;
+        if (c < 1) { c = 1; }
+        var big: *NumberBig = new NumberBig{};
+        big.sign = sign;
+        var digits_buf: u64 = heap_alloc(c * sizeof(u32));
+        big.digits = new Vec<u32>{digits_buf, 0, c};
+        return big;
     }
-    return number_make_big_handle(number_big_from_i64_raw(v));
-}
 
-func number_from_u64(v: u64) -> Number {
-    if (v <= NUMBER_SMALL_MAX_U64) {
-        return number_make_small((i64)v);
+    public static func zero() -> *NumberBig {
+        return NumberBig.alloc(0, 1);
     }
-    return number_make_big_handle(number_big_from_u64_raw(v));
-}
 
-func number_is_small(v: *Number) -> u64 {
-    if (v == 0) { return number_panic_null("number_is_small: null Number*"); }
-    return (v.bits & NUMBER_TAG_MASK) != 0;
-}
-
-func number_small_value(v: *Number) -> i64 {
-    if (v == 0) {
-        number_panic_null("number_small_value: null Number*");
-        return 0;
-    }
-    return number_small_decode(v.bits);
-}
-
-func number_big_ptr(v: *Number) -> *NumberBig {
-    if (v == 0) { return 0; }
-    if (number_is_small(v) != 0) { return 0; }
-    return (*NumberBig)(v.bits & NUMBER_PTR_MASK);
-}
-
-func number_make_big_handle(big: *NumberBig) -> Number {
-    if (big == 0) { return number_make_zero(); }
-    return Number { ((u64)big) & NUMBER_PTR_MASK };
-}
-
-func number_i64_abs_mag(v: i64, out: *u64) -> u64 {
-    if (out == 0) { return 0; }
-    if (v >= 0) {
-        out[0] = (u64)v;
-        return 1;
-    }
-    if (v == i64.MIN) {
-        out[0] = NUMBER_MIN_I64_MAG;
-        return 1;
-    }
-    out[0] = (u64)(0 - v);
-    return 1;
-}
-
-func number_fits_small_i64(v: i64) -> u64 {
-    if (v < NUMBER_SMALL_MIN_I64) { return 0; }
-    if (v > NUMBER_SMALL_MAX_I64) { return 0; }
-    return 1;
-}
-
-func number_big_new(sign: i64, cap: u64) -> *NumberBig {
-    var c: u64 = cap;
-    if (c < 1) { c = 1; }
-    var big: *NumberBig = new NumberBig{};
-    big.sign = sign;
-    var digits_buf: u64 = heap_alloc(c * sizeof(u32));
-    big.digits = new Vec<u32>{digits_buf, 0, c};
-    return big;
-}
-
-func number_big_zero() -> *NumberBig {
-    return number_big_new(0, 1);
-}
-
-func number_big_trim_inplace(big: *NumberBig) -> u64 {
-    if (big == 0 || big.digits == 0) { return 0; }
-    var n: u64 = big.digits.len();
-    while (n > 0) {
-        var last: u32 = big.digits.get(n - 1);
-        if ((u64)last != 0) { break; }
-        big.digits.pop();
-        n = n - 1;
-    }
-    if (n == 0) {
-        big.sign = 0;
-        return 0;
-    }
-    if (big.sign > 0) { big.sign = 1; }
-    else if (big.sign < 0) { big.sign = -1; }
-    return 0;
-}
-
-func number_big_copy(src: *NumberBig) -> *NumberBig {
-    if (src == 0) {
-        return number_big_zero();
-    }
-    var n: u64 = 0;
-    if (src.digits != 0) { n = src.digits.len(); }
-    var out: *NumberBig = number_big_new(src.sign, n + 1);
-    for (var i: u64 = 0; i < n; i = i + 1) {
-        out.digits.push(src.digits.get(i));
-    }
-    number_big_trim_inplace(out);
-    return out;
-}
-
-func number_big_abs_copy(src: *NumberBig) -> *NumberBig {
-    var out: *NumberBig = number_big_copy(src);
-    if (out.sign < 0) { out.sign = 1; }
-    return out;
-}
-
-func number_big_from_u64_raw(v: u64) -> *NumberBig {
-    if (v == 0) {
-        return number_big_zero();
-    }
-    var out: *NumberBig = number_big_new(1, 4);
-    var mag: u64 = v;
-    while (mag != 0) {
-        out.digits.push((u32)(mag % NUMBER_BASE));
-        mag = mag / NUMBER_BASE;
-    }
-    number_big_trim_inplace(out);
-    return out;
-}
-
-func number_big_from_i64_raw(v: i64) -> *NumberBig {
-    if (v == 0) {
-        return number_big_zero();
-    }
-    var mag: u64 = 0;
-    number_i64_abs_mag(v, &mag);
-    var out: *NumberBig = number_big_from_u64_raw(mag);
-    if (v < 0 && out.sign != 0) { out.sign = -1; }
-    return out;
-}
-
-func number_big_abs_to_u64_checked(big: *NumberBig, out: *u64) -> u64 {
-    if (out == 0) { return 0; }
-    out[0] = 0;
-    if (big == 0 || big.sign == 0 || big.digits == 0) { return 1; }
-    var n: u64 = big.digits.len();
-    var acc: u64 = 0;
-    var i: u64 = n;
-    while (i > 0) {
-        i = i - 1;
-        var limb: u64 = (u64)big.digits.get(i);
-        if (acc > (NUMBER_MAX_U64 - limb) / NUMBER_BASE) { return 0; }
-        acc = acc * NUMBER_BASE + limb;
-    }
-    out[0] = acc;
-    return 1;
-}
-
-func number_big_try_to_i64(big: *NumberBig, out: *i64) -> u64 {
-    if (out == 0) { return 0; }
-    out[0] = 0;
-    if (big == 0 || big.sign == 0) { return 1; }
-    var mag: u64 = 0;
-    if (number_big_abs_to_u64_checked(big, &mag) == 0) { return 0; }
-    if (big.sign > 0) {
-        if (mag > NUMBER_MAX_I64_U64) { return 0; }
-        out[0] = (i64)mag;
-        return 1;
-    }
-    if (mag > NUMBER_MIN_I64_MAG) { return 0; }
-    if (mag == NUMBER_MIN_I64_MAG) {
-        out[0] = i64.MIN;
-        return 1;
-    }
-    out[0] = 0 - (i64)mag;
-    return 1;
-}
-
-func number_big_abs_cmp(a: *NumberBig, b: *NumberBig) -> i64 {
-    var an: u64 = 0;
-    var bn: u64 = 0;
-    if (a != 0 && a.digits != 0) { an = a.digits.len(); }
-    if (b != 0 && b.digits != 0) { bn = b.digits.len(); }
-    if (an > bn) { return 1; }
-    if (an < bn) { return -1; }
-    var i: u64 = an;
-    while (i > 0) {
-        i = i - 1;
-        var av: u64 = (u64)a.digits.get(i);
-        var bv: u64 = (u64)b.digits.get(i);
-        if (av > bv) { return 1; }
-        if (av < bv) { return -1; }
-    }
-    return 0;
-}
-
-func number_big_add_abs(a: *NumberBig, b: *NumberBig) -> *NumberBig {
-    var an: u64 = 0;
-    var bn: u64 = 0;
-    if (a != 0 && a.digits != 0) { an = a.digits.len(); }
-    if (b != 0 && b.digits != 0) { bn = b.digits.len(); }
-    var n: u64 = an;
-    if (bn > n) { n = bn; }
-
-    var out: *NumberBig = number_big_new(1, n + 2);
-    var carry: u64 = 0;
-    for (var i: u64 = 0; i < n; i = i + 1) {
-        var av: u64 = 0;
-        var bv: u64 = 0;
-        if (i < an) { av = (u64)a.digits.get(i); }
-        if (i < bn) { bv = (u64)b.digits.get(i); }
-        var cur: u64 = av + bv + carry;
-        out.digits.push((u32)(cur % NUMBER_BASE));
-        carry = cur / NUMBER_BASE;
-    }
-    if (carry != 0) {
-        out.digits.push((u32)carry);
-    }
-    number_big_trim_inplace(out);
-    return out;
-}
-
-func number_big_sub_abs(a: *NumberBig, b: *NumberBig) -> *NumberBig {
-    // Preconditions: |a| >= |b|
-    var an: u64 = 0;
-    var bn: u64 = 0;
-    if (a != 0 && a.digits != 0) { an = a.digits.len(); }
-    if (b != 0 && b.digits != 0) { bn = b.digits.len(); }
-
-    var out: *NumberBig = number_big_new(1, an + 1);
-    var borrow: i64 = 0;
-    for (var i: u64 = 0; i < an; i = i + 1) {
-        var av: i64 = (i64)(u64)a.digits.get(i);
-        var bv: i64 = 0;
-        if (i < bn) { bv = (i64)(u64)b.digits.get(i); }
-        var cur: i64 = av - bv - borrow;
-        if (cur < 0) {
-            cur = cur + (i64)NUMBER_BASE;
-            borrow = 1;
-        } else {
-            borrow = 0;
+    public static func alloc_zeroed(sign: i64, len: u64) -> *NumberBig {
+        var out: *NumberBig = NumberBig.alloc(sign, len + 1);
+        for (var i: u64 = 0; i < len; i = i + 1) {
+            out.digits.push(0);
         }
-        out.digits.push((u32)(u64)cur);
-    }
-    number_big_trim_inplace(out);
-    return out;
-}
-
-func number_big_mul_abs(a: *NumberBig, b: *NumberBig) -> *NumberBig {
-    if (a == 0 || b == 0 || a.sign == 0 || b.sign == 0) {
-        return number_big_zero();
-    }
-    var an: u64 = a.digits.len();
-    var bn: u64 = b.digits.len();
-    var out: *NumberBig = number_big_new(1, an + bn + 2);
-
-    for (var i0: u64 = 0; i0 < an + bn + 1; i0 = i0 + 1) {
-        out.digits.push(0);
+        return out;
     }
 
-    for (var i: u64 = 0; i < an; i = i + 1) {
+    public static func limb_low(v: u64) -> u32 {
+        return (u32)(v & NUMBER_BASE_MASK);
+    }
+
+    public static func limb_carry(v: u64) -> u64 {
+        return v >> NUMBER_BASE_BITS;
+    }
+
+    public static func digit_or_zero(big: *NumberBig, len: u64, i: u64) -> u64 {
+        if (big == 0 || big.digits == 0 || i >= len) { return 0; }
+        return (u64)big.digits.get(i);
+    }
+
+    public static func limb_and_value(a: u64, b: u64) -> u64 {
+        return a & b;
+    }
+
+    public static func limb_or_value(a: u64, b: u64) -> u64 {
+        var both: u64 = a & b;
+        return a + b - both;
+    }
+
+    public static func limb_xor_value(a: u64, b: u64) -> u64 {
+        var both: u64 = a & b;
+        return a + b - both - both;
+    }
+
+    public static func mod_pow(base: u64, exp: u64, mod: u64) -> u64 {
+        var result: u64 = 1;
+        var b: u64 = base % mod;
+        var e: u64 = exp;
+        while (e != 0) {
+            if ((e & 1) != 0) {
+                result = (result * b) % mod;
+            }
+            b = (b * b) % mod;
+            e = e >> 1;
+        }
+        return result;
+    }
+
+    public static func mod_inv(v: u64, mod: u64) -> u64 {
+        return NumberBig.mod_pow(v, mod - 2, mod);
+    }
+
+    public static func next_pow2(v: u64) -> u64 {
+        var n: u64 = 1;
+        while (n < v) {
+            n = n << 1;
+        }
+        return n;
+    }
+
+    public static func vec_u64_zeroed(len: u64) -> *Vec<u64> {
+        var buf: u64 = heap_alloc(len * sizeof(u64));
+        var out: *Vec<u64> = new Vec<u64>{buf, 0, len};
+        for (var i: u64 = 0; i < len; i = i + 1) {
+            out.push(0);
+        }
+        return out;
+    }
+
+    public static func from_u64_raw(v: u64) -> *NumberBig {
+        if (v == 0) {
+            return NumberBig.zero();
+        }
+        var out: *NumberBig = NumberBig.alloc(1, 4);
+        var mag: u64 = v;
+        while (mag != 0) {
+            out.digits.push(NumberBig.limb_low(mag));
+            mag = mag >> NUMBER_BASE_BITS;
+        }
+        out.trim_inplace();
+        return out;
+    }
+
+    public static func pow2_abs(bits: u64) -> *NumberBig {
+        var limb_shift: u64 = bits / NUMBER_BASE_BITS;
+        var bit_shift: u64 = bits % NUMBER_BASE_BITS;
+        var out: *NumberBig = NumberBig.alloc_zeroed(1, limb_shift + 1);
+        var digit: u64 = 1;
+        digit = digit << bit_shift;
+        out.digits.set(limb_shift, (u32)digit);
+        out.trim_inplace();
+        return out;
+    }
+
+    public static func from_i64_raw(v: i64) -> *NumberBig {
+        if (v == 0) {
+            return NumberBig.zero();
+        }
+        var mag: u64 = 0;
+        Number.i64_abs_mag(v, &mag);
+        var out: *NumberBig = NumberBig.from_u64_raw(mag);
+        if (v < 0 && out.sign != 0) { out.sign = -1; }
+        return out;
+    }
+
+    public func trim_inplace(self: *NumberBig) -> u64 {
+        if (self == 0 || self.digits == 0) { return 0; }
+        var n: u64 = self.digits.len();
+        while (n > 0) {
+            var last: u32 = self.digits.get(n - 1);
+            if ((u64)last != 0) { break; }
+            self.digits.pop();
+            n = n - 1;
+        }
+        if (n == 0) {
+            self.sign = 0;
+            return 0;
+        }
+        if (self.sign > 0) { self.sign = 1; }
+        else if (self.sign < 0) { self.sign = -1; }
+        return 0;
+    }
+
+    public func copy(self: *NumberBig) -> *NumberBig {
+        if (self == 0) {
+            return NumberBig.zero();
+        }
+        var n: u64 = 0;
+        if (self.digits != 0) { n = self.digits.len(); }
+        var out: *NumberBig = NumberBig.alloc(self.sign, n + 1);
+        for (var i: u64 = 0; i < n; i = i + 1) {
+            out.digits.push(self.digits.get(i));
+        }
+        out.trim_inplace();
+        return out;
+    }
+
+    public func abs_copy(self: *NumberBig) -> *NumberBig {
+        var out: *NumberBig = self.copy();
+        if (out.sign < 0) { out.sign = 1; }
+        return out;
+    }
+
+    public func abs_to_u64_checked(self: *NumberBig, out: *u64) -> u64 {
+        if (out == 0) { return 0; }
+        out[0] = 0;
+        if (self == 0 || self.sign == 0 || self.digits == 0) { return 1; }
+        var n: u64 = self.digits.len();
+        var acc: u64 = 0;
+        var i: u64 = n;
+        while (i > 0) {
+            i = i - 1;
+            var limb: u64 = (u64)self.digits.get(i);
+            if (acc > (NUMBER_MAX_U64 - limb) / NUMBER_BASE) { return 0; }
+            acc = acc * NUMBER_BASE + limb;
+        }
+        out[0] = acc;
+        return 1;
+    }
+
+    public func try_to_i64(self: *NumberBig, out: *i64) -> u64 {
+        if (out == 0) { return 0; }
+        out[0] = 0;
+        if (self == 0 || self.sign == 0) { return 1; }
+        var mag: u64 = 0;
+        if (self.abs_to_u64_checked(&mag) == 0) { return 0; }
+        if (self.sign > 0) {
+            if (mag > NUMBER_MAX_I64_U64) { return 0; }
+            out[0] = (i64)mag;
+            return 1;
+        }
+        if (mag > NUMBER_MIN_I64_MAG) { return 0; }
+        if (mag == NUMBER_MIN_I64_MAG) {
+            out[0] = i64.MIN;
+            return 1;
+        }
+        out[0] = 0 - (i64)mag;
+        return 1;
+    }
+
+    public func abs_cmp(self: *NumberBig, rhs: *NumberBig) -> i64 {
+        var an: u64 = 0;
+        var bn: u64 = 0;
+        if (self != 0 && self.digits != 0) { an = self.digits.len(); }
+        if (rhs != 0 && rhs.digits != 0) { bn = rhs.digits.len(); }
+        if (an > bn) { return 1; }
+        if (an < bn) { return -1; }
+        var i: u64 = an;
+        while (i > 0) {
+            i = i - 1;
+            var av: u64 = (u64)self.digits.get(i);
+            var bv: u64 = (u64)rhs.digits.get(i);
+            if (av > bv) { return 1; }
+            if (av < bv) { return -1; }
+        }
+        return 0;
+    }
+
+    public func add_abs(self: *NumberBig, rhs: *NumberBig) -> *NumberBig {
+        var an: u64 = 0;
+        var bn: u64 = 0;
+        if (self != 0 && self.digits != 0) { an = self.digits.len(); }
+        if (rhs != 0 && rhs.digits != 0) { bn = rhs.digits.len(); }
+        var n: u64 = an;
+        if (bn > n) { n = bn; }
+
+        var out: *NumberBig = NumberBig.alloc(1, n + 2);
         var carry: u64 = 0;
-        var av: u64 = (u64)a.digits.get(i);
-        for (var j: u64 = 0; j < bn; j = j + 1) {
-            var idx: u64 = i + j;
-            var cur: u64 = (u64)out.digits.get(idx);
-            var bv: u64 = (u64)b.digits.get(j);
-            var prod: u64 = cur + av * bv + carry;
-            out.digits.set(idx, (u32)(prod % NUMBER_BASE));
-            carry = prod / NUMBER_BASE;
+        for (var i: u64 = 0; i < n; i = i + 1) {
+            var av: u64 = 0;
+            var bv: u64 = 0;
+            if (i < an) { av = (u64)self.digits.get(i); }
+            if (i < bn) { bv = (u64)rhs.digits.get(i); }
+            var cur: u64 = av + bv + carry;
+            out.digits.push(NumberBig.limb_low(cur));
+            carry = NumberBig.limb_carry(cur);
         }
-        var k: u64 = i + bn;
+        if (carry != 0) {
+            out.digits.push((u32)carry);
+        }
+        out.trim_inplace();
+        return out;
+    }
+
+    public func sub_abs(self: *NumberBig, rhs: *NumberBig) -> *NumberBig {
+        // Preconditions: |self| >= |rhs|
+        var an: u64 = 0;
+        var bn: u64 = 0;
+        if (self != 0 && self.digits != 0) { an = self.digits.len(); }
+        if (rhs != 0 && rhs.digits != 0) { bn = rhs.digits.len(); }
+
+        var out: *NumberBig = NumberBig.alloc(1, an + 1);
+        var borrow: i64 = 0;
+        for (var i: u64 = 0; i < an; i = i + 1) {
+            var av: i64 = (i64)(u64)self.digits.get(i);
+            var bv: i64 = 0;
+            if (i < bn) { bv = (i64)(u64)rhs.digits.get(i); }
+            var cur: i64 = av - bv - borrow;
+            if (cur < 0) {
+                cur = cur + (i64)NUMBER_BASE;
+                borrow = 1;
+            } else {
+                borrow = 0;
+            }
+            out.digits.push((u32)(u64)cur);
+        }
+        out.trim_inplace();
+        return out;
+    }
+
+    public func add_mul_digit_shift_abs(
+        self: *NumberBig,
+        out: *NumberBig,
+        digit: u64,
+        shift: u64
+    ) -> u64 {
+        if (self == 0 || out == 0 || self.sign == 0 || digit == 0) {
+            return 0;
+        }
+        var n: u64 = self.digits.len();
+        var carry: u64 = 0;
+        for (var i: u64 = 0; i < n; i = i + 1) {
+            var idx: u64 = i + shift;
+            var cur: u64 =
+                (u64)out.digits.get(idx) +
+                (u64)self.digits.get(i) * digit +
+                carry;
+            out.digits.set(idx, NumberBig.limb_low(cur));
+            carry = NumberBig.limb_carry(cur);
+        }
+        var k: u64 = n + shift;
         while (carry != 0) {
-            var cur2: u64 = (u64)out.digits.get(k);
-            var sum2: u64 = cur2 + carry;
-            out.digits.set(k, (u32)(sum2 % NUMBER_BASE));
-            carry = sum2 / NUMBER_BASE;
+            var cur2: u64 = (u64)out.digits.get(k) + carry;
+            out.digits.set(k, NumberBig.limb_low(cur2));
+            carry = NumberBig.limb_carry(cur2);
             k = k + 1;
         }
-    }
-
-    number_big_trim_inplace(out);
-    return out;
-}
-
-func number_big_mul_small_abs(a: *NumberBig, m: u64) -> *NumberBig {
-    if (a == 0 || a.sign == 0 || m == 0) {
-        return number_big_zero();
-    }
-    var an: u64 = a.digits.len();
-    var out: *NumberBig = number_big_new(1, an + 2);
-    var carry: u64 = 0;
-    for (var i: u64 = 0; i < an; i = i + 1) {
-        var av: u64 = (u64)a.digits.get(i);
-        var cur: u64 = av * m + carry;
-        out.digits.push((u32)(cur % NUMBER_BASE));
-        carry = cur / NUMBER_BASE;
-    }
-    while (carry != 0) {
-        out.digits.push((u32)(carry % NUMBER_BASE));
-        carry = carry / NUMBER_BASE;
-    }
-    number_big_trim_inplace(out);
-    return out;
-}
-
-func number_big_div_small_abs(a: *NumberBig, m: u64) -> *NumberBig {
-    if (m == 0) {
-        return number_panic_big("Number divide by zero");
-    }
-    if (a == 0 || a.sign == 0) {
-        return number_big_zero();
-    }
-    var an: u64 = a.digits.len();
-    var q: *NumberBig = number_big_new(1, an + 1);
-    for (var i0: u64 = 0; i0 < an; i0 = i0 + 1) {
-        q.digits.push(0);
-    }
-
-    var rem: u64 = 0;
-    var i: u64 = an;
-    while (i > 0) {
-        i = i - 1;
-        var cur: u64 = rem * NUMBER_BASE + (u64)a.digits.get(i);
-        var qd: u64 = cur / m;
-        rem = cur % m;
-        q.digits.set(i, (u32)qd);
-    }
-    number_big_trim_inplace(q);
-    return q;
-}
-
-func number_big_mod_small_abs(a: *NumberBig, m: u64) -> u64 {
-    if (m == 0) {
-        return number_panic_u64("Number modulo by zero");
-    }
-    if (a == 0 || a.sign == 0) { return 0; }
-    var an: u64 = a.digits.len();
-    var rem: u64 = 0;
-    var i: u64 = an;
-    while (i > 0) {
-        i = i - 1;
-        var cur: u64 = rem * NUMBER_BASE + (u64)a.digits.get(i);
-        rem = cur % m;
-    }
-    return rem;
-}
-
-func number_from_big_normalized(big: *NumberBig) -> Number {
-    if (big == 0) { return number_make_zero(); }
-    number_big_trim_inplace(big);
-    if (big.sign == 0) { return number_make_zero(); }
-
-    var iv: i64 = 0;
-    if (number_big_try_to_i64(big, &iv) != 0) {
-        if (number_fits_small_i64(iv) != 0) {
-            return number_make_small(iv);
-        }
-    }
-    return number_make_big_handle(big);
-}
-
-func number_to_abs_big(v: *Number) -> *NumberBig {
-    if (v == 0) {
-        return number_big_zero();
-    }
-    if (number_is_small(v) != 0) {
-        var sv: i64 = number_small_value(v);
-        if (sv == 0) {
-            return number_big_zero();
-        }
-        var mag: u64 = 0;
-        number_i64_abs_mag(sv, &mag);
-        return number_big_from_u64_raw(mag);
-    }
-    return number_big_abs_copy(number_big_ptr(v));
-}
-
-func number_signum(v: *Number) -> i64 {
-    if (v == 0) {
-        number_panic_null("number_signum: null Number*");
         return 0;
     }
-    if (number_is_small(v) != 0) {
-        var sv: i64 = number_small_value(v);
-        if (sv > 0) { return 1; }
-        if (sv < 0) { return -1; }
+
+    public static func add_shifted_abs_to(
+        out: *NumberBig,
+        src: *NumberBig,
+        shift: u64
+    ) -> u64 {
+        if (out == 0 || src == 0 || src.sign == 0) { return 0; }
+        var n: u64 = src.digits.len();
+        var carry: u64 = 0;
+        for (var i: u64 = 0; i < n; i = i + 1) {
+            var idx: u64 = i + shift;
+            var cur: u64 =
+                (u64)out.digits.get(idx) +
+                (u64)src.digits.get(i) +
+                carry;
+            out.digits.set(idx, NumberBig.limb_low(cur));
+            carry = NumberBig.limb_carry(cur);
+        }
+        var k: u64 = n + shift;
+        while (carry != 0) {
+            var cur2: u64 = (u64)out.digits.get(k) + carry;
+            out.digits.set(k, NumberBig.limb_low(cur2));
+            carry = NumberBig.limb_carry(cur2);
+            k = k + 1;
+        }
         return 0;
     }
-    var b: *NumberBig = number_big_ptr(v);
-    if (b == 0) { return 0; }
-    if (b.sign > 0) { return 1; }
-    if (b.sign < 0) { return -1; }
-    return 0;
-}
 
-func number_negated(v: *Number) -> Number {
-    if (v == 0) {
-        number_panic_null("number_negated: null Number*");
-        return number_make_zero();
+    public func slice_abs(
+        self: *NumberBig,
+        start: u64,
+        count: u64
+    ) -> *NumberBig {
+        if (self == 0 || self.sign == 0 || self.digits == 0) {
+            return NumberBig.zero();
+        }
+        var n: u64 = self.digits.len();
+        if (start >= n || count == 0) { return NumberBig.zero(); }
+        var end: u64 = start + count;
+        if (end > n) { end = n; }
+        var out: *NumberBig = NumberBig.alloc(1, end - start + 1);
+        for (var i: u64 = start; i < end; i = i + 1) {
+            out.digits.push(self.digits.get(i));
+        }
+        out.trim_inplace();
+        return out;
     }
-    if (number_is_small(v) != 0) {
-        return number_from_i64(0 - number_small_value(v));
-    }
-    var src: *NumberBig = number_big_ptr(v);
-    if (src == 0 || src.sign == 0) { return number_make_zero(); }
-    var copy: *NumberBig = number_big_copy(src);
-    copy.sign = 0 - copy.sign;
-    return number_from_big_normalized(copy);
-}
 
-func number_abs_with_sign(v: *Number, sign: i64) -> Number {
-    if (v == 0) {
-        number_panic_null("number_abs_with_sign: null Number*");
-        return number_make_zero();
-    }
-    if (sign == 0 || number_signum(v) == 0) { return number_make_zero(); }
-    if (number_is_small(v) != 0) {
-        var sv: i64 = number_small_value(v);
-        var mag: u64 = 0;
-        number_i64_abs_mag(sv, &mag);
-        if (sign < 0) {
-            if (mag <= NUMBER_MAX_I64_U64) {
-                return number_from_i64(0 - (i64)mag);
+    public func to_ntt_chunks_abs(self: *NumberBig) -> *Vec<u64> {
+        var n: u64 = 0;
+        if (self != 0 && self.sign != 0 && self.digits != 0) {
+            n = self.digits.len();
+        }
+        var buf: u64 = heap_alloc((n * 3 + 1) * sizeof(u64));
+        var out: *Vec<u64> = new Vec<u64>{buf, 0, n * 3 + 1};
+        var pending: u64 = 0;
+        var pending_bits: u64 = 0;
+        for (var i: u64 = 0; i < n; i = i + 1) {
+            var d: u64 = (u64)self.digits.get(i);
+            pending = pending + (d << pending_bits);
+            pending_bits = pending_bits + NUMBER_BASE_BITS;
+            while (pending_bits >= NUMBER_NTT_CHUNK_BITS) {
+                out.push(pending & NUMBER_NTT_CHUNK_MASK);
+                pending = pending >> NUMBER_NTT_CHUNK_BITS;
+                pending_bits = pending_bits - NUMBER_NTT_CHUNK_BITS;
             }
-            var bneg: *NumberBig = number_big_from_u64_raw(mag);
-            bneg.sign = -1;
-            return number_from_big_normalized(bneg);
         }
-        return number_from_u64(mag);
-    }
-    var srcb: *NumberBig = number_big_ptr(v);
-    if (srcb == 0) { return number_make_zero(); }
-    var copyb: *NumberBig = number_big_abs_copy(srcb);
-    if (sign < 0) { copyb.sign = -1; }
-    else { copyb.sign = 1; }
-    return number_from_big_normalized(copyb);
-}
-
-func number_abs_cmp(a: *Number, b: *Number) -> i64 {
-    if (a == 0) {
-        number_panic_null("number_abs_cmp: null lhs");
-        return 0;
-    }
-    if (b == 0) {
-        number_panic_null("number_abs_cmp: null rhs");
-        return 0;
-    }
-    var a_small: u64 = number_is_small(a);
-    var b_small: u64 = number_is_small(b);
-    if (a_small != 0 && b_small != 0) {
-        var amag: u64 = 0;
-        var bmag: u64 = 0;
-        number_i64_abs_mag(number_small_value(a), &amag);
-        number_i64_abs_mag(number_small_value(b), &bmag);
-        if (amag < bmag) { return -1; }
-        if (amag > bmag) { return 1; }
-        return 0;
-    }
-    if (a_small != 0) {
-        // A big value cannot fit in small range.
-        var bptr0: *NumberBig = number_big_ptr(b);
-        if (bptr0 == 0 || bptr0.sign == 0) {
-            var amag0: u64 = 0;
-            number_i64_abs_mag(number_small_value(a), &amag0);
-            if (amag0 == 0) { return 0; }
+        if (pending_bits != 0 || pending != 0) {
+            out.push(pending & NUMBER_NTT_CHUNK_MASK);
         }
-        return -1;
-    }
-    if (b_small != 0) {
-        var aptr0: *NumberBig = number_big_ptr(a);
-        if (aptr0 == 0 || aptr0.sign == 0) {
-            var bmag0: u64 = 0;
-            number_i64_abs_mag(number_small_value(b), &bmag0);
-            if (bmag0 == 0) { return 0; }
+        var len: u64 = out.len();
+        while (len > 0) {
+            if (out.get(len - 1) != 0) { break; }
+            out.pop();
+            len = len - 1;
         }
-        return 1;
-    }
-    return number_big_abs_cmp(number_big_ptr(a), number_big_ptr(b));
-}
-
-func number_cmp_ptr(a: *Number, b: *Number) -> i64 {
-    if (a == 0) {
-        number_panic_null("number_cmp_ptr: null lhs");
-        return 0;
-    }
-    if (b == 0) {
-        number_panic_null("number_cmp_ptr: null rhs");
-        return 0;
-    }
-
-    var a_small: u64 = number_is_small(a);
-    var b_small: u64 = number_is_small(b);
-    if (a_small != 0 && b_small != 0) {
-        var av: i64 = number_small_value(a);
-        var bv: i64 = number_small_value(b);
-        if (av < bv) { return -1; }
-        if (av > bv) { return 1; }
-        return 0;
-    }
-
-    var a_sign: i64 = number_signum(a);
-    var bs: i64 = number_signum(b);
-    if (a_sign != bs) {
-        if (a_sign < bs) { return -1; }
-        return 1;
-    }
-    if (a_sign == 0) { return 0; }
-
-    var cmp: i64 = 0;
-    if (a_small == 0 && b_small == 0) {
-        cmp = number_big_abs_cmp(number_big_ptr(a), number_big_ptr(b));
-    } else if (a_small == 0) {
-        cmp = 1;
-    } else {
-        cmp = -1;
-    }
-    if (a_sign > 0) { return cmp; }
-    return 0 - cmp;
-}
-
-func number_add_values(a: *Number, b: *Number) -> Number {
-    var a_sign: i64 = number_signum(a);
-    var bs: i64 = number_signum(b);
-    if (a_sign == 0) { return number_clone(b); }
-    if (bs == 0) { return number_clone(a); }
-
-    var aa: *NumberBig = number_to_abs_big(a);
-    var bb: *NumberBig = number_to_abs_big(b);
-
-    if (a_sign == bs) {
-        var sum: *NumberBig = number_big_add_abs(aa, bb);
-        sum.sign = a_sign;
-        return number_from_big_normalized(sum);
-    }
-
-    var cmp: i64 = number_big_abs_cmp(aa, bb);
-    if (cmp == 0) { return number_make_zero(); }
-    if (cmp > 0) {
-        var diff1: *NumberBig = number_big_sub_abs(aa, bb);
-        diff1.sign = a_sign;
-        return number_from_big_normalized(diff1);
-    }
-    var diff2: *NumberBig = number_big_sub_abs(bb, aa);
-    diff2.sign = bs;
-    return number_from_big_normalized(diff2);
-}
-
-func number_sub_values(a: *Number, b: *Number) -> Number {
-    var neg: Number = number_negated(b);
-    return number_add_values(a, &neg);
-}
-
-func number_mul_values(a: *Number, b: *Number) -> Number {
-    var a_sign: i64 = number_signum(a);
-    var bs: i64 = number_signum(b);
-    if (a_sign == 0 || bs == 0) { return number_make_zero(); }
-
-    var aa: *NumberBig = number_to_abs_big(a);
-    var bb: *NumberBig = number_to_abs_big(b);
-    var out: *NumberBig = number_big_mul_abs(aa, bb);
-    out.sign = a_sign * bs;
-    return number_from_big_normalized(out);
-}
-
-func number_divmod_values_nonzero(a: *Number, b: *Number) -> NumberDivMod {
-    var out: NumberDivMod = NumberDivMod {
-        number_make_zero(),
-        number_make_zero()
-    };
-    if (a == 0 || b == 0) { return out; }
-
-    var a_sign: i64 = number_signum(a);
-    if (a_sign == 0) { return out; }
-    var bs: i64 = number_signum(b);
-    if (bs == 0) { return out; }
-
-    if (number_is_small(a) != 0 && number_is_small(b) != 0) {
-        var av: i64 = number_small_value(a);
-        var bv: i64 = number_small_value(b);
-        out.q = number_from_i64(av / bv);
-        out.r = number_from_i64(av % bv);
         return out;
     }
 
-    var aa: *NumberBig = number_to_abs_big(a);
-    var bb: *NumberBig = number_to_abs_big(b);
-
-    var q_abs: *NumberBig = number_big_zero();
-    var r_abs: Number = number_make_zero();
-    var bb_u64: u64 = 0;
-    if (number_big_abs_to_u64_checked(bb, &bb_u64) != 0) {
-        q_abs = number_big_div_small_abs(aa, bb_u64);
-        var rem: u64 = number_big_mod_small_abs(aa, bb_u64);
-        if (rem != 0) {
-            r_abs = number_from_u64(rem);
+    public static func ntt_transform(a: *Vec<u64>, n: u64, invert: u64, mod: u64) -> u64 {
+        var j: u64 = 0;
+        for (var i: u64 = 1; i < n; i = i + 1) {
+            var bit: u64 = n >> 1;
+            while ((j & bit) != 0) {
+                j = j ^ bit;
+                bit = bit >> 1;
+            }
+            j = j ^ bit;
+            if (i < j) {
+                var ai: u64 = a.get(i);
+                var aj: u64 = a.get(j);
+                a.set(i, aj);
+                a.set(j, ai);
+            }
         }
-    } else {
-        var dm: NumberBigDivMod = number_big_abs_divmod_long(aa, bb);
-        q_abs = dm.q;
-        r_abs = number_from_big_normalized(dm.r);
-    }
 
-    if (q_abs.sign != 0) { q_abs.sign = a_sign * bs; }
-    out.q = number_from_big_normalized(q_abs);
-    out.r = r_abs;
-    if (a_sign < 0 && number_signum(&out.r) != 0) {
-        out.r = number_abs_with_sign(&out.r, -1);
-    }
-    return out;
-}
+        var len: u64 = 2;
+        while (len <= n) {
+            var wlen: u64 = NumberBig.mod_pow(NUMBER_NTT_ROOT, (mod - 1) / len, mod);
+            if (invert != 0) {
+                wlen = NumberBig.mod_inv(wlen, mod);
+            }
+            var i0: u64 = 0;
+            while (i0 < n) {
+                var w: u64 = 1;
+                var half: u64 = len / 2;
+                for (var k: u64 = 0; k < half; k = k + 1) {
+                    var u: u64 = a.get(i0 + k);
+                    var v: u64 = (a.get(i0 + k + half) * w) % mod;
+                    var x: u64 = u + v;
+                    if (x >= mod) { x = x - mod; }
+                    var y: u64 = 0;
+                    if (u >= v) { y = u - v; }
+                    else { y = u + mod - v; }
+                    a.set(i0 + k, x);
+                    a.set(i0 + k + half, y);
+                    w = (w * wlen) % mod;
+                }
+                i0 = i0 + len;
+            }
+            len = len << 1;
+        }
 
-func number_div_values(a: *Number, b: *Number) -> Number {
-    if (a == 0) {
-        number_panic_null("number_div_values: null lhs");
-        return number_make_zero();
-    }
-    if (b == 0) {
-        number_panic_null("number_div_values: null rhs");
-        return number_make_zero();
-    }
-    if (number_signum(b) == 0) {
-        return number_panic_number("Number divide by zero");
-    }
-    var dm: NumberDivMod = number_divmod_values_nonzero(a, b);
-    return dm.q;
-}
-
-func number_mod_values(a: *Number, b: *Number) -> Number {
-    if (a == 0) {
-        number_panic_null("number_mod_values: null lhs");
-        return number_make_zero();
-    }
-    if (b == 0) {
-        number_panic_null("number_mod_values: null rhs");
-        return number_make_zero();
-    }
-    if (number_signum(b) == 0) {
-        return number_panic_number("Number modulo by zero");
-    }
-    var dm: NumberDivMod = number_divmod_values_nonzero(a, b);
-    return dm.r;
-}
-
-func number_mul_small(a: *Number, m: u64) -> Number {
-    if (a == 0 || m == 0) { return number_make_zero(); }
-    var a_sign: i64 = number_signum(a);
-    if (a_sign == 0) { return number_make_zero(); }
-    var aa: *NumberBig = number_to_abs_big(a);
-    var out: *NumberBig = number_big_mul_small_abs(aa, m);
-    out.sign = a_sign;
-    return number_from_big_normalized(out);
-}
-
-func number_abs_clone(a: *Number) -> Number {
-    if (a == 0) {
-        number_panic_null("number_abs_clone: null Number*");
-        return number_make_zero();
-    }
-    if (number_is_small(a) != 0) {
-        var sv: i64 = number_small_value(a);
-        if (sv >= 0) { return number_make_small(sv); }
-        var mag: u64 = 0;
-        number_i64_abs_mag(sv, &mag);
-        return number_from_u64(mag);
-    }
-    var out: *NumberBig = number_big_abs_copy(number_big_ptr(a));
-    return number_from_big_normalized(out);
-}
-
-func number_div_small_abs(a: *Number, m: u64) -> Number {
-    if (a == 0) {
-        number_panic_null("number_div_small_abs: null Number*");
-        return number_make_zero();
-    }
-    if (m == 0) { return number_panic_number("Number divide by zero"); }
-    if (number_signum(a) == 0) { return number_make_zero(); }
-
-    if (number_is_small(a) != 0) {
-        var mag: u64 = 0;
-        number_i64_abs_mag(number_small_value(a), &mag);
-        return number_from_u64(mag / m);
-    }
-
-    var aa: *NumberBig = number_to_abs_big(a);
-    var q: *NumberBig = number_big_div_small_abs(aa, m);
-    return number_from_big_normalized(q);
-}
-
-func number_mod_small_abs(a: *Number, m: u64) -> u64 {
-    if (a == 0) {
-        number_panic_null("number_mod_small_abs: null Number*");
+        if (invert != 0) {
+            var n_inv: u64 = NumberBig.mod_inv(n % mod, mod);
+            for (var ii: u64 = 0; ii < n; ii = ii + 1) {
+                a.set(ii, (a.get(ii) * n_inv) % mod);
+            }
+        }
         return 0;
     }
-    if (m == 0) {
-        return number_panic_u64("Number modulo by zero");
-    }
-    if (number_signum(a) == 0) { return 0; }
 
-    if (number_is_small(a) != 0) {
-        var mag: u64 = 0;
-        number_i64_abs_mag(number_small_value(a), &mag);
-        return mag % m;
-    }
+    public func mul_schoolbook_abs(
+        self: *NumberBig,
+        rhs: *NumberBig
+    ) -> *NumberBig {
+        if (self == 0 || rhs == 0 || self.sign == 0 || rhs.sign == 0) {
+            return NumberBig.zero();
+        }
+        var an: u64 = self.digits.len();
+        var bn: u64 = rhs.digits.len();
+        var out: *NumberBig = NumberBig.alloc(1, an + bn + 2);
 
-    var aa: *NumberBig = number_to_abs_big(a);
-    return number_big_mod_small_abs(aa, m);
-}
+        for (var i0: u64 = 0; i0 < an + bn + 1; i0 = i0 + 1) {
+            out.digits.push(0);
+        }
 
-func number_big_shift_limbs_abs(
-    src: *NumberBig,
-    limb_shift: u64
-) -> *NumberBig {
-    if (src == 0 || src.sign == 0 || src.digits == 0) {
-        return number_big_zero();
-    }
-    var n: u64 = src.digits.len();
-    var out: *NumberBig = number_big_new(1, n + limb_shift + 1);
-    for (var i: u64 = 0; i < limb_shift; i = i + 1) {
-        out.digits.push(0);
-    }
-    for (var j: u64 = 0; j < n; j = j + 1) {
-        out.digits.push(src.digits.get(j));
-    }
-    number_big_trim_inplace(out);
-    return out;
-}
+        for (var i: u64 = 0; i < an; i = i + 1) {
+            var carry: u64 = 0;
+            var av: u64 = (u64)self.digits.get(i);
+            for (var j: u64 = 0; j < bn; j = j + 1) {
+                var idx: u64 = i + j;
+                var cur: u64 = (u64)out.digits.get(idx);
+                var bv: u64 = (u64)rhs.digits.get(j);
+                var prod: u64 = cur + av * bv + carry;
+                out.digits.set(idx, NumberBig.limb_low(prod));
+                carry = NumberBig.limb_carry(prod);
+            }
+            var k: u64 = i + bn;
+            while (carry != 0) {
+                var cur2: u64 = (u64)out.digits.get(k);
+                var sum2: u64 = cur2 + carry;
+                out.digits.set(k, NumberBig.limb_low(sum2));
+                carry = NumberBig.limb_carry(sum2);
+                k = k + 1;
+            }
+        }
 
-func number_big_abs_divmod_long(
-    a: *NumberBig,
-    b: *NumberBig
-) -> NumberBigDivMod {
-    var out: NumberBigDivMod = NumberBigDivMod { 0, 0 };
-
-    if (a == 0 || b == 0 || b.sign == 0 || a.sign == 0) {
-        out.q = number_big_zero();
-        out.r = number_big_zero();
+        out.trim_inplace();
         return out;
     }
 
-    var cmp0: i64 = number_big_abs_cmp(a, b);
-    if (cmp0 < 0) {
-        out.q = number_big_zero();
-        out.r = number_big_abs_copy(a);
+    public func mul_u64_abs(self: *NumberBig, m: u64) -> *NumberBig {
+        if (self == 0 || self.sign == 0 || m == 0) {
+            return NumberBig.zero();
+        }
+        var an: u64 = self.digits.len();
+        var tmp: u64 = m;
+        var mn: u64 = 0;
+        while (tmp != 0) {
+            mn = mn + 1;
+            tmp = tmp >> NUMBER_BASE_BITS;
+        }
+
+        var out: *NumberBig = NumberBig.alloc(1, an + mn + 1);
+        for (var i: u64 = 0; i < an + mn + 1; i = i + 1) {
+            out.digits.push(0);
+        }
+
+        var rem: u64 = m;
+        var shift: u64 = 0;
+        while (rem != 0) {
+            var digit: u64 = rem & NUMBER_BASE_MASK;
+            self.add_mul_digit_shift_abs(out, digit, shift);
+            rem = rem >> NUMBER_BASE_BITS;
+            shift = shift + 1;
+        }
+
+        out.trim_inplace();
         return out;
     }
-    if (cmp0 == 0) {
-        out.q = number_big_from_u64_raw(1);
-        out.r = number_big_zero();
+
+    public func mul_karatsuba_abs(
+        self: *NumberBig,
+        rhs: *NumberBig
+    ) -> *NumberBig {
+        var an: u64 = self.digits.len();
+        var bn: u64 = rhs.digits.len();
+        var n: u64 = an;
+        if (bn > n) { n = bn; }
+        var m: u64 = n / 2;
+        if (m == 0) { return self.mul_schoolbook_abs(rhs); }
+
+        var a0: *NumberBig = self.slice_abs(0, m);
+        var a1: *NumberBig = self.slice_abs(m, an - m);
+        var b0: *NumberBig = rhs.slice_abs(0, m);
+        var b1: *NumberBig = rhs.slice_abs(m, bn - m);
+
+        var z0: *NumberBig = a0.mul_abs(b0);
+        var z2: *NumberBig = a1.mul_abs(b1);
+        var asum: *NumberBig = a0.add_abs(a1);
+        var bsum: *NumberBig = b0.add_abs(b1);
+        var cross: *NumberBig = asum.mul_abs(bsum);
+        cross = cross.sub_abs(z2);
+        cross = cross.sub_abs(z0);
+
+        var out: *NumberBig = NumberBig.alloc(1, an + bn + 2);
+        for (var i: u64 = 0; i < an + bn + 2; i = i + 1) {
+            out.digits.push(0);
+        }
+        NumberBig.add_shifted_abs_to(out, z0, 0);
+        NumberBig.add_shifted_abs_to(out, cross, m);
+        NumberBig.add_shifted_abs_to(out, z2, m * 2);
+        out.trim_inplace();
         return out;
     }
 
-    var an: u64 = a.digits.len();
-    var bn: u64 = b.digits.len();
-    var q_len: u64 = an - bn + 1;
+    public func mul_toom3_abs(
+        self: *NumberBig,
+        rhs: *NumberBig
+    ) -> *NumberBig {
+        var an: u64 = self.digits.len();
+        var bn: u64 = rhs.digits.len();
+        var n: u64 = an;
+        if (bn > n) { n = bn; }
+        var m: u64 = (n + 2) / 3;
+        if (m == 0) { return self.mul_schoolbook_abs(rhs); }
 
-    var q: *NumberBig = number_big_new(1, q_len + 1);
-    for (var qi: u64 = 0; qi < q_len; qi = qi + 1) {
-        q.digits.push(0);
+        var a1_count: u64 = 0;
+        if (an > m) {
+            a1_count = an - m;
+            if (a1_count > m) { a1_count = m; }
+        }
+        var a2_count: u64 = 0;
+        if (an > m * 2) { a2_count = an - m * 2; }
+        var b1_count: u64 = 0;
+        if (bn > m) {
+            b1_count = bn - m;
+            if (b1_count > m) { b1_count = m; }
+        }
+        var b2_count: u64 = 0;
+        if (bn > m * 2) { b2_count = bn - m * 2; }
+
+        var a0b: *NumberBig = self.slice_abs(0, m);
+        var a1b: *NumberBig = self.slice_abs(m, a1_count);
+        var a2b: *NumberBig = self.slice_abs(m * 2, a2_count);
+        var b0b: *NumberBig = rhs.slice_abs(0, m);
+        var b1b: *NumberBig = rhs.slice_abs(m, b1_count);
+        var b2b: *NumberBig = rhs.slice_abs(m * 2, b2_count);
+
+        var a0: Number = Number.from_big_normalized(a0b);
+        var a1: Number = Number.from_big_normalized(a1b);
+        var a2: Number = Number.from_big_normalized(a2b);
+        var b0: Number = Number.from_big_normalized(b0b);
+        var b1: Number = Number.from_big_normalized(b1b);
+        var b2: Number = Number.from_big_normalized(b2b);
+
+        var v0b: *NumberBig = a0b.mul_abs(b0b);
+        var v4b: *NumberBig = a2b.mul_abs(b2b);
+        var v0: Number = Number.from_big_normalized(v0b);
+        var v4: Number = Number.from_big_normalized(v4b);
+
+        var a01: Number = a0.add_values(&a1);
+        var eval1a: Number = a01.add_values(&a2);
+        var b01: Number = b0.add_values(&b1);
+        var eval1b: Number = b01.add_values(&b2);
+        var v1: Number = eval1a.mul_values(&eval1b);
+
+        var am1a0: Number = a0.sub_values(&a1);
+        var evalm1a: Number = am1a0.add_values(&a2);
+        var bm1a0: Number = b0.sub_values(&b1);
+        var evalm1b: Number = bm1a0.add_values(&b2);
+        var vm1: Number = evalm1a.mul_values(&evalm1b);
+
+        var a1x2: Number = a1.mul_small(2);
+        var a2x4: Number = a2.mul_small(4);
+        var eval2a0: Number = a0.add_values(&a1x2);
+        var eval2a: Number = eval2a0.add_values(&a2x4);
+        var b1x2: Number = b1.mul_small(2);
+        var b2x4: Number = b2.mul_small(4);
+        var eval2b0: Number = b0.add_values(&b1x2);
+        var eval2b: Number = eval2b0.add_values(&b2x4);
+        var v2: Number = eval2a.mul_values(&eval2b);
+
+        var two: Number = Number { NUMBER_TAG_SMALL };
+        two.set_i64(2);
+        var three: Number = Number { NUMBER_TAG_SMALL };
+        three.set_i64(3);
+
+        var s1_tmp: Number = v1.sub_values(&v0);
+        var s1: Number = s1_tmp.sub_values(&v4);
+        var sm1_tmp: Number = vm1.sub_values(&v0);
+        var sm1: Number = sm1_tmp.sub_values(&v4);
+        var v4x16: Number = v4.mul_small(16);
+        var s2_tmp: Number = v2.sub_values(&v0);
+        var s2: Number = s2_tmp.sub_values(&v4x16);
+
+        var c2_num: Number = s1.add_values(&sm1);
+        var r2: Number = c2_num.div_values(&two);
+        var s_num: Number = s1.sub_values(&sm1);
+        var s: Number = s_num.div_values(&two);
+        var r2x4: Number = r2.mul_small(4);
+        var t_num: Number = s2.sub_values(&r2x4);
+        var t: Number = t_num.div_values(&two);
+        var r3_num: Number = t.sub_values(&s);
+        var r3: Number = r3_num.div_values(&three);
+        var r1: Number = s.sub_values(&r3);
+
+        var outn: Number = v0.clone();
+        var shift1: u64 = m * NUMBER_BASE_BITS;
+        var part1: Number = r1.shl_values(shift1);
+        outn = outn.add_values(&part1);
+        var part2: Number = r2.shl_values(shift1 * 2);
+        outn = outn.add_values(&part2);
+        var part3: Number = r3.shl_values(shift1 * 3);
+        outn = outn.add_values(&part3);
+        var part4: Number = v4.shl_values(shift1 * 4);
+        outn = outn.add_values(&part4);
+
+        var out: *NumberBig = outn.to_abs_big();
+        out.trim_inplace();
+        return out;
     }
 
-    var r: *NumberBig = number_big_abs_copy(a);
+    public func mul_ntt_abs(
+        self: *NumberBig,
+        rhs: *NumberBig
+    ) -> *NumberBig {
+        var ach: *Vec<u64> = self.to_ntt_chunks_abs();
+        var bch: *Vec<u64> = rhs.to_ntt_chunks_abs();
+        var alen: u64 = ach.len();
+        var blen: u64 = bch.len();
+        if (alen == 0 || blen == 0) { return NumberBig.zero(); }
 
-    var shift: u64 = q_len;
-    while (shift > 0) {
-        shift = shift - 1;
-        var shifted_b: *NumberBig = number_big_shift_limbs_abs(b, shift);
-        if (number_big_abs_cmp(r, shifted_b) < 0) { continue; }
+        var need: u64 = alen + blen - 1;
+        var ntt_len: u64 = NumberBig.next_pow2(need);
+        if (ntt_len > NUMBER_NTT_MAX_LEN) {
+            return self.mul_toom3_abs(rhs);
+        }
 
-        var lo: u64 = 1;
-        var hi: u64 = NUMBER_BASE - 1;
-        var best: u64 = 0;
-        while (lo <= hi) {
-            var mid: u64 = lo + ((hi - lo) / 2);
-            var prod_mid: *NumberBig = number_big_mul_small_abs(shifted_b, mid);
-            var cmp_mid: i64 = number_big_abs_cmp(prod_mid, r);
-            if (cmp_mid <= 0) {
-                best = mid;
-                lo = mid + 1;
+        var a1: *Vec<u64> = NumberBig.vec_u64_zeroed(ntt_len);
+        var b1: *Vec<u64> = NumberBig.vec_u64_zeroed(ntt_len);
+        var a2: *Vec<u64> = NumberBig.vec_u64_zeroed(ntt_len);
+        var b2: *Vec<u64> = NumberBig.vec_u64_zeroed(ntt_len);
+
+        for (var i: u64 = 0; i < alen; i = i + 1) {
+            var v: u64 = ach.get(i);
+            a1.set(i, v % NUMBER_NTT_MOD1);
+            a2.set(i, v % NUMBER_NTT_MOD2);
+        }
+        for (var j: u64 = 0; j < blen; j = j + 1) {
+            var v2: u64 = bch.get(j);
+            b1.set(j, v2 % NUMBER_NTT_MOD1);
+            b2.set(j, v2 % NUMBER_NTT_MOD2);
+        }
+
+        NumberBig.ntt_transform(a1, ntt_len, 0, NUMBER_NTT_MOD1);
+        NumberBig.ntt_transform(b1, ntt_len, 0, NUMBER_NTT_MOD1);
+        NumberBig.ntt_transform(a2, ntt_len, 0, NUMBER_NTT_MOD2);
+        NumberBig.ntt_transform(b2, ntt_len, 0, NUMBER_NTT_MOD2);
+
+        for (var k: u64 = 0; k < ntt_len; k = k + 1) {
+            a1.set(k, (a1.get(k) * b1.get(k)) % NUMBER_NTT_MOD1);
+            a2.set(k, (a2.get(k) * b2.get(k)) % NUMBER_NTT_MOD2);
+        }
+
+        NumberBig.ntt_transform(a1, ntt_len, 1, NUMBER_NTT_MOD1);
+        NumberBig.ntt_transform(a2, ntt_len, 1, NUMBER_NTT_MOD2);
+
+        var out: *NumberBig = NumberBig.alloc(1, (need * NUMBER_NTT_CHUNK_BITS) / NUMBER_BASE_BITS + 4);
+        var pending: u64 = 0;
+        var pending_bits: u64 = 0;
+        var carry: u64 = 0;
+        var inv_mod1_mod2: u64 = NumberBig.mod_inv(NUMBER_NTT_MOD1 % NUMBER_NTT_MOD2, NUMBER_NTT_MOD2);
+
+        for (var ci: u64 = 0; ci < need; ci = ci + 1) {
+            var r1: u64 = a1.get(ci);
+            var r2: u64 = a2.get(ci);
+            var diff: u64 = 0;
+            if (r2 >= r1) { diff = r2 - r1; }
+            else { diff = r2 + NUMBER_NTT_MOD2 - r1; }
+            var t: u64 = (diff * inv_mod1_mod2) % NUMBER_NTT_MOD2;
+            var coeff: u64 = r1 + NUMBER_NTT_MOD1 * t;
+            var cur: u64 = coeff + carry;
+            var chunk: u64 = cur & NUMBER_NTT_CHUNK_MASK;
+            carry = cur >> NUMBER_NTT_CHUNK_BITS;
+
+            pending = pending + (chunk << pending_bits);
+            pending_bits = pending_bits + NUMBER_NTT_CHUNK_BITS;
+            while (pending_bits >= NUMBER_BASE_BITS) {
+                out.digits.push((u32)(pending & NUMBER_BASE_MASK));
+                pending = pending >> NUMBER_BASE_BITS;
+                pending_bits = pending_bits - NUMBER_BASE_BITS;
+            }
+        }
+
+        while (carry != 0) {
+            var chunk2: u64 = carry & NUMBER_NTT_CHUNK_MASK;
+            carry = carry >> NUMBER_NTT_CHUNK_BITS;
+            pending = pending + (chunk2 << pending_bits);
+            pending_bits = pending_bits + NUMBER_NTT_CHUNK_BITS;
+            while (pending_bits >= NUMBER_BASE_BITS) {
+                out.digits.push((u32)(pending & NUMBER_BASE_MASK));
+                pending = pending >> NUMBER_BASE_BITS;
+                pending_bits = pending_bits - NUMBER_BASE_BITS;
+            }
+        }
+        if (pending_bits != 0 || pending != 0) {
+            out.digits.push((u32)(pending & NUMBER_BASE_MASK));
+        }
+        out.trim_inplace();
+        return out;
+    }
+
+    public func mul_abs(self: *NumberBig, rhs: *NumberBig) -> *NumberBig {
+        if (self == 0 || rhs == 0 || self.sign == 0 || rhs.sign == 0) {
+            return NumberBig.zero();
+        }
+        var an: u64 = self.digits.len();
+        var bn: u64 = rhs.digits.len();
+        if (an < bn) { return rhs.mul_abs(self); }
+        if (bn <= NUMBER_KARATSUBA_THRESHOLD) {
+            return self.mul_schoolbook_abs(rhs);
+        }
+        if (an > bn * NUMBER_KARATSUBA_UNBALANCED_FACTOR) {
+            return self.mul_schoolbook_abs(rhs);
+        }
+        if (bn >= NUMBER_NTT_THRESHOLD) {
+            return self.mul_ntt_abs(rhs);
+        }
+        if (bn >= NUMBER_TOOM3_THRESHOLD && an <= bn * NUMBER_TOOM3_UNBALANCED_FACTOR) {
+            return self.mul_toom3_abs(rhs);
+        }
+        return self.mul_karatsuba_abs(rhs);
+    }
+
+    public func mul_small_abs(self: *NumberBig, m: u64) -> *NumberBig {
+        if (self == 0 || self.sign == 0 || m == 0) {
+            return NumberBig.zero();
+        }
+        var an: u64 = self.digits.len();
+        var out: *NumberBig = NumberBig.alloc(1, an + 2);
+        var carry: u64 = 0;
+        for (var i: u64 = 0; i < an; i = i + 1) {
+            var av: u64 = (u64)self.digits.get(i);
+            var cur: u64 = av * m + carry;
+            out.digits.push(NumberBig.limb_low(cur));
+            carry = NumberBig.limb_carry(cur);
+        }
+        while (carry != 0) {
+            out.digits.push(NumberBig.limb_low(carry));
+            carry = NumberBig.limb_carry(carry);
+        }
+        out.trim_inplace();
+        return out;
+    }
+
+    public func div_small_abs(self: *NumberBig, m: u64) -> *NumberBig {
+        if (m == 0) {
+            panic("Number divide by zero");
+            return NumberBig.zero();
+        }
+        if (self == 0 || self.sign == 0) {
+            return NumberBig.zero();
+        }
+        var an: u64 = self.digits.len();
+        var q: *NumberBig = NumberBig.alloc(1, an + 1);
+        for (var i0: u64 = 0; i0 < an; i0 = i0 + 1) {
+            q.digits.push(0);
+        }
+
+        var rem: u64 = 0;
+        var i: u64 = an;
+        while (i > 0) {
+            i = i - 1;
+            var cur: u64 = (rem << NUMBER_BASE_BITS) + (u64)self.digits.get(i);
+            var qd: u64 = cur / m;
+            rem = cur % m;
+            q.digits.set(i, (u32)qd);
+        }
+        q.trim_inplace();
+        return q;
+    }
+
+    public func mod_small_abs(self: *NumberBig, m: u64) -> u64 {
+        if (m == 0) {
+            panic("Number modulo by zero");
+            return 0;
+        }
+        if (self == 0 || self.sign == 0) { return 0; }
+        var an: u64 = self.digits.len();
+        var rem: u64 = 0;
+        var i: u64 = an;
+        while (i > 0) {
+            i = i - 1;
+            var cur: u64 = (rem << NUMBER_BASE_BITS) + (u64)self.digits.get(i);
+            rem = cur % m;
+        }
+        return rem;
+    }
+
+    public func shift_limbs_abs(self: *NumberBig, limb_shift: u64) -> *NumberBig {
+        if (self == 0 || self.sign == 0 || self.digits == 0) {
+            return NumberBig.zero();
+        }
+        var n: u64 = self.digits.len();
+        var out: *NumberBig = NumberBig.alloc(1, n + limb_shift + 1);
+        for (var i: u64 = 0; i < limb_shift; i = i + 1) {
+            out.digits.push(0);
+        }
+        for (var j: u64 = 0; j < n; j = j + 1) {
+            out.digits.push(self.digits.get(j));
+        }
+        out.trim_inplace();
+        return out;
+    }
+
+    public func shl_bits_abs(self: *NumberBig, bits: u64) -> *NumberBig {
+        if (self == 0 || self.sign == 0 || self.digits == 0) {
+            return NumberBig.zero();
+        }
+        if (bits == 0) { return self.abs_copy(); }
+        var n: u64 = self.digits.len();
+        var limb_shift: u64 = bits / NUMBER_BASE_BITS;
+        var bit_shift: u64 = bits % NUMBER_BASE_BITS;
+        var out: *NumberBig = NumberBig.alloc(1, n + limb_shift + 2);
+        for (var z: u64 = 0; z < limb_shift; z = z + 1) {
+            out.digits.push(0);
+        }
+        var carry: u64 = 0;
+        for (var i: u64 = 0; i < n; i = i + 1) {
+            var cur: u64 = ((u64)self.digits.get(i) << bit_shift) + carry;
+            out.digits.push(NumberBig.limb_low(cur));
+            carry = NumberBig.limb_carry(cur);
+        }
+        if (carry != 0) { out.digits.push((u32)carry); }
+        out.trim_inplace();
+        return out;
+    }
+
+    public func shr_bits_abs(self: *NumberBig, bits: u64) -> *NumberBig {
+        if (self == 0 || self.sign == 0 || self.digits == 0) {
+            return NumberBig.zero();
+        }
+        if (bits == 0) { return self.abs_copy(); }
+        var n: u64 = self.digits.len();
+        var limb_shift: u64 = bits / NUMBER_BASE_BITS;
+        if (limb_shift >= n) { return NumberBig.zero(); }
+        var bit_shift: u64 = bits % NUMBER_BASE_BITS;
+        var out_len: u64 = n - limb_shift;
+        var out: *NumberBig = NumberBig.alloc_zeroed(1, out_len);
+
+        if (bit_shift == 0) {
+            for (var i0: u64 = 0; i0 < out_len; i0 = i0 + 1) {
+                out.digits.set(i0, self.digits.get(i0 + limb_shift));
+            }
+            out.trim_inplace();
+            return out;
+        }
+
+        var low_mask: u64 = (1 << bit_shift) - 1;
+        var carry: u64 = 0;
+        var i: u64 = n;
+        while (i > limb_shift) {
+            i = i - 1;
+            var digit: u64 = (u64)self.digits.get(i);
+            var val: u64 = (digit >> bit_shift) | (carry << (NUMBER_BASE_BITS - bit_shift));
+            out.digits.set(i - limb_shift, (u32)(val & NUMBER_BASE_MASK));
+            carry = digit & low_mask;
+        }
+        out.trim_inplace();
+        return out;
+    }
+
+    public func bit_length_abs(self: *NumberBig) -> u64 {
+        if (self == 0 || self.sign == 0 || self.digits == 0) { return 0; }
+        var n: u64 = self.digits.len();
+        if (n == 0) { return 0; }
+        var top: u64 = (u64)self.digits.get(n - 1);
+        var top_bits: u64 = 0;
+        while (top != 0) {
+            top = top >> 1;
+            top_bits = top_bits + 1;
+        }
+        return (n - 1) * NUMBER_BASE_BITS + top_bits;
+    }
+
+    public func abs_divmod_knuth(self: *NumberBig, rhs: *NumberBig) -> NumberBigDivMod {
+        var out: NumberBigDivMod = NumberBigDivMod { 0, 0 };
+
+        if (self == 0 || rhs == 0 || rhs.sign == 0 || self.sign == 0) {
+            out.q = NumberBig.zero();
+            out.r = NumberBig.zero();
+            return out;
+        }
+
+        var cmp0: i64 = self.abs_cmp(rhs);
+        if (cmp0 < 0) {
+            out.q = NumberBig.zero();
+            out.r = self.abs_copy();
+            return out;
+        }
+        if (cmp0 == 0) {
+            out.q = NumberBig.from_u64_raw(1);
+            out.r = NumberBig.zero();
+            return out;
+        }
+
+        var rhs_len0: u64 = rhs.digits.len();
+        if (rhs_len0 == 1) {
+            var d0: u64 = (u64)rhs.digits.get(0);
+            out.q = self.div_small_abs(d0);
+            var r0: u64 = self.mod_small_abs(d0);
+            out.r = NumberBig.from_u64_raw(r0);
+            return out;
+        }
+
+        var top0: u64 = (u64)rhs.digits.get(rhs_len0 - 1);
+        var norm: u64 = NUMBER_BASE / (top0 + 1);
+        if (norm < 1) { norm = 1; }
+
+        var u: *NumberBig = 0;
+        var v: *NumberBig = 0;
+        if (norm == 1) {
+            u = self.abs_copy();
+            v = rhs.abs_copy();
+        } else {
+            u = self.mul_small_abs(norm);
+            v = rhs.mul_small_abs(norm);
+        }
+
+        var n: u64 = v.digits.len();
+        var u_len: u64 = u.digits.len();
+        if (u_len < n) {
+            out.q = NumberBig.zero();
+            if (norm == 1) { out.r = u; }
+            else { out.r = u.div_small_abs(norm); }
+            return out;
+        }
+
+        var m: u64 = u_len - n;
+        u.digits.push(0);
+
+        var q: *NumberBig = NumberBig.alloc_zeroed(1, m + 1);
+        var vtop: u64 = (u64)v.digits.get(n - 1);
+        var vnext: u64 = 0;
+        if (n > 1) { vnext = (u64)v.digits.get(n - 2); }
+
+        var jj: u64 = m + 1;
+        while (jj > 0) {
+            jj = jj - 1;
+
+            var u_hi: u64 = (u64)u.digits.get(jj + n);
+            var u_mid: u64 = (u64)u.digits.get(jj + n - 1);
+            var numerator: u64 = (u_hi << NUMBER_BASE_BITS) + u_mid;
+            var qhat: u64 = numerator / vtop;
+            var rhat: u64 = numerator % vtop;
+            if (qhat >= NUMBER_BASE) {
+                qhat = NUMBER_BASE - 1;
+                rhat = rhat + vtop;
+            }
+
+            if (n > 1) {
+                var adjusting: u64 = 1;
+                while (adjusting != 0) {
+                    adjusting = 0;
+                    var u_low: u64 = (u64)u.digits.get(jj + n - 2);
+                    var lhs: u64 = qhat * vnext;
+                    var rhs_cmp: u64 = (rhat << NUMBER_BASE_BITS) + u_low;
+                    if (lhs > rhs_cmp) {
+                        qhat = qhat - 1;
+                        rhat = rhat + vtop;
+                        if (rhat < NUMBER_BASE) {
+                            adjusting = 1;
+                        }
+                    }
+                }
+            }
+
+            var borrow: u64 = 0;
+            var carry: u64 = 0;
+            for (var i: u64 = 0; i < n; i = i + 1) {
+                var prod: u64 = qhat * (u64)v.digits.get(i) + carry;
+                carry = NumberBig.limb_carry(prod);
+                var sub_digit: u64 = prod & NUMBER_BASE_MASK;
+                var ui: u64 = (u64)u.digits.get(jj + i);
+                var need: u64 = sub_digit + borrow;
+                if (ui < need) {
+                    u.digits.set(jj + i, (u32)(ui + NUMBER_BASE - need));
+                    borrow = 1;
+                } else {
+                    u.digits.set(jj + i, (u32)(ui - need));
+                    borrow = 0;
+                }
+            }
+
+            var top: u64 = (u64)u.digits.get(jj + n);
+            var need_top: u64 = carry + borrow;
+            var negative: u64 = 0;
+            if (top < need_top) {
+                u.digits.set(jj + n, (u32)(top + NUMBER_BASE - need_top));
+                negative = 1;
             } else {
-                hi = mid - 1;
+                u.digits.set(jj + n, (u32)(top - need_top));
+            }
+
+            if (negative != 0) {
+                qhat = qhat - 1;
+                var carry_add: u64 = 0;
+                for (var ai: u64 = 0; ai < n; ai = ai + 1) {
+                    var sum: u64 =
+                        (u64)u.digits.get(jj + ai) +
+                        (u64)v.digits.get(ai) +
+                        carry_add;
+                    if (sum >= NUMBER_BASE) {
+                        u.digits.set(jj + ai, (u32)(sum - NUMBER_BASE));
+                        carry_add = 1;
+                    } else {
+                        u.digits.set(jj + ai, (u32)sum);
+                        carry_add = 0;
+                    }
+                }
+                var top2: u64 = (u64)u.digits.get(jj + n) + carry_add;
+                if (top2 >= NUMBER_BASE) { top2 = top2 - NUMBER_BASE; }
+                u.digits.set(jj + n, (u32)top2);
+            }
+
+            q.digits.set(jj, (u32)qhat);
+        }
+
+        q.trim_inplace();
+        u.trim_inplace();
+        out.q = q;
+        if (norm == 1) {
+            out.r = u;
+        } else {
+            out.r = u.div_small_abs(norm);
+        }
+        out.r.trim_inplace();
+        return out;
+    }
+
+    public func abs_divmod_divide_conquer(self: *NumberBig, rhs: *NumberBig) -> NumberBigDivMod {
+        var out: NumberBigDivMod = NumberBigDivMod { 0, 0 };
+
+        if (self == 0 || rhs == 0 || rhs.sign == 0 || self.sign == 0) {
+            out.q = NumberBig.zero();
+            out.r = NumberBig.zero();
+            return out;
+        }
+
+        var cmp0: i64 = self.abs_cmp(rhs);
+        if (cmp0 < 0) {
+            out.q = NumberBig.zero();
+            out.r = self.abs_copy();
+            return out;
+        }
+        if (cmp0 == 0) {
+            out.q = NumberBig.from_u64_raw(1);
+            out.r = NumberBig.zero();
+            return out;
+        }
+
+        var an: u64 = self.digits.len();
+        var bn: u64 = rhs.digits.len();
+        if (bn < NUMBER_DIV_DC_THRESHOLD || an <= bn * 2) {
+            return self.abs_divmod_knuth(rhs);
+        }
+
+        var split: u64 = an / 2;
+        if (split == 0 || split >= an) {
+            return self.abs_divmod_knuth(rhs);
+        }
+
+        var low: *NumberBig = self.slice_abs(0, split);
+        var high: *NumberBig = self.slice_abs(split, an - split);
+        var high_dm: NumberBigDivMod = high.abs_divmod_divide_conquer(rhs);
+
+        var shifted_r: *NumberBig = high_dm.r.shift_limbs_abs(split);
+        var combined: *NumberBig = shifted_r.add_abs(low);
+        var low_dm: NumberBigDivMod = combined.abs_divmod_divide_conquer(rhs);
+
+        var shifted_q: *NumberBig = high_dm.q.shift_limbs_abs(split);
+        var q: *NumberBig = shifted_q.add_abs(low_dm.q);
+        q.trim_inplace();
+        low_dm.r.trim_inplace();
+        out.q = q;
+        out.r = low_dm.r;
+        return out;
+    }
+
+    public func abs_divmod_long(self: *NumberBig, rhs: *NumberBig) -> NumberBigDivMod {
+        var out: NumberBigDivMod = NumberBigDivMod { 0, 0 };
+
+        if (self == 0 || rhs == 0 || rhs.sign == 0 || self.sign == 0) {
+            out.q = NumberBig.zero();
+            out.r = NumberBig.zero();
+            return out;
+        }
+
+        var cmp0: i64 = self.abs_cmp(rhs);
+        if (cmp0 < 0) {
+            out.q = NumberBig.zero();
+            out.r = self.abs_copy();
+            return out;
+        }
+        if (cmp0 == 0) {
+            out.q = NumberBig.from_u64_raw(1);
+            out.r = NumberBig.zero();
+            return out;
+        }
+
+        var an: u64 = self.digits.len();
+        var bn: u64 = rhs.digits.len();
+        var q_len: u64 = an - bn + 1;
+
+        var q: *NumberBig = NumberBig.alloc(1, q_len + 1);
+        for (var qi: u64 = 0; qi < q_len; qi = qi + 1) {
+            q.digits.push(0);
+        }
+
+        var r: *NumberBig = self.abs_copy();
+
+        var shift: u64 = q_len;
+        while (shift > 0) {
+            shift = shift - 1;
+            var shifted_b: *NumberBig = rhs.shift_limbs_abs(shift);
+            if (r.abs_cmp(shifted_b) < 0) { continue; }
+
+            var lo: u64 = 1;
+            var hi: u64 = NUMBER_BASE - 1;
+            var best: u64 = 0;
+            while (lo <= hi) {
+                var mid: u64 = lo + ((hi - lo) / 2);
+                var prod_mid: *NumberBig = shifted_b.mul_small_abs(mid);
+                var cmp_mid: i64 = prod_mid.abs_cmp(r);
+                if (cmp_mid <= 0) {
+                    best = mid;
+                    lo = mid + 1;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+
+            if (best != 0) {
+                var best_prod: *NumberBig = shifted_b.mul_small_abs(best);
+                r = r.sub_abs(best_prod);
+                q.digits.set(shift, (u32)best);
             }
         }
 
-        if (best != 0) {
-            var best_prod: *NumberBig =
-                number_big_mul_small_abs(shifted_b, best);
-            r = number_big_sub_abs(r, best_prod);
-            q.digits.set(shift, (u32)best);
-        }
+        q.trim_inplace();
+        r.trim_inplace();
+        out.q = q;
+        out.r = r;
+        return out;
     }
-
-    number_big_trim_inplace(q);
-    number_big_trim_inplace(r);
-    out.q = q;
-    out.r = r;
-    return out;
-}
-
-func number_pow2(bits: u64) -> Number {
-    var out: Number = number_from_i64(1);
-    for (var i: u64 = 0; i < bits; i = i + 1) {
-        out = number_mul_small(&out, 2);
-    }
-    return out;
-}
-
-func number_bit_length_abs(a: *Number) -> u64 {
-    if (a == 0) { return 0; }
-    var t: Number = number_abs_clone(a);
-    var bits: u64 = 0;
-    while (number_signum(&t) != 0) {
-        t = number_div_small_abs(&t, 2);
-        bits = bits + 1;
-    }
-    return bits;
-}
-
-func number_shl_values(a: *Number, sh: u64) -> Number {
-    if (a == 0 || number_signum(a) == 0) { return number_make_zero(); }
-    if (sh == 0) { return number_clone(a); }
-
-    var out: Number = number_abs_clone(a);
-    for (var i: u64 = 0; i < sh; i = i + 1) {
-        out = number_mul_small(&out, 2);
-    }
-
-    var a_sign: i64 = number_signum(a);
-    if (a_sign < 0 && number_signum(&out) != 0) {
-        out = number_abs_with_sign(&out, -1);
-    }
-    return out;
-}
-
-func number_bitwise_nonneg_abs(a: *Number, b: *Number, mode: u64) -> Number {
-    // mode: NUMBER_BITWISE_AND / OR / XOR
-    var aa: Number = number_abs_clone(a);
-    var bb: Number = number_abs_clone(b);
-    var place: Number = number_from_i64(1);
-    var out: Number = number_make_zero();
-
-    while (number_signum(&aa) != 0 || number_signum(&bb) != 0) {
-        var abit: u64 = number_mod_small_abs(&aa, 2);
-        var bbit: u64 = number_mod_small_abs(&bb, 2);
-        var obit: u64 = 0;
-        if (mode == NUMBER_BITWISE_AND) { obit = abit & bbit; }
-        else if (mode == NUMBER_BITWISE_OR) { obit = abit | bbit; }
-        else { obit = abit ^ bbit; }
-
-        if (obit != 0) {
-            out = number_add_values(&out, &place);
-        }
-
-        aa = number_div_small_abs(&aa, 2);
-        bb = number_div_small_abs(&bb, 2);
-        place = number_mul_small(&place, 2);
-    }
-    return out;
-}
-
-func number_bitwise_values(a: *Number, b: *Number, mode: u64) -> Number {
-    var abit: u64 = number_bit_length_abs(a);
-    var bbit: u64 = number_bit_length_abs(b);
-    var width: u64 = abit;
-    if (bbit > width) { width = bbit; }
-    width = width + 2;
-
-    var atc: Number = number_abs_clone(a);
-    if (number_signum(a) < 0) {
-        var abase: Number = number_pow2(width);
-        atc = number_add_values(&abase, a);
-    }
-    var btc: Number = number_abs_clone(b);
-    if (number_signum(b) < 0) {
-        var bbase: Number = number_pow2(width);
-        btc = number_add_values(&bbase, b);
-    }
-    var otc: Number = number_bitwise_nonneg_abs(&atc, &btc, mode);
-    if (number_signum(&otc) == 0 || width == 0) { return number_make_zero(); }
-    var sign_bit: Number = number_pow2(width - 1);
-    if (number_abs_cmp(&otc, &sign_bit) < 0) {
-        return number_abs_clone(&otc);
-    }
-    var base: Number = number_pow2(width);
-    return number_sub_values(&otc, &base);
-}
-
-// ABI compatibility: backend still lowers some bitwise ops to these symbols.
-func number_bitand_values(a: *Number, b: *Number) -> Number {
-    return number_bitwise_values(a, b, NUMBER_BITWISE_AND);
-}
-
-func number_bitor_values(a: *Number, b: *Number) -> Number {
-    return number_bitwise_values(a, b, NUMBER_BITWISE_OR);
-}
-
-func number_bitxor_values(a: *Number, b: *Number) -> Number {
-    return number_bitwise_values(a, b, NUMBER_BITWISE_XOR);
-}
-
-func number_bitnot_values(a: *Number) -> Number {
-    var neg: Number = number_negated(a);
-    var one: Number = number_from_i64(1);
-    return number_sub_values(&neg, &one);
-}
-
-func number_shift_amount_from_number(rhs: *Number) -> u64 {
-    if (rhs == 0) {
-        return number_panic_null(
-            "number_shift_amount_from_number: null rhs"
-        );
-    }
-    if (number_signum(rhs) <= 0) { return 0; }
-    if (number_is_small(rhs) != 0) {
-        var mag: u64 = 0;
-        number_i64_abs_mag(number_small_value(rhs), &mag);
-        return mag;
-    }
-    var out: u64 = 0;
-    if (number_big_abs_to_u64_checked(number_big_ptr(rhs), &out) == 0) {
-        return NUMBER_MAX_U64;
-    }
-    return out;
-}
-
-func number_shr_values(a: *Number, sh: u64) -> Number {
-    if (a == 0 || number_signum(a) == 0) { return number_make_zero(); }
-    if (sh == 0) { return number_clone(a); }
-
-    if (number_signum(a) > 0) {
-        var out_pos: Number = number_abs_clone(a);
-        for (var i: u64 = 0; i < sh; i = i + 1) {
-            out_pos = number_div_small_abs(&out_pos, 2);
-            if (number_signum(&out_pos) == 0) { break; }
-        }
-        return out_pos;
-    }
-
-    var pow2: Number = number_pow2(sh);
-    var q: Number = number_div_values(a, &pow2);
-    var r: Number = number_mod_values(a, &pow2);
-    if (number_signum(&r) != 0) {
-        var one: Number = number_from_i64(1);
-        q = number_sub_values(&q, &one);
-    }
-    return q;
-}
-
-func number_clone(src: *Number) -> Number {
-    if (src == 0) {
-        number_panic_null("number_clone: null Number*");
-        return number_make_zero();
-    }
-    return Number { src.bits };
-}
-
-func number_from_str(src: []u8) -> Number {
-    if (src.ptr == 0 || src.len == 0) { return number_make_zero(); }
-
-    var s: *u8 = (*u8)src.ptr;
-    var idx: u64 = 0;
-    var sign: i64 = 1;
-    if (s[0] == 45) {
-        sign = -1;
-        idx = 1;
-    } else if (s[0] == 43) {
-        idx = 1;
-    }
-    if (idx >= src.len) { return number_make_zero(); }
-
-    var out: Number = number_make_zero();
-    for (; idx < src.len; idx = idx + 1) {
-        var c: u8 = s[idx];
-        if (c < 48 || c > 57) {
-            return number_make_zero();
-        }
-        out = number_mul_small(&out, 10);
-        var d: Number = number_from_u64((u64)(c - 48));
-        out = number_add_values(&out, &d);
-    }
-
-    if (sign < 0 && number_signum(&out) != 0) {
-        out = number_abs_with_sign(&out, -1);
-    }
-    return out;
-}
-
-func number_input(max_len: u64 = IO_INPUT_DEFAULT_MAX_LEN, out_len: *u64 = 0) -> Number {
-    var line_len: u64 = 0;
-    var line: u64 = (u64)input(max_len, &line_len);
-    if (out_len != 0) { out_len[0] = line_len; }
-    return number_from_str(slice(line, line_len));
 }
 
 impl Number {
+    public static func i64_abs_mag(v: i64, out: *u64) -> u64 {
+        if (out == 0) { return 0; }
+        if (v >= 0) {
+            out[0] = (u64)v;
+            return 1;
+        }
+        if (v == i64.MIN) {
+            out[0] = NUMBER_MIN_I64_MAG;
+            return 1;
+        }
+        out[0] = (u64)(0 - v);
+        return 1;
+    }
+
+    public static func fits_small_i64(v: i64) -> u64 {
+        if (v < NUMBER_SMALL_MIN_I64) { return 0; }
+        if (v > NUMBER_SMALL_MAX_I64) { return 0; }
+        return 1;
+    }
+
+    public static func zero() -> Number {
+        return Number { NUMBER_TAG_SMALL };
+    }
+
+    public func is_small(self: *Number) -> u64 {
+        if (self == 0) {
+            panic("Number.is_small: null Number*");
+            return 0;
+        }
+        if (number_bits_is_boxed(self.bits) == 0) { return 0; }
+        return number_box_tag(self.bits) == NUMBER_BOX_TAG_SMALL;
+    }
+
+    public func is_real(self: *Number) -> u64 {
+        if (self == 0) { return 0; }
+        if (number_bits_is_boxed(self.bits) == 0) { return 1; }
+        return number_box_tag(self.bits) == NUMBER_BOX_TAG_REAL;
+    }
+
+    public func is_complex(self: *Number) -> u64 {
+        if (self == 0) { return 0; }
+        if (number_bits_is_boxed(self.bits) == 0) { return 0; }
+        return number_box_tag(self.bits) == NUMBER_BOX_TAG_COMPLEX;
+    }
+
+    public func is_ext(self: *Number) -> u64 {
+        if (self == 0) { return 0; }
+        if (number_bits_is_boxed(self.bits) == 0) { return 0; }
+        return number_box_tag(self.bits) == NUMBER_BOX_TAG_EXT;
+    }
+
+    public func ext_kind(self: *Number) -> u64 {
+        if (self == 0 || self.is_ext() == 0) { return 0; }
+        var h: *NumberExtHeader = (*NumberExtHeader)(self.bits & NUMBER_PTR_MASK);
+        if (h == 0) { return 0; }
+        return h.kind;
+    }
+
+    public func is_rational(self: *Number) -> u64 {
+        return self.ext_kind() == NUMBER_EXT_RATIONAL;
+    }
+
+    public func is_decimal(self: *Number) -> u64 {
+        return self.ext_kind() == NUMBER_EXT_DECIMAL;
+    }
+
+    public func is_bigfloat(self: *Number) -> u64 {
+        return self.ext_kind() == NUMBER_EXT_BIGFLOAT;
+    }
+
+    public func is_exact_extended(self: *Number) -> u64 {
+        if (self.is_rational() != 0) { return 1; }
+        if (self.is_decimal() != 0) { return 1; }
+        if (self.is_bigfloat() != 0) { return 1; }
+        return 0;
+    }
+
+    public func small_value(self: *Number) -> i64 {
+        if (self == 0) {
+            panic("Number.small_value: null Number*");
+            return 0;
+        }
+        var payload: u64 = self.bits & NUMBER_PTR_MASK;
+        if ((payload & NUMBER_SMALL_SIGN_BIT) != 0) {
+            payload = payload | NUMBER_SMALL_SIGN_EXT_MASK;
+        }
+        return (i64)payload;
+    }
+
+    public func big_ptr(self: *Number) -> *NumberBig {
+        if (self == 0) { return 0; }
+        if (number_bits_is_boxed(self.bits) == 0) { return 0; }
+        if (number_box_tag(self.bits) != NUMBER_BOX_TAG_BIG) { return 0; }
+        return (*NumberBig)(self.bits & NUMBER_PTR_MASK);
+    }
+
+    public func real_ptr(self: *Number) -> *NumberReal {
+        if (self == 0) { return 0; }
+        if (number_bits_is_boxed(self.bits) == 0) { return 0; }
+        if (number_box_tag(self.bits) != NUMBER_BOX_TAG_REAL) { return 0; }
+        return (*NumberReal)(self.bits & NUMBER_PTR_MASK);
+    }
+
+    public func real_value(self: *Number) -> f64 {
+        if (self == 0) { return 0.0; }
+        if (number_bits_is_boxed(self.bits) == 0) { return number_bits_to_f64(self.bits); }
+        var real: *NumberReal = self.real_ptr();
+        if (real == 0) { return 0.0; }
+        return real.value;
+    }
+
+    public func complex_ptr(self: *Number) -> *NumberComplex {
+        if (self == 0) { return 0; }
+        if (self.is_complex() == 0) { return 0; }
+        return (*NumberComplex)(self.bits & NUMBER_PTR_MASK);
+    }
+
+    public func rational_ptr(self: *Number) -> *NumberRational {
+        if (self == 0 || self.is_rational() == 0) { return 0; }
+        return (*NumberRational)(self.bits & NUMBER_PTR_MASK);
+    }
+
+    public func decimal_ptr(self: *Number) -> *NumberDecimal {
+        if (self == 0 || self.is_decimal() == 0) { return 0; }
+        return (*NumberDecimal)(self.bits & NUMBER_PTR_MASK);
+    }
+
+    public func bigfloat_ptr(self: *Number) -> *NumberBigFloat {
+        if (self == 0 || self.is_bigfloat() == 0) { return 0; }
+        return (*NumberBigFloat)(self.bits & NUMBER_PTR_MASK);
+    }
+
     public static func from_i64(v: i64) -> Number {
-        return number_from_i64(v);
+        if (Number.fits_small_i64(v) != 0) {
+            return number_box_small_i64(v);
+        }
+        var big: *NumberBig = NumberBig.from_i64_raw(v);
+        return number_box_ptr(NUMBER_BOX_TAG_BIG, (u64)big);
+    }
+
+    public static func from_i8(v: i8) -> Number {
+        return number_box_small_i64((i64)v);
+    }
+
+    public static func from_i16(v: i16) -> Number {
+        return number_box_small_i64((i64)v);
+    }
+
+    public static func from_i32(v: i32) -> Number {
+        return number_box_small_i64((i64)v);
     }
 
     public static func from_u64(v: u64) -> Number {
-        return number_from_u64(v);
+        if (v <= NUMBER_SMALL_MAX_U64) {
+            return number_box_small_u64(v);
+        }
+        var big: *NumberBig = NumberBig.from_u64_raw(v);
+        return number_box_ptr(NUMBER_BOX_TAG_BIG, (u64)big);
+    }
+
+    public static func from_u8(v: u8) -> Number {
+        return number_box_small_u64((u64)v);
+    }
+
+    public static func from_u16(v: u16) -> Number {
+        return number_box_small_u64((u64)v);
+    }
+
+    public static func from_u32(v: u32) -> Number {
+        return number_box_small_u64((u64)v);
+    }
+
+    public static func from_f64(v: f64) -> Number {
+        return number_make_real(v);
+    }
+
+    public static func from_complex(real: Number, imag: Number) -> Number {
+        return number_make_complex(real, imag);
+    }
+
+    public static func from_complex_f64(real: f64, imag: f64) -> Number {
+        var r: Number = number_make_real(real);
+        var i: Number = number_make_real(imag);
+        return number_make_complex(r, i);
+    }
+
+    public static func from_rational(num: Number, den: Number) -> Number {
+        return number_make_rational(num, den);
+    }
+
+    public static func from_decimal(coeff: Number, scale: u64) -> Number {
+        return number_make_decimal(coeff, scale);
+    }
+
+    public static func from_bigfloat(mant: Number, exp: i64, precision: u64) -> Number {
+        return number_make_bigfloat(mant, exp, precision);
     }
 
     public static func from_str(src: []u8) -> Number {
-        return number_from_str(slice(src.ptr, src.len));
+        var out: Number = Number { NUMBER_TAG_SMALL };
+        out.set_from_str(slice(src.ptr, src.len));
+        return out;
+    }
+
+    public static func input(max_len: u64 = IO_INPUT_DEFAULT_MAX_LEN, out_len: *u64 = 0) -> Number {
+        var line_len: u64 = 0;
+        var line: u64 = (u64)input(max_len, &line_len);
+        if (out_len != 0) { out_len[0] = line_len; }
+        var out: Number = Number { NUMBER_TAG_SMALL };
+        out.set_from_str(slice(line, line_len));
+        return out;
+    }
+
+    public static func from_big_normalized(big: *NumberBig) -> Number {
+        if (big == 0) { return Number { NUMBER_TAG_SMALL }; }
+        big.trim_inplace();
+        if (big.sign == 0) { return Number { NUMBER_TAG_SMALL }; }
+
+        var iv: i64 = 0;
+        if (big.try_to_i64(&iv) != 0) {
+            if (Number.fits_small_i64(iv) != 0) {
+                return number_box_small_i64(iv);
+            }
+        }
+        return number_box_ptr(NUMBER_BOX_TAG_BIG, (u64)big);
+    }
+
+    public func to_abs_big(self: *Number) -> *NumberBig {
+        if (self == 0) {
+            return NumberBig.zero();
+        }
+        if (self.is_small() != 0) {
+            var sv: i64 = self.small_value();
+            if (sv == 0) {
+                return NumberBig.zero();
+            }
+            var mag: u64 = 0;
+            Number.i64_abs_mag(sv, &mag);
+            return NumberBig.from_u64_raw(mag);
+        }
+        if (self.is_real() != 0) {
+            var rv: f64 = self.real_value();
+            if (rv < 0.0) { rv = 0.0 - rv; }
+            return NumberBig.from_u64_raw((u64)rv);
+        }
+        if (self.is_complex() != 0) {
+            return NumberBig.zero();
+        }
+        if (self.is_exact_extended() != 0) {
+            var n: Number = self.numerator();
+            return n.to_abs_big();
+        }
+        return self.big_ptr().abs_copy();
     }
 
     public func set_i64(self: *Number, v: i64) -> u64 {
         if (self == 0) { return 0; }
-        self.bits = number_from_i64(v).bits;
+        if (Number.fits_small_i64(v) != 0) {
+            var boxed_small: Number = number_box_small_i64(v);
+            self.bits = boxed_small.bits;
+            return 0;
+        }
+        var boxed_big: Number = number_box_ptr(NUMBER_BOX_TAG_BIG, (u64)NumberBig.from_i64_raw(v));
+        self.bits = boxed_big.bits;
         return 0;
     }
 
     public func set_u64(self: *Number, v: u64) -> u64 {
         if (self == 0) { return 0; }
-        self.bits = number_from_u64(v).bits;
+        if (v <= NUMBER_SMALL_MAX_U64) {
+            var boxed_small: Number = number_box_small_u64(v);
+            self.bits = boxed_small.bits;
+            return 0;
+        }
+        var boxed_big: Number = number_box_ptr(NUMBER_BOX_TAG_BIG, (u64)NumberBig.from_u64_raw(v));
+        self.bits = boxed_big.bits;
         return 0;
     }
 
     public func set_from_str(self: *Number, src: []u8) -> u64 {
         if (self == 0) { return 0; }
-        self.bits = number_from_str(slice(src.ptr, src.len)).bits;
+        self.bits = NUMBER_TAG_SMALL;
+        if (src.ptr == 0 || src.len == 0) { return 0; }
+
+        var s: *u8 = (*u8)src.ptr;
+        var idx: u64 = 0;
+        var sign: i64 = 1;
+        if (s[0] == 45) {
+            sign = -1;
+            idx = 1;
+        } else if (s[0] == 43) {
+            idx = 1;
+        }
+        if (idx >= src.len) { return 0; }
+
+        var out: Number = Number { NUMBER_TAG_SMALL };
+        for (; idx < src.len; idx = idx + 1) {
+            var c: u8 = s[idx];
+            if (c < 48 || c > 57) {
+                self.bits = NUMBER_TAG_SMALL;
+                return 0;
+            }
+            out = out.mul_small(10);
+            var d: Number = Number { NUMBER_TAG_SMALL };
+            d.set_u64((u64)(c - 48));
+            out = out.add_values(&d);
+        }
+
+        if (sign < 0 && out.signum() != 0) {
+            out = out.abs_with_sign(-1);
+        }
+        self.bits = out.bits;
         return 0;
     }
 
     public func clone(self: *Number) -> Number {
-        return number_clone(self);
+        if (self == 0) {
+            panic("number_clone: null Number*");
+            return Number { NUMBER_TAG_SMALL };
+        }
+        return Number { self.bits };
     }
 
-    public func operator +(self: *Number, rhs: Number) -> Number { return number_add_values(self, &rhs); }
-    public func operator +(self: *Number, rhs: i64) -> Number { var rv: Number = number_from_i64(rhs); return number_add_values(self, &rv); }
-    public func operator +(self: *Number, rhs: u64) -> Number { var rv: Number = number_from_u64(rhs); return number_add_values(self, &rv); }
-    public func operator -(self: *Number, rhs: Number) -> Number { return number_sub_values(self, &rhs); }
-    public func operator -(self: *Number, rhs: i64) -> Number { var rv: Number = number_from_i64(rhs); return number_sub_values(self, &rv); }
-    public func operator -(self: *Number, rhs: u64) -> Number { var rv: Number = number_from_u64(rhs); return number_sub_values(self, &rv); }
-    public func operator -(self: *Number) -> Number { return number_negated(self); }
-    public func operator *(self: *Number, rhs: Number) -> Number { return number_mul_values(self, &rhs); }
-    public func operator *(self: *Number, rhs: i64) -> Number { var rv: Number = number_from_i64(rhs); return number_mul_values(self, &rv); }
-    public func operator *(self: *Number, rhs: u64) -> Number { var rv: Number = number_from_u64(rhs); return number_mul_values(self, &rv); }
-    public func operator /(self: *Number, rhs: Number) -> Number { return number_div_values(self, &rhs); }
-    public func operator /(self: *Number, rhs: i64) -> Number { var rv: Number = number_from_i64(rhs); return number_div_values(self, &rv); }
-    public func operator /(self: *Number, rhs: u64) -> Number { var rv: Number = number_from_u64(rhs); return number_div_values(self, &rv); }
-    public func operator %(self: *Number, rhs: Number) -> Number { return number_mod_values(self, &rhs); }
-    public func operator %(self: *Number, rhs: i64) -> Number { var rv: Number = number_from_i64(rhs); return number_mod_values(self, &rv); }
-    public func operator %(self: *Number, rhs: u64) -> Number { var rv: Number = number_from_u64(rhs); return number_mod_values(self, &rv); }
-    public func operator &(self: *Number, rhs: Number) -> Number { return number_bitwise_values(self, &rhs, NUMBER_BITWISE_AND); }
-    public func operator &(self: *Number, rhs: i64) -> Number { var rv: Number = number_from_i64(rhs); return number_bitwise_values(self, &rv, NUMBER_BITWISE_AND); }
-    public func operator &(self: *Number, rhs: u64) -> Number { var rv: Number = number_from_u64(rhs); return number_bitwise_values(self, &rv, NUMBER_BITWISE_AND); }
-    public func operator |(self: *Number, rhs: Number) -> Number { return number_bitwise_values(self, &rhs, NUMBER_BITWISE_OR); }
-    public func operator |(self: *Number, rhs: i64) -> Number { var rv: Number = number_from_i64(rhs); return number_bitwise_values(self, &rv, NUMBER_BITWISE_OR); }
-    public func operator |(self: *Number, rhs: u64) -> Number { var rv: Number = number_from_u64(rhs); return number_bitwise_values(self, &rv, NUMBER_BITWISE_OR); }
-    public func operator ^(self: *Number, rhs: Number) -> Number { return number_bitwise_values(self, &rhs, NUMBER_BITWISE_XOR); }
-    public func operator ^(self: *Number, rhs: i64) -> Number { var rv: Number = number_from_i64(rhs); return number_bitwise_values(self, &rv, NUMBER_BITWISE_XOR); }
-    public func operator ^(self: *Number, rhs: u64) -> Number { var rv: Number = number_from_u64(rhs); return number_bitwise_values(self, &rv, NUMBER_BITWISE_XOR); }
-    public func operator <<(self: *Number, rhs: Number) -> Number { return number_shl_values(self, number_shift_amount_from_number(&rhs)); }
-    public func operator <<(self: *Number, rhs: i64) -> Number { var rv: Number = number_from_i64(rhs); return number_shl_values(self, number_shift_amount_from_number(&rv)); }
-    public func operator <<(self: *Number, rhs: u64) -> Number { var rv: Number = number_from_u64(rhs); return number_shl_values(self, number_shift_amount_from_number(&rv)); }
-    public func operator >>(self: *Number, rhs: Number) -> Number { return number_shr_values(self, number_shift_amount_from_number(&rhs)); }
-    public func operator >>(self: *Number, rhs: i64) -> Number { var rv: Number = number_from_i64(rhs); return number_shr_values(self, number_shift_amount_from_number(&rv)); }
-    public func operator >>(self: *Number, rhs: u64) -> Number { var rv: Number = number_from_u64(rhs); return number_shr_values(self, number_shift_amount_from_number(&rv)); }
-    public func operator ~(self: *Number) -> Number { return number_bitnot_values(self); }
+    public func signum(self: *Number) -> i64 {
+        if (self == 0) {
+            panic("number_signum: null Number*");
+            return 0;
+        }
+        if (self.is_small() != 0) {
+            var sv: i64 = self.small_value();
+            if (sv > 0) { return 1; }
+            if (sv < 0) { return -1; }
+            return 0;
+        }
+        if (self.is_real() != 0) {
+            var rv: f64 = self.real_value();
+            if (rv > 0.0) { return 1; }
+            if (rv < 0.0) { return -1; }
+            return 0;
+        }
+        if (self.is_complex() != 0) {
+            var c: *NumberComplex = self.complex_ptr();
+            if (c == 0) { return 0; }
+            if (c.real.signum() != 0 || c.imag.signum() != 0) { return 1; }
+            return 0;
+        }
+        if (self.is_rational() != 0) {
+            var r: *NumberRational = self.rational_ptr();
+            if (r == 0) { return 0; }
+            return r.num.signum();
+        }
+        if (self.is_decimal() != 0) {
+            var d: *NumberDecimal = self.decimal_ptr();
+            if (d == 0) { return 0; }
+            return d.coeff.signum();
+        }
+        if (self.is_bigfloat() != 0) {
+            var bf: *NumberBigFloat = self.bigfloat_ptr();
+            if (bf == 0) { return 0; }
+            return bf.mant.signum();
+        }
+        var b: *NumberBig = self.big_ptr();
+        if (b == 0) { return 0; }
+        if (b.sign > 0) { return 1; }
+        if (b.sign < 0) { return -1; }
+        return 0;
+    }
 
-    public func __op_eq(self: *Number, rhs: Number) -> u64 { return number_cmp_ptr(self, &rhs) == 0; }
-    public func __op_ne(self: *Number, rhs: Number) -> u64 { return number_cmp_ptr(self, &rhs) != 0; }
-    public func __op_ne(self: *Number, rhs: i64) -> u64 { var rv: Number = number_from_i64(rhs); return number_cmp_ptr(self, &rv) != 0; }
-    public func __op_ne(self: *Number, rhs: u64) -> u64 { var rv: Number = number_from_u64(rhs); return number_cmp_ptr(self, &rv) != 0; }
-    public func __op_lt(self: *Number, rhs: Number) -> u64 { return number_cmp_ptr(self, &rhs) < 0; }
-    public func __op_lt(self: *Number, rhs: i64) -> u64 { var rv: Number = number_from_i64(rhs); return number_cmp_ptr(self, &rv) < 0; }
-    public func __op_lt(self: *Number, rhs: u64) -> u64 { var rv: Number = number_from_u64(rhs); return number_cmp_ptr(self, &rv) < 0; }
-    public func __op_le(self: *Number, rhs: Number) -> u64 { return number_cmp_ptr(self, &rhs) <= 0; }
-    public func __op_le(self: *Number, rhs: i64) -> u64 { var rv: Number = number_from_i64(rhs); return number_cmp_ptr(self, &rv) <= 0; }
-    public func __op_le(self: *Number, rhs: u64) -> u64 { var rv: Number = number_from_u64(rhs); return number_cmp_ptr(self, &rv) <= 0; }
-    public func __op_gt(self: *Number, rhs: Number) -> u64 { return number_cmp_ptr(self, &rhs) > 0; }
-    public func __op_gt(self: *Number, rhs: i64) -> u64 { var rv: Number = number_from_i64(rhs); return number_cmp_ptr(self, &rv) > 0; }
-    public func __op_gt(self: *Number, rhs: u64) -> u64 { var rv: Number = number_from_u64(rhs); return number_cmp_ptr(self, &rv) > 0; }
-    public func __op_ge(self: *Number, rhs: Number) -> u64 { return number_cmp_ptr(self, &rhs) >= 0; }
-    public func __op_ge(self: *Number, rhs: i64) -> u64 { var rv: Number = number_from_i64(rhs); return number_cmp_ptr(self, &rv) >= 0; }
-    public func __op_ge(self: *Number, rhs: u64) -> u64 { var rv: Number = number_from_u64(rhs); return number_cmp_ptr(self, &rv) >= 0; }
+    public func negated(self: *Number) -> Number {
+        if (self == 0) {
+            panic("number_negated: null Number*");
+            return Number { NUMBER_TAG_SMALL };
+        }
+        if (self.is_small() != 0) {
+            var out_small: Number = Number { NUMBER_TAG_SMALL };
+            out_small.set_i64(0 - self.small_value());
+            return out_small;
+        }
+        if (self.is_real() != 0) {
+            return number_make_real(0.0 - self.real_value());
+        }
+        if (self.is_complex() != 0) {
+            var c: *NumberComplex = self.complex_ptr();
+            if (c == 0) { return Number { NUMBER_TAG_SMALL }; }
+            var nr: Number = c.real.negated();
+            var ni: Number = c.imag.negated();
+            return number_make_complex(nr, ni);
+        }
+        if (self.is_rational() != 0) {
+            var r: *NumberRational = self.rational_ptr();
+            if (r == 0) { return Number { NUMBER_TAG_SMALL }; }
+            var rn: Number = r.num.negated();
+            return number_make_rational(rn, r.den);
+        }
+        if (self.is_decimal() != 0) {
+            var d: *NumberDecimal = self.decimal_ptr();
+            if (d == 0) { return Number { NUMBER_TAG_SMALL }; }
+            var dc: Number = d.coeff.negated();
+            return number_make_decimal(dc, d.scale);
+        }
+        if (self.is_bigfloat() != 0) {
+            var bf: *NumberBigFloat = self.bigfloat_ptr();
+            if (bf == 0) { return Number { NUMBER_TAG_SMALL }; }
+            var bm: Number = bf.mant.negated();
+            return number_make_bigfloat(bm, bf.exp, bf.precision);
+        }
+        var src: *NumberBig = self.big_ptr();
+        if (src == 0 || src.sign == 0) { return Number { NUMBER_TAG_SMALL }; }
+        var copy: *NumberBig = src.copy();
+        copy.sign = 0 - copy.sign;
+        var out: Number = Number.from_big_normalized(copy);
+        return out;
+    }
 
-    public func cmp(self: *Number, rhs: Number) -> i64 { return number_cmp_ptr(self, &rhs); }
+    public func abs_with_sign(self: *Number, sign: i64) -> Number {
+        if (self == 0) {
+            panic("number_abs_with_sign: null Number*");
+            return Number { NUMBER_TAG_SMALL };
+        }
+        if (sign == 0 || self.signum() == 0) {
+            return Number { NUMBER_TAG_SMALL };
+        }
+        if (self.is_small() != 0) {
+            var sv: i64 = self.small_value();
+            var mag: u64 = 0;
+            Number.i64_abs_mag(sv, &mag);
+            if (sign < 0) {
+                if (mag <= NUMBER_MAX_I64_U64) {
+                    var out_small_neg: Number = Number { NUMBER_TAG_SMALL };
+                    out_small_neg.set_i64(0 - (i64)mag);
+                    return out_small_neg;
+                }
+                var bneg: *NumberBig = NumberBig.from_u64_raw(mag);
+                bneg.sign = -1;
+                var out_neg: Number = Number.from_big_normalized(bneg);
+                return out_neg;
+            }
+            var out_small_abs: Number = Number { NUMBER_TAG_SMALL };
+            out_small_abs.set_u64(mag);
+            return out_small_abs;
+        }
+        if (self.is_real() != 0) {
+            var rv: f64 = self.real_value();
+            if (rv < 0.0) { rv = 0.0 - rv; }
+            if (sign < 0) { rv = 0.0 - rv; }
+            return number_make_real(rv);
+        }
+        if (self.is_rational() != 0) {
+            var r: *NumberRational = self.rational_ptr();
+            if (r == 0) { return Number { NUMBER_TAG_SMALL }; }
+            var rn: Number = r.num.abs_with_sign(sign);
+            return number_make_rational(rn, r.den);
+        }
+        if (self.is_decimal() != 0) {
+            var d: *NumberDecimal = self.decimal_ptr();
+            if (d == 0) { return Number { NUMBER_TAG_SMALL }; }
+            var dc: Number = d.coeff.abs_with_sign(sign);
+            return number_make_decimal(dc, d.scale);
+        }
+        if (self.is_bigfloat() != 0) {
+            var bf: *NumberBigFloat = self.bigfloat_ptr();
+            if (bf == 0) { return Number { NUMBER_TAG_SMALL }; }
+            var bm: Number = bf.mant.abs_with_sign(sign);
+            return number_make_bigfloat(bm, bf.exp, bf.precision);
+        }
+        var srcb: *NumberBig = self.big_ptr();
+        if (srcb == 0) { return Number { NUMBER_TAG_SMALL }; }
+        var copyb: *NumberBig = srcb.abs_copy();
+        if (sign < 0) { copyb.sign = -1; }
+        else { copyb.sign = 1; }
+        var out: Number = Number.from_big_normalized(copyb);
+        return out;
+    }
+
+    public func abs_cmp(self: *Number, rhs: *Number) -> i64 {
+        if (self == 0) {
+            panic("number_abs_cmp: null lhs");
+            return 0;
+        }
+        if (rhs == 0) {
+            panic("number_abs_cmp: null rhs");
+            return 0;
+        }
+        if (self.is_real() != 0 || rhs.is_real() != 0 || self.is_complex() != 0 || rhs.is_complex() != 0) {
+            var avf: f64 = self.to_f64_lossy();
+            var bvf: f64 = rhs.to_f64_lossy();
+            if (avf < 0.0) { avf = 0.0 - avf; }
+            if (bvf < 0.0) { bvf = 0.0 - bvf; }
+            if (avf < bvf) { return -1; }
+            if (avf > bvf) { return 1; }
+            return 0;
+        }
+        if (self.is_exact_extended() != 0 || rhs.is_exact_extended() != 0) {
+            var an0: Number = self.numerator();
+            var an: Number = an0.abs_clone();
+            var ad: Number = self.denominator();
+            var bn0: Number = rhs.numerator();
+            var bn: Number = bn0.abs_clone();
+            var bd: Number = rhs.denominator();
+            var left_abs: Number = an.mul_values(&bd);
+            var right_abs: Number = bn.mul_values(&ad);
+            return left_abs.cmp_ptr(&right_abs);
+        }
+        var a_small: u64 = self.is_small();
+        var b_small: u64 = rhs.is_small();
+        if (a_small != 0 && b_small != 0) {
+            var amag: u64 = 0;
+            var bmag: u64 = 0;
+            Number.i64_abs_mag(self.small_value(), &amag);
+            Number.i64_abs_mag(rhs.small_value(), &bmag);
+            if (amag < bmag) { return -1; }
+            if (amag > bmag) { return 1; }
+            return 0;
+        }
+        if (a_small != 0) {
+            var bptr0: *NumberBig = rhs.big_ptr();
+            if (bptr0 == 0 || bptr0.sign == 0) {
+                var amag0: u64 = 0;
+                Number.i64_abs_mag(self.small_value(), &amag0);
+                if (amag0 == 0) { return 0; }
+            }
+            return -1;
+        }
+        if (b_small != 0) {
+            var aptr0: *NumberBig = self.big_ptr();
+            if (aptr0 == 0 || aptr0.sign == 0) {
+                var bmag0: u64 = 0;
+                Number.i64_abs_mag(rhs.small_value(), &bmag0);
+                if (bmag0 == 0) { return 0; }
+            }
+            return 1;
+        }
+        return self.big_ptr().abs_cmp(rhs.big_ptr());
+    }
+
+    public func real_part(self: *Number) -> Number {
+        if (self == 0) { return Number { NUMBER_TAG_SMALL }; }
+        if (self.is_complex() != 0) {
+            var c: *NumberComplex = self.complex_ptr();
+            if (c == 0) { return Number { NUMBER_TAG_SMALL }; }
+            return Number { c.real.bits };
+        }
+        return Number { self.bits };
+    }
+
+    public func imag_part(self: *Number) -> Number {
+        if (self == 0) { return Number { NUMBER_TAG_SMALL }; }
+        if (self.is_complex() != 0) {
+            var c: *NumberComplex = self.complex_ptr();
+            if (c == 0) { return Number { NUMBER_TAG_SMALL }; }
+            return Number { c.imag.bits };
+        }
+        return Number { NUMBER_TAG_SMALL };
+    }
+
+    public func numerator(self: *Number) -> Number {
+        if (self == 0) { return Number { NUMBER_TAG_SMALL }; }
+        if (self.is_rational() != 0) {
+            var r: *NumberRational = self.rational_ptr();
+            if (r == 0) { return Number { NUMBER_TAG_SMALL }; }
+            return Number { r.num.bits };
+        }
+        if (self.is_decimal() != 0) {
+            var d: *NumberDecimal = self.decimal_ptr();
+            if (d == 0) { return Number { NUMBER_TAG_SMALL }; }
+            return Number { d.coeff.bits };
+        }
+        if (self.is_bigfloat() != 0) {
+            var bf: *NumberBigFloat = self.bigfloat_ptr();
+            if (bf == 0) { return Number { NUMBER_TAG_SMALL }; }
+            if (bf.exp >= 0) {
+                return bf.mant.shl_values((u64)bf.exp);
+            }
+            return Number { bf.mant.bits };
+        }
+        if (self.is_complex() != 0) {
+            return self.real_part();
+        }
+        return Number { self.bits };
+    }
+
+    public func denominator(self: *Number) -> Number {
+        if (self == 0) {
+            var one_null: Number = Number.from_u64(1);
+            return one_null;
+        }
+        if (self.is_rational() != 0) {
+            var r: *NumberRational = self.rational_ptr();
+            if (r == 0) {
+                var one_r: Number = Number.from_u64(1);
+                return one_r;
+            }
+            return Number { r.den.bits };
+        }
+        if (self.is_decimal() != 0) {
+            var d: *NumberDecimal = self.decimal_ptr();
+            if (d == 0) {
+                var one_d: Number = Number.from_u64(1);
+                return one_d;
+            }
+            return number_pow10(d.scale);
+        }
+        if (self.is_bigfloat() != 0) {
+            var bf: *NumberBigFloat = self.bigfloat_ptr();
+            if (bf == 0 || bf.exp >= 0) {
+                var one_bf: Number = Number.from_u64(1);
+                return one_bf;
+            }
+            var den_bf: Number = Number.pow2((u64)(0 - bf.exp));
+            return den_bf;
+        }
+        var one: Number = Number.from_u64(1);
+        return one;
+    }
+
+    public func fraction_add_values(self: *Number, rhs: *Number) -> Number {
+        var an: Number = self.numerator();
+        var ad: Number = self.denominator();
+        var bn: Number = rhs.numerator();
+        var bd: Number = rhs.denominator();
+        var left: Number = an.mul_values(&bd);
+        var right: Number = bn.mul_values(&ad);
+        var num: Number = left.add_values(&right);
+        var den: Number = ad.mul_values(&bd);
+        return number_make_rational(num, den);
+    }
+
+    public func fraction_mul_values(self: *Number, rhs: *Number) -> Number {
+        var an: Number = self.numerator();
+        var ad: Number = self.denominator();
+        var bn: Number = rhs.numerator();
+        var bd: Number = rhs.denominator();
+        var num: Number = an.mul_values(&bn);
+        var den: Number = ad.mul_values(&bd);
+        return number_make_rational(num, den);
+    }
+
+    public func fraction_div_values(self: *Number, rhs: *Number) -> Number {
+        var an: Number = self.numerator();
+        var ad: Number = self.denominator();
+        var bn: Number = rhs.numerator();
+        var bd: Number = rhs.denominator();
+        if (bn.signum() == 0) {
+            panic("Number divide by zero");
+            return Number { NUMBER_TAG_SMALL };
+        }
+        var num: Number = an.mul_values(&bd);
+        var den: Number = ad.mul_values(&bn);
+        return number_make_rational(num, den);
+    }
+
+    public func cmp_ptr(self: *Number, rhs: *Number) -> i64 {
+        if (self == 0) {
+            panic("number_cmp_ptr: null lhs");
+            return 0;
+        }
+        if (rhs == 0) {
+            panic("number_cmp_ptr: null rhs");
+            return 0;
+        }
+
+        if (self.is_complex() != 0 || rhs.is_complex() != 0) {
+            var ai: Number = self.imag_part();
+            var bi: Number = rhs.imag_part();
+            if (ai.signum() != 0 || bi.signum() != 0) {
+                panic("Number ordered comparison is undefined for complex values");
+                return 0;
+            }
+            var ar: Number = self.real_part();
+            var br: Number = rhs.real_part();
+            return ar.cmp_ptr(&br);
+        }
+
+        if (self.is_real() != 0 || rhs.is_real() != 0) {
+            var avf: f64 = self.to_f64_lossy();
+            var bvf: f64 = rhs.to_f64_lossy();
+            if (avf < bvf) { return -1; }
+            if (avf > bvf) { return 1; }
+            return 0;
+        }
+
+        if (self.is_exact_extended() != 0 || rhs.is_exact_extended() != 0) {
+            var an: Number = self.numerator();
+            var ad: Number = self.denominator();
+            var bn: Number = rhs.numerator();
+            var bd: Number = rhs.denominator();
+            var left_exact: Number = an.mul_values(&bd);
+            var right_exact: Number = bn.mul_values(&ad);
+            return left_exact.cmp_ptr(&right_exact);
+        }
+
+        var a_small: u64 = self.is_small();
+        var b_small: u64 = rhs.is_small();
+        if (a_small != 0 && b_small != 0) {
+            var av: i64 = self.small_value();
+            var bv: i64 = rhs.small_value();
+            if (av < bv) { return -1; }
+            if (av > bv) { return 1; }
+            return 0;
+        }
+
+        var a_sign: i64 = self.signum();
+        var bs: i64 = rhs.signum();
+        if (a_sign != bs) {
+            if (a_sign < bs) { return -1; }
+            return 1;
+        }
+        if (a_sign == 0) { return 0; }
+
+        var cmp: i64 = 0;
+        if (a_small == 0 && b_small == 0) {
+            cmp = self.big_ptr().abs_cmp(rhs.big_ptr());
+        } else if (a_small == 0) {
+            cmp = 1;
+        } else {
+            cmp = -1;
+        }
+        if (a_sign > 0) { return cmp; }
+        return 0 - cmp;
+    }
+
+    public func eq_cmp_ptr(self: *Number, rhs: *Number) -> i64 {
+        if (self == 0) {
+            panic("number_eq_cmp_ptr: null lhs");
+            return 1;
+        }
+        if (rhs == 0) {
+            panic("number_eq_cmp_ptr: null rhs");
+            return 1;
+        }
+        if (self.is_complex() != 0 || rhs.is_complex() != 0) {
+            var ar: Number = self.real_part();
+            var ai: Number = self.imag_part();
+            var br: Number = rhs.real_part();
+            var bi: Number = rhs.imag_part();
+            if (ar.eq_cmp_ptr(&br) != 0) { return 1; }
+            if (ai.eq_cmp_ptr(&bi) != 0) { return 1; }
+            return 0;
+        }
+        if (self.is_real() != 0 || rhs.is_real() != 0) {
+            var avf: f64 = self.to_f64_lossy();
+            var bvf: f64 = rhs.to_f64_lossy();
+            if (avf == bvf) { return 0; }
+            return 1;
+        }
+        return self.cmp_ptr(rhs);
+    }
+
+    public func add_values(self: *Number, rhs: *Number) -> Number {
+        if (self.is_complex() != 0 || rhs.is_complex() != 0) {
+            var ar: Number = self.real_part();
+            var ai: Number = self.imag_part();
+            var br: Number = rhs.real_part();
+            var bi: Number = rhs.imag_part();
+            var rr: Number = ar.add_values(&br);
+            var ii: Number = ai.add_values(&bi);
+            return number_make_complex(rr, ii);
+        }
+        if (self.is_real() != 0 || rhs.is_real() != 0) {
+            return number_make_real(self.to_f64_lossy() + rhs.to_f64_lossy());
+        }
+        if (self.is_exact_extended() != 0 || rhs.is_exact_extended() != 0) {
+            return self.fraction_add_values(rhs);
+        }
+
+        var a_sign: i64 = self.signum();
+        var bs: i64 = rhs.signum();
+        if (a_sign == 0) { return Number { rhs.bits }; }
+        if (bs == 0) { return Number { self.bits }; }
+
+        if (self.is_small() != 0 && rhs.is_small() != 0) {
+            var av: i64 = self.small_value();
+            var bv: i64 = rhs.small_value();
+            var sv: i64 = av + bv;
+            if (
+                a_sign != bs ||
+                (a_sign > 0 && sv <= NUMBER_SMALL_MAX_I64) ||
+                (a_sign < 0 && sv >= NUMBER_SMALL_MIN_I64)
+            ) {
+                var out_small_sum: Number = Number.from_i64(sv);
+                return out_small_sum;
+            }
+        }
+
+        var aa: *NumberBig = self.to_abs_big();
+        var bb: *NumberBig = rhs.to_abs_big();
+
+        if (a_sign == bs) {
+            var sum: *NumberBig = aa.add_abs(bb);
+            sum.sign = a_sign;
+            var out_sum: Number = Number.from_big_normalized(sum);
+            return out_sum;
+        }
+
+        var cmp: i64 = aa.abs_cmp(bb);
+        if (cmp == 0) { return Number { NUMBER_TAG_SMALL }; }
+        if (cmp > 0) {
+            var diff1: *NumberBig = aa.sub_abs(bb);
+            diff1.sign = a_sign;
+            var out_diff1: Number = Number.from_big_normalized(diff1);
+            return out_diff1;
+        }
+        var diff2: *NumberBig = bb.sub_abs(aa);
+        diff2.sign = bs;
+        var out_diff2: Number = Number.from_big_normalized(diff2);
+        return out_diff2;
+    }
+
+    public func sub_values(self: *Number, rhs: *Number) -> Number {
+        var neg: Number = rhs.negated();
+        var out: Number = self.add_values(&neg);
+        return out;
+    }
+
+    public func mul_values(self: *Number, rhs: *Number) -> Number {
+        if (self.is_complex() != 0 || rhs.is_complex() != 0) {
+            var ar: Number = self.real_part();
+            var ai: Number = self.imag_part();
+            var br: Number = rhs.real_part();
+            var bi: Number = rhs.imag_part();
+            var ac: Number = ar.mul_values(&br);
+            var bd: Number = ai.mul_values(&bi);
+            var ad: Number = ar.mul_values(&bi);
+            var bc: Number = ai.mul_values(&br);
+            var rr: Number = ac.sub_values(&bd);
+            var ii: Number = ad.add_values(&bc);
+            return number_make_complex(rr, ii);
+        }
+        if (self.is_real() != 0 || rhs.is_real() != 0) {
+            return number_make_real(self.to_f64_lossy() * rhs.to_f64_lossy());
+        }
+        if (self.is_exact_extended() != 0 || rhs.is_exact_extended() != 0) {
+            return self.fraction_mul_values(rhs);
+        }
+
+        var a_sign: i64 = self.signum();
+        var bs: i64 = rhs.signum();
+        if (a_sign == 0 || bs == 0) { return Number { NUMBER_TAG_SMALL }; }
+
+        if (self.is_small() != 0 && rhs.is_small() != 0) {
+            var amag: u64 = 0;
+            var bmag: u64 = 0;
+            Number.i64_abs_mag(self.small_value(), &amag);
+            Number.i64_abs_mag(rhs.small_value(), &bmag);
+            if (amag != 0 && bmag <= NUMBER_SMALL_MAX_U64 / amag) {
+                var prod: u64 = amag * bmag;
+                if (a_sign == bs) {
+                    var out_prod_pos: Number = Number.from_u64(prod);
+                    return out_prod_pos;
+                }
+                var out_prod_neg: Number = Number.from_i64(0 - (i64)prod);
+                return out_prod_neg;
+            }
+        }
+
+        if (self.is_small() != 0 && rhs.is_small() == 0) {
+            var amag2: u64 = 0;
+            Number.i64_abs_mag(self.small_value(), &amag2);
+            var rb: *NumberBig = rhs.big_ptr();
+            var out_rhs: *NumberBig = rb.mul_u64_abs(amag2);
+            out_rhs.sign = a_sign * bs;
+            var out_small_lhs: Number = Number.from_big_normalized(out_rhs);
+            return out_small_lhs;
+        }
+        if (rhs.is_small() != 0 && self.is_small() == 0) {
+            var bmag2: u64 = 0;
+            Number.i64_abs_mag(rhs.small_value(), &bmag2);
+            var lb: *NumberBig = self.big_ptr();
+            var out_lhs: *NumberBig = lb.mul_u64_abs(bmag2);
+            out_lhs.sign = a_sign * bs;
+            var out_small_rhs: Number = Number.from_big_normalized(out_lhs);
+            return out_small_rhs;
+        }
+
+        var aa: *NumberBig = self.to_abs_big();
+        var bb: *NumberBig = rhs.to_abs_big();
+        var out_big: *NumberBig = aa.mul_abs(bb);
+        out_big.sign = a_sign * bs;
+        var out: Number = Number.from_big_normalized(out_big);
+        return out;
+    }
+
+    public func divmod_values_nonzero(
+        self: *Number,
+        rhs: *Number
+    ) -> NumberDivMod {
+        var out: NumberDivMod = NumberDivMod {
+            Number { NUMBER_TAG_SMALL },
+            Number { NUMBER_TAG_SMALL }
+        };
+        if (self == 0 || rhs == 0) { return out; }
+
+        var a_sign: i64 = self.signum();
+        if (a_sign == 0) { return out; }
+        var bs: i64 = rhs.signum();
+        if (bs == 0) { return out; }
+
+        if (self.is_small() != 0 && rhs.is_small() != 0) {
+            var av: i64 = self.small_value();
+            var bv: i64 = rhs.small_value();
+            out.q.set_i64(av / bv);
+            out.r.set_i64(av % bv);
+            return out;
+        }
+
+        var aa: *NumberBig = self.to_abs_big();
+        var bb: *NumberBig = rhs.to_abs_big();
+
+        var q_abs: *NumberBig = NumberBig.zero();
+        var r_abs: Number = Number { NUMBER_TAG_SMALL };
+        var bb_u64: u64 = 0;
+        if (bb.abs_to_u64_checked(&bb_u64) != 0 && bb_u64 < NUMBER_BASE) {
+            q_abs = aa.div_small_abs(bb_u64);
+            var rem: u64 = aa.mod_small_abs(bb_u64);
+            if (rem != 0) {
+                r_abs.set_u64(rem);
+            }
+        } else {
+            var dm: NumberBigDivMod = aa.abs_divmod_divide_conquer(bb);
+            q_abs = dm.q;
+            r_abs = Number.from_big_normalized(dm.r);
+        }
+
+        if (q_abs.sign != 0) { q_abs.sign = a_sign * bs; }
+        out.q = Number.from_big_normalized(q_abs);
+        out.r = r_abs;
+        if (a_sign < 0 && out.r.signum() != 0) {
+            out.r = out.r.abs_with_sign(-1);
+        }
+        return out;
+    }
+
+    public func div_values(self: *Number, rhs: *Number) -> Number {
+        if (self == 0) {
+            panic("number_div_values: null lhs");
+            return Number { NUMBER_TAG_SMALL };
+        }
+        if (rhs == 0) {
+            panic("number_div_values: null rhs");
+            return Number { NUMBER_TAG_SMALL };
+        }
+        if (self.is_complex() != 0 || rhs.is_complex() != 0) {
+            var ar_num: Number = self.real_part();
+            var ai_num: Number = self.imag_part();
+            var br_num: Number = rhs.real_part();
+            var bi_num: Number = rhs.imag_part();
+            var ar: f64 = ar_num.to_f64_lossy();
+            var ai: f64 = ai_num.to_f64_lossy();
+            var br: f64 = br_num.to_f64_lossy();
+            var bi: f64 = bi_num.to_f64_lossy();
+            var denom: f64 = (br * br) + (bi * bi);
+            if (denom == 0.0) {
+                panic("Number complex divide by zero");
+                return Number { NUMBER_TAG_SMALL };
+            }
+            var rr: Number = number_make_real(((ar * br) + (ai * bi)) / denom);
+            var ii: Number = number_make_real(((ai * br) - (ar * bi)) / denom);
+            return number_make_complex(rr, ii);
+        }
+        if (self.is_real() != 0 || rhs.is_real() != 0) {
+            var rv: f64 = rhs.to_f64_lossy();
+            if (rv == 0.0) {
+                panic("Number divide by zero");
+                return Number { NUMBER_TAG_SMALL };
+            }
+            return number_make_real(self.to_f64_lossy() / rv);
+        }
+        if (self.is_exact_extended() != 0 || rhs.is_exact_extended() != 0) {
+            return self.fraction_div_values(rhs);
+        }
+        if (rhs.signum() == 0) {
+            panic("Number divide by zero");
+            return Number { NUMBER_TAG_SMALL };
+        }
+        var dm: NumberDivMod = self.divmod_values_nonzero(rhs);
+        return dm.q;
+    }
+
+    public func mod_values(self: *Number, rhs: *Number) -> Number {
+        if (self == 0) {
+            panic("number_mod_values: null lhs");
+            return Number { NUMBER_TAG_SMALL };
+        }
+        if (rhs == 0) {
+            panic("number_mod_values: null rhs");
+            return Number { NUMBER_TAG_SMALL };
+        }
+        if (self.is_real() != 0 || rhs.is_real() != 0 || self.is_complex() != 0 || rhs.is_complex() != 0 ||
+            self.is_exact_extended() != 0 || rhs.is_exact_extended() != 0) {
+            panic("Number modulo requires integer operands");
+            return Number { NUMBER_TAG_SMALL };
+        }
+        if (rhs.signum() == 0) {
+            panic("Number modulo by zero");
+            return Number { NUMBER_TAG_SMALL };
+        }
+        var dm: NumberDivMod = self.divmod_values_nonzero(rhs);
+        return dm.r;
+    }
+
+    public func mul_small(self: *Number, m: u64) -> Number {
+        if (self == 0 || m == 0) { return Number { NUMBER_TAG_SMALL }; }
+        var a_sign: i64 = self.signum();
+        if (a_sign == 0) { return Number { NUMBER_TAG_SMALL }; }
+        if (self.is_small() != 0) {
+            var mag: u64 = 0;
+            Number.i64_abs_mag(self.small_value(), &mag);
+            if (mag <= NUMBER_SMALL_MAX_U64 / m) {
+                var prod: u64 = mag * m;
+                if (a_sign > 0) {
+                    var out_mul_small_pos: Number = Number.from_u64(prod);
+                    return out_mul_small_pos;
+                }
+                var out_mul_small_neg: Number = Number.from_i64(0 - (i64)prod);
+                return out_mul_small_neg;
+            }
+        }
+        var aa: *NumberBig = self.to_abs_big();
+        var out_big: *NumberBig = aa.mul_u64_abs(m);
+        out_big.sign = a_sign;
+        var out: Number = Number.from_big_normalized(out_big);
+        return out;
+    }
+
+    public func abs_clone(self: *Number) -> Number {
+        if (self == 0) {
+            panic("number_abs_clone: null Number*");
+            return Number { NUMBER_TAG_SMALL };
+        }
+        if (self.is_small() != 0) {
+            var sv: i64 = self.small_value();
+            if (sv >= 0) {
+                return number_box_small_i64(sv);
+            }
+            var mag: u64 = 0;
+            Number.i64_abs_mag(sv, &mag);
+            var out_small: Number = Number { NUMBER_TAG_SMALL };
+            out_small.set_u64(mag);
+            return out_small;
+        }
+        if (self.is_real() != 0) {
+            var rv: f64 = self.real_value();
+            if (rv < 0.0) { rv = 0.0 - rv; }
+            return number_make_real(rv);
+        }
+        if (self.is_complex() != 0) {
+            var rp: Number = self.real_part();
+            return rp.abs_clone();
+        }
+        if (self.is_rational() != 0) {
+            var r: *NumberRational = self.rational_ptr();
+            if (r == 0) { return Number { NUMBER_TAG_SMALL }; }
+            var rn: Number = r.num.abs_clone();
+            return number_make_rational(rn, r.den);
+        }
+        if (self.is_decimal() != 0) {
+            var d: *NumberDecimal = self.decimal_ptr();
+            if (d == 0) { return Number { NUMBER_TAG_SMALL }; }
+            var dc: Number = d.coeff.abs_clone();
+            return number_make_decimal(dc, d.scale);
+        }
+        if (self.is_bigfloat() != 0) {
+            var bf: *NumberBigFloat = self.bigfloat_ptr();
+            if (bf == 0) { return Number { NUMBER_TAG_SMALL }; }
+            var bm: Number = bf.mant.abs_clone();
+            return number_make_bigfloat(bm, bf.exp, bf.precision);
+        }
+        var out_big: *NumberBig = self.big_ptr().abs_copy();
+        var out: Number = Number.from_big_normalized(out_big);
+        return out;
+    }
+
+    public func div_small_abs(self: *Number, m: u64) -> Number {
+        if (self == 0) {
+            panic("number_div_small_abs: null Number*");
+            return Number { NUMBER_TAG_SMALL };
+        }
+        if (m == 0) {
+            panic("Number divide by zero");
+            return Number { NUMBER_TAG_SMALL };
+        }
+        if (self.signum() == 0) { return Number { NUMBER_TAG_SMALL }; }
+        if (m >= NUMBER_BASE) {
+            var absn: Number = self.abs_clone();
+            var divisor: Number = Number.from_u64(m);
+            var out_large_small_div: Number = absn.div_values(&divisor);
+            return out_large_small_div;
+        }
+
+        if (self.is_small() != 0) {
+            var mag: u64 = 0;
+            Number.i64_abs_mag(self.small_value(), &mag);
+            var out_small: Number = Number { NUMBER_TAG_SMALL };
+            out_small.set_u64(mag / m);
+            return out_small;
+        }
+
+        var aa: *NumberBig = self.to_abs_big();
+        var q: *NumberBig = aa.div_small_abs(m);
+        var out: Number = Number.from_big_normalized(q);
+        return out;
+    }
+
+    public func mod_small_abs(self: *Number, m: u64) -> u64 {
+        if (self == 0) {
+            panic("number_mod_small_abs: null Number*");
+            return 0;
+        }
+        if (m == 0) {
+            panic("Number modulo by zero");
+            return 0;
+        }
+        if (self.signum() == 0) { return 0; }
+        if (m >= NUMBER_BASE) {
+            var absn: Number = self.abs_clone();
+            var divisor: Number = Number.from_u64(m);
+            var remn: Number = absn.mod_values(&divisor);
+            var rem_out: u64 = 0;
+            remn.to_u64_checked(&rem_out);
+            return rem_out;
+        }
+
+        if (self.is_small() != 0) {
+            var mag: u64 = 0;
+            Number.i64_abs_mag(self.small_value(), &mag);
+            return mag % m;
+        }
+
+        var aa: *NumberBig = self.to_abs_big();
+        return aa.mod_small_abs(m);
+    }
+
+    public func scale_pow2_abs(self: *Number, bits: u64, divide: u64) -> Number {
+        if (self == 0 || self.signum() == 0) { return Number { NUMBER_TAG_SMALL }; }
+        var aa: *NumberBig = self.to_abs_big();
+        var out_big: *NumberBig = 0;
+        if (divide != 0) {
+            out_big = aa.shr_bits_abs(bits);
+        } else {
+            out_big = aa.shl_bits_abs(bits);
+        }
+        var out: Number = Number.from_big_normalized(out_big);
+        return out;
+    }
+
+    public static func pow2(bits: u64) -> Number {
+        var out_big: *NumberBig = NumberBig.pow2_abs(bits);
+        var out: Number = Number.from_big_normalized(out_big);
+        return out;
+    }
+
+    public func bit_length_abs(self: *Number) -> u64 {
+        if (self == 0) { return 0; }
+        if (self.is_small() != 0) {
+            var mag: u64 = 0;
+            Number.i64_abs_mag(self.small_value(), &mag);
+            var small_bits: u64 = 0;
+            while (mag != 0) {
+                mag = mag >> 1;
+                small_bits = small_bits + 1;
+            }
+            return small_bits;
+        }
+        var b: *NumberBig = self.big_ptr();
+        if (b == 0) { return 0; }
+        return b.bit_length_abs();
+    }
+
+    public func shl_values(self: *Number, sh: u64) -> Number {
+        if (self == 0 || self.signum() == 0) { return Number { NUMBER_TAG_SMALL }; }
+        if (self.is_real() != 0 || self.is_complex() != 0 || self.is_exact_extended() != 0) {
+            panic("Number shift requires integer operand");
+            return Number { NUMBER_TAG_SMALL };
+        }
+        if (sh == 0) {
+            var cloned: Number = self.clone();
+            return cloned;
+        }
+
+        var out: Number = self.scale_pow2_abs(sh, 0);
+
+        var a_sign: i64 = self.signum();
+        if (a_sign < 0 && out.signum() != 0) {
+            out = out.abs_with_sign(-1);
+        }
+        return out;
+    }
+
+    public func bitwise_nonneg_abs(
+        self: *Number,
+        rhs: *Number,
+        mode: u64
+    ) -> Number {
+        var aa: *NumberBig = self.to_abs_big();
+        var bb: *NumberBig = rhs.to_abs_big();
+        var an: u64 = 0;
+        var bn: u64 = 0;
+        if (aa != 0 && aa.digits != 0) { an = aa.digits.len(); }
+        if (bb != 0 && bb.digits != 0) { bn = bb.digits.len(); }
+        var n: u64 = an;
+        if (bn > n) { n = bn; }
+        var out_big: *NumberBig = NumberBig.alloc(1, n + 1);
+
+        if (mode == NUMBER_BITWISE_AND) {
+            for (var i_and: u64 = 0; i_and < n; i_and = i_and + 1) {
+                var av_and: u64 = NumberBig.digit_or_zero(aa, an, i_and);
+                var bv_and: u64 = NumberBig.digit_or_zero(bb, bn, i_and);
+                out_big.digits.push((u32)NumberBig.limb_and_value(av_and, bv_and));
+            }
+        } else if (mode == NUMBER_BITWISE_OR) {
+            for (var i_or: u64 = 0; i_or < n; i_or = i_or + 1) {
+                var av_or: u64 = NumberBig.digit_or_zero(aa, an, i_or);
+                var bv_or: u64 = NumberBig.digit_or_zero(bb, bn, i_or);
+                out_big.digits.push((u32)NumberBig.limb_or_value(av_or, bv_or));
+            }
+        } else {
+            for (var i_xor: u64 = 0; i_xor < n; i_xor = i_xor + 1) {
+                var av_xor: u64 = NumberBig.digit_or_zero(aa, an, i_xor);
+                var bv_xor: u64 = NumberBig.digit_or_zero(bb, bn, i_xor);
+                out_big.digits.push((u32)NumberBig.limb_xor_value(av_xor, bv_xor));
+            }
+        }
+        out_big.trim_inplace();
+        var out: Number = Number.from_big_normalized(out_big);
+        return out;
+    }
+
+    public func bitwise_values(
+        self: *Number,
+        rhs: *Number,
+        mode: u64
+    ) -> Number {
+        if (self.is_real() != 0 || rhs.is_real() != 0 || self.is_complex() != 0 || rhs.is_complex() != 0 ||
+            self.is_exact_extended() != 0 || rhs.is_exact_extended() != 0) {
+            panic("Number bitwise operation requires integer operands");
+            return Number { NUMBER_TAG_SMALL };
+        }
+        var self_sign0: i64 = self.signum();
+        var rhs_sign0: i64 = rhs.signum();
+        if (self_sign0 >= 0 && rhs_sign0 >= 0) {
+            if (mode == NUMBER_BITWISE_AND) {
+                var out_and: Number = self.bitwise_nonneg_abs(rhs, NUMBER_BITWISE_AND);
+                return out_and;
+            }
+            if (mode == NUMBER_BITWISE_OR) {
+                var out_or: Number = self.bitwise_nonneg_abs(rhs, NUMBER_BITWISE_OR);
+                return out_or;
+            }
+            var out_xor: Number = self.bitwise_nonneg_abs(rhs, NUMBER_BITWISE_XOR);
+            return out_xor;
+        }
+
+        var abit: u64 = self.bit_length_abs();
+        var bbit: u64 = rhs.bit_length_abs();
+        var width: u64 = abit;
+        if (bbit > width) { width = bbit; }
+        width = width + 2;
+
+        var atc: Number = self.abs_clone();
+        if (self.signum() < 0) {
+            var abase: Number = Number.pow2(width);
+            atc = abase.add_values(self);
+        }
+        var btc: Number = rhs.abs_clone();
+        if (rhs.signum() < 0) {
+            var bbase: Number = Number.pow2(width);
+            btc = bbase.add_values(rhs);
+        }
+        var otc: Number = Number { NUMBER_TAG_SMALL };
+        if (mode == NUMBER_BITWISE_AND) {
+            otc = atc.bitwise_nonneg_abs(&btc, NUMBER_BITWISE_AND);
+        } else if (mode == NUMBER_BITWISE_OR) {
+            otc = atc.bitwise_nonneg_abs(&btc, NUMBER_BITWISE_OR);
+        } else {
+            otc = atc.bitwise_nonneg_abs(&btc, NUMBER_BITWISE_XOR);
+        }
+        if (otc.signum() == 0 || width == 0) {
+            return Number { NUMBER_TAG_SMALL };
+        }
+        var sign_bit: Number = Number.pow2(width - 1);
+        if (otc.abs_cmp(&sign_bit) < 0) {
+            var out_abs: Number = otc.abs_clone();
+            return out_abs;
+        }
+        var base: Number = Number.pow2(width);
+        var out_sub: Number = otc.sub_values(&base);
+        return out_sub;
+    }
+
+    public func bitnot_values(self: *Number) -> Number {
+        if (self.is_real() != 0 || self.is_complex() != 0 || self.is_exact_extended() != 0) {
+            panic("Number bitwise operation requires integer operand");
+            return Number { NUMBER_TAG_SMALL };
+        }
+        var neg: Number = self.negated();
+        var one: Number = Number { NUMBER_TAG_SMALL };
+        one.set_i64(1);
+        var out: Number = neg.sub_values(&one);
+        return out;
+    }
+
+    public func shift_amount(self: *Number) -> u64 {
+        if (self == 0) {
+            panic("number_shift_amount_from_number: null rhs");
+            return 0;
+        }
+        if (self.is_real() != 0 || self.is_complex() != 0 || self.is_exact_extended() != 0) {
+            panic("Number shift amount requires integer operand");
+            return 0;
+        }
+        if (self.signum() <= 0) { return 0; }
+        if (self.is_small() != 0) {
+            var mag: u64 = 0;
+            Number.i64_abs_mag(self.small_value(), &mag);
+            return mag;
+        }
+        var out: u64 = 0;
+        if (self.big_ptr().abs_to_u64_checked(&out) == 0) {
+            return NUMBER_MAX_U64;
+        }
+        return out;
+    }
+
+    public func shr_values(self: *Number, sh: u64) -> Number {
+        if (self == 0 || self.signum() == 0) { return Number { NUMBER_TAG_SMALL }; }
+        if (self.is_real() != 0 || self.is_complex() != 0 || self.is_exact_extended() != 0) {
+            panic("Number shift requires integer operand");
+            return Number { NUMBER_TAG_SMALL };
+        }
+        if (sh == 0) {
+            var cloned: Number = self.clone();
+            return cloned;
+        }
+
+        var a_sign: i64 = self.signum();
+        var q: Number = self.scale_pow2_abs(sh, 1);
+        if (a_sign > 0) { return q; }
+
+        var restored: Number = q.scale_pow2_abs(sh, 0);
+        if (restored.abs_cmp(self) != 0) {
+            var one: Number = Number { NUMBER_TAG_SMALL };
+            one.set_i64(1);
+            q = q.add_values(&one);
+        }
+        var out_neg: Number = q.abs_with_sign(-1);
+        return out_neg;
+    }
+
+    public func operator +(self: *Number, rhs: Number) -> Number { var out: Number = self.add_values(&rhs); return out; }
+    public func operator +(self: *Number, rhs: i64) -> Number { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_i64(rhs); var out: Number = self.add_values(&rv); return out; }
+    public func operator +(self: *Number, rhs: u64) -> Number { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_u64(rhs); var out: Number = self.add_values(&rv); return out; }
+    public func operator +(self: *Number, rhs: f64) -> Number { var rv: Number = number_make_real(rhs); var out: Number = self.add_values(&rv); return out; }
+    public func operator -(self: *Number, rhs: Number) -> Number { var out: Number = self.sub_values(&rhs); return out; }
+    public func operator -(self: *Number, rhs: i64) -> Number { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_i64(rhs); var out: Number = self.sub_values(&rv); return out; }
+    public func operator -(self: *Number, rhs: u64) -> Number { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_u64(rhs); var out: Number = self.sub_values(&rv); return out; }
+    public func operator -(self: *Number, rhs: f64) -> Number { var rv: Number = number_make_real(rhs); var out: Number = self.sub_values(&rv); return out; }
+    public func operator -(self: *Number) -> Number { var out: Number = self.negated(); return out; }
+    public func operator *(self: *Number, rhs: Number) -> Number { var out: Number = self.mul_values(&rhs); return out; }
+    public func operator *(self: *Number, rhs: i64) -> Number { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_i64(rhs); var out: Number = self.mul_values(&rv); return out; }
+    public func operator *(self: *Number, rhs: u64) -> Number { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_u64(rhs); var out: Number = self.mul_values(&rv); return out; }
+    public func operator *(self: *Number, rhs: f64) -> Number { var rv: Number = number_make_real(rhs); var out: Number = self.mul_values(&rv); return out; }
+    public func operator /(self: *Number, rhs: Number) -> Number { var out: Number = self.div_values(&rhs); return out; }
+    public func operator /(self: *Number, rhs: i64) -> Number { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_i64(rhs); var out: Number = self.div_values(&rv); return out; }
+    public func operator /(self: *Number, rhs: u64) -> Number { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_u64(rhs); var out: Number = self.div_values(&rv); return out; }
+    public func operator /(self: *Number, rhs: f64) -> Number { var rv: Number = number_make_real(rhs); var out: Number = self.div_values(&rv); return out; }
+    public func operator %(self: *Number, rhs: Number) -> Number { var out: Number = self.mod_values(&rhs); return out; }
+    public func operator %(self: *Number, rhs: i64) -> Number { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_i64(rhs); var out: Number = self.mod_values(&rv); return out; }
+    public func operator %(self: *Number, rhs: u64) -> Number { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_u64(rhs); var out: Number = self.mod_values(&rv); return out; }
+    public func operator &(self: *Number, rhs: Number) -> Number { var out: Number = self.bitwise_values(&rhs, NUMBER_BITWISE_AND); return out; }
+    public func operator &(self: *Number, rhs: i64) -> Number { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_i64(rhs); var out: Number = self.bitwise_values(&rv, NUMBER_BITWISE_AND); return out; }
+    public func operator &(self: *Number, rhs: u64) -> Number { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_u64(rhs); var out: Number = self.bitwise_values(&rv, NUMBER_BITWISE_AND); return out; }
+    public func operator |(self: *Number, rhs: Number) -> Number { var out: Number = self.bitwise_values(&rhs, NUMBER_BITWISE_OR); return out; }
+    public func operator |(self: *Number, rhs: i64) -> Number { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_i64(rhs); var out: Number = self.bitwise_values(&rv, NUMBER_BITWISE_OR); return out; }
+    public func operator |(self: *Number, rhs: u64) -> Number { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_u64(rhs); var out: Number = self.bitwise_values(&rv, NUMBER_BITWISE_OR); return out; }
+    public func operator ^(self: *Number, rhs: Number) -> Number { var out: Number = self.bitwise_values(&rhs, NUMBER_BITWISE_XOR); return out; }
+    public func operator ^(self: *Number, rhs: i64) -> Number { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_i64(rhs); var out: Number = self.bitwise_values(&rv, NUMBER_BITWISE_XOR); return out; }
+    public func operator ^(self: *Number, rhs: u64) -> Number { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_u64(rhs); var out: Number = self.bitwise_values(&rv, NUMBER_BITWISE_XOR); return out; }
+    public func operator <<(self: *Number, rhs: Number) -> Number { var out: Number = self.shl_values(rhs.shift_amount()); return out; }
+    public func operator <<(self: *Number, rhs: i64) -> Number { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_i64(rhs); var out: Number = self.shl_values(rv.shift_amount()); return out; }
+    public func operator <<(self: *Number, rhs: u64) -> Number { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_u64(rhs); var out: Number = self.shl_values(rv.shift_amount()); return out; }
+    public func operator >>(self: *Number, rhs: Number) -> Number { var out: Number = self.shr_values(rhs.shift_amount()); return out; }
+    public func operator >>(self: *Number, rhs: i64) -> Number { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_i64(rhs); var out: Number = self.shr_values(rv.shift_amount()); return out; }
+    public func operator >>(self: *Number, rhs: u64) -> Number { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_u64(rhs); var out: Number = self.shr_values(rv.shift_amount()); return out; }
+    public func operator ~(self: *Number) -> Number { var out: Number = self.bitnot_values(); return out; }
+
+    public func __op_eq(self: *Number, rhs: Number) -> u64 { return self.eq_cmp_ptr(&rhs) == 0; }
+    public func __op_eq(self: *Number, rhs: f64) -> u64 { var rv: Number = number_make_real(rhs); return self.eq_cmp_ptr(&rv) == 0; }
+    public func __op_ne(self: *Number, rhs: Number) -> u64 { return self.eq_cmp_ptr(&rhs) != 0; }
+    public func __op_ne(self: *Number, rhs: i64) -> u64 { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_i64(rhs); return self.eq_cmp_ptr(&rv) != 0; }
+    public func __op_ne(self: *Number, rhs: u64) -> u64 { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_u64(rhs); return self.eq_cmp_ptr(&rv) != 0; }
+    public func __op_ne(self: *Number, rhs: f64) -> u64 { var rv: Number = number_make_real(rhs); return self.eq_cmp_ptr(&rv) != 0; }
+    public func __op_lt(self: *Number, rhs: Number) -> u64 { return self.cmp_ptr(&rhs) < 0; }
+    public func __op_lt(self: *Number, rhs: i64) -> u64 { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_i64(rhs); return self.cmp_ptr(&rv) < 0; }
+    public func __op_lt(self: *Number, rhs: u64) -> u64 { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_u64(rhs); return self.cmp_ptr(&rv) < 0; }
+    public func __op_lt(self: *Number, rhs: f64) -> u64 { var rv: Number = number_make_real(rhs); return self.cmp_ptr(&rv) < 0; }
+    public func __op_le(self: *Number, rhs: Number) -> u64 { return self.cmp_ptr(&rhs) <= 0; }
+    public func __op_le(self: *Number, rhs: i64) -> u64 { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_i64(rhs); return self.cmp_ptr(&rv) <= 0; }
+    public func __op_le(self: *Number, rhs: u64) -> u64 { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_u64(rhs); return self.cmp_ptr(&rv) <= 0; }
+    public func __op_le(self: *Number, rhs: f64) -> u64 { var rv: Number = number_make_real(rhs); return self.cmp_ptr(&rv) <= 0; }
+    public func __op_gt(self: *Number, rhs: Number) -> u64 { return self.cmp_ptr(&rhs) > 0; }
+    public func __op_gt(self: *Number, rhs: i64) -> u64 { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_i64(rhs); return self.cmp_ptr(&rv) > 0; }
+    public func __op_gt(self: *Number, rhs: u64) -> u64 { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_u64(rhs); return self.cmp_ptr(&rv) > 0; }
+    public func __op_gt(self: *Number, rhs: f64) -> u64 { var rv: Number = number_make_real(rhs); return self.cmp_ptr(&rv) > 0; }
+    public func __op_ge(self: *Number, rhs: Number) -> u64 { return self.cmp_ptr(&rhs) >= 0; }
+    public func __op_ge(self: *Number, rhs: i64) -> u64 { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_i64(rhs); return self.cmp_ptr(&rv) >= 0; }
+    public func __op_ge(self: *Number, rhs: u64) -> u64 { var rv: Number = Number { NUMBER_TAG_SMALL }; rv.set_u64(rhs); return self.cmp_ptr(&rv) >= 0; }
+    public func __op_ge(self: *Number, rhs: f64) -> u64 { var rv: Number = number_make_real(rhs); return self.cmp_ptr(&rv) >= 0; }
+
+    public func cmp(self: *Number, rhs: Number) -> i64 { return self.cmp_ptr(&rhs); }
 
     public func to_i64_checked(self: *Number, out: *i64) -> u64 {
         if (out == 0) { return 0; }
         out[0] = 0;
         if (self == 0) { return 1; }
 
-        if (number_is_small(self) != 0) {
-            out[0] = number_small_value(self);
+        if (self.is_small() != 0) {
+            out[0] = self.small_value();
             return 1;
         }
+        if (self.is_real() != 0) {
+            var rv: f64 = self.real_value();
+            var iv: i64 = (i64)rv;
+            if ((f64)iv == rv) {
+                out[0] = iv;
+                return 1;
+            }
+            return 0;
+        }
+        if (self.is_complex() != 0) {
+            return 0;
+        }
+        if (self.is_exact_extended() != 0) {
+            var n: Number = self.numerator();
+            var d: Number = self.denominator();
+            var dm: NumberDivMod = n.divmod_values_nonzero(&d);
+            if (dm.r.signum() != 0) { return 0; }
+            return dm.q.to_i64_checked(out);
+        }
 
-        return number_big_try_to_i64(number_big_ptr(self), out);
+        return self.big_ptr().try_to_i64(out);
     }
 
     public func to_u64_checked(self: *Number, out: *u64) -> u64 {
@@ -1179,23 +2998,128 @@ impl Number {
         out[0] = 0;
         if (self == 0) { return 1; }
 
-        if (number_is_small(self) != 0) {
-            var sv: i64 = number_small_value(self);
+        if (self.is_small() != 0) {
+            var sv: i64 = self.small_value();
             if (sv < 0) { return 0; }
             out[0] = (u64)sv;
             return 1;
         }
+        if (self.is_real() != 0) {
+            var rv: f64 = self.real_value();
+            if (rv < 0.0) { return 0; }
+            var uv: u64 = (u64)rv;
+            if ((f64)uv == rv) {
+                out[0] = uv;
+                return 1;
+            }
+            return 0;
+        }
+        if (self.is_complex() != 0) {
+            return 0;
+        }
+        if (self.is_exact_extended() != 0) {
+            var n: Number = self.numerator();
+            var d: Number = self.denominator();
+            var dm: NumberDivMod = n.divmod_values_nonzero(&d);
+            if (dm.r.signum() != 0) { return 0; }
+            return dm.q.to_u64_checked(out);
+        }
 
-        var b: *NumberBig = number_big_ptr(self);
+        var b: *NumberBig = self.big_ptr();
         if (b == 0 || b.sign == 0) { return 1; }
         if (b.sign < 0) { return 0; }
-        return number_big_abs_to_u64_checked(b, out);
+        return b.abs_to_u64_checked(out);
+    }
+
+    public func to_i64_checked_value(self: *Number) -> i64 {
+        var out: i64 = 0;
+        if (self.to_i64_checked(&out) == 0) {
+            panic("number does not fit in i64");
+        }
+        return out;
+    }
+
+    public func to_u64_checked_value(self: *Number) -> u64 {
+        var out: u64 = 0;
+        if (self.to_u64_checked(&out) == 0) {
+            panic("number does not fit in u64");
+        }
+        return out;
+    }
+
+    public func to_i8_checked_value(self: *Number) -> i8 {
+        var out: i64 = self.to_i64_checked_value();
+        if (out < -128 || out > 127) { panic("number does not fit in i8"); }
+        return (i8)out;
+    }
+
+    public func to_i16_checked_value(self: *Number) -> i16 {
+        var out: i64 = self.to_i64_checked_value();
+        if (out < -32768 || out > 32767) { panic("number does not fit in i16"); }
+        return (i16)out;
+    }
+
+    public func to_i32_checked_value(self: *Number) -> i32 {
+        var out: i64 = self.to_i64_checked_value();
+        if (out < -2147483648 || out > 2147483647) { panic("number does not fit in i32"); }
+        return (i32)out;
+    }
+
+    public func to_u8_checked_value(self: *Number) -> u8 {
+        var out: u64 = self.to_u64_checked_value();
+        if (out > 255) { panic("number does not fit in u8"); }
+        return (u8)out;
+    }
+
+    public func to_u16_checked_value(self: *Number) -> u16 {
+        var out: u64 = self.to_u64_checked_value();
+        if (out > 65535) { panic("number does not fit in u16"); }
+        return (u16)out;
+    }
+
+    public func to_u32_checked_value(self: *Number) -> u32 {
+        var out: u64 = self.to_u64_checked_value();
+        if (out > 4294967295) { panic("number does not fit in u32"); }
+        return (u32)out;
     }
 
     public func to_str(self: *Number) -> u64 {
+        if (self != 0 && self.is_real() != 0) {
+            return to_str_f64(self.real_value());
+        }
+        if (self != 0 && self.is_complex() != 0) {
+            var c: *NumberComplex = self.complex_ptr();
+            if (c == 0) { return "0"; }
+            var rs: u64 = c.real.to_str();
+            var is: u64 = c.imag.to_str();
+            var joined: u64 = str_concat3(rs, str_len(rs), "+", 1, is, str_len(is));
+            return str_concat(joined, str_len(joined), "i", 1);
+        }
+        if (self != 0 && self.is_rational() != 0) {
+            var r: *NumberRational = self.rational_ptr();
+            if (r == 0) { return "0"; }
+            var ns: u64 = r.num.to_str();
+            var ds: u64 = r.den.to_str();
+            return str_concat3(ns, str_len(ns), "/", 1, ds, str_len(ds));
+        }
+        if (self != 0 && self.is_decimal() != 0) {
+            var d: *NumberDecimal = self.decimal_ptr();
+            if (d == 0) { return "0"; }
+            var cs: u64 = d.coeff.to_str();
+            var ss: u64 = to_str_u64(d.scale);
+            return str_concat3(cs, str_len(cs), "e-", 2, ss, str_len(ss));
+        }
+        if (self != 0 && self.is_bigfloat() != 0) {
+            var bf: *NumberBigFloat = self.bigfloat_ptr();
+            if (bf == 0) { return "0"; }
+            var ms: u64 = bf.mant.to_str();
+            var es: u64 = to_str_i64(bf.exp);
+            return str_concat3(ms, str_len(ms), "p", 1, es, str_len(es));
+        }
+
         var sign: i64 = 0;
         if (self != 0) {
-            sign = number_signum(self);
+            sign = self.signum();
         }
         if (sign == 0) {
             var z: u64 = heap_alloc(2 * sizeof(u8));
@@ -1205,13 +3129,13 @@ impl Number {
             return z;
         }
 
-        var t: Number = number_abs_clone(self);
+        var t: Number = self.abs_clone();
         var rev_buf: u64 = heap_alloc(32 * sizeof(u8));
         var rev: *Vec<u8> = new Vec<u8>{rev_buf, 0, 32};
-        while (number_signum(&t) != 0) {
-            var d: u64 = number_mod_small_abs(&t, 10);
+        while (t.signum() != 0) {
+            var d: u64 = t.mod_small_abs(10);
             rev.push((u8)(48 + d));
-            t = number_div_small_abs(&t, 10);
+            t = t.div_small_abs(10);
         }
 
         var sign_len: u64 = 0;
@@ -1234,13 +3158,74 @@ impl Number {
         return out;
     }
 
+    public func to_f64_lossy(self: *Number) -> f64 {
+        if (self == 0) { return 0.0; }
+        if (self.is_real() != 0) { return self.real_value(); }
+        if (self.is_complex() != 0) {
+            var rp: Number = self.real_part();
+            return rp.to_f64_lossy();
+        }
+        if (self.is_rational() != 0) {
+            var r: *NumberRational = self.rational_ptr();
+            if (r == 0) { return 0.0; }
+            return r.num.to_f64_lossy() / r.den.to_f64_lossy();
+        }
+        if (self.is_decimal() != 0) {
+            var d: *NumberDecimal = self.decimal_ptr();
+            if (d == 0) { return 0.0; }
+            var dv: f64 = d.coeff.to_f64_lossy();
+            for (var di: u64 = 0; di < d.scale; di = di + 1) {
+                dv = dv / 10.0;
+            }
+            return dv;
+        }
+        if (self.is_bigfloat() != 0) {
+            var bf: *NumberBigFloat = self.bigfloat_ptr();
+            if (bf == 0) { return 0.0; }
+            var fv: f64 = bf.mant.to_f64_lossy();
+            if (bf.exp >= 0) {
+                for (var ei: u64 = 0; ei < (u64)bf.exp; ei = ei + 1) {
+                    fv = fv * 2.0;
+                }
+            } else {
+                var neg_exp: u64 = (u64)(0 - bf.exp);
+                for (var ej: u64 = 0; ej < neg_exp; ej = ej + 1) {
+                    fv = fv / 2.0;
+                }
+            }
+            return fv;
+        }
+        if (self.is_small() != 0) { return (f64)self.small_value(); }
+
+        var b: *NumberBig = self.big_ptr();
+        if (b == 0 || b.sign == 0) { return 0.0; }
+
+        var n: u64 = b.digits.len();
+        var acc: f64 = 0.0;
+        var i: u64 = n;
+        while (i > 0) {
+            i = i - 1;
+            acc = (acc * (f64)NUMBER_BASE) + (f64)b.digits.get(i);
+        }
+        if (b.sign < 0) { return 0.0 - acc; }
+        return acc;
+    }
+
     public func to_i64_lossy(self: *Number) -> i64 {
         var out: i64 = 0;
         if (self.to_i64_checked(&out) != 0) { return out; }
 
         if (self == 0) { return 0; }
-        if (number_is_small(self) != 0) { return number_small_value(self); }
-        var b: *NumberBig = number_big_ptr(self);
+        if (self.is_real() != 0) { return (i64)self.real_value(); }
+        if (self.is_complex() != 0) {
+            var rp: Number = self.real_part();
+            return rp.to_i64_lossy();
+        }
+        if (self.is_exact_extended() != 0) {
+            return (i64)self.to_f64_lossy();
+        }
+        if (self.is_small() != 0) { return self.small_value(); }
+        var b: *NumberBig = self.big_ptr();
         if (b == 0 || b.sign == 0) { return 0; }
 
         var n: u64 = b.digits.len();
@@ -1254,3 +3239,363 @@ impl Number {
         return (i64)acc;
     }
 }
+
+impl NumberSlice {
+    public static func infer_value_shape(v: *Number) -> u64 {
+        if (v == 0) { return NUMBER_PROOF_SHAPE_UNKNOWN; }
+        if (v.is_complex() != 0) { return NUMBER_PROOF_SHAPE_COMPLEX; }
+        if (v.is_real() != 0) { return NUMBER_PROOF_SHAPE_F64; }
+        if (v.is_exact_extended() != 0) { return NUMBER_PROOF_SHAPE_EXACT; }
+        var iv: i64 = 0;
+        if (v.to_i64_checked(&iv) != 0) { return NUMBER_PROOF_SHAPE_I64; }
+        return NUMBER_PROOF_SHAPE_BIGINT;
+    }
+
+    public static func from_ptr(ptr: *Number, len: u64) -> NumberSlice {
+        var p: *tagged(NumberProofTag) Number = (*tagged(NumberProofTag) Number)ptr;
+        p.domain = (u8)NUMBER_PROOF_DOMAIN_SLICE;
+        p.capability = (u8)NUMBER_PROOF_CAP_BORROWED;
+        if (ptr != 0) { p.nonnull = 1; }
+        else { p.nonnull = 0; }
+        p.bounds = (u8)NUMBER_PROOF_BOUNDS_STABLE_LEN;
+        p.epoch = 0;
+        p.shape = (u8)NUMBER_PROOF_SHAPE_EMPTY;
+        var out: NumberSlice;
+        out.ptr = p;
+        out.len = len;
+        return out;
+    }
+
+    public static func from_initialized_ptr(ptr: *Number, len: u64) -> NumberSlice {
+        var out: NumberSlice = NumberSlice.from_ptr(ptr, len);
+        var shape: u64 = NUMBER_PROOF_SHAPE_EMPTY;
+        var raw: *Number = ptr;
+        for (var i: u64 = 0; i < len; i = i + 1) {
+            var cur: Number = raw[i];
+            shape = number_proof_shape_combine(shape, NumberSlice.infer_value_shape(&cur));
+        }
+        var p: *tagged(NumberProofTag) Number = out.ptr;
+        p.shape = (u8)shape;
+        out.ptr = p;
+        return out;
+    }
+
+    public func shape(self: *NumberSlice) -> u64 {
+        if (self == 0) { return NUMBER_PROOF_SHAPE_UNKNOWN; }
+        var p: *tagged(NumberProofTag) Number = self.ptr;
+        return (u64)p.shape;
+    }
+
+    public func domain(self: *NumberSlice) -> u64 {
+        if (self == 0) { return NUMBER_PROOF_DOMAIN_UNKNOWN; }
+        var p: *tagged(NumberProofTag) Number = self.ptr;
+        return (u64)p.domain;
+    }
+
+    public func capability(self: *NumberSlice) -> u64 {
+        if (self == 0) { return NUMBER_PROOF_CAP_UNKNOWN; }
+        var p: *tagged(NumberProofTag) Number = self.ptr;
+        return (u64)p.capability;
+    }
+
+    public func is_nonnull(self: *NumberSlice) -> u64 {
+        if (self == 0) { return 0; }
+        var p: *tagged(NumberProofTag) Number = self.ptr;
+        return (u64)p.nonnull;
+    }
+
+    public func has_stable_bounds(self: *NumberSlice) -> u64 {
+        if (self == 0) { return 0; }
+        var p: *tagged(NumberProofTag) Number = self.ptr;
+        return (u64)p.bounds == NUMBER_PROOF_BOUNDS_STABLE_LEN;
+    }
+
+    public func tagged_slice(self: *NumberSlice) -> BppTaggedSlice<Number> {
+        if (self == 0) {
+            return bpp_tag_slice_from_ptr<Number>((*Number)0, 0, BPP_TAG_SHAPE_EMPTY);
+        }
+        var p: *tagged(NumberProofTag) Number = self.ptr;
+        var domain: u64 = (u64)p.domain;
+        var storage: u64 = number_proof_domain_to_bpp_storage(domain);
+        var lifecycle: u64 = number_proof_lifecycle_for_domain(domain);
+        var ownership: u64 = number_proof_cap_to_bpp_ownership((u64)p.capability);
+        var barrier: u64 = BPP_TAG_BARRIER_CLEAN;
+        if (storage == BPP_TAG_STORAGE_STACK || storage == BPP_TAG_STORAGE_STATIC) {
+            barrier = BPP_TAG_BARRIER_SKIP;
+        }
+        return bpp_tag_slice_from_raw_tag<Number>(
+            number_slice_raw_ptr(p),
+            self.len,
+            lifecycle,
+            ownership,
+            storage,
+            barrier,
+            number_proof_shape_to_bpp_shape((u64)p.shape),
+            0
+        );
+    }
+
+    public func profiled_tagged_slice(self: *NumberSlice) -> BppTaggedSlice<Number> {
+        var out: BppTaggedSlice<Number> = self.tagged_slice();
+        bpp_tag_slice_mark_profiled<Number>(&out);
+        return out;
+    }
+
+    public func common_proof(self: *NumberSlice) -> BppSliceProof {
+        var tagged_slice2: BppTaggedSlice<Number> = self.profiled_tagged_slice();
+        return bpp_slice_proof_from_tagged<Number>(&tagged_slice2);
+    }
+
+    public func vector_plan(self: *NumberSlice, profile: *BppLoopProfile) -> BppVectorPlan {
+        var tagged_slice2: BppTaggedSlice<Number> = self.profiled_tagged_slice();
+        return bpp_tag_slice_vector_plan<Number>(profile, &tagged_slice2);
+    }
+
+    public func fast_guard(self: *NumberSlice, profile: *BppLoopProfile, epoch: u64) -> BppTagFastGuard {
+        var tagged_slice2: BppTaggedSlice<Number> = self.profiled_tagged_slice();
+        return bpp_tag_fast_guard_from_slice<Number>(&tagged_slice2, profile, epoch);
+    }
+
+    public func access_plan(self: *NumberSlice, profile: *BppLoopProfile, epoch: u64) -> BppTaggedAccessPlan {
+        var tagged_slice2: BppTaggedSlice<Number> = self.profiled_tagged_slice();
+        return bpp_tag_access_plan_from_slice<Number>(&tagged_slice2, profile, epoch);
+    }
+
+    public func hot_path_plan(self: *NumberSlice, profile: *BppLoopProfile, epoch: u64, require_index: u64, index: u64) -> BppHotPathPlan {
+        var plan: BppTaggedAccessPlan = self.access_plan(profile, epoch);
+        return bpp_hot_path_plan_from_access(&plan, require_index, index);
+    }
+
+    public func can_skip_bounds(self: *NumberSlice, profile: *BppLoopProfile, epoch: u64, index: u64) -> u64 {
+        var plan: BppTaggedAccessPlan = self.access_plan(profile, epoch);
+        return bpp_tag_access_plan_can_index(&plan, index);
+    }
+
+    public func element_ptr(self: *NumberSlice, profile: *BppLoopProfile, epoch: u64, index: u64) -> *Number {
+        var plan: BppTaggedAccessPlan = self.access_plan(profile, epoch);
+        if (bpp_tag_access_plan_can_index(&plan, index) == 0) { return (*Number)0; }
+        var p: *tagged(NumberProofTag) Number = self.ptr;
+        var raw: *Number = number_slice_raw_ptr(p);
+        return (*Number)((u64)raw + index * sizeof(Number));
+    }
+
+    public func at_proven(self: *NumberSlice, profile: *BppLoopProfile, epoch: u64, index: u64) -> Number {
+        var p: *Number = self.element_ptr(profile, epoch, index);
+        if (p == 0) { return self.at(index); }
+        var out: Number = *p;
+        return out;
+    }
+
+    public func set_proven(self: *NumberSlice, profile: *BppLoopProfile, epoch: u64, index: u64, value: Number) -> u64 {
+        var p: *Number = self.element_ptr(profile, epoch, index);
+        if (p == 0) { return self.set_number(index, value); }
+        *p = value;
+        var proof: *tagged(NumberProofTag) Number = self.ptr;
+        var new_shape: u64 = number_proof_shape_combine(self.shape(), NumberSlice.infer_value_shape(&value));
+        proof.shape = (u8)new_shape;
+        self.ptr = proof;
+        return 0;
+    }
+
+    public func retag_shape(self: *NumberSlice, shape: u64) -> u64 {
+        if (self == 0) { return 0; }
+        var p: *tagged(NumberProofTag) Number = self.ptr;
+        p.shape = (u8)shape;
+        self.ptr = p;
+        return 0;
+    }
+
+    public func refresh_shape(self: *NumberSlice) -> u64 {
+        if (self == 0) { return NUMBER_PROOF_SHAPE_UNKNOWN; }
+        var p: *tagged(NumberProofTag) Number = self.ptr;
+        var shape: u64 = NUMBER_PROOF_SHAPE_EMPTY;
+        var raw: *Number = number_slice_raw_ptr(p);
+        for (var i: u64 = 0; i < self.len; i = i + 1) {
+            var cur: Number = raw[i];
+            shape = number_proof_shape_combine(shape, NumberSlice.infer_value_shape(&cur));
+        }
+        p.shape = (u8)shape;
+        if (p != 0) { p.nonnull = 1; }
+        self.ptr = p;
+        return shape;
+    }
+
+    public func at_unchecked(self: *NumberSlice, i: u64) -> Number {
+        var out: Number = Number { NUMBER_TAG_SMALL };
+        if (self == 0) { return out; }
+        var p: *tagged(NumberProofTag) Number = self.ptr;
+        var raw: *Number = number_slice_raw_ptr(p);
+        out = raw[i];
+        return out;
+    }
+
+    public func at(self: *NumberSlice, i: u64) -> Number {
+        if (self == 0 || i >= self.len) {
+            panic("NumberSlice index out of bounds");
+            return Number { NUMBER_TAG_SMALL };
+        }
+        var p: *tagged(NumberProofTag) Number = self.ptr;
+        var raw: *Number = number_slice_raw_ptr(p);
+        var out: Number = Number { NUMBER_TAG_SMALL };
+        out = raw[i];
+        return out;
+    }
+
+    public func set_number(self: *NumberSlice, i: u64, value: Number) -> u64 {
+        if (self == 0 || i >= self.len) {
+            panic("NumberSlice set index out of bounds");
+            return 0;
+        }
+        var p: *tagged(NumberProofTag) Number = self.ptr;
+        var raw: *Number = number_slice_raw_ptr(p);
+        raw[i] = value;
+        var new_shape: u64 = number_proof_shape_combine(self.shape(), NumberSlice.infer_value_shape(&value));
+        p.shape = (u8)new_shape;
+        self.ptr = p;
+        return 0;
+    }
+
+    public func set_i64(self: *NumberSlice, i: u64, value: i64) -> u64 {
+        var n: Number = Number.from_i64(value);
+        return self.set_number(i, n);
+    }
+
+    public func set_u64(self: *NumberSlice, i: u64, value: u64) -> u64 {
+        var n: Number = Number.from_u64(value);
+        return self.set_number(i, n);
+    }
+
+    public func set_f64(self: *NumberSlice, i: u64, value: f64) -> u64 {
+        var n: Number = Number.from_f64(value);
+        return self.set_number(i, n);
+    }
+
+    public func sum_generic_from(self: *NumberSlice, start: u64, initial: Number) -> Number {
+        var out: Number = initial;
+        var p: *tagged(NumberProofTag) Number = self.ptr;
+        var raw: *Number = number_slice_raw_ptr(p);
+        for (var i: u64 = start; i < self.len; i = i + 1) {
+            var cur: Number = raw[i];
+            out = out.add_values(&cur);
+        }
+        return out;
+    }
+
+    public func sum_i64_fast(self: *NumberSlice) -> Number {
+        var p: *tagged(NumberProofTag) Number = self.ptr;
+        var raw: *Number = number_slice_raw_ptr(p);
+        var acc: i64 = 0;
+        for (var i: u64 = 0; i < self.len; i = i + 1) {
+            var cur: Number = raw[i];
+            var v: i64 = cur.to_i64_checked_value();
+            if (v > 0 && acc > i64.MAX - v) {
+                var partial_pos: Number = Number.from_i64(acc);
+                var fallback_pos: Number = self.sum_generic_from(i, partial_pos);
+                return fallback_pos;
+            }
+            if (v < 0 && acc < i64.MIN - v) {
+                var partial_neg: Number = Number.from_i64(acc);
+                var fallback_neg: Number = self.sum_generic_from(i, partial_neg);
+                return fallback_neg;
+            }
+            acc = acc + v;
+        }
+        var out: Number = Number.from_i64(acc);
+        return out;
+    }
+
+    public func sum_f64_fast(self: *NumberSlice) -> Number {
+        var p: *tagged(NumberProofTag) Number = self.ptr;
+        var raw: *Number = number_slice_raw_ptr(p);
+        var acc: f64 = 0.0;
+        for (var i: u64 = 0; i < self.len; i = i + 1) {
+            var cur: Number = raw[i];
+            acc = acc + cur.to_f64_lossy();
+        }
+        var out: Number = Number.from_f64(acc);
+        return out;
+    }
+
+    public func sum_complex_fast(self: *NumberSlice) -> Number {
+        var p: *tagged(NumberProofTag) Number = self.ptr;
+        var raw: *Number = number_slice_raw_ptr(p);
+        var real_acc: Number = Number.zero();
+        var imag_acc: Number = Number.zero();
+        for (var i: u64 = 0; i < self.len; i = i + 1) {
+            var cur: Number = raw[i];
+            var rp: Number = cur.real_part();
+            var ip: Number = cur.imag_part();
+            real_acc = real_acc.add_values(&rp);
+            imag_acc = imag_acc.add_values(&ip);
+        }
+        var out: Number = Number.from_complex(real_acc, imag_acc);
+        return out;
+    }
+
+    public func sum(self: *NumberSlice) -> Number {
+        if (self == 0 || self.len == 0) {
+            var empty: Number = Number.zero();
+            return empty;
+        }
+        var shape: u64 = self.shape();
+        var tagged_slice2: BppTaggedSlice<Number> = self.profiled_tagged_slice();
+        var proof: BppSliceProof = bpp_slice_proof_from_tagged<Number>(&tagged_slice2);
+        var profile: BppLoopProfile = bpp_loop_profile_new(self.len);
+        bpp_loop_profile_record(&profile, self.len, bpp_tag_slice_shape<Number>(&tagged_slice2));
+        var plan: BppVectorPlan = bpp_tag_slice_vector_plan<Number>(&profile, &tagged_slice2);
+        if (shape == NUMBER_PROOF_SHAPE_I64) {
+            if (proof.stable_bounds == 0 || plan.fast_path == BPP_FAST_PATH_NONE) {
+                return self.sum_generic_from(0, Number.zero());
+            }
+            var out_i64: Number = self.sum_i64_fast();
+            return out_i64;
+        }
+        if (shape == NUMBER_PROOF_SHAPE_F64) {
+            if (proof.stable_bounds == 0 || plan.fast_path == BPP_FAST_PATH_NONE) {
+                return self.sum_generic_from(0, Number.zero());
+            }
+            var out_f64: Number = self.sum_f64_fast();
+            return out_f64;
+        }
+        if (shape == NUMBER_PROOF_SHAPE_COMPLEX) {
+            var out_complex: Number = self.sum_complex_fast();
+            return out_complex;
+        }
+        var z: Number = Number.zero();
+        var out_generic: Number = self.sum_generic_from(0, z);
+        return out_generic;
+    }
+}
+
+func number_from_i8(v: i8) -> Number { var out: Number = Number { NUMBER_TAG_SMALL }; out.set_i64((i64)v); return out; }
+func number_from_i16(v: i16) -> Number { var out: Number = Number { NUMBER_TAG_SMALL }; out.set_i64((i64)v); return out; }
+func number_from_i32(v: i32) -> Number { var out: Number = Number { NUMBER_TAG_SMALL }; out.set_i64((i64)v); return out; }
+func number_from_i64(v: i64) -> Number { var out: Number = Number { NUMBER_TAG_SMALL }; out.set_i64(v); return out; }
+func number_from_u8(v: u8) -> Number { var out: Number = Number { NUMBER_TAG_SMALL }; out.set_u64((u64)v); return out; }
+func number_from_u16(v: u16) -> Number { var out: Number = Number { NUMBER_TAG_SMALL }; out.set_u64((u64)v); return out; }
+func number_from_u32(v: u32) -> Number { var out: Number = Number { NUMBER_TAG_SMALL }; out.set_u64((u64)v); return out; }
+func number_from_u64(v: u64) -> Number { var out: Number = Number { NUMBER_TAG_SMALL }; out.set_u64(v); return out; }
+func number_from_f64(v: f64) -> Number { return number_make_real(v); }
+func number_from_rational(num: Number, den: Number) -> Number { return number_make_rational(num, den); }
+func number_from_decimal(coeff: Number, scale: u64) -> Number { return number_make_decimal(coeff, scale); }
+func number_from_bigfloat(mant: Number, exp: i64, precision: u64) -> Number { return number_make_bigfloat(mant, exp, precision); }
+func number_is_complex(v: *Number) -> u64 { return v.is_complex(); }
+func number_is_real(v: *Number) -> u64 { return v.is_real(); }
+func number_is_exact_extended(v: *Number) -> u64 { return v.is_exact_extended(); }
+func number_to_i64_checked(v: *Number, out: *i64) -> u64 { return v.to_i64_checked(out); }
+func number_to_i64_checked_value(v: *Number) -> i64 { return v.to_i64_checked_value(); }
+func number_to_f64_lossy(v: *Number) -> f64 { return v.to_f64_lossy(); }
+func number_real_part(v: *Number) -> Number { return v.real_part(); }
+func number_imag_part(v: *Number) -> Number { return v.imag_part(); }
+func number_add_values(lhs: *Number, rhs: *Number) -> Number { return lhs.add_values(rhs); }
+
+func number_slice_sum_from_initialized_ptr(ptr: *Number, len: u64) -> Number {
+    var values: NumberSlice = NumberSlice.from_initialized_ptr(ptr, len);
+    return values.sum();
+}
+
+func number_slice_sum(values: []Number) -> Number {
+    return number_slice_sum_from_initialized_ptr((*Number)values.ptr, values.len);
+}
+func number_cmp_ptr(lhs: *Number, rhs: *Number) -> i64 { return lhs.cmp_ptr(rhs); }
+func number_eq_cmp_ptr(lhs: *Number, rhs: *Number) -> i64 { return lhs.eq_cmp_ptr(rhs); }

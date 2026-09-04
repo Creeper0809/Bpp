@@ -1,9 +1,6 @@
 name: Bootstrap Release
 
 on:
-  push:
-    branches:
-      - main
   workflow_dispatch:
 
 permissions:
@@ -11,7 +8,7 @@ permissions:
 
 concurrency:
   group: bootstrap-release-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   prepare:
@@ -20,6 +17,7 @@ jobs:
       version: ${{ steps.meta.outputs.version }}
       release_tag: ${{ steps.meta.outputs.release_tag }}
       linux_asset: ${{ steps.meta.outputs.linux_asset }}
+      linux_sdk_asset: ${{ steps.meta.outputs.linux_sdk_asset }}
       windows_asset: ${{ steps.meta.outputs.windows_asset }}
     steps:
       - uses: actions/checkout@v4
@@ -38,9 +36,10 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "release_tag=bootstrap-$version" >> "$GITHUB_OUTPUT"
           echo "linux_asset=bpp-bootstrap-$version-linux-x86_64" >> "$GITHUB_OUTPUT"
+          echo "linux_sdk_asset=bpp-$version-linux-x86_64.tar.gz" >> "$GITHUB_OUTPUT"
           echo "windows_asset=bpp-bootstrap-$version-windows-x86_64.exe" >> "$GITHUB_OUTPUT"
 
-  linux-bootstrap:
+  bootstrap-seeds:
     needs: prepare
     runs-on: ubuntu-latest
     steps:
@@ -49,13 +48,74 @@ jobs:
       - name: Install Linux dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y nasm binutils coreutils
+          sudo apt-get install -y nasm binutils coreutils binutils-mingw-w64-x86-64 mingw-w64-x86-64-dev
 
-      - name: Build Linux bootstrap compiler
+      - name: Self-host Linux compiler and verify Stage 1 equals Stage 2
+        env:
+          BUILD_SKIP_TESTS: "1"
+          TEST_JOBS: "4"
+          TEST_PROGRESS: "1"
+          TEST_QUIET: "1"
         run: |
           chmod +x build_and_test.sh test/run_tests.sh
           cmake -S . -B build-linux
-          cmake --build build-linux --target bpp-selfhost-fast
+          cmake --build build-linux --target bpp-selfhost
+
+      - name: Cross-build initial Windows bootstrap seed
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x tools/build_windows_bootstrap.sh
+          tools/build_windows_bootstrap.sh "${{ needs.prepare.outputs.windows_asset }}"
+
+      - name: Upload Windows cross-bootstrap seed
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-cross-bootstrap
+          path: ${{ needs.prepare.outputs.windows_asset }}
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload verified Linux compiler
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-selfhost-compiler
+          path: bin/stage1
+          if-no-files-found: error
+          retention-days: 1
+
+  linux-validation:
+    needs:
+      - prepare
+      - bootstrap-seeds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nasm binutils coreutils clang
+
+      - name: Download verified Linux compiler
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-selfhost-compiler
+          path: .
+
+      - name: Run full Linux compiler tests
+        env:
+          TEST_PROFILE: full
+          TEST_JOBS: "4"
+          TEST_PROGRESS: "1"
+          TEST_QUIET: "1"
+          TEST_SKIP_LLVM_BUILD: "1"
+          COMPILE_FAIL_SINGLE_VARIANT: "0"
+          STRESS_RUNS: "0"
+          STABILITY_RUNS: "0"
+        run: |
+          chmod +x bin/stage1 test/run_tests.sh
+          bash test/run_tests.sh bin/stage1
 
       - name: Package Linux bootstrap asset
         shell: bash
@@ -68,6 +128,44 @@ jobs:
           hash="$(sha256sum "$asset_name" | awk '{print $1}')"
           printf '%s  %s\n' "$hash" "$asset_name" > "$asset_name.sha256"
 
+      - name: Package Linux SDK asset
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          chmod +x tools/package_linux_release.sh
+          BPP_PACKAGE_OUT_DIR="$PWD" tools/package_linux_release.sh
+          test -f "${{ needs.prepare.outputs.linux_sdk_asset }}"
+          test -f "${{ needs.prepare.outputs.linux_sdk_asset }}.sha256"
+
+      - name: Smoke test Linux SDK package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tmp_dir="$(mktemp -d)"
+          trap 'rm -rf "$tmp_dir"' EXIT
+          tar -xzf "${{ needs.prepare.outputs.linux_sdk_asset }}" -C "$tmp_dir"
+          pkg_dir="$tmp_dir/bpp-${{ needs.prepare.outputs.version }}-linux-x86_64"
+          cat > "$tmp_dir/hello.bpp" <<'EOF'
+          import std.io;
+
+          func main() -> u64 {
+              print("Hello, Bpp!");
+              return 0;
+          }
+          EOF
+          (
+            cd "$tmp_dir"
+            "$pkg_dir/install.sh" --help >/dev/null
+            "$pkg_dir/bin/bpp" "$tmp_dir/hello.bpp"
+            test -x "$tmp_dir/hello.out"
+            mkdir -p "$tmp_dir/home"
+            HOME="$tmp_dir/home" SHELL=/bin/bash "$pkg_dir/install.sh" --prefix "$tmp_dir/prefix" --add-path
+            grep -Fq "export PATH=\"$tmp_dir/prefix/bin:\$PATH\"" "$tmp_dir/home/.bashrc"
+            "$tmp_dir/prefix/bin/bpp" "$tmp_dir/hello.bpp"
+          )
+
       - name: Upload Linux bootstrap artifact
         uses: actions/upload-artifact@v4
         with:
@@ -75,23 +173,31 @@ jobs:
           path: |
             ${{ needs.prepare.outputs.linux_asset }}
             ${{ needs.prepare.outputs.linux_asset }}.sha256
+            ${{ needs.prepare.outputs.linux_sdk_asset }}
+            ${{ needs.prepare.outputs.linux_sdk_asset }}.sha256
           if-no-files-found: error
           retention-days: 7
 
   windows-bootstrap:
-    needs: prepare
+    needs:
+      - prepare
+      - bootstrap-seeds
     runs-on: windows-latest
-    outputs:
-      has_asset: ${{ steps.seed.outputs.available }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Download cross-built Windows seed
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-cross-bootstrap
+          path: build/windows-cross-bootstrap
 
       - name: Setup MSVC developer command prompt
         uses: ilammy/msvc-dev-cmd@v1
 
       - name: Configure Windows toolchain
         run: |
-          cmake -S . -B build-win -DBPP_BOOTSTRAP_NASM=ON
+          cmake -S . -B build-win -DBPP_BOOTSTRAP_NASM=ON -DBPP_BOOTSTRAP_COMPILER=OFF
 
       - name: Export resolved toolchain paths
         shell: pwsh
@@ -106,66 +212,45 @@ jobs:
         run: |
           cmake --build build-win --target toolchain-check windows-smoke
 
-      - id: seed
-        name: Check for Windows bootstrap seed asset
+      - name: Self-host and validate Windows bootstrap
         shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          $assetName = "${{ needs.prepare.outputs.windows_asset }}"
-          $releaseTag = "${{ needs.prepare.outputs.release_tag }}"
-          $available = $false
-
-          try {
-            $release = gh release view $releaseTag --repo "${{ github.repository }}" --json assets | ConvertFrom-Json
-            if ($release.assets | Where-Object { $_.name -eq $assetName }) {
-              $available = $true
-            }
-          } catch {
-            $available = $false
-          }
-
-          "available=$($available.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-
-          if (-not $available) {
-            $summary = @(
-              "## Windows Bootstrap Seed Missing"
-              ""
-              "- release tag: $releaseTag"
-              "- expected asset: $assetName"
-              ""
-              "Windows hosted self-build is not implemented in the current source tree."
-              "Once a seed compiler exe is uploaded under this name, this workflow will validate and republish it."
-            ) -join "`n"
-            $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
-          }
-
-      - name: Download and validate Windows bootstrap asset
-        if: steps.seed.outputs.available == 'true'
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
+          $seed = (Resolve-Path "build/windows-cross-bootstrap/${{ needs.prepare.outputs.windows_asset }}").Path
           ./build_and_test.ps1 `
-            -SkipTests `
+            -CompilerPath $seed `
             -NasmPath "$env:BPP_NASM_EXECUTABLE" `
             -LinkerPath "$env:BPP_LINKER_EXECUTABLE" `
-            -BootstrapRepository "${{ github.repository }}" `
-            -BootstrapReleaseTag "${{ needs.prepare.outputs.release_tag }}"
+            -TestJobs 4 `
+            -TimingJsonPath "build/timings/windows-tests.json"
+
+      - name: Publish Windows timing summary
+        if: always()
+        shell: pwsh
+        run: |
+          ./tools/write_windows_timing_summary.ps1 `
+            -TimingJsonPath "build/timings/windows-tests.json" `
+            -Title "Windows release verification timing"
+
+      - name: Upload Windows timing data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-release-verification-timings
+          path: build/timings
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Package Windows bootstrap asset
-        if: steps.seed.outputs.available == 'true'
         shell: pwsh
         run: |
           $assetName = "${{ needs.prepare.outputs.windows_asset }}"
-          $assetPath = Resolve-Path "build-win\_tools\$assetName"
+          $assetPath = Resolve-Path "bin\${{ needs.prepare.outputs.version }}_stage1.exe"
           Copy-Item $assetPath $assetName -Force
 
           $hash = (Get-FileHash $assetName -Algorithm SHA256).Hash.ToLowerInvariant()
           Set-Content -Path "$assetName.sha256" -Value "$hash  $assetName"
 
       - name: Upload Windows bootstrap artifact
-        if: steps.seed.outputs.available == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: windows-bootstrap
@@ -178,9 +263,9 @@ jobs:
   publish-release:
     needs:
       - prepare
-      - linux-bootstrap
+      - linux-validation
       - windows-bootstrap
-    if: needs.linux-bootstrap.result == 'success'
+    if: needs.linux-validation.result == 'success' && needs.windows-bootstrap.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - name: Download Linux bootstrap artifact
@@ -190,7 +275,6 @@ jobs:
           path: release-assets
 
       - name: Download Windows bootstrap artifact
-        if: needs.windows-bootstrap.outputs.has_asset == 'true'
         uses: actions/download-artifact@v4
         with:
           name: windows-bootstrap
@@ -213,7 +297,7 @@ jobs:
             --repo "${{ github.repository }}" \
             --target "${GITHUB_SHA}" \
             --title "Bootstrap $version" \
-            --notes "Bootstrap compiler assets for automated self-host builds."
+            --notes "Bootstrap compiler assets for automated self-host builds, plus the Linux SDK tarball with the matching compiler launcher and standard library."
 
       - name: Upload bootstrap release assets
         env:

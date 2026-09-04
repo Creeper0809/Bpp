@@ -15,6 +15,7 @@ import compiler.trait_runtime;
 import compiler.core_utils;
 import compiler.generic.engine;
 import compiler.symbol_runtime;
+import compiler.ast_lowering;
 import emitter.emitter;
 import emitter.symtab;
 import emitter.typeinfo;
@@ -25,7 +26,136 @@ import emitter.gen.expr;
 // ============================================
 
 var g_defer_emit_mode: u64;
-const LAMBDA_CLOSURE_MAGIC_STMT = 4778407454613394245;
+const LAMBDA_CLOSURE_HANDLE_MASK_STMT = 9223372036854775807;
+
+func emit_gc_type_is_root_slot_candidate(ti: *TypeInfo) -> u64 {
+    if (ti == 0) { return 0; }
+    if (ti.ptr_depth > 0) { return 1; }
+    return 0;
+}
+
+func emit_gc_call_is_raw_strip(name: []u8) -> u64 {
+    if (name.ptr == 0 || name.len == 0) { return 0; }
+    if (str_eq(name, slice("bpp_tag_strip", str_len("bpp_tag_strip"))) != 0) { return 1; }
+    if (str_eq(name, slice("std_mem__bpp_tag_strip", str_len("std_mem__bpp_tag_strip"))) != 0) { return 1; }
+    return 0;
+}
+
+func emit_gc_init_is_raw_strip(init: u64) -> u64 {
+    if (init == 0) { return 0; }
+    var k: u64 = ast_kind(init);
+    if (k == AST_CAST) {
+        var cast: *AstCast = (*AstCast)init;
+        return emit_gc_init_is_raw_strip((u64)cast.expr);
+    }
+    if (k == AST_CALL) {
+        var call: *AstCall = (*AstCall)init;
+        if (emit_gc_call_is_raw_strip(call.name) != 0) { return 1; }
+    }
+    return 0;
+}
+
+func emit_gc_name_has_prefix(name: []u8, prefix: u64, prefix_len: u64) -> u64 {
+    if (name.ptr == 0 || name.len < prefix_len || prefix == 0 || prefix_len == 0) { return 0; }
+    if (str_eq(slice(name.ptr, prefix_len), slice(prefix, prefix_len)) != 0) { return 1; }
+    return 0;
+}
+
+func emit_gc_auto_slots_disabled() -> u64 {
+    var name: []u8 = current_func_name_current();
+    if (emit_gc_name_has_prefix(name, (u64)"std_", str_len("std_")) != 0) { return 1; }
+    if (emit_gc_name_has_prefix(name, (u64)"std.", str_len("std.")) != 0) { return 1; }
+    if (emit_gc_name_has_prefix(name, (u64)"std_mem__", str_len("std_mem__")) != 0) { return 1; }
+    if (emit_gc_name_has_prefix(name, (u64)"std_mem.", str_len("std_mem.")) != 0) { return 1; }
+    if (emit_gc_name_has_prefix(name, (u64)"bpp_gc_", str_len("bpp_gc_")) != 0) { return 1; }
+    if (emit_gc_name_has_prefix(name, (u64)"bpp_tag_", str_len("bpp_tag_")) != 0) { return 1; }
+    if (emit_gc_name_has_prefix(name, (u64)"__bpp_", str_len("__bpp_")) != 0) { return 1; }
+    if (emit_gc_name_has_prefix(name, (u64)"emitter_", str_len("emitter_")) != 0) { return 1; }
+    if (emit_gc_name_has_prefix(name, (u64)"emitter.", str_len("emitter.")) != 0) { return 1; }
+    if (emit_gc_name_has_prefix(name, (u64)"ssa_", str_len("ssa_")) != 0) { return 1; }
+    if (emit_gc_name_has_prefix(name, (u64)"ssa.", str_len("ssa.")) != 0) { return 1; }
+    if (emit_gc_name_has_prefix(name, (u64)"compiler_", str_len("compiler_")) != 0) { return 1; }
+    if (emit_gc_name_has_prefix(name, (u64)"compiler.", str_len("compiler.")) != 0) { return 1; }
+    if (emit_gc_name_has_prefix(name, (u64)"llvm_", str_len("llvm_")) != 0) { return 1; }
+    if (emit_gc_name_has_prefix(name, (u64)"llvm.", str_len("llvm.")) != 0) { return 1; }
+    if (emit_gc_name_has_prefix(name, (u64)"parser_", str_len("parser_")) != 0) { return 1; }
+    if (emit_gc_name_has_prefix(name, (u64)"parser.", str_len("parser.")) != 0) { return 1; }
+    if (emit_gc_name_has_prefix(name, (u64)"lexer_", str_len("lexer_")) != 0) { return 1; }
+    if (emit_gc_name_has_prefix(name, (u64)"lexer.", str_len("lexer.")) != 0) { return 1; }
+    if (emit_gc_name_has_prefix(name, (u64)"codegen__", str_len("codegen__")) != 0) { return 1; }
+    if (emit_gc_name_has_prefix(name, (u64)"codegen.", str_len("codegen.")) != 0) { return 1; }
+    return 0;
+}
+
+func emit_gc_direct_call_name(name: []u8) -> u64 {
+    var fn_ptr: u64 = name.ptr;
+    var fn_len: u64 = name.len;
+    var resolved: *NameInfo = resolve_name(slice(fn_ptr, fn_len));
+    if (resolved != 0) {
+        fn_ptr = resolved.ptr;
+        fn_len = resolved.len;
+    }
+    _cg_emit_direct_call_name(slice(fn_ptr, fn_len), 0, 0);
+    return 0;
+}
+
+func emit_gc_root_slot_call_offset(fn_name: []u8, offset: u64) -> u64 {
+    if (offset == 0) { return 0; }
+    if (emit_gc_auto_slots_disabled() != 0) { return 0; }
+    emit("    lea rax, [rbp");
+    emit_signed_disp(offset);
+    emit("]\n");
+    _cg_emit_mov_user_arg_from_reg(0, 0, slice("rax", 3));
+    emit_gc_direct_call_name(fn_name);
+    return 1;
+}
+
+func emit_gc_root_slot_push_offset(offset: u64) -> u64 {
+    return emit_gc_root_slot_call_offset(slice("bpp_gc_root_slot_push", str_len("bpp_gc_root_slot_push")), offset);
+}
+
+func emit_gc_root_slot_remove_offset(offset: u64) -> u64 {
+    return emit_gc_root_slot_call_offset(slice("bpp_gc_root_slot_remove", str_len("bpp_gc_root_slot_remove")), offset);
+}
+
+func emit_gc_root_slot_refresh_offset(offset: u64) -> u64 {
+    if (offset == 0) { return 0; }
+    emit_gc_root_slot_remove_offset(offset);
+    emit_gc_root_slot_push_offset(offset);
+    return 1;
+}
+
+func emit_gc_root_slot_remove_ident(node: u64, symtab: *Symtab) -> u64 {
+    if (node == 0 || ast_kind(node) != AST_IDENT) { return 0; }
+    var idn: *AstIdent = (*AstIdent)node;
+    var ti: *TypeInfo = symtab_get_type(symtab, idn.name);
+    if (emit_gc_type_is_root_slot_candidate(ti) == 0) { return 0; }
+    var offset: u64 = symtab_find(symtab, idn.name);
+    return emit_gc_root_slot_remove_offset(offset);
+}
+
+func emit_gc_cleanup_root_slots() -> u64 {
+    var symtab: *Symtab = symtab_current();
+    if (symtab == 0 || symtab.count == 0) { return 0; }
+    if (emit_gc_auto_slots_disabled() != 0) { return 0; }
+    var count: u64 = symtab.count;
+    for (var i: u64 = 0; i < count; i = i + 1) {
+        var ti: *TypeInfo = symtab.types_vec.get(i);
+        if (emit_gc_type_is_root_slot_candidate(ti) == 0) { continue; }
+        var offset: u64 = symtab.offsets_vec.get(i);
+        emit_gc_root_slot_remove_offset(offset);
+    }
+    return 0;
+}
+
+func emit_gc_cleanup_root_slots_preserve_ret() -> u64 {
+    emit("    push rax\n");
+    emit("    push rdx\n");
+    emit_gc_cleanup_root_slots();
+    emit("    pop rdx\n");
+    emit("    pop rax\n");
+    return 0;
+}
 
 func emit_defer_stack_len() -> u64 {
     var stack: *Vec<*AstNode> = defer_stack();
@@ -78,7 +208,7 @@ func emit_defer_emit_for_return(skip_delete_name: []u8) -> u64 {
             var del: *AstDelete = (*AstDelete)stmt;
             if (del.expr != 0 && ast_kind((u64)del.expr) == AST_IDENT) {
                 var idn: *AstIdent = (*AstIdent)del.expr;
-                if (str_eq(slice(idn.name_ptr, idn.name_len), slice(skip_delete_name.ptr, skip_delete_name.len)) != 0) {
+                if (str_eq(idn.name, slice(skip_delete_name.ptr, skip_delete_name.len)) != 0) {
                     skip_stmt = 1;
                 }
             }
@@ -145,10 +275,10 @@ func emit_stmt_expr_stmt(node: u64, symtab: *Symtab) -> u64 {
         var expr_kind: u64 = ast_kind(expr);
         if (expr_kind == AST_CALL) {
             var call_node: *AstCall = (*AstCall)expr;
-            var fn: *AstFunc = typeinfo_find_func(slice(call_node.name_ptr, call_node.name_len));
+            var fn: *AstFunc = typeinfo_find_func(call_node.name);
             if (fn != 0) {
                 if (fn.ret_type == TYPE_STRUCT && fn.ret_ptr_depth == 0) {
-                    var sret_size: u64 = layout_type_sizeof(TYPE_STRUCT, 0, slice(fn.ret_struct_name_ptr, fn.ret_struct_name_len));
+                    var sret_size: u64 = layout_type_sizeof(TYPE_STRUCT, 0, fn.ret_struct_name);
                     if (sret_size > 16) {
                         var tmp_offset: u64 = emit_alloc_tmp_struct(symtab, sret_size);
                         emit_call_sret(call_node, tmp_offset, symtab);
@@ -207,7 +337,8 @@ func emit_stmt_handle_defer(node: u64) -> u64 {
     return 0;
 }
 
-func emit_stmt(node: u64) -> u64 {
+func emit_stmt_core(node: u64) -> u64 {
+    if (node == 0) { return 0; }
     if (diag_should_stop_pass() != 0) { return 0; }
     var kind: u64 = ast_kind(node);
     var symtab: *Symtab = symtab_current();
@@ -250,7 +381,7 @@ func emit_stmt(node: u64) -> u64 {
             return;
         case AST_ALIAS:
             var al: *AstAlias = (*AstAlias)node;
-            sym_reg_alias_set(slice(al.reg_ptr, al.reg_len), slice(al.name_ptr, al.name_len));
+            sym_reg_alias_set(al.reg, al.name);
             return;
         case AST_DEFER:
             emit_stmt_handle_defer(node);
@@ -263,6 +394,39 @@ func emit_stmt(node: u64) -> u64 {
             return;
     }
 
+}
+
+func emit_stmt(node: u64) -> u64 {
+    if (node == 0) { return 0; }
+    var prev_file_ptr: u64 = 0;
+    var prev_file_len: u64 = 0;
+    var prev_start_line: u64 = 0;
+    var prev_start_col: u64 = 0;
+    var prev_end_line: u64 = 0;
+    var prev_end_col: u64 = 0;
+    var prev_range_id: u64 = 0;
+    var prev_start_offset: u64 = 0;
+    var prev_end_offset: u64 = 0;
+    asm_source_capture_get_current_span_full(&prev_file_ptr, &prev_file_len, &prev_start_line, &prev_start_col, &prev_end_line, &prev_end_col, &prev_range_id, &prev_start_offset, &prev_end_offset);
+
+    var file_ptr: u64 = 0;
+    var file_len: u64 = 0;
+    var start_line: u64 = 0;
+    var start_col: u64 = 0;
+    var end_line: u64 = 0;
+    var end_col: u64 = 0;
+    var range_id: u64 = 0;
+    var start_offset: u64 = 0;
+    var end_offset: u64 = 0;
+    var has_span: u64 = ast_source_span_get(node, &file_ptr, &file_len, &start_line, &start_col, &end_line, &end_col);
+    ast_source_span_get_extra(node, &range_id, &start_offset, &end_offset);
+    if (has_span != 0) {
+        asm_source_capture_set_current_span_full(file_ptr, file_len, start_line, start_col, end_line, end_col, range_id, start_offset, end_offset);
+    }
+
+    emit_stmt_core(node);
+    asm_source_capture_set_current_span_full(prev_file_ptr, prev_file_len, prev_start_line, prev_start_col, prev_end_line, prev_end_col, prev_range_id, prev_start_offset, prev_end_offset);
+    return 0;
 }
 
 func emit_call_resolved(name: []u8) -> u64 {
@@ -283,26 +447,24 @@ func emit_call_sret(call: *AstCall, dest_offset: u64, symtab: *Symtab) -> u64 {
         while (i > 0) {
             i = i - 1;
             var arg: *AstNode = args.get(i);
-            total_arg_words = total_arg_words + _cg_sysv_push_call_arg(arg, symtab);
+            total_arg_words = total_arg_words + _cg_target_push_call_arg(arg, symtab);
         }
     }
 
     _cg_emit_sret_ptr_from_rbp(dest_offset);
-    var stack_words: u64 = _cg_sysv_pop_arg_regs_sret(total_arg_words);
-    emit_call_resolved_with_layout(slice(call.name_ptr, call.name_len), stack_words, 0);
+    var stack_words: u64 = _cg_target_pop_arg_regs_sret(total_arg_words);
+    emit_call_resolved_with_layout(call.name, stack_words, 0);
     return 0;
 }
 
 func emit_ensure_heap_brk_global() -> u64 {
     if (is_global_var(slice("__cg_heap_brk", 13)) != 0) { return 0; }
     var ginfo: *GlobalInfo = new GlobalInfo{};
-    ginfo.name_ptr = "__cg_heap_brk";
-    ginfo.name_len = 13;
+    ginfo.name = slice("__cg_heap_brk", 13);
     ginfo.typeinfo_ptr = typeinfo_make(TYPE_U64, 0);
         ginfo.init_kind = GLOBAL_INIT_NONE;
         ginfo.init_value = 0;
-        ginfo.init_name_ptr = 0;
-        ginfo.init_name_len = 0;
+        ginfo.init_name = slice(0, 0);
         ginfo.init_expr = 0;
         add_backend_global(ginfo);
     return 0;
@@ -313,6 +475,8 @@ func emit_ensure_heap_brk_global() -> u64 {
 // ============================================
 
 func emit_return_emit_epilogue() -> u64 {
+    emit_gc_cleanup_root_slots_preserve_ret();
+    emit_legacy_nonvolatile_restore();
     emit("    mov rsp, rbp\n");
     emit("    pop rbp\n");
     emit("    ret\n");
@@ -345,26 +509,28 @@ func emit_return_struct_large_from_literal(expr: u64, struct_size: u64) -> u64 {
     return 0;
 }
 
-func emit_return_struct_large_from_call(expr: u64, symtab: *Symtab) -> u64 {
+func emit_return_struct_large_from_call(expr: u64, symtab: *Symtab, sret_offset: u64) -> u64 {
     var call_expr: *AstCall = (*AstCall)expr;
     var args_call: *Vec<*AstNode> = call_expr.args_vec;
     var nargs_call: u64 = 0;
     if (args_call != 0) { nargs_call = args_call.len(); }
 
-    emit("    push rdi\n");
     var total_arg_words_call: u64 = 0;
     if (nargs_call > 0) {
         var ci: u64 = nargs_call;
         while (ci > 0) {
             ci = ci - 1;
             var carg: *AstNode = args_call.get(ci);
-            total_arg_words_call = total_arg_words_call + _cg_sysv_push_call_arg(carg, symtab);
+            total_arg_words_call = total_arg_words_call + _cg_target_push_call_arg(carg, symtab);
         }
     }
-    var stack_words_call: u64 = _cg_sysv_pop_arg_regs_sret(total_arg_words_call);
-    emit("    pop rdi\n");
-    _cg_emit_mov_raw_arg_from_reg(0, slice("rdi", 3));
-    emit_call_resolved_with_layout(slice(call_expr.name_ptr, call_expr.name_len), stack_words_call, 0);
+    emit("    mov ");
+    _cg_emit_raw_arg_reg_name(0);
+    emit(", [rbp");
+    emit_signed_disp(sret_offset);
+    emit("]\n");
+    var stack_words_call: u64 = _cg_target_pop_arg_regs_sret(total_arg_words_call);
+    emit_call_resolved_with_layout(call_expr.name, stack_words_call, 0);
     return 0;
 }
 
@@ -400,7 +566,9 @@ func emit_return_struct_large(expr: u64, expr_kind: u64, struct_size: u64, symta
     if (expr_kind == AST_STRUCT_LITERAL) {
         emit_return_struct_large_from_literal(expr, struct_size);
     } else if (expr_kind == AST_CALL) {
-        emit_return_struct_large_from_call(expr, symtab);
+        emit_return_struct_large_from_call(expr, symtab, sret_offset);
+    } else if (expr_kind == AST_METHOD_CALL) {
+        emit_method_call_sret_to_offset((*AstMethodCall)expr, sret_offset, symtab, 1);
     } else if (expr_kind == AST_STACK_CTOR) {
         emit("    mov r12, rdi\n");
         emit_stack_ctor_call_at_r12((*AstStackCtor)expr, symtab);
@@ -412,7 +580,7 @@ func emit_return_struct_large(expr: u64, expr_kind: u64, struct_size: u64, symta
 }
 
 func emit_return_struct_small(expr: u64, expr_kind: u64, struct_size: u64, symtab: *Symtab) -> u64 {
-    if (expr_kind == AST_CALL) {
+    if (expr_kind == AST_CALL || expr_kind == AST_METHOD_CALL || expr_kind == AST_CALL_PTR) {
         emit_expr(expr);
         return 0;
     }
@@ -443,6 +611,18 @@ func emit_return_struct_small(expr: u64, expr_kind: u64, struct_size: u64, symta
         }
         return 0;
     }
+    if (expr_kind == AST_IDENT) {
+        var idn_ret: *AstIdent = (*AstIdent)expr;
+        var ret_local_ti: *TypeInfo = symtab_get_type(symtab, idn_ret.name);
+        if (typeinfo_number_storage_is_specialized(ret_local_ti) != 0) {
+            emit_expr(expr);
+            return 0;
+        }
+    }
+    if (emit_binary_is_addressable((*AstNode)expr) == 0) {
+        emit_expr(expr);
+        return 0;
+    }
 
     emit_lvalue(expr);
     emit("    mov r10, rax\n");
@@ -458,7 +638,7 @@ func emit_return_slice_try_array_heap_copy(slice_node: *AstSlice, symtab: *Symta
     if (ptr_kind != AST_IDENT) { return 0; }
 
     var idn: *AstIdent = (*AstIdent)slice_node.ptr_expr;
-    var ti2: *TypeInfo = symtab_get_type(symtab, slice(idn.name_ptr, idn.name_len));
+    var ti2: *TypeInfo = symtab_get_type(symtab, idn.name);
     if (ti2 == 0 || ti2.type_kind != TYPE_ARRAY || ti2.ptr_depth != 0) { return 0; }
 
     emit_ensure_heap_brk_global();
@@ -599,7 +779,7 @@ func emit_return_emit_typeinfo_desc(ti: *TypeInfo) -> u64 {
         emit_stderr("<unknown>");
         return 0;
     }
-    emit_return_emit_type_desc(ti.type_kind, ti.ptr_depth, slice(ti.struct_name_ptr, ti.struct_name_len));
+    emit_return_emit_type_desc(ti.type_kind, ti.ptr_depth, ti.struct_name);
     return 0;
 }
 
@@ -638,8 +818,7 @@ func emit_return_is_zero_literal(expr: u64) -> u64 {
 func emit_return_validate_expr(expr: u64, symtab: *Symtab) -> u64 {
     var ret_type: u64 = ret_type_current();
     var ret_ptr_depth: u64 = ret_ptr_depth_current();
-    var ret_struct_name_ptr: u64 = ret_struct_name_ptr_current();
-    var ret_struct_name_len: u64 = ret_struct_name_len_current();
+    var ret_struct_name: []u8 = ret_struct_name_current();
 
     // Preserve historical semantics: bare `return;` in non-void context
     // is lowered as zero/default value by backend conventions.
@@ -654,43 +833,40 @@ func emit_return_validate_expr(expr: u64, symtab: *Symtab) -> u64 {
 
     if (ret_type == TYPE_STRUCT || ret_type == TYPE_TRAIT || ret_type == TYPE_GENERIC) {
         if (actual_ti.type_kind != ret_type || actual_ti.ptr_depth != ret_ptr_depth) {
-            return emit_return_report_type_error(ret_type, ret_ptr_depth, slice(ret_struct_name_ptr, ret_struct_name_len), actual_ti, 0);
+            return emit_return_report_type_error(ret_type, ret_ptr_depth, ret_struct_name, actual_ti, 0);
         }
-        if (ret_struct_name_ptr != 0 && ret_struct_name_len != 0 &&
-            actual_ti.struct_name_ptr != 0 && actual_ti.struct_name_len != 0 &&
-            str_eq(slice(actual_ti.struct_name_ptr, actual_ti.struct_name_len), slice(ret_struct_name_ptr, ret_struct_name_len)) == 0) {
-            return emit_return_report_type_error(ret_type, ret_ptr_depth, slice(ret_struct_name_ptr, ret_struct_name_len), actual_ti, 0);
+        if (u8_slice_ptr(ret_struct_name) != 0 && u8_slice_len(ret_struct_name) != 0 &&
+            u8_slice_ptr(actual_ti.struct_name) != 0 && u8_slice_len(actual_ti.struct_name) != 0 &&
+            str_eq(actual_ti.struct_name, ret_struct_name) == 0) {
+            return emit_return_report_type_error(ret_type, ret_ptr_depth, ret_struct_name, actual_ti, 0);
         }
         return 1;
     }
 
     if (ret_type == TYPE_ARRAY || ret_type == TYPE_SLICE) {
         if (actual_ti.type_kind != ret_type || actual_ti.ptr_depth != ret_ptr_depth) {
-            return emit_return_report_type_error(ret_type, ret_ptr_depth, slice(ret_struct_name_ptr, ret_struct_name_len), actual_ti, 0);
+            return emit_return_report_type_error(ret_type, ret_ptr_depth, ret_struct_name, actual_ti, 0);
         }
         return 1;
     }
 
-    return emit_return_report_type_error(ret_type, ret_ptr_depth, slice(ret_struct_name_ptr, ret_struct_name_len), actual_ti, 0);
+    return emit_return_report_type_error(ret_type, ret_ptr_depth, ret_struct_name, actual_ti, 0);
 }
 
 func emit_return_stmt(node: u64, symtab: *Symtab) -> u64 {
     var ret: *AstReturn = (*AstReturn)node;
     var expr: u64 = ret.expr;
-    var skip_delete_name_ptr: u64 = 0;
-    var skip_delete_name_len: u64 = 0;
+    var skip_delete_name: []u8 = slice(0, 0);
     if (expr != 0 && ast_kind(expr) == AST_IDENT) {
         var ret_ident: *AstIdent = (*AstIdent)expr;
-        if (closure_handle_is(slice(ret_ident.name_ptr, ret_ident.name_len)) != 0) {
-            skip_delete_name_ptr = ret_ident.name_ptr;
-            skip_delete_name_len = ret_ident.name_len;
+        if (closure_handle_is(ret_ident.name) != 0) {
+            skip_delete_name = ret_ident.name;
         }
     }
 
     var ret_type: u64 = ret_type_current();
     var ret_ptr_depth: u64 = ret_ptr_depth_current();
-    var ret_struct_name_ptr: u64 = ret_struct_name_ptr_current();
-    var ret_struct_name_len: u64 = ret_struct_name_len_current();
+    var ret_struct_name: []u8 = ret_struct_name_current();
     if (emit_return_validate_expr(expr, symtab) == 0) { return 0; }
 
     if (expr == 0) {
@@ -703,7 +879,7 @@ func emit_return_stmt(node: u64, symtab: *Symtab) -> u64 {
     if (ret_type == TYPE_STRUCT && ret_ptr_depth == 0) {
         emit_defer_emit_for_return(slice(0, 0));
         var expr_kind: u64 = ast_kind(expr);
-        var struct_size: u64 = layout_type_sizeof(ret_type, 0, slice(ret_struct_name_ptr, ret_struct_name_len));
+        var struct_size: u64 = layout_type_sizeof(ret_type, 0, ret_struct_name);
         if (struct_size > 16) {
             emit_return_struct_large(expr, expr_kind, struct_size, symtab);
             return 0;
@@ -717,14 +893,14 @@ func emit_return_stmt(node: u64, symtab: *Symtab) -> u64 {
         emit_return_slice(expr, symtab);
         emit("    push rax\n");
         emit("    push rdx\n");
-        emit_defer_emit_for_return(slice(skip_delete_name_ptr, skip_delete_name_len));
+        emit_defer_emit_for_return(skip_delete_name);
         emit("    pop rdx\n");
         emit("    pop rax\n");
         emit_return_emit_epilogue();
         return 0;
     }
 
-    if (ast_kind(expr) == AST_IDENT && skip_delete_name_ptr == 0 && skip_delete_name_len == 0) {
+    if (ast_kind(expr) == AST_IDENT && u8_slice_ptr(skip_delete_name) == 0 && u8_slice_len(skip_delete_name) == 0) {
         emit_defer_emit_for_return(slice(0, 0));
         emit_expr(expr);
         emit_return_emit_epilogue();
@@ -733,7 +909,7 @@ func emit_return_stmt(node: u64, symtab: *Symtab) -> u64 {
 
     emit_expr(expr);
     emit("    push rax\n");
-    emit_defer_emit_for_return(slice(skip_delete_name_ptr, skip_delete_name_len));
+    emit_defer_emit_for_return(skip_delete_name);
     emit("    pop rax\n");
     emit_return_emit_epilogue();
     return 0;
@@ -747,14 +923,13 @@ struct CgDeclTypeSpec {
     public type_kind: u64;
     public ptr_depth: u64;
     public is_tagged: u64;
-    public struct_name_ptr: u64;
-    public struct_name_len: u64;
-    public tag_layout_ptr: u64;
-    public tag_layout_len: u64;
+    public struct_name: []u8;
+    public tag_layout: []u8;
     public elem_type_kind: u64;
     public elem_ptr_depth: u64;
     public array_len: u64;
     public elem_typeinfo: *TypeInfo;
+    public number_storage_kind: u64;
 }
 
 func emit_var_decl_try_ctor_or_sret_init(init: u64, init_kind: u64, spec: *CgDeclTypeSpec, offset: u64, symtab: *Symtab) -> u64 {
@@ -763,7 +938,7 @@ func emit_var_decl_try_ctor_or_sret_init(init: u64, init_kind: u64, spec: *CgDec
         return 1;
     }
     if (spec.type_kind == TYPE_STRUCT && spec.ptr_depth == 0) {
-        var struct_size0: u64 = layout_type_sizeof(spec.type_kind, spec.ptr_depth, slice(spec.struct_name_ptr, spec.struct_name_len));
+        var struct_size0: u64 = layout_type_sizeof(spec.type_kind, spec.ptr_depth, spec.struct_name);
         if (struct_size0 > 16) {
             if (init_kind == AST_CALL) {
                 emit_call_sret((*AstCall)init, offset, symtab);
@@ -786,7 +961,7 @@ func emit_var_decl_check_init_compat(decl: *AstVarDecl, init: u64, type_kind: u6
     if (type_kind == 0) { return 0; }
     var it_info: *TypeInfo = get_expr_type_with_symtab((*AstNode)init, symtab);
     if (it_info == 0) { return 0; }
-    check_type_compat(it_info.type_kind, it_info.ptr_depth, it_info.is_tagged, slice(it_info.tag_layout_ptr, it_info.tag_layout_len), type_kind, ptr_depth, decl.is_tagged, slice(decl.tag_layout_ptr, decl.tag_layout_len));
+    check_type_compat(it_info.type_kind, it_info.ptr_depth, it_info.is_tagged, it_info.tag_layout, type_kind, ptr_depth, decl.is_tagged, decl.tag_layout);
     return 0;
 }
 
@@ -840,7 +1015,10 @@ func emit_var_decl_try_struct_copy_init(init: u64, init_kind: u64, spec: *CgDecl
     if (init_ti == 0 || init_ti.type_kind != TYPE_STRUCT || init_ti.ptr_depth != 0) {
         return 0;
     }
-    var struct_size_copy: u64 = layout_type_sizeof(spec.type_kind, spec.ptr_depth, slice(spec.struct_name_ptr, spec.struct_name_len));
+    if (typeinfo_number_storage_is_specialized(init_ti) != 0) {
+        return 0;
+    }
+    var struct_size_copy: u64 = layout_type_sizeof(spec.type_kind, spec.ptr_depth, spec.struct_name);
     emit_lvalue(init);
     emit("    mov rbx, rax\n");
     emit("    lea r8, [rbp");
@@ -878,7 +1056,7 @@ func emit_var_decl_try_array_copy_init(init: u64, spec: *CgDeclTypeSpec, offset:
     if (spec.elem_typeinfo != 0) {
         total_size = sizeof_type_ex(spec.elem_typeinfo) * spec.array_len;
     } else {
-        var elem_size: u64 = layout_type_sizeof(spec.elem_type_kind, spec.elem_ptr_depth, slice(spec.struct_name_ptr, spec.struct_name_len));
+        var elem_size: u64 = layout_type_sizeof(spec.elem_type_kind, spec.elem_ptr_depth, spec.struct_name);
         total_size = elem_size * spec.array_len;
     }
 
@@ -942,10 +1120,123 @@ func emit_var_decl_store_eval_result(type_kind: u64, ptr_depth: u64, struct_name
     return 0;
 }
 
+func emit_var_decl_store_number_storage_raw(kind: u64, offset: u64) -> u64 {
+    if (kind == TYPE_F64) {
+        emit("    mov [rbp");
+        emit_signed_disp(offset);
+        emit("], rax\n");
+        return 1;
+    }
+    var raw_ti: *TypeInfo = typeinfo_new(kind, 0);
+    emit_binary_emit_int_rax_normalize(raw_ti);
+    if (emit_var_decl_try_store_small_int(kind, 0, offset) != 0) { return 1; }
+    emit("    mov [rbp");
+    emit_signed_disp(offset);
+    emit("], rax\n");
+    return 1;
+}
+
+func emit_var_decl_try_number_storage_init(init: u64, spec: *CgDeclTypeSpec, offset: u64, symtab: *Symtab) -> u64 {
+    if (spec == 0 || spec.number_storage_kind == 0) { return 0; }
+    var ctor_kind: u64 = lower_number_storage_ctor_kind_from_expr((*AstNode)init);
+    if (ctor_kind == 0 || ctor_kind != spec.number_storage_kind) { return 0; }
+    if (ast_kind(init) != AST_CALL) { return 0; }
+    var call: *AstCall = (*AstCall)init;
+    if (call.args_vec == 0 || call.args_vec.len() != 1) { return 0; }
+    emit_expr(call.args_vec.get(0));
+    return emit_var_decl_store_number_storage_raw(spec.number_storage_kind, offset);
+}
+
+func emit_var_decl_unwrap_new_expr(expr: u64) -> *AstNew {
+    if (expr == 0) { return 0; }
+    var kind: u64 = ast_kind(expr);
+    if (kind == AST_NEW) { return (*AstNew)expr; }
+    if (kind == AST_CAST) {
+        var cs: *AstCast = (*AstCast)expr;
+        return emit_var_decl_unwrap_new_expr((u64)cs.expr);
+    }
+    return 0;
+}
+
+func emit_var_decl_new_alloc_size(nw: *AstNew) -> u64 {
+    if (nw == 0 || nw.array_len_is_param != 0) { return 0; }
+    if (nw.type_kind == TYPE_ARRAY) {
+        var elem_size: u64 = 0;
+        if (nw.elem_typeinfo != 0) {
+            elem_size = sizeof_type_ex(nw.elem_typeinfo);
+        } else {
+            elem_size = layout_type_sizeof(nw.elem_type_kind, nw.elem_ptr_depth, nw.struct_name);
+        }
+        return elem_size * nw.array_len;
+    }
+    if (nw.type_kind == TYPE_SLICE) { return 16; }
+    return layout_type_sizeof(nw.type_kind, nw.ptr_depth, nw.struct_name);
+}
+
+func emit_var_decl_gc_alloc_raw_to_r12(size: u64, shape: u64) -> u64 {
+    var alloc_ptr: u64 = (u64)"bpp_gc_alloc_raw";
+    var alloc_len: u64 = str_len("bpp_gc_alloc_raw");
+    var alloc_res: *NameInfo = resolve_name(slice(alloc_ptr, alloc_len));
+    if (alloc_res != 0) {
+        alloc_ptr = alloc_res.ptr;
+        alloc_len = alloc_res.len;
+    }
+    _cg_emit_mov_user_arg_imm_u64(0, 0, size);
+    _cg_emit_mov_user_arg_imm_u64(1, 0, shape);
+    _cg_emit_direct_call_name(slice(alloc_ptr, alloc_len), 0, 0);
+    emit("    mov r12, rax\n");
+    return 0;
+}
+
+func emit_var_decl_new_init_r12(nw: *AstNew, size: u64, symtab: *Symtab) -> u64 {
+    var memset_ptr: u64 = (u64)"memset";
+    var memset_len: u64 = 6;
+    var memset_res: *NameInfo = resolve_name(slice(memset_ptr, memset_len));
+    if (memset_res != 0) {
+        memset_ptr = memset_res.ptr;
+        memset_len = memset_res.len;
+    }
+    _cg_emit_mov_user_arg_from_reg(0, 0, slice("r12", 3));
+    _cg_emit_mov_user_arg_imm_u64(1, 0, 0);
+    _cg_emit_mov_user_arg_imm_u64(2, 0, size);
+    _cg_emit_direct_call_name(slice(memset_ptr, memset_len), 0, 0);
+
+    if (nw.type_kind == TYPE_STRUCT) {
+        emit_emit_trait_vptr_init_at_r12(nw.struct_name);
+    }
+    if (nw.literal_expr != 0 && ast_kind(nw.literal_expr) == AST_STRUCT_LITERAL) {
+        emit_struct_literal_init_ptr(nw.literal_expr);
+    }
+    emit_new_invoke_constructor(nw, symtab);
+    emit("    mov rax, r12\n");
+    return 0;
+}
+
+func emit_var_decl_try_gc_rooted_new_init(decl: *AstVarDecl, init: u64, spec: *CgDeclTypeSpec, offset: u64, symtab: *Symtab) -> u64 {
+    if (decl == 0 || spec == 0 || spec.ptr_depth == 0 || offset == 0) { return 0; }
+    if (emit_gc_auto_slots_disabled() != 0) { return 0; }
+    var nw: *AstNew = emit_var_decl_unwrap_new_expr(init);
+    if (nw == 0) { return 0; }
+    var size: u64 = emit_var_decl_new_alloc_size(nw);
+    if (size == 0) { return 0; }
+    emit_var_decl_gc_alloc_raw_to_r12(size, emit_new_tag_shape_for_new(nw));
+    emit("    mov [rbp");
+    emit_signed_disp(offset);
+    emit("], r12\n");
+    emit_gc_root_slot_push_offset(offset);
+    emit("    mov r12, [rbp");
+    emit_signed_disp(offset);
+    emit("]\n");
+    emit_var_decl_new_init_r12(nw, size, symtab);
+    return 1;
+}
+
 func emit_var_decl_init_value(decl: *AstVarDecl, init: u64, spec: *CgDeclTypeSpec, offset: u64, symtab: *Symtab) -> u64 {
     var init_kind: u64 = ast_kind(init);
 
+    if (emit_var_decl_try_number_storage_init(init, spec, offset, symtab) != 0) { return 1; }
     if (emit_var_decl_try_array_copy_init(init, spec, offset, symtab) != 0) { return 1; }
+    if (emit_var_decl_try_gc_rooted_new_init(decl, init, spec, offset, symtab) != 0) { return 1; }
     if (emit_var_decl_try_ctor_or_sret_init(init, init_kind, spec, offset, symtab) != 0) { return 1; }
     emit_var_decl_check_init_compat(decl, init, spec.type_kind, spec.ptr_depth, symtab);
     if (emit_var_decl_try_slice_init(init, init_kind, spec, offset) != 0) { return 1; }
@@ -954,23 +1245,30 @@ func emit_var_decl_init_value(decl: *AstVarDecl, init: u64, spec: *CgDeclTypeSpe
     emit_expr(init);
     emit_var_decl_apply_tagged_mask_if_needed(init, spec.is_tagged, spec.ptr_depth, symtab);
     if (emit_var_decl_try_store_small_int(spec.type_kind, spec.ptr_depth, offset) != 0) { return 1; }
-    emit_var_decl_store_eval_result(spec.type_kind, spec.ptr_depth, slice(spec.struct_name_ptr, spec.struct_name_len), offset);
+    emit_var_decl_store_eval_result(spec.type_kind, spec.ptr_depth, spec.struct_name, offset);
+    if (spec.ptr_depth > 0 && emit_gc_init_is_raw_strip(init) == 0) {
+        emit_gc_root_slot_push_offset(offset);
+    }
     return 0;
 }
 
 func emit_var_decl_calc_size(spec: *CgDeclTypeSpec) -> u64 {
+    if (spec.number_storage_kind != 0) {
+        var number_storage_size: u64 = typeinfo_number_storage_size(spec.number_storage_kind);
+        if (number_storage_size != 0) { return number_storage_size; }
+    }
     if (spec.type_kind == TYPE_ARRAY) {
         var elem_size: u64 = 0;
         if (spec.elem_typeinfo != 0) {
             elem_size = sizeof_type_ex(spec.elem_typeinfo);
         } else {
-            elem_size = layout_type_sizeof(spec.elem_type_kind, spec.elem_ptr_depth, slice(spec.struct_name_ptr, spec.struct_name_len));
+            elem_size = layout_type_sizeof(spec.elem_type_kind, spec.elem_ptr_depth, spec.struct_name);
         }
         return elem_size * spec.array_len;
     }
     if (spec.type_kind == TYPE_SLICE) { return 16; }
 
-    var size: u64 = layout_type_sizeof(spec.type_kind, spec.ptr_depth, slice(spec.struct_name_ptr, spec.struct_name_len));
+    var size: u64 = layout_type_sizeof(spec.type_kind, spec.ptr_depth, spec.struct_name);
     if (spec.type_kind == TYPE_STRUCT && spec.ptr_depth == 0) {
         var align_rem: u64 = size % 8;
         if (align_rem != 0) { size = size + (8 - align_rem); }
@@ -984,7 +1282,7 @@ func emit_var_decl_find_struct_def(g_structs_vec: *Vec<*AstStructDef>, struct_na
     while (i > 0) {
         i = i - 1;
         var sd: *AstStructDef = g_structs_vec.get(i);
-        if (str_eq(slice(sd.name_ptr, sd.name_len), slice(struct_name.ptr, struct_name.len))) {
+        if (str_eq(sd.name, slice(struct_name.ptr, struct_name.len))) {
             return sd;
         }
     }
@@ -994,24 +1292,21 @@ func emit_var_decl_find_struct_def(g_structs_vec: *Vec<*AstStructDef>, struct_na
 func emit_var_decl_setup_typeinfo(symtab: *Symtab, name: []u8, spec: *CgDeclTypeSpec, g_structs_vec: *Vec<*AstStructDef>) -> u64 {
     var ti0: *TypeInfo = symtab_get_type(symtab, slice(name.ptr, name.len));
     ti0.is_tagged = spec.is_tagged;
-    if (spec.is_tagged == 1 && spec.struct_name_ptr != 0 && spec.type_kind != TYPE_STRUCT && spec.type_kind != TYPE_ARRAY && spec.type_kind != TYPE_SLICE) {
-        ti0.struct_name_ptr = spec.struct_name_ptr;
-        ti0.struct_name_len = spec.struct_name_len;
+    ti0.number_storage_kind = spec.number_storage_kind;
+    if (spec.is_tagged == 1 && u8_slice_ptr(spec.struct_name) != 0 && spec.type_kind != TYPE_STRUCT && spec.type_kind != TYPE_ARRAY && spec.type_kind != TYPE_SLICE) {
+        ti0.struct_name = spec.struct_name;
     }
-    if (spec.is_tagged == 1 && spec.tag_layout_ptr != 0) {
-        ti0.tag_layout_ptr = spec.tag_layout_ptr;
-        ti0.tag_layout_len = spec.tag_layout_len;
+    if (spec.is_tagged == 1 && u8_slice_ptr(spec.tag_layout) != 0) {
+        ti0.tag_layout = spec.tag_layout;
     }
 
     if (spec.type_kind == TYPE_STRUCT) {
         var ti: *TypeInfo = symtab_get_type(symtab, slice(name.ptr, name.len));
-        ti.struct_def = emit_var_decl_find_struct_def(g_structs_vec, slice(spec.struct_name_ptr, spec.struct_name_len));
+        ti.struct_def = emit_var_decl_find_struct_def(g_structs_vec, spec.struct_name);
         if (ti.struct_def != 0) {
-            ti.struct_name_ptr = ti.struct_def.name_ptr;
-            ti.struct_name_len = ti.struct_def.name_len;
+            ti.struct_name = ti.struct_def.name;
         } else {
-            ti.struct_name_ptr = spec.struct_name_ptr;
-            ti.struct_name_len = spec.struct_name_len;
+            ti.struct_name = spec.struct_name;
         }
         ti.elem_type_kind = 0;
         ti.elem_ptr_depth = 0;
@@ -1022,8 +1317,7 @@ func emit_var_decl_setup_typeinfo(symtab: *Symtab, name: []u8, spec: *CgDeclType
 
     if (spec.type_kind == TYPE_TRAIT) {
         var ti_trait: *TypeInfo = symtab_get_type(symtab, slice(name.ptr, name.len));
-        ti_trait.struct_name_ptr = spec.struct_name_ptr;
-        ti_trait.struct_name_len = spec.struct_name_len;
+        ti_trait.struct_name = spec.struct_name;
         ti_trait.struct_def = 0;
         ti_trait.elem_type_kind = 0;
         ti_trait.elem_ptr_depth = 0;
@@ -1049,53 +1343,51 @@ func emit_var_decl_setup_typeinfo(symtab: *Symtab, name: []u8, spec: *CgDeclType
         ti2.elem_ptr_depth = spec.elem_ptr_depth;
         ti2.array_len = spec.array_len;
         ti2.elem_typeinfo = spec.elem_typeinfo;
-        ti2.struct_name_ptr = spec.struct_name_ptr;
-        ti2.struct_name_len = spec.struct_name_len;
+        ti2.struct_name = spec.struct_name;
         if (spec.elem_type_kind == TYPE_STRUCT) {
-            ti2.struct_def = emit_var_decl_find_struct_def(g_structs_vec, slice(spec.struct_name_ptr, spec.struct_name_len));
+            ti2.struct_def = emit_var_decl_find_struct_def(g_structs_vec, spec.struct_name);
         }
     }
     return 0;
 }
 
 func emit_var_decl_emit_struct_vptr_init(spec: *CgDeclTypeSpec, offset: u64) -> u64 {
+    if (spec.number_storage_kind != 0) { return 0; }
     if (!(spec.type_kind == TYPE_STRUCT && spec.ptr_depth == 0)) { return 0; }
     emit("    lea r12, [rbp");
     emit_signed_disp(offset);
     emit("]\n");
-    emit_emit_trait_vptr_init_at_r12(slice(spec.struct_name_ptr, spec.struct_name_len));
+    emit_emit_trait_vptr_init_at_r12(spec.struct_name);
     return 0;
 }
 
 func emit_var_decl_stmt(node: u64, symtab: *Symtab, g_structs_vec: *Vec<*AstStructDef>) -> u64 {
     var decl: *AstVarDecl = (*AstVarDecl)node;
-    var name_ptr: u64 = decl.name_ptr;
-    var name_len: u64 = decl.name_len;
+    var name: []u8 = decl.name;
     var init: u64 = decl.init_expr;
     var spec: *CgDeclTypeSpec = new CgDeclTypeSpec{};
     spec.type_kind = decl.type_kind;
     spec.ptr_depth = decl.ptr_depth;
     spec.is_tagged = decl.is_tagged;
-    spec.struct_name_ptr = decl.struct_name_ptr;
-    spec.struct_name_len = decl.struct_name_len;
-    spec.tag_layout_ptr = decl.tag_layout_ptr;
-    spec.tag_layout_len = decl.tag_layout_len;
+    spec.struct_name = decl.struct_name;
+    spec.tag_layout = decl.tag_layout;
     spec.elem_type_kind = decl.elem_type_kind;
     spec.elem_ptr_depth = decl.elem_ptr_depth;
     spec.array_len = decl.array_len;
     spec.elem_typeinfo = decl.elem_typeinfo;
+    spec.number_storage_kind = decl.number_storage_kind;
 
     var size: u64 = emit_var_decl_calc_size(spec);
-    var offset: u64 = symtab_add(symtab, slice(name_ptr, name_len), spec.type_kind, spec.ptr_depth, size);
-    emit_var_decl_setup_typeinfo(symtab, slice(name_ptr, name_len), spec, g_structs_vec);
+    var offset: u64 = symtab_add(symtab, name, spec.type_kind, spec.ptr_depth, size);
+    emit_var_decl_setup_typeinfo(symtab, name, spec, g_structs_vec);
     
     if (init != 0) {
         if (emit_var_decl_init_value(decl, init, spec, offset, symtab) != 0) {
             return;
         }
-        emitter_closure_track_from_expr(slice(name_ptr, name_len), init);
+        emitter_closure_track_from_expr(name, init);
     } else {
-        closure_handle_set(slice(name_ptr, name_len), 0);
+        closure_handle_set(name, 0);
     }
 
     emit_var_decl_emit_struct_vptr_init(spec, offset);
@@ -1116,7 +1408,7 @@ func emit_struct_literal_init(init: u64, offset: u64) -> u64 {
             var parent_desc: *ParentDesc = parents.get(pi);
             var parent_def: *AstStructDef = parent_desc.struct_def;
             if (parent_def == 0) {
-                parent_def = get_struct_def(slice(parent_desc.name_ptr, parent_desc.name_len));
+                parent_def = get_struct_def(parent_desc.name);
                 if (parent_def == 0) {
                     emit("[ERROR] Parent struct not found\n");
                     diag_force_stop_pass();
@@ -1124,7 +1416,7 @@ func emit_struct_literal_init(init: u64, offset: u64) -> u64 {
                 }
                 parent_desc.struct_def = parent_def;
             }
-            var parent_size: u64 = layout_type_sizeof(TYPE_STRUCT, 0, slice(parent_desc.name_ptr, parent_desc.name_len));
+            var parent_size: u64 = layout_type_sizeof(TYPE_STRUCT, 0, parent_desc.name);
             parent_total = parent_total + parent_size;
         }
     }
@@ -1134,8 +1426,8 @@ func emit_struct_literal_init(init: u64, offset: u64) -> u64 {
         var ni: u64 = impls.len();
         for (var ti: u64 = 0; ti < ni; ti++) {
             var impl_info: *TraitImpl = impls.get(ti);
-            if (!str_eq(slice(impl_info.struct_ptr, impl_info.struct_len), slice(lit.struct_def.name_ptr, lit.struct_def.name_len))) { continue; }
-            var vptr_name: *NameInfo = trait_build_vptr_field_name(slice(impl_info.trait_ptr, impl_info.trait_len));
+            if (!str_eq(impl_info.impl_struct_name, lit.struct_def.name)) { continue; }
+            var vptr_name: *NameInfo = trait_build_vptr_field_name(impl_info.trait_name);
             var field_offset_v: u64 = 0;
             var field_desc_v: *FieldDesc = 0;
             var found_v: u64 = struct_find_field_desc_scoped(lit.struct_def, slice(0, 0), slice(vptr_name.ptr, vptr_name.len), &field_offset_v, &field_desc_v);
@@ -1145,7 +1437,7 @@ func emit_struct_literal_init(init: u64, offset: u64) -> u64 {
         return 0;
             }
             emit("    lea rax, [rel _gvar_");
-            emit_len(impl_info.vtable_global_ptr, impl_info.vtable_global_len);
+            emit_len(u8_slice_ptr(impl_info.vtable_global), u8_slice_len(impl_info.vtable_global));
             emit("]\n");
             emit("    mov [rbp");
             var total_off_v: u64 = offset + field_offset_v;
@@ -1160,12 +1452,41 @@ func emit_struct_literal_init(init: u64, offset: u64) -> u64 {
     for (var fi: u64 = 0; fi < num_fields && value_index < num_values; fi++) {
         var field: *FieldDesc = fields.get(fi);
         var field_size: u64 = layout_field_sizeof(field);
-        if (trait_is_vptr_field_name(slice(field.name_ptr, field.name_len)) != 0) {
+        if (trait_is_vptr_field_name(field.name) != 0) {
             field_offset = field_offset + field_size;
             continue;
         }
 
-        emit_expr(values.get(value_index));
+        var value_expr: u64 = values.get(value_index);
+        if (field.type_kind == TYPE_SLICE && field.ptr_depth == 0) {
+            var total_slice_offset: u64 = offset + field_offset;
+            if (ast_kind(value_expr) == AST_SLICE) {
+                var sl: *AstSlice = (*AstSlice)value_expr;
+                emit_expr(sl.ptr_expr);
+                emit("    mov [rbp");
+                emit_signed_disp(total_slice_offset);
+                emit("], rax\n");
+                emit_expr(sl.len_expr);
+                emit("    mov [rbp");
+                emit_signed_disp(total_slice_offset + 8);
+                emit("], rax\n");
+            } else {
+                emit_lvalue(value_expr);
+                emit("    mov rbx, [rax]\n");
+                emit("    mov rcx, [rax+8]\n");
+                emit("    mov [rbp");
+                emit_signed_disp(total_slice_offset);
+                emit("], rbx\n");
+                emit("    mov [rbp");
+                emit_signed_disp(total_slice_offset + 8);
+                emit("], rcx\n");
+            }
+            field_offset = field_offset + field_size;
+            value_index = value_index + 1;
+            continue;
+        }
+
+        emit_expr(value_expr);
 
         emit("    mov [rbp");
         var total_offset: u64 = offset + field_offset;
@@ -1182,8 +1503,8 @@ func emit_struct_literal_init(init: u64, offset: u64) -> u64 {
 // ============================================
 
 func emit_assign_try_member_tagged_layout(obj: u64, member: []u8, ot: *TypeInfo, value: u64) -> u64 {
-    if (ot.ptr_depth > 0 && ot.is_tagged == 1 && ot.tag_layout_ptr != 0) {
-        var layout_info: *AstStructDef = get_struct_def(slice(ot.tag_layout_ptr, ot.tag_layout_len));
+    if (ot.ptr_depth > 0 && ot.is_tagged == 1 && u8_slice_ptr(ot.tag_layout) != 0) {
+        var layout_info: *AstStructDef = get_struct_def(ot.tag_layout);
         if (layout_info == 0) {
             emit("[ERROR] Tagged layout struct not found\n");
             diag_force_stop_pass();
@@ -1359,8 +1680,8 @@ func emit_assign_try_member_packed_special(target: u64, value: u64, symtab: *Sym
 
     var m: *AstMemberAccess = (*AstMemberAccess)target;
     var obj: u64 = m.object;
-    var member_ptr: u64 = m.member_ptr;
-    var member_len: u64 = m.member_len;
+    var member_ptr: u64 = u8_slice_ptr(m.member);
+    var member_len: u64 = u8_slice_len(m.member);
     var ot: *TypeInfo = get_expr_type_with_symtab((*AstNode)obj, symtab);
     if (ot == 0) { return 0; }
 
@@ -1373,13 +1694,12 @@ func emit_assign_update_ident_ptr_type(target: u64, target_kind: u64, value: u64
     if (target_kind != AST_IDENT) { return 0; }
 
     var ident: *AstIdent = (*AstIdent)target;
-    var name_ptr: u64 = ident.name_ptr;
-    var name_len: u64 = ident.name_len;
-    var target_type: *TypeInfo = symtab_get_type(symtab, slice(name_ptr, name_len));
+    var name: []u8 = ident.name;
+    var target_type: *TypeInfo = symtab_get_type(symtab, name);
     var value_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)value, symtab);
     if (target_type == 0 || value_ti == 0) { return 0; }
     if (value_ti.ptr_depth == 0) { return 0; }
-    symtab_update_type(symtab, slice(name_ptr, name_len), value_ti.type_kind, value_ti.ptr_depth);
+    symtab_update_type(symtab, name, value_ti.type_kind, value_ti.ptr_depth);
     return 0;
 }
 
@@ -1424,16 +1744,16 @@ func emit_assign_try_slice_copy(target: u64, target_kind: u64, value: u64, value
 func emit_assign_array_elem_struct_name_matches(target_ti: *TypeInfo, value_ti: *TypeInfo) -> u64 {
     if (target_ti == 0 || value_ti == 0) { return 0; }
     if (target_ti.elem_type_kind != TYPE_STRUCT) { return 1; }
-    if (target_ti.struct_name_ptr == 0 || target_ti.struct_name_len == 0) { return 1; }
+    if (u8_slice_ptr(target_ti.struct_name) == 0 || u8_slice_len(target_ti.struct_name) == 0) { return 1; }
 
-    var value_struct_ptr: u64 = value_ti.struct_name_ptr;
-    var value_struct_len: u64 = value_ti.struct_name_len;
+    var value_struct_ptr: u64 = u8_slice_ptr(value_ti.struct_name);
+    var value_struct_len: u64 = u8_slice_len(value_ti.struct_name);
     if (value_ti.type_kind == TYPE_ARRAY) {
-        value_struct_ptr = value_ti.struct_name_ptr;
-        value_struct_len = value_ti.struct_name_len;
+        value_struct_ptr = u8_slice_ptr(value_ti.struct_name);
+        value_struct_len = u8_slice_len(value_ti.struct_name);
     }
     if (value_struct_ptr == 0 || value_struct_len == 0) { return 0; }
-    if (str_eq(slice(target_ti.struct_name_ptr, target_ti.struct_name_len), slice(value_struct_ptr, value_struct_len)) == 0) { return 0; }
+    if (str_eq(target_ti.struct_name, slice(value_struct_ptr, value_struct_len)) == 0) { return 0; }
     return 1;
 }
 
@@ -1444,7 +1764,7 @@ func emit_assign_array_total_size(target_ti: *TypeInfo) -> u64 {
     if (target_ti.elem_typeinfo != 0) {
         elem_size = sizeof_type_ex(target_ti.elem_typeinfo);
     } else {
-        elem_size = layout_type_sizeof(target_ti.elem_type_kind, target_ti.elem_ptr_depth, slice(target_ti.struct_name_ptr, target_ti.struct_name_len));
+        elem_size = layout_type_sizeof(target_ti.elem_type_kind, target_ti.elem_ptr_depth, target_ti.struct_name);
     }
     return elem_size * target_ti.array_len;
 }
@@ -1554,6 +1874,10 @@ func emit_assign_try_store_by_target_kind(target: u64, target_kind: u64, symtab:
         var tt: *TypeInfo = get_expr_type_with_symtab((*AstNode)target, symtab);
         if (tt != 0) {
             emit_store_rbx_to_addr(tt.type_kind, tt.ptr_depth);
+            if (emit_gc_type_is_root_slot_candidate(tt) != 0) {
+                var idn_refresh: *AstIdent = (*AstIdent)target;
+                emit_gc_root_slot_refresh_offset(symtab_find(symtab, idn_refresh.name));
+            }
             return 1;
         }
         return 0;
@@ -1562,14 +1886,35 @@ func emit_assign_try_store_by_target_kind(target: u64, target_kind: u64, symtab:
     return 0;
 }
 
+func emit_assign_gc_member_edge_slot_after_store(target: u64, target_ti: *TypeInfo, symtab: *Symtab) -> u64 {
+    if (target == 0 || ast_kind(target) != AST_MEMBER_ACCESS) { return 0; }
+    if (emit_gc_type_is_root_slot_candidate(target_ti) == 0) { return 0; }
+    var m: *AstMemberAccess = (*AstMemberAccess)target;
+    if (m.object == 0 || ast_kind((u64)m.object) != AST_IDENT) { return 0; }
+    var obj_ti: *TypeInfo = get_expr_type_with_symtab(m.object, symtab);
+    if (obj_ti == 0 || obj_ti.ptr_depth == 0) { return 0; }
+    var obj_idn: *AstIdent = (*AstIdent)m.object;
+    var obj_offset: u64 = symtab_find(symtab, obj_idn.name);
+    if (obj_offset == 0) { return 0; }
+    emit("    mov r12, rax\n");
+    emit("    mov r13, [rbp");
+    emit_signed_disp(obj_offset);
+    emit("]\n");
+    _cg_emit_mov_user_arg_from_reg(0, 0, slice("r13", 3));
+    _cg_emit_mov_user_arg_from_reg(1, 0, slice("r12", 3));
+    emit_gc_direct_call_name(slice("bpp_tag_write_barrier_runtime_slot", str_len("bpp_tag_write_barrier_runtime_slot")));
+    return 1;
+}
+
 func emit_assign_try_struct_copy(target: u64, value: u64, symtab: *Symtab) -> u64 {
     var target_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)target, symtab);
     if (target_ti == 0 || target_ti.type_kind != TYPE_STRUCT || target_ti.ptr_depth != 0) { return 0; }
+    if (emit_binary_is_addressable((*AstNode)value) == 0) { return 0; }
 
     var struct_def: *AstStructDef = target_ti.struct_def;
     if (struct_def == 0) { return 0; }
 
-    var struct_size: u64 = layout_type_sizeof(TYPE_STRUCT, 0, slice(struct_def.name_ptr, struct_def.name_len));
+    var struct_size: u64 = layout_type_sizeof(TYPE_STRUCT, 0, struct_def.name);
     emit("    mov r8, rax  ; save dest addr\n");
     emit_lvalue(value);
     emit_copy_bytes_with_regs(slice("rax", 3), slice("r8", 2), struct_size);
@@ -1583,10 +1928,10 @@ func emit_assign_try_index_setter(target: u64, value: u64, symtab: *Symtab) -> u
     if (ast_kind(ix.base) != AST_IDENT) { return 0; }
     var idn: *AstIdent = (*AstIdent)ix.base;
 
-    var recv_ti: *TypeInfo = symtab_get_type(symtab, slice(idn.name_ptr, idn.name_len));
+    var recv_ti: *TypeInfo = symtab_get_type(symtab, idn.name);
     if (recv_ti == 0 || recv_ti.type_kind != TYPE_STRUCT) { return 0; }
-    var struct_ptr: u64 = recv_ti.struct_name_ptr;
-    var struct_len: u64 = recv_ti.struct_name_len;
+    var struct_ptr: u64 = u8_slice_ptr(recv_ti.struct_name);
+    var struct_len: u64 = u8_slice_len(recv_ti.struct_name);
     if (struct_ptr == 0 || struct_len == 0) { return 0; }
     if (get_struct_def(slice(struct_ptr, struct_len)) == 0) { return 0; }
 
@@ -1624,7 +1969,7 @@ func emit_assign_stmt(node: u64, symtab: *Symtab) -> u64 {
     var value_kind: u64 = ast_kind(value);
     if (target_kind == AST_IDENT) {
         var idn_tgt: *AstIdent = (*AstIdent)target;
-        emitter_closure_track_from_expr(slice(idn_tgt.name_ptr, idn_tgt.name_len), value);
+        emitter_closure_track_from_expr(idn_tgt.name, value);
     }
     if (target_kind == AST_SAFE_MEMBER_ACCESS) {
         emit_stderr("[ERROR] Safe member access cannot be used in assignment\n");
@@ -1648,6 +1993,18 @@ func emit_assign_stmt(node: u64, symtab: *Symtab) -> u64 {
         emit_stack_ctor_call_at_r12((*AstStackCtor)value, symtab);
         return;
     }
+    if (value_kind == AST_STRUCT_LITERAL) {
+        var target_ti_lit: *TypeInfo = get_expr_type_with_symtab((*AstNode)target, symtab);
+        if (target_ti_lit == 0 || target_ti_lit.type_kind != TYPE_STRUCT || target_ti_lit.ptr_depth != 0) {
+            emit_stderr("[ERROR] struct literal assignment requires struct lvalue\n");
+            diag_force_stop_pass();
+            return;
+        }
+        emit_lvalue(target);
+        emit("    mov r12, rax\n");
+        emit_struct_literal_init_ptr(value);
+        return;
+    }
     if (emit_assign_try_member_packed_special(target, value, symtab) != 0) {
         return;
     }
@@ -1656,7 +2013,7 @@ func emit_assign_stmt(node: u64, symtab: *Symtab) -> u64 {
     var target_type_info: *TypeInfo = 0;
     if (target_kind == AST_IDENT) {
         var ident3: *AstIdent = (*AstIdent)target;
-        target_type_info = symtab_get_type(symtab, slice(ident3.name_ptr, ident3.name_len));
+        target_type_info = symtab_get_type(symtab, ident3.name);
     }
     if (target_type_info == 0) {
         target_type_info = get_expr_type_with_symtab((*AstNode)target, symtab);
@@ -1672,8 +2029,9 @@ func emit_assign_stmt(node: u64, symtab: *Symtab) -> u64 {
     // NOTE: operator []= dispatch is temporarily disabled in assignment codegen.
 
     if (target_type_info != 0 && target_type_info.type_kind == TYPE_STRUCT && target_type_info.ptr_depth == 0) {
-        var struct_size: u64 = layout_type_sizeof(TYPE_STRUCT, 0, slice(target_type_info.struct_name_ptr, target_type_info.struct_name_len));
+        var struct_size: u64 = layout_type_sizeof(TYPE_STRUCT, 0, target_type_info.struct_name);
         if (value_type_info != 0 && value_type_info.type_kind == TYPE_STRUCT && value_type_info.ptr_depth == 0 &&
+            emit_binary_is_addressable((*AstNode)value) != 0 &&
             value_kind != AST_CALL && value_kind != AST_METHOD_CALL && value_kind != AST_CALL_PTR &&
             value_kind != AST_STRUCT_LITERAL && value_kind != AST_STACK_CTOR) {
             emit_lvalue(target);
@@ -1727,11 +2085,24 @@ func emit_assign_stmt(node: u64, symtab: *Symtab) -> u64 {
     if (emit_assign_try_struct_copy(target, value, symtab) != 0) { return; }
     
     emit_store_rbx_to_addr(TYPE_I64, 1);
+    emit_assign_gc_member_edge_slot_after_store(target, target_type_info, symtab);
 }
 
 // ============================================
 // Delete Statement
 // ============================================
+
+func emit_tag_layout_has_memory_state_capability(layout: []u8) -> u64 {
+    if (layout.ptr == 0 || layout.len == 0) { return 0; }
+    if (str_eq(layout, slice("BppObjectTag", str_len("BppObjectTag"))) != 0) { return 1; }
+    if (str_eq(layout, slice("std_mem__BppObjectTag", str_len("std_mem__BppObjectTag"))) != 0) { return 1; }
+    return 0;
+}
+
+func emit_delete_uses_bpp_object_tag(ti: *TypeInfo) -> u64 {
+    if (ti == 0 || ti.is_tagged == 0 || u8_slice_ptr(ti.tag_layout) == 0) { return 0; }
+    return emit_tag_layout_has_memory_state_capability(ti.tag_layout);
+}
 
 func emit_delete_stmt(node: u64, symtab: *Symtab) -> u64 {
     var dl: *AstDelete = (*AstDelete)node;
@@ -1747,17 +2118,37 @@ func emit_delete_stmt(node: u64, symtab: *Symtab) -> u64 {
         free_len = free_res.len;
     }
 
+    var delete_begin_ptr: u64 = (u64)"__bpp_delete_begin";
+    var delete_begin_len: u64 = str_len("__bpp_delete_begin");
+    if (emit_delete_uses_bpp_object_tag(ti) != 0) {
+        delete_begin_ptr = (u64)"__bpp_tagged_delete_begin";
+        delete_begin_len = str_len("__bpp_tagged_delete_begin");
+    }
+    var delete_begin_res: *NameInfo = resolve_name(slice(delete_begin_ptr, delete_begin_len));
+    if (delete_begin_res != 0) {
+        delete_begin_ptr = delete_begin_res.ptr;
+        delete_begin_len = delete_begin_res.len;
+    }
+
+    var delete_end_ptr: u64 = (u64)"__bpp_delete_end";
+    var delete_end_len: u64 = 16;
+    var delete_end_res: *NameInfo = resolve_name(slice(delete_end_ptr, delete_end_len));
+    if (delete_end_res != 0) {
+        delete_end_ptr = delete_end_res.ptr;
+        delete_end_len = delete_end_res.len;
+    }
+
     var closure_handle_from_tracker: u64 = emitter_closure_expr_is_lambda_handle(expr);
     var closure_handle_delete: u64 = closure_handle_from_tracker;
     var typed_closure_delete: u64 = 0;
     var closure_struct_def: *AstStructDef = 0;
     if (ti != 0 && ti.type_kind == TYPE_STRUCT && ti.ptr_depth > 0 &&
-        typeinfo_is_lambda_closure_name(slice(ti.struct_name_ptr, ti.struct_name_len)) != 0) {
+        typeinfo_is_lambda_closure_name(ti.struct_name) != 0) {
         typed_closure_delete = 1;
         closure_handle_delete = 1;
         closure_struct_def = ti.struct_def;
         if (closure_struct_def == 0) {
-            closure_struct_def = get_struct_def(slice(ti.struct_name_ptr, ti.struct_name_len));
+            closure_struct_def = get_struct_def(ti.struct_name);
         }
     }
     emit_expr(expr);
@@ -1805,7 +2196,11 @@ func emit_delete_stmt(node: u64, symtab: *Symtab) -> u64 {
             if (closure_handle_from_tracker != 0) {
                 var label_closure_done_raw: u64 = new_label();
                 emit("    mov r12, rax\n");
-                emit("    mov rbx, [r12+16]\n");
+                emit("    mov r11, ");
+                emit_u64(LAMBDA_CLOSURE_HANDLE_MASK_STMT);
+                emit_nl();
+                emit("    and r12, r11\n");
+                emit("    mov rbx, [r12+8]\n");
                 emit("    test rbx, rbx\n");
                 emit("    je ");
                 emit_label(label_closure_done_raw);
@@ -1822,11 +2217,9 @@ func emit_delete_stmt(node: u64, symtab: *Symtab) -> u64 {
                 var label_closure_done: u64 = new_label();
                 var label_closure_env_done: u64 = new_label();
                 emit("    mov r12, rax\n");
-                emit("    mov r10, [r12]\n");
-                emit("    mov r11, ");
-                emit_u64(LAMBDA_CLOSURE_MAGIC_STMT);
-                emit_nl();
-                emit("    cmp r10, r11\n");
+                emit("    mov r10, r12\n");
+                emit("    shr r10, 63\n");
+                emit("    cmp r10, 1\n");
                 emit("    jz ");
                 emit_label(label_closure_done);
                 emit_nl();
@@ -1835,7 +2228,11 @@ func emit_delete_stmt(node: u64, symtab: *Symtab) -> u64 {
                 emit_nl();
 
                 emit_label_def(label_closure_done);
-                emit("    mov rbx, [r12+16]\n");
+                emit("    mov r11, ");
+                emit_u64(LAMBDA_CLOSURE_HANDLE_MASK_STMT);
+                emit_nl();
+                emit("    and r12, r11\n");
+                emit("    mov rbx, [r12+8]\n");
                 emit("    test rbx, rbx\n");
                 emit("    je ");
                 emit_label(label_closure_env_done);
@@ -1853,15 +2250,26 @@ func emit_delete_stmt(node: u64, symtab: *Symtab) -> u64 {
     }
 
     emit("    mov rbx, rax\n");
+    emit("    push rbx\n");
+    emit_gc_root_slot_remove_ident(expr, symtab);
+    emit("    pop rbx\n");
     if (closure_handle_delete == 0 && ti != 0 && ti.ptr_depth == 0) {
         emit_stderr("[ERROR] delete expects pointer type or lambda closure handle\n");
         diag_force_stop_pass();
         return 0;
     }
+    _cg_emit_mov_user_arg_from_reg(0, 0, slice("rbx", 3));
+    _cg_emit_direct_call_name(slice(delete_begin_ptr, delete_begin_len), 0, 0);
+    emit("    mov rbx, rax\n");
+    emit("    test rbx, rbx\n");
+    emit("    je ");
+    emit_label(label_end);
+    emit_nl();
+
     if (ti != 0 && ti.type_kind == TYPE_STRUCT && ti.ptr_depth > 0) {
         var method_ptr: u64 = (u64)"destructor";
         var method_len: u64 = 10;
-        var name_info: *NameInfo = build_method_name(slice(ti.struct_name_ptr, ti.struct_name_len), slice(method_ptr, method_len));
+        var name_info: *NameInfo = build_method_name(ti.struct_name, slice(method_ptr, method_len));
         var resolved_ptr: u64 = name_info.ptr;
         var resolved_len: u64 = name_info.len;
         var resolved: *NameInfo = resolve_name(slice(name_info.ptr, name_info.len));
@@ -1872,13 +2280,13 @@ func emit_delete_stmt(node: u64, symtab: *Symtab) -> u64 {
 
         if (sym_func_exists(slice(name_info.ptr, name_info.len)) != 0) {
             emit("    push rbx\n");
-            var stack_words: u64 = _cg_sysv_pop_arg_regs(1);
+            var stack_words: u64 = _cg_target_pop_arg_regs(1);
             _cg_emit_direct_call_name(slice(resolved_ptr, resolved_len), stack_words, 0);
         }
     }
 
     _cg_emit_mov_user_arg_from_reg(0, 0, slice("rbx", 3));
-    _cg_emit_direct_call_name(slice(free_ptr, free_len), 0, 0);
+    _cg_emit_direct_call_name(slice(delete_end_ptr, delete_end_len), 0, 0);
 
     emit_label_def(label_end);
     return 0;

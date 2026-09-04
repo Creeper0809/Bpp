@@ -6,10 +6,17 @@
 import std.io;
 import std.util;
 import std.vec;
+import std.mem;
 import ssa.datastruct;
 import ssa.core;
 
 const SSA_REGALLOC_DEBUG = 0;
+const SSA_REGALLOC_RELEASE_SCRATCH = 0;
+const SSA_REGALLOC_USE_SCRATCH_ARENA = 1;
+const SSA_REGALLOC_MAP_IN_ARENA = 1;
+const SSA_REGALLOC_GRAPH_MAX_REG_BUDGET = 256;
+const SSA_REGALLOC_GRAPH_INST_BUDGET = 900;
+const SSA_REGALLOC_SPILL_REWRITE_MAX_REG_BUDGET = 80;
 
 const SSA_PHYS_RAX = 1;
 const SSA_PHYS_RBX = 2;
@@ -19,8 +26,13 @@ const SSA_PHYS_R8 = 5;
 const SSA_PHYS_R9 = 6;
 const SSA_PHYS_R10 = 7;
 const SSA_PHYS_R11 = 8;
+const SSA_PHYS_R12 = 9;
+const SSA_PHYS_R13 = 10;
+const SSA_PHYS_R14 = 11;
+const SSA_PHYS_R15 = 12;
 
 const SSA_REG_MAX_LIMIT = 1048576;
+const SSA_REGALLOC_TAGGED_PTR_MASK = 281474976710655;
 
 func all_ones() -> u64 {
     var v: u64 = 0;
@@ -35,14 +47,33 @@ func bits_len(nbits: u64) -> u64 {
     return words;
 }
 
-func bitset_new(nbits: u64) -> u64 {
+func bitset_new_scratch(nbits: u64, arena: *BppScratchArena) -> u64 {
     var words: u64 = bits_len(nbits);
-    var buf: u64 = heap_alloc(words * sizeof(u64));
+    var buf: u64 = 0;
+    if (arena != 0) {
+        buf = bpp_scratch_arena_alloc_zero(arena, words * sizeof(u64));
+    } else {
+        buf = heap_alloc(words * sizeof(u64));
+    }
     var buf_u64: *u64 = (*u64)buf;
     for (var i: u64 = 0; i < words; i++) {
         buf_u64[i] = 0;
     }
     return buf;
+}
+
+func bitset_new(nbits: u64) -> u64 {
+    return bitset_new_scratch(nbits, 0);
+}
+
+func bitset_free_array(arr: u64, count: u64) -> u64 {
+    if (arr == 0) { return 0; }
+    var arr_u64: *u64 = (*u64)arr;
+    for (var i: u64 = 0; i < count; i++) {
+        if (arr_u64[i] != 0) { free(arr_u64[i]); }
+    }
+    free(arr);
+    return 0;
 }
 
 func bitset_zero(buf: u64, nbits: u64) -> u64 {
@@ -254,7 +285,7 @@ func use_add_call_operands(use: u64, def: u64, info_ptr: u64, op: u64, max_reg: 
     return 0;
 }
 
-func build_use_def(fn: *SSAFunction, max_reg: u64, use_arr: u64, def_arr: u64) -> u64 {
+func build_use_def(fn: *SSAFunction, max_reg: u64, use_arr: u64, def_arr: u64, arena: *BppScratchArena) -> u64 {
     var blocks: []*SSABlock = fn.blocks;
     var n: u64 = slice_len(blocks);
     var use_arr_u64: *u64 = (*u64)use_arr;
@@ -262,8 +293,8 @@ func build_use_def(fn: *SSAFunction, max_reg: u64, use_arr: u64, def_arr: u64) -
     for (var i: u64 = 0; i < n; i++) {
         var b: *SSABlock = blocks[i];
 
-        var use: u64 = bitset_new(max_reg + 1);
-        var def: u64 = bitset_new(max_reg + 1);
+        var use: u64 = bitset_new_scratch(max_reg + 1, arena);
+        var def: u64 = bitset_new_scratch(max_reg + 1, arena);
 
         var cur: *SSAInstruction = b.inst_head;
         while (cur != 0) {
@@ -319,18 +350,18 @@ func build_use_def(fn: *SSAFunction, max_reg: u64, use_arr: u64, def_arr: u64) -
     return 0;
 }
 
-func liveness(fn: *SSAFunction, max_reg: u64, live_in: u64, live_out: u64) -> u64 {
+func liveness(fn: *SSAFunction, max_reg: u64, live_in: u64, live_out: u64, arena: *BppScratchArena) -> u64 {
     var n: u64 = slice_len(fn.blocks);
     var live_in_u64: *u64 = (*u64)live_in;
     var live_out_u64: *u64 = (*u64)live_out;
     for (var i: u64 = 0; i < n; i++) {
-        live_in_u64[i] = bitset_new(max_reg + 1);
-        live_out_u64[i] = bitset_new(max_reg + 1);
+        live_in_u64[i] = bitset_new_scratch(max_reg + 1, arena);
+        live_out_u64[i] = bitset_new_scratch(max_reg + 1, arena);
     }
 
-    var use_arr: u64 = heap_alloc(n * sizeof(u64));
-    var def_arr: u64 = heap_alloc(n * sizeof(u64));
-    build_use_def(fn, max_reg, use_arr, def_arr);
+    var use_arr: u64 = bpp_scratch_arena_alloc(arena, n * sizeof(u64));
+    var def_arr: u64 = bpp_scratch_arena_alloc(arena, n * sizeof(u64));
+    build_use_def(fn, max_reg, use_arr, def_arr, arena);
     var use_arr_u64: *u64 = (*u64)use_arr;
     var def_arr_u64: *u64 = (*u64)def_arr;
     var blocks: []*SSABlock = fn.blocks;
@@ -343,7 +374,7 @@ func liveness(fn: *SSAFunction, max_reg: u64, live_in: u64, live_out: u64) -> u6
     }
     var idx_cap: u64 = max_block_id + 1;
     var undef_idx: u64 = all_ones();
-    var idx_map: u64 = heap_alloc(idx_cap * sizeof(u64));
+    var idx_map: u64 = bpp_scratch_arena_alloc(arena, idx_cap * sizeof(u64));
     var idx_map_u64: *u64 = (*u64)idx_map;
     for (var fill: u64 = 0; fill < idx_cap; fill++) {
         idx_map_u64[fill] = undef_idx;
@@ -353,13 +384,13 @@ func liveness(fn: *SSAFunction, max_reg: u64, live_in: u64, live_out: u64) -> u6
         idx_map_u64[b1.id] = bi1;
     }
 
-    var tmp_out_arr: u64 = heap_alloc(n * sizeof(u64));
-    var tmp_in_arr: u64 = heap_alloc(n * sizeof(u64));
+    var tmp_out_arr: u64 = bpp_scratch_arena_alloc(arena, n * sizeof(u64));
+    var tmp_in_arr: u64 = bpp_scratch_arena_alloc(arena, n * sizeof(u64));
     var tmp_out_arr_u64: *u64 = (*u64)tmp_out_arr;
     var tmp_in_arr_u64: *u64 = (*u64)tmp_in_arr;
     for (var ti: u64 = 0; ti < n; ti++) {
-        tmp_out_arr_u64[ti] = bitset_new(max_reg + 1);
-        tmp_in_arr_u64[ti] = bitset_new(max_reg + 1);
+        tmp_out_arr_u64[ti] = bitset_new_scratch(max_reg + 1, arena);
+        tmp_in_arr_u64[ti] = bitset_new_scratch(max_reg + 1, arena);
     }
 
     var changed: u64 = 1;
@@ -411,6 +442,13 @@ func liveness(fn: *SSAFunction, max_reg: u64, live_in: u64, live_out: u64) -> u6
         }
     }
 
+    if (SSA_REGALLOC_RELEASE_SCRATCH != 0) {
+        bitset_free_array(use_arr, n);
+        bitset_free_array(def_arr, n);
+        bitset_free_array(tmp_out_arr, n);
+        bitset_free_array(tmp_in_arr, n);
+        free(idx_map);
+    }
     return 0;
 }
 
@@ -491,31 +529,33 @@ func live_mark_call_operands(live: u64, info_ptr: u64, op: u64, nregs: u64) -> u
     return 0;
 }
 
-func interference_build(fn: *SSAFunction, max_reg: u64) -> u64 {
+func interference_build(fn: *SSAFunction, max_reg: u64, arena: *BppScratchArena) -> u64 {
     var nregs: u64 = max_reg + 1;
-    var adj: u64 = heap_alloc(nregs * sizeof(u64));
+    var adj: u64 = bpp_scratch_arena_alloc(arena, nregs * sizeof(u64));
     var adj_u64: *u64 = (*u64)adj;
     for (var r: u64 = 0; r < nregs; r++) {
-        adj_u64[r] = bitset_new(nregs);
+        adj_u64[r] = bitset_new_scratch(nregs, arena);
     }
 
     var blocks: []*SSABlock = fn.blocks;
     var bcount: u64 = slice_len(blocks);
-    var live_in: u64 = heap_alloc(bcount * sizeof(u64));
-    var live_out: u64 = heap_alloc(bcount * sizeof(u64));
-    liveness(fn, max_reg, live_in, live_out);
+    var live_in: u64 = bpp_scratch_arena_alloc(arena, bcount * sizeof(u64));
+    var live_out: u64 = bpp_scratch_arena_alloc(arena, bcount * sizeof(u64));
+    liveness(fn, max_reg, live_in, live_out, arena);
     var live_in_u64: *u64 = (*u64)live_in;
     var live_out_u64: *u64 = (*u64)live_out;
 
     for (var bi: u64 = 0; bi < bcount; bi++) {
         var b: *SSABlock = blocks[bi];
-        var live: u64 = bitset_new(nregs);
+        var live_mark: BppScratchArenaMark;
+        bpp_scratch_arena_mark_into(arena, &live_mark);
+        var live: u64 = bitset_new_scratch(nregs, arena);
         bitset_copy(live, live_out_u64[bi], nregs);
 
-            var insts: *Vec<*SSAInstruction> = new Vec<*SSAInstruction>{heap_alloc((8) * sizeof(*SSAInstruction)), 0, (8)};
+        var insts: *Vec<*SSAInstruction> = vec_new_scratch<*SSAInstruction>(arena, 8);
         var cur: *SSAInstruction = b.inst_head;
         while (cur != 0) {
-            insts.push(cur);
+            insts.push_scratch(cur, arena);
             cur = cur.next;
         }
 
@@ -592,27 +632,332 @@ func interference_build(fn: *SSAFunction, max_reg: u64) -> u64 {
             }
         }
 
+        if (SSA_REGALLOC_RELEASE_SCRATCH != 0) {
+            insts.release_buffer();
+            free((u64)insts);
+            free(live);
+        }
+        bpp_scratch_arena_rewind(arena, &live_mark);
     }
 
+    if (SSA_REGALLOC_RELEASE_SCRATCH != 0) {
+        bitset_free_array(live_in, bcount);
+        bitset_free_array(live_out, bcount);
+    }
     return adj;
 }
 
-func color_fn(fn: *SSAFunction, k: u64) -> *Vec<u64> {
+func regalloc_degree(adj_u64: *u64, reg: u64, max_reg: u64) -> u64 {
+    if (adj_u64 == 0 || reg == 0) { return 0; }
+    var degree: u64 = 0;
+    var neigh: u64 = adj_u64[reg];
+    for (var n: u64 = 1; n <= max_reg; n++) {
+        if (bitset_test(neigh, n) != 0) { degree = degree + 1; }
+    }
+    return degree;
+}
+
+func regalloc_interval_note_reg(start_u64: *u64, end_u64: *u64, use_u64: *u64, reg: u64, pos: u64, max_reg: u64) -> u64 {
+    if (reg == 0 || reg > max_reg) { return 0; }
+    if (start_u64[reg] == 0) { start_u64[reg] = pos; }
+    end_u64[reg] = pos;
+    use_u64[reg] = use_u64[reg] + 1;
+    return 0;
+}
+
+func regalloc_interval_note_def(start_u64: *u64, end_u64: *u64, def_u64: *u64, reg: u64, pos: u64, max_reg: u64) -> u64 {
+    if (reg == 0 || reg > max_reg) { return 0; }
+    if (start_u64[reg] == 0) { start_u64[reg] = pos; }
+    end_u64[reg] = pos;
+    def_u64[reg] = def_u64[reg] + 1;
+    return 0;
+}
+
+func regalloc_interval_note_operand(start_u64: *u64, end_u64: *u64, use_u64: *u64, opr: u64, pos: u64, max_reg: u64) -> u64 {
+    if (opr == 0 || operand_is_const(opr) != 0) { return 0; }
+    return regalloc_interval_note_reg(start_u64, end_u64, use_u64, operand_value(opr), pos, max_reg);
+}
+
+func regalloc_interval_note_args(start_u64: *u64, end_u64: *u64, use_u64: *u64, args_vec: *Vec<u64>, nargs: u64, pos: u64, max_reg: u64) -> u64 {
+    var n: u64 = call_args_len(args_vec, nargs);
+    for (var i: u64 = 0; i < n; i++) {
+        regalloc_interval_note_reg(start_u64, end_u64, use_u64, args_vec.get(i), pos, max_reg);
+    }
+    return 0;
+}
+
+func regalloc_interval_note_call(start_u64: *u64, end_u64: *u64, use_u64: *u64, info_ptr: u64, op: u64, pos: u64, max_reg: u64) -> u64 {
+    if (op == SSA_OP_CALL) {
+        var info: *SSACallInfo = (*SSACallInfo)info_ptr;
+        return regalloc_interval_note_args(start_u64, end_u64, use_u64, info.args_vec, info.nargs, pos, max_reg);
+    }
+    if (op == SSA_OP_CALL_PTR) {
+        var info_ptrp: *SSACallPtrInfo = (*SSACallPtrInfo)info_ptr;
+        regalloc_interval_note_reg(start_u64, end_u64, use_u64, info_ptrp.callee_reg, pos, max_reg);
+        return regalloc_interval_note_args(start_u64, end_u64, use_u64, info_ptrp.args_vec, info_ptrp.nargs, pos, max_reg);
+    }
+    if (op == SSA_OP_CALL_SLICE_STORE) {
+        var info_s: *SSACallSliceStoreInfo = (*SSACallSliceStoreInfo)info_ptr;
+        if (info_s.is_ptr > 1) {
+            var info_call: *SSACallInfo = (*SSACallInfo)info_ptr;
+            return regalloc_interval_note_args(start_u64, end_u64, use_u64, info_call.args_vec, info_call.nargs, pos, max_reg);
+        }
+        if (info_s.is_ptr != 0) {
+            regalloc_interval_note_reg(start_u64, end_u64, use_u64, info_s.callee_reg, pos, max_reg);
+        }
+        return regalloc_interval_note_args(start_u64, end_u64, use_u64, info_s.args_vec, info_s.nargs, pos, max_reg);
+    }
+    return 0;
+}
+
+func regalloc_is_remat_op(op: u64) -> u64 {
+    if (op == SSA_OP_CONST || op == SSA_OP_LEA_STR || op == SSA_OP_LEA_LOCAL || op == SSA_OP_LEA_GLOBAL || op == SSA_OP_LEA_FUNC) { return 1; }
+    return 0;
+}
+
+func regalloc_scan_intervals(fn: *SSAFunction, max_reg: u64, start_u64: *u64, end_u64: *u64, use_u64: *u64, def_u64: *u64, remat_u64: *u64) -> u64 {
+    if (fn == 0 || max_reg == 0) { return 0; }
+    var pos: u64 = 1;
+    var blocks: []*SSABlock = fn.blocks;
+    var bcount: u64 = slice_len(blocks);
+    for (var bi: u64 = 0; bi < bcount; bi++) {
+        var b: *SSABlock = blocks[bi];
+        if (b == 0) { continue; }
+
+        var phi: *SSAInstruction = b.phi_head;
+        while (phi != 0) {
+            regalloc_interval_note_def(start_u64, end_u64, def_u64, phi.dest, pos, max_reg);
+            var arg: *SSAPhiArg = (*SSAPhiArg)phi.src1;
+            while (arg != 0) {
+                regalloc_interval_note_reg(start_u64, end_u64, use_u64, arg.val, pos, max_reg);
+                arg = arg.next;
+            }
+            pos = pos + 1;
+            phi = phi.next;
+        }
+
+        var cur: *SSAInstruction = b.inst_head;
+        while (cur != 0) {
+            var op: u64 = op_of(cur);
+            if (op != SSA_OP_BR && op != SSA_OP_JMP && op != SSA_OP_RET && op != SSA_OP_RET_SLICE_HEAP && cur.dest != 0) {
+                regalloc_interval_note_def(start_u64, end_u64, def_u64, cur.dest, pos, max_reg);
+                if (cur.dest <= max_reg && regalloc_is_remat_op(op) != 0) {
+                    remat_u64[cur.dest] = remat_u64[cur.dest] + 1;
+                }
+            }
+            if ((op == SSA_OP_CALL || op == SSA_OP_CALL_PTR) && cur.src2 != 0 && operand_is_const(cur.src2) == 0) {
+                regalloc_interval_note_def(start_u64, end_u64, def_u64, operand_value(cur.src2), pos, max_reg);
+            }
+
+            if (op == SSA_OP_CALL || op == SSA_OP_CALL_PTR || op == SSA_OP_CALL_SLICE_STORE) {
+                regalloc_interval_note_call(start_u64, end_u64, use_u64, operand_value(cur.src1), op, pos, max_reg);
+                if (op == SSA_OP_CALL_SLICE_STORE) {
+                    regalloc_interval_note_operand(start_u64, end_u64, use_u64, cur.src2, pos, max_reg);
+                }
+            } else {
+                regalloc_interval_note_operand(start_u64, end_u64, use_u64, cur.src1, pos, max_reg);
+                regalloc_interval_note_operand(start_u64, end_u64, use_u64, cur.src2, pos, max_reg);
+            }
+            pos = pos + 1;
+            cur = cur.next;
+        }
+    }
+    return 0;
+}
+
+func regalloc_is_call_like_op(op: u64) -> u64 {
+    if (op == SSA_OP_CALL || op == SSA_OP_CALL_PTR || op == SSA_OP_CALL_SLICE_STORE) { return 1; }
+    return 0;
+}
+
+func regalloc_is_xmm_op(op: u64) -> u64 {
+    if (op == SSA_OP_FCONST || op == SSA_OP_FADD || op == SSA_OP_FSUB || op == SSA_OP_FMUL || op == SSA_OP_FDIV) { return 1; }
+    if (op == SSA_OP_FNEG || op == SSA_OP_FEQ || op == SSA_OP_FNE || op == SSA_OP_FLT || op == SSA_OP_FGT) { return 1; }
+    if (op == SSA_OP_FLE || op == SSA_OP_FGE || op == SSA_OP_I2F || op == SSA_OP_U2F || op == SSA_OP_F2I || op == SSA_OP_F2U) { return 1; }
+    return 0;
+}
+
+func regalloc_note_xmm_operand(xmm_u64: *u64, opr: u64, max_reg: u64) -> u64 {
+    if (xmm_u64 == 0 || opr == 0 || operand_is_const(opr) != 0) { return 0; }
+    var reg: u64 = operand_value(opr);
+    if (reg != 0 && reg <= max_reg) { xmm_u64[reg] = 1; }
+    return 0;
+}
+
+func regalloc_scan_constraints(fn: *SSAFunction, max_reg: u64, start_u64: *u64, end_u64: *u64, call_live_u64: *u64, xmm_u64: *u64) -> u64 {
+    if (fn == 0 || max_reg == 0) { return 0; }
+    if (max_reg > 512) { return 0; }
+    var pos: u64 = 1;
+    var blocks: []*SSABlock = fn.blocks;
+    var bcount: u64 = slice_len(blocks);
+    for (var bi: u64 = 0; bi < bcount; bi++) {
+        var b: *SSABlock = blocks[bi];
+        if (b == 0) { continue; }
+
+        var phi: *SSAInstruction = b.phi_head;
+        while (phi != 0) {
+            pos = pos + 1;
+            phi = phi.next;
+        }
+
+        var cur: *SSAInstruction = b.inst_head;
+        while (cur != 0) {
+            var op: u64 = op_of(cur);
+            if (regalloc_is_call_like_op(op) != 0 && call_live_u64 != 0) {
+                for (var r: u64 = 1; r <= max_reg; r++) {
+                    if (start_u64[r] < pos && end_u64[r] > pos) {
+                        call_live_u64[r] = 1;
+                    }
+                }
+            }
+            if (regalloc_is_xmm_op(op) != 0 && xmm_u64 != 0) {
+                if (cur.dest != 0 && cur.dest <= max_reg) { xmm_u64[cur.dest] = 1; }
+                regalloc_note_xmm_operand(xmm_u64, cur.src1, max_reg);
+                regalloc_note_xmm_operand(xmm_u64, cur.src2, max_reg);
+            }
+            pos = pos + 1;
+            cur = cur.next;
+        }
+    }
+    return 0;
+}
+
+func regalloc_interval_width(start_u64: *u64, end_u64: *u64, reg: u64) -> u64 {
+    if (start_u64 == 0 || end_u64 == 0 || reg == 0) { return 0; }
+    if (start_u64[reg] == 0 || end_u64[reg] < start_u64[reg]) { return 0; }
+    return end_u64[reg] - start_u64[reg] + 1;
+}
+
+func regalloc_interval_better(degree: u64, width: u64, uses: u64, defs: u64, remat: u64, best_degree: u64, best_width: u64, best_uses: u64, best_defs: u64, best_remat: u64, best: u64) -> u64 {
+    if (best == 0) { return 1; }
+    if (degree > best_degree) { return 1; }
+    if (degree < best_degree) { return 0; }
+    if (width > best_width) { return 1; }
+    if (width < best_width) { return 0; }
+    if (uses > best_uses) { return 1; }
+    if (uses < best_uses) { return 0; }
+    if (defs > best_defs) { return 1; }
+    if (defs < best_defs) { return 0; }
+    if (remat < best_remat) { return 1; }
+    return 0;
+}
+
+func regalloc_select_uncolored(colors_vec: *Vec<u64>, adj_u64: *u64, max_reg: u64, start_u64: *u64, end_u64: *u64, use_u64: *u64, def_u64: *u64, remat_u64: *u64) -> u64 {
+    var best: u64 = 0;
+    var best_degree: u64 = 0;
+    var best_width: u64 = 0;
+    var best_uses: u64 = 0;
+    var best_defs: u64 = 0;
+    var best_remat: u64 = 0;
+    for (var r: u64 = 1; r <= max_reg; r++) {
+        if (colors_vec.get(r) != 0) { continue; }
+        var degree: u64 = regalloc_degree(adj_u64, r, max_reg);
+        var width: u64 = regalloc_interval_width(start_u64, end_u64, r);
+        var uses: u64 = use_u64[r];
+        var defs: u64 = def_u64[r];
+        var remat: u64 = remat_u64[r];
+        if (regalloc_interval_better(degree, width, uses, defs, remat, best_degree, best_width, best_uses, best_defs, best_remat, best) != 0) {
+            best = r;
+            best_degree = degree;
+            best_width = width;
+            best_uses = uses;
+            best_defs = defs;
+            best_remat = remat;
+        }
+    }
+    return best;
+}
+
+func regalloc_copy_partner(fn: *SSAFunction, reg: u64, adj_u64: *u64, max_reg: u64) -> u64 {
+    if (fn == 0 || reg == 0 || adj_u64 == 0) { return 0; }
+    var blocks: []*SSABlock = fn.blocks;
+    var bcount: u64 = slice_len(blocks);
+    for (var bi: u64 = 0; bi < bcount; bi++) {
+        var b: *SSABlock = blocks[bi];
+        if (b == 0) { continue; }
+        var cur: *SSAInstruction = b.inst_head;
+        while (cur != 0) {
+            if (op_of(cur) == SSA_OP_COPY && cur.dest != 0 && cur.src1 != 0 && operand_is_const(cur.src1) == 0) {
+                var src: u64 = operand_value(cur.src1);
+                if (cur.dest == reg && src != 0 && src <= max_reg && bitset_test(adj_u64[reg], src) == 0) { return src; }
+                if (src == reg && cur.dest <= max_reg && bitset_test(adj_u64[reg], cur.dest) == 0) { return cur.dest; }
+            }
+            cur = cur.next;
+        }
+    }
+    return 0;
+}
+
+func regalloc_preferred_copy_color(fn: *SSAFunction, reg: u64, colors_vec: *Vec<u64>, used_vec: *Vec<u64>, adj_u64: *u64, max_reg: u64, k: u64) -> u64 {
+    var partner: u64 = regalloc_copy_partner(fn, reg, adj_u64, max_reg);
+    if (partner == 0) { return 0; }
+    var c: u64 = colors_vec.get(partner);
+    if (c == 0 || c > k) { return 0; }
+    if (used_vec.get(c) != 0) { return 0; }
+    return c;
+}
+
+func regalloc_try_color_range(used_vec: *Vec<u64>, first: u64, last: u64, k: u64) -> u64 {
+    if (used_vec == 0 || first == 0 || last == 0) { return 0; }
+    if (last > k) { last = k; }
+    if (first > last) { return 0; }
+    for (var c: u64 = first; c <= last; c++) {
+        if (used_vec.get(c) == 0) { return c; }
+    }
+    return 0;
+}
+
+func regalloc_pick_color_for_reg(reg: u64, k: u64, used_vec: *Vec<u64>, preferred: u64, call_live_u64: *u64, xmm_u64: *u64) -> u64 {
+    var is_call_live: u64 = 0;
+    var is_xmm: u64 = 0;
+    if (call_live_u64 != 0 && call_live_u64[reg] != 0) { is_call_live = 1; }
+    if (xmm_u64 != 0 && xmm_u64[reg] != 0) { is_xmm = 1; }
+
+    if (is_call_live != 0 && k >= 12) {
+        if (preferred >= 9 && preferred <= 12 && used_vec.get(preferred) == 0) { return preferred; }
+        var callee: u64 = regalloc_try_color_range(used_vec, 9, 12, k);
+        if (callee != 0) { return callee; }
+    }
+
+    if (preferred != 0 && preferred <= k && used_vec.get(preferred) == 0) { return preferred; }
+
+    if (is_xmm != 0) {
+        var xmm_low: u64 = regalloc_try_color_range(used_vec, 1, 8, k);
+        if (xmm_low != 0) { return xmm_low; }
+    }
+
+    return regalloc_try_color_range(used_vec, 1, k, k);
+}
+
+func color_fn(fn: *SSAFunction, k: u64, arena: *BppScratchArena) -> *Vec<u64> {
     var max_reg: u64 = calc_max_reg(fn);
     if (max_reg == 0) { return 0; }
 
-    var adj: u64 = interference_build(fn, max_reg);
+    var interval_bytes: u64 = (max_reg + 1) * sizeof(u64);
+    var start_u64: *u64 = (*u64)bpp_scratch_arena_alloc_zero(arena, interval_bytes);
+    var end_u64: *u64 = (*u64)bpp_scratch_arena_alloc_zero(arena, interval_bytes);
+    var use_u64: *u64 = (*u64)bpp_scratch_arena_alloc_zero(arena, interval_bytes);
+    var def_u64: *u64 = (*u64)bpp_scratch_arena_alloc_zero(arena, interval_bytes);
+    var remat_u64: *u64 = (*u64)bpp_scratch_arena_alloc_zero(arena, interval_bytes);
+    regalloc_scan_intervals(fn, max_reg, start_u64, end_u64, use_u64, def_u64, remat_u64);
+    var call_live_u64: *u64 = (*u64)bpp_scratch_arena_alloc_zero(arena, interval_bytes);
+    var xmm_u64: *u64 = (*u64)bpp_scratch_arena_alloc_zero(arena, interval_bytes);
+    regalloc_scan_constraints(fn, max_reg, start_u64, end_u64, call_live_u64, xmm_u64);
+
+    var adj: u64 = interference_build(fn, max_reg, arena);
     var adj_u64: *u64 = (*u64)adj;
-        var colors_vec: *Vec<u64> = new Vec<u64>{heap_alloc((max_reg + 1) * sizeof(u64)), 0, (max_reg + 1)};
+    var colors_vec: *Vec<u64> = vec_new_scratch<u64>(arena, max_reg + 1);
     for (var i: u64 = 0; i <= max_reg; i++) {
-        colors_vec.push(0);
+        colors_vec.push_scratch(0, arena);
     }
-    var used_vec: *Vec<u64> = new Vec<u64>{heap_alloc((k + 1) * sizeof(u64)), 0, (k + 1)};
+    var used_vec: *Vec<u64> = vec_new_scratch<u64>(arena, k + 1);
         for (var j: u64 = 0; j <= k; j++) {
-        used_vec.push(0);
+        used_vec.push_scratch(0, arena);
     }
 
-    for (var r: u64 = 1; r <= max_reg; r++) {
+    for (var pick_iter: u64 = 1; pick_iter <= max_reg; pick_iter++) {
+        var r: u64 = regalloc_select_uncolored(colors_vec, adj_u64, max_reg, start_u64, end_u64, use_u64, def_u64, remat_u64);
+        if (r == 0) { break; }
         for (var j: u64 = 0; j <= k; j++) {
             used_vec.set(j, 0);
         }
@@ -625,11 +970,8 @@ func color_fn(fn: *SSAFunction, k: u64) -> *Vec<u64> {
             }
         }
 
-        var color: u64 = k + 1;
-        for (var c: u64 = 1; c <= k; c++) {
-            if (used_vec.get(c) == 0) { color = c; break; }
-        }
-
+        var preferred: u64 = regalloc_preferred_copy_color(fn, r, colors_vec, used_vec, adj_u64, max_reg, k);
+        var color: u64 = regalloc_pick_color_for_reg(r, k, used_vec, preferred, call_live_u64, xmm_u64);
         if (color > k) { color = 0; }
         colors_vec.set(r, color);
     }
@@ -638,6 +980,11 @@ func color_fn(fn: *SSAFunction, k: u64) -> *Vec<u64> {
         println("[DEBUG] color_fn: done", 36);
     }
 
+    if (SSA_REGALLOC_RELEASE_SCRATCH != 0) {
+        bitset_free_array(adj, max_reg + 1);
+        used_vec.release_buffer();
+        free((u64)used_vec);
+    }
     return colors_vec;
 }
 
@@ -651,11 +998,384 @@ func color_to_phys(color: u64) -> u64 {
         case 6: return SSA_PHYS_R9;
         case 7: return SSA_PHYS_R10;
         case 8: return SSA_PHYS_R11;
+        case 9: return SSA_PHYS_R12;
+        case 10: return SSA_PHYS_R13;
+        case 11: return SSA_PHYS_R14;
+        case 12: return SSA_PHYS_R15;
         default: return 0;
     }
 }
 
-func map_fn(fn: *SSAFunction, k: u64) -> u64 {
+func regalloc_find_uncolored(colors: *Vec<u64>, max_reg: u64) -> u64 {
+    if (colors == 0) { return 0; }
+    for (var r: u64 = 1; r <= max_reg; r++) {
+        if (colors.get(r) == 0) { return r; }
+    }
+    return 0;
+}
+
+func regalloc_spill_candidate_from_colors(fn: *SSAFunction, colors: *Vec<u64>, max_reg: u64, arena: *BppScratchArena) -> u64 {
+    if (fn == 0 || colors == 0 || max_reg == 0) { return 0; }
+    var bytes: u64 = (max_reg + 1) * sizeof(u64);
+    var start_u64: *u64 = (*u64)bpp_scratch_arena_alloc_zero(arena, bytes);
+    var end_u64: *u64 = (*u64)bpp_scratch_arena_alloc_zero(arena, bytes);
+    var use_u64: *u64 = (*u64)bpp_scratch_arena_alloc_zero(arena, bytes);
+    var def_u64: *u64 = (*u64)bpp_scratch_arena_alloc_zero(arena, bytes);
+    var remat_u64: *u64 = (*u64)bpp_scratch_arena_alloc_zero(arena, bytes);
+    regalloc_scan_intervals(fn, max_reg, start_u64, end_u64, use_u64, def_u64, remat_u64);
+
+    var best: u64 = 0;
+    var best_width: u64 = 0;
+    var best_uses: u64 = 0;
+    var best_defs: u64 = 0;
+    var best_remat: u64 = 1;
+    for (var r: u64 = 1; r <= max_reg; r++) {
+        if (colors.get(r) != 0) { continue; }
+        var width: u64 = regalloc_interval_width(start_u64, end_u64, r);
+        var uses: u64 = use_u64[r];
+        var defs: u64 = def_u64[r];
+        var remat: u64 = remat_u64[r];
+        if (width == 0 && uses == 0 && defs == 0) { continue; }
+        if (best == 0 ||
+            width > best_width ||
+            (width == best_width && uses > best_uses) ||
+            (width == best_width && uses == best_uses && defs > best_defs) ||
+            (width == best_width && uses == best_uses && defs == best_defs && remat < best_remat)) {
+            best = r;
+            best_width = width;
+            best_uses = uses;
+            best_defs = defs;
+            best_remat = remat;
+        }
+    }
+    if (best != 0) { return best; }
+    return regalloc_find_uncolored(colors, max_reg);
+}
+
+func regalloc_interval_for_reg(fn: *SSAFunction, max_reg: u64, reg: u64, arena: *BppScratchArena, start_ptr: *u64, end_ptr: *u64) -> u64 {
+    if (fn == 0 || reg == 0 || reg > max_reg || start_ptr == 0 || end_ptr == 0) { return 0; }
+    var bytes: u64 = (max_reg + 1) * sizeof(u64);
+    var start_u64: *u64 = (*u64)bpp_scratch_arena_alloc_zero(arena, bytes);
+    var end_u64: *u64 = (*u64)bpp_scratch_arena_alloc_zero(arena, bytes);
+    var use_u64: *u64 = (*u64)bpp_scratch_arena_alloc_zero(arena, bytes);
+    var def_u64: *u64 = (*u64)bpp_scratch_arena_alloc_zero(arena, bytes);
+    var remat_u64: *u64 = (*u64)bpp_scratch_arena_alloc_zero(arena, bytes);
+    regalloc_scan_intervals(fn, max_reg, start_u64, end_u64, use_u64, def_u64, remat_u64);
+    *start_ptr = start_u64[reg];
+    *end_ptr = end_u64[reg];
+    return 0;
+}
+
+func regalloc_intervals_overlap(a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> u64 {
+    if (a_start == 0 || b_start == 0) { return 0; }
+    if (a_end < b_start) { return 0; }
+    if (b_end < a_start) { return 0; }
+    return 1;
+}
+
+func regalloc_pick_spill_slot(slot_ids: *u64, slot_start: *u64, slot_end: *u64, slot_count_ptr: *u64, next_slot_ptr: *u64, interval_start: u64, interval_end: u64, slot_cap: u64) -> u64 {
+    if (slot_ids == 0 || slot_start == 0 || slot_end == 0 || slot_count_ptr == 0 || next_slot_ptr == 0) { return 0; }
+    var slot_count: u64 = *slot_count_ptr;
+    for (var i: u64 = 0; i < slot_count; i++) {
+        if (regalloc_intervals_overlap(interval_start, interval_end, slot_start[i], slot_end[i]) == 0) {
+            if (interval_start != 0 && (slot_start[i] == 0 || interval_start < slot_start[i])) { slot_start[i] = interval_start; }
+            if (interval_end > slot_end[i]) { slot_end[i] = interval_end; }
+            return slot_ids[i];
+        }
+    }
+
+    var slot: u64 = *next_slot_ptr;
+    *next_slot_ptr = slot + 1;
+    if (slot_count < slot_cap) {
+        slot_ids[slot_count] = slot;
+        slot_start[slot_count] = interval_start;
+        slot_end[slot_count] = interval_end;
+        *slot_count_ptr = slot_count + 1;
+    }
+    return slot;
+}
+
+func regalloc_max_pseudo_var_id(fn: *SSAFunction) -> u64 {
+    if (fn == 0) { return 0; }
+    var max_id: u64 = 0;
+    var blocks: []*SSABlock = fn.blocks;
+    var n: u64 = slice_len(blocks);
+    for (var i: u64 = 0; i < n; i++) {
+        var b: *SSABlock = blocks[i];
+        if (b == 0) { continue; }
+        var cur: *SSAInstruction = b.inst_head;
+        while (cur != 0) {
+            var op: u64 = op_of(cur);
+            if (op == SSA_OP_LOAD || op == SSA_OP_STORE) {
+                var var_id: u64 = operand_value(cur.src1);
+                if (var_id > max_id) { max_id = var_id; }
+            }
+            cur = cur.next;
+        }
+    }
+    return max_id;
+}
+
+func regalloc_insert_before_inst(block: *SSABlock, cur: *SSAInstruction, inst: *SSAInstruction) -> u64 {
+    if (block == 0 || cur == 0 || inst == 0) { return 0; }
+    var prev_raw: u64 = ((u64)cur.prev) & SSA_REGALLOC_TAGGED_PTR_MASK;
+    var prev_inst: *SSAInstruction = (*SSAInstruction)prev_raw;
+    inst.next = cur;
+    set_prev(inst, prev_inst);
+    if (prev_inst != 0) {
+        prev_inst.next = inst;
+    } else {
+        block.inst_head = inst;
+    }
+    set_prev(cur, inst);
+    return 0;
+}
+
+func regalloc_insert_after_inst(block: *SSABlock, cur: *SSAInstruction, inst: *SSAInstruction) -> u64 {
+    if (block == 0 || cur == 0 || inst == 0) { return 0; }
+    var next_inst: *SSAInstruction = cur.next;
+    inst.next = next_inst;
+    set_prev(inst, cur);
+    cur.next = inst;
+    if (next_inst != 0) {
+        set_prev(next_inst, inst);
+    } else {
+        block.inst_tail = inst;
+    }
+    return 0;
+}
+
+func regalloc_operand_uses_reg(opr: u64, reg: u64) -> u64 {
+    if (opr == 0 || reg == 0) { return 0; }
+    if (operand_is_const(opr) != 0) { return 0; }
+    if (operand_value(opr) == reg) { return 1; }
+    return 0;
+}
+
+func regalloc_replace_operand_reg(opr_ptr: *u64, reg: u64, repl: u64) -> u64 {
+    if (opr_ptr == 0 || reg == 0 || repl == 0) { return 0; }
+    if (regalloc_operand_uses_reg(*opr_ptr, reg) == 0) { return 0; }
+    *opr_ptr = operand_reg(repl);
+    return 1;
+}
+
+func regalloc_args_use_reg(args_vec: *Vec<u64>, nargs: u64, reg: u64) -> u64 {
+    if (args_vec == 0 || reg == 0) { return 0; }
+    var n: u64 = call_args_len(args_vec, nargs);
+    for (var i: u64 = 0; i < n; i++) {
+        if (args_vec.get(i) == reg) { return 1; }
+    }
+    return 0;
+}
+
+func regalloc_replace_args_reg(args_vec: *Vec<u64>, nargs: u64, reg: u64, repl: u64) -> u64 {
+    if (args_vec == 0 || reg == 0 || repl == 0) { return 0; }
+    var changed: u64 = 0;
+    var n: u64 = call_args_len(args_vec, nargs);
+    for (var i: u64 = 0; i < n; i++) {
+        if (args_vec.get(i) == reg) {
+            args_vec.set(i, repl);
+            changed = 1;
+        }
+    }
+    return changed;
+}
+
+func regalloc_call_uses_reg(op: u64, info_ptr: u64, reg: u64) -> u64 {
+    if (reg == 0) { return 0; }
+    if (op == SSA_OP_CALL) {
+        var info: *SSACallInfo = (*SSACallInfo)info_ptr;
+        if (info == 0) { return 0; }
+        return regalloc_args_use_reg(info.args_vec, info.nargs, reg);
+    }
+    if (op == SSA_OP_CALL_PTR) {
+        var info_ptrp: *SSACallPtrInfo = (*SSACallPtrInfo)info_ptr;
+        if (info_ptrp == 0) { return 0; }
+        if (info_ptrp.callee_reg == reg) { return 1; }
+        return regalloc_args_use_reg(info_ptrp.args_vec, info_ptrp.nargs, reg);
+    }
+    if (op == SSA_OP_CALL_SLICE_STORE) {
+        var info_s: *SSACallSliceStoreInfo = (*SSACallSliceStoreInfo)info_ptr;
+        if (info_s == 0) { return 0; }
+        if (info_s.is_ptr != 0 && info_s.callee_reg == reg) { return 1; }
+        return regalloc_args_use_reg(info_s.args_vec, info_s.nargs, reg);
+    }
+    return 0;
+}
+
+func regalloc_replace_call_reg(op: u64, info_ptr: u64, reg: u64, repl: u64) -> u64 {
+    if (reg == 0 || repl == 0) { return 0; }
+    if (op == SSA_OP_CALL) {
+        var info: *SSACallInfo = (*SSACallInfo)info_ptr;
+        if (info == 0) { return 0; }
+        return regalloc_replace_args_reg(info.args_vec, info.nargs, reg, repl);
+    }
+    if (op == SSA_OP_CALL_PTR) {
+        var info_ptrp: *SSACallPtrInfo = (*SSACallPtrInfo)info_ptr;
+        if (info_ptrp == 0) { return 0; }
+        var changed: u64 = 0;
+        if (info_ptrp.callee_reg == reg) {
+            info_ptrp.callee_reg = repl;
+            changed = 1;
+        }
+        if (regalloc_replace_args_reg(info_ptrp.args_vec, info_ptrp.nargs, reg, repl) != 0) { changed = 1; }
+        return changed;
+    }
+    if (op == SSA_OP_CALL_SLICE_STORE) {
+        var info_s: *SSACallSliceStoreInfo = (*SSACallSliceStoreInfo)info_ptr;
+        if (info_s == 0) { return 0; }
+        var changed2: u64 = 0;
+        if (info_s.is_ptr != 0 && info_s.callee_reg == reg) {
+            info_s.callee_reg = repl;
+            changed2 = 1;
+        }
+        if (regalloc_replace_args_reg(info_s.args_vec, info_s.nargs, reg, repl) != 0) { changed2 = 1; }
+        return changed2;
+    }
+    return 0;
+}
+
+func regalloc_inst_sources_use_reg(inst: *SSAInstruction, reg: u64) -> u64 {
+    if (inst == 0 || reg == 0) { return 0; }
+    var op: u64 = op_of(inst);
+    if (op == SSA_OP_CALL || op == SSA_OP_CALL_PTR || op == SSA_OP_CALL_SLICE_STORE) {
+        if (regalloc_call_uses_reg(op, operand_value(inst.src1), reg) != 0) { return 1; }
+    }
+    if (regalloc_operand_uses_reg(inst.src1, reg) != 0) { return 1; }
+    if (regalloc_operand_uses_reg(inst.src2, reg) != 0) { return 1; }
+    if (op == SSA_OP_RET_SLICE_HEAP) {
+        if (ret_slice_heap_uses_reg((u64)inst, reg) != 0) { return 1; }
+    }
+    return 0;
+}
+
+func regalloc_replace_inst_sources(ctx: *SSAContext, block: *SSABlock, inst: *SSAInstruction, reg: u64, slot: u64, next_temp_ptr: *u64) -> u64 {
+    if (ctx == 0 || block == 0 || inst == 0 || next_temp_ptr == 0) { return 0; }
+    if (regalloc_inst_sources_use_reg(inst, reg) == 0) { return 0; }
+    var tmp: u64 = *next_temp_ptr;
+    *next_temp_ptr = tmp + 1;
+    var load_inst: *SSAInstruction = create_inst(ctx, SSA_OP_LOAD, tmp, operand_const(slot), 0);
+    regalloc_insert_before_inst(block, inst, load_inst);
+
+    var op: u64 = op_of(inst);
+    if (op == SSA_OP_CALL || op == SSA_OP_CALL_PTR || op == SSA_OP_CALL_SLICE_STORE) {
+        regalloc_replace_call_reg(op, operand_value(inst.src1), reg, tmp);
+    }
+    regalloc_replace_operand_reg(&inst.src1, reg, tmp);
+    regalloc_replace_operand_reg(&inst.src2, reg, tmp);
+    if (op == SSA_OP_RET_SLICE_HEAP) {
+        ret_slice_heap_remap_single((u64)inst, reg, tmp);
+    }
+    return 1;
+}
+
+func regalloc_inst_can_define(op: u64) -> u64 {
+    if (op == SSA_OP_BR || op == SSA_OP_JMP || op == SSA_OP_RET || op == SSA_OP_RET_SLICE_HEAP) { return 0; }
+    if (op == SSA_OP_STORE || op == SSA_OP_STORE8 || op == SSA_OP_STORE16 || op == SSA_OP_STORE32 || op == SSA_OP_STORE64 || op == SSA_OP_STORE_SLICE) { return 0; }
+    if (op == SSA_OP_CALL_SLICE_STORE) { return 0; }
+    return 1;
+}
+
+func regalloc_replace_inst_def(ctx: *SSAContext, block: *SSABlock, inst: *SSAInstruction, reg: u64, slot: u64, next_temp_ptr: *u64) -> u64 {
+    if (ctx == 0 || block == 0 || inst == 0 || reg == 0 || next_temp_ptr == 0) { return 0; }
+    var op: u64 = op_of(inst);
+    if (regalloc_inst_can_define(op) == 0) { return 0; }
+    if (inst.dest != reg) { return 0; }
+    var tmp: u64 = *next_temp_ptr;
+    *next_temp_ptr = tmp + 1;
+    inst.dest = tmp;
+    var store_inst: *SSAInstruction = create_inst(ctx, SSA_OP_STORE, 0, operand_const(slot), operand_reg(tmp));
+    regalloc_insert_after_inst(block, inst, store_inst);
+    return 1;
+}
+
+func regalloc_spill_one(ctx: *SSAContext, fn: *SSAFunction, reg: u64, slot: u64) -> u64 {
+    if (ctx == 0 || fn == 0 || reg == 0 || slot == 0) { return 0; }
+    var next_temp: u64 = calc_max_reg(fn) + 1;
+    var changed: u64 = 0;
+    var blocks: []*SSABlock = fn.blocks;
+    var n: u64 = slice_len(blocks);
+    for (var i: u64 = 0; i < n; i++) {
+        var b: *SSABlock = blocks[i];
+        if (b == 0) { continue; }
+        var cur: *SSAInstruction = b.inst_head;
+        while (cur != 0) {
+            var next: *SSAInstruction = cur.next;
+            if (regalloc_replace_inst_sources(ctx, b, cur, reg, slot, &next_temp) != 0) { changed = changed + 1; }
+            if (regalloc_replace_inst_def(ctx, b, cur, reg, slot, &next_temp) != 0) { changed = changed + 1; }
+            cur = next;
+        }
+    }
+    if (changed != 0) {
+        fn.opt_regalloc3_engine_count = fn.opt_regalloc3_engine_count + 1;
+        fn.opt_regalloc3_detail_count = fn.opt_regalloc3_detail_count + changed;
+    }
+    return changed;
+}
+
+func regalloc_map_uses_arena(arena: *BppScratchArena) -> u64 {
+    if (arena != 0 && SSA_REGALLOC_MAP_IN_ARENA != 0) { return 1; }
+    return 0;
+}
+
+func regalloc_map_alloc(max_reg: u64, arena: *BppScratchArena) -> u64 {
+    var bytes: u64 = (max_reg + 1) * sizeof(u64);
+    if (regalloc_map_uses_arena(arena) != 0) {
+        return bpp_scratch_arena_alloc_zero(arena, bytes);
+    }
+    return heap_alloc(bytes);
+}
+
+func regalloc_map_free(map: u64, arena: *BppScratchArena) -> u64 {
+    if (map == 0) { return 0; }
+    if (regalloc_map_uses_arena(arena) == 0) {
+        free(map);
+    }
+    return 0;
+}
+
+func regalloc_count_function_insts(fn: *SSAFunction) -> u64 {
+    if (fn == 0) { return 0; }
+    var count: u64 = 0;
+    var blocks: []*SSABlock = fn.blocks;
+    var n: u64 = slice_len(blocks);
+    for (var i: u64 = 0; i < n; i++) {
+        var b: *SSABlock = blocks[i];
+        if (b == 0) { continue; }
+        var phi: *SSAInstruction = b.phi_head;
+        while (phi != 0) {
+            count = count + 1;
+            phi = phi.next;
+        }
+        var cur: *SSAInstruction = b.inst_head;
+        while (cur != 0) {
+            count = count + 1;
+            cur = cur.next;
+        }
+    }
+    return count;
+}
+
+func regalloc_should_skip_graph_allocator(fn: *SSAFunction, max_reg: u64) -> u64 {
+    if (fn == 0) { return 1; }
+    if (max_reg > SSA_REGALLOC_GRAPH_MAX_REG_BUDGET) { return 1; }
+    var inst_count: u64 = regalloc_count_function_insts(fn);
+    if (inst_count > SSA_REGALLOC_GRAPH_INST_BUDGET) { return 1; }
+    return 0;
+}
+
+func regalloc_mark_graph_allocator_skipped(fn: *SSAFunction, max_reg: u64) -> u64 {
+    if (fn == 0) { return 0; }
+    fn.regalloc_failed = 1;
+    fn.regalloc_done = 0;
+    fn.reg_map_data = 0;
+    fn.reg_map_len = 0;
+    fn.opt_regalloc3_engine_count = fn.opt_regalloc3_engine_count + 1;
+    fn.opt_regalloc3_detail_count = fn.opt_regalloc3_detail_count + max_reg;
+    return 0;
+}
+
+func map_fn_once(fn: *SSAFunction, k: u64, arena: *BppScratchArena) -> u64 {
     var max_reg: u64 = calc_max_reg(fn);
     if (max_reg == 0) {
         fn.regalloc_failed = 0;
@@ -663,7 +1383,7 @@ func map_fn(fn: *SSAFunction, k: u64) -> u64 {
         return 0;
     }
 
-    var colors: *Vec<u64> = color_fn(fn, k);
+    var colors: *Vec<u64> = color_fn(fn, k, arena);
     if (colors == 0) {
         fn.regalloc_failed = 1;
         fn.regalloc_done = 0;
@@ -672,7 +1392,7 @@ func map_fn(fn: *SSAFunction, k: u64) -> u64 {
         return 0;
     }
 
-    var map: u64 = heap_alloc((max_reg + 1) * sizeof(u64));
+    var map: u64 = regalloc_map_alloc(max_reg, arena);
     var map_u64: *u64 = (*u64)map;
     for (var i: u64 = 0; i <= max_reg; i++) {
         map_u64[i] = 0;
@@ -694,6 +1414,11 @@ func map_fn(fn: *SSAFunction, k: u64) -> u64 {
     }
 
     if (failed != 0) {
+        regalloc_map_free(map, arena);
+        if (SSA_REGALLOC_RELEASE_SCRATCH != 0) {
+            colors.release_buffer();
+            free((u64)colors);
+        }
         fn.regalloc_failed = 1;
         fn.regalloc_done = 0;
         fn.reg_map_data = 0;
@@ -705,7 +1430,61 @@ func map_fn(fn: *SSAFunction, k: u64) -> u64 {
     fn.reg_map_len = max_reg + 1;
     fn.regalloc_failed = 0;
     fn.regalloc_done = 1;
+    if (SSA_REGALLOC_RELEASE_SCRATCH != 0) {
+        colors.release_buffer();
+        free((u64)colors);
+    }
     return map;
+}
+
+func map_fn(ctx: *SSAContext, fn: *SSAFunction, k: u64, arena: *BppScratchArena) -> u64 {
+    if (fn == 0) { return 0; }
+    var initial_max_reg: u64 = calc_max_reg(fn);
+    if (regalloc_should_skip_graph_allocator(fn, initial_max_reg) != 0) {
+        regalloc_mark_graph_allocator_skipped(fn, initial_max_reg);
+        return 0;
+    }
+    if (initial_max_reg > SSA_REGALLOC_SPILL_REWRITE_MAX_REG_BUDGET) {
+        return map_fn_once(fn, k, arena);
+    }
+    var next_spill_slot: u64 = regalloc_max_pseudo_var_id(fn);
+    if (initial_max_reg > next_spill_slot) { next_spill_slot = initial_max_reg; }
+    next_spill_slot = next_spill_slot + 1;
+    var slot_cap: u64 = 64;
+    var slot_ids: *u64 = (*u64)bpp_scratch_arena_alloc_zero(arena, slot_cap * sizeof(u64));
+    var slot_start: *u64 = (*u64)bpp_scratch_arena_alloc_zero(arena, slot_cap * sizeof(u64));
+    var slot_end: *u64 = (*u64)bpp_scratch_arena_alloc_zero(arena, slot_cap * sizeof(u64));
+    var slot_count: u64 = 0;
+    for (var attempt: u64 = 0; attempt < 32; attempt++) {
+        var attempt_mark: BppScratchArenaMark;
+        if (arena != 0) { bpp_scratch_arena_mark_into(arena, &attempt_mark); }
+        var map: u64 = map_fn_once(fn, k, arena);
+        if (fn.regalloc_failed == 0 && fn.regalloc_done != 0) { return map; }
+
+        var max_reg: u64 = calc_max_reg(fn);
+        var colors: *Vec<u64> = color_fn(fn, k, arena);
+        var spill_reg: u64 = regalloc_spill_candidate_from_colors(fn, colors, max_reg, arena);
+        if (spill_reg == 0) {
+            if (arena != 0) { bpp_scratch_arena_rewind(arena, &attempt_mark); }
+            break;
+        }
+        var interval_start: u64 = 0;
+        var interval_end: u64 = 0;
+        regalloc_interval_for_reg(fn, max_reg, spill_reg, arena, &interval_start, &interval_end);
+        var spill_slot: u64 = regalloc_pick_spill_slot(slot_ids, slot_start, slot_end, &slot_count, &next_spill_slot, interval_start, interval_end, slot_cap);
+        if (regalloc_spill_one(ctx, fn, spill_reg, spill_slot) == 0) {
+            if (arena != 0) { bpp_scratch_arena_rewind(arena, &attempt_mark); }
+            break;
+        }
+        if (arena != 0) { bpp_scratch_arena_rewind(arena, &attempt_mark); }
+        fn.regalloc_failed = 0;
+        fn.regalloc_done = 0;
+    }
+    fn.regalloc_failed = 1;
+    fn.regalloc_done = 0;
+    fn.reg_map_data = 0;
+    fn.reg_map_len = 0;
+    return 0;
 }
 
 func run(ctx: *SSAContext, k: u64) -> u64 {
@@ -719,9 +1498,21 @@ func run(ctx: *SSAContext, k: u64) -> u64 {
             println("[DEBUG] regalloc_run", 26);
         }
         var fn: *SSAFunction = funcs[i];
-        map_fn(fn, k);
+        var arena: BppScratchArena;
+        var arena_ptr: *BppScratchArena = 0;
+        if (SSA_REGALLOC_USE_SCRATCH_ARENA != 0) {
+            bpp_scratch_arena_init(&arena, 0);
+            arena_ptr = &arena;
+        }
+        map_fn(ctx, fn, k, arena_ptr);
         if (fn.regalloc_failed == 0 && fn.regalloc_done != 0) {
             apply_fn(fn);
+            regalloc_map_free(fn.reg_map_data, arena_ptr);
+        }
+        fn.reg_map_data = 0;
+        fn.reg_map_len = 0;
+        if (SSA_REGALLOC_USE_SCRATCH_ARENA != 0) {
+            bpp_scratch_arena_reset(&arena);
         }
     }
     return 0;
@@ -779,6 +1570,32 @@ func remap_call_operands(op: u64, info_ptr: u64, map_u64: *u64, map_len: u64) ->
         return remap_args(info_s.args_vec, info_s.nargs, map_u64, map_len);
     }
     return 0;
+}
+
+func regalloc_eliminate_redundant_copies(fn: *SSAFunction) -> u64 {
+    if (fn == 0) { return 0; }
+    var removed: u64 = 0;
+    var blocks: []*SSABlock = fn.blocks;
+    var n: u64 = slice_len(blocks);
+    for (var i: u64 = 0; i < n; i++) {
+        var b: *SSABlock = blocks[i];
+        if (b == 0) { continue; }
+        var cur: *SSAInstruction = b.inst_head;
+        while (cur != 0) {
+            if (op_of(cur) == SSA_OP_COPY && cur.src1 != 0 && operand_is_const(cur.src1) == 0) {
+                var src: u64 = operand_value(cur.src1);
+                if (src == cur.dest) {
+                    set_op(cur, SSA_OP_NOP);
+                    cur.dest = 0;
+                    cur.src1 = 0;
+                    cur.src2 = 0;
+                    removed = removed + 1;
+                }
+            }
+            cur = cur.next;
+        }
+    }
+    return removed;
 }
 
 func apply_fn(fn: *SSAFunction) -> u64 {
@@ -853,6 +1670,7 @@ func apply_fn(fn: *SSAFunction) -> u64 {
 
     }
 
+    regalloc_eliminate_redundant_copies(fn);
     return 0;
 }
 

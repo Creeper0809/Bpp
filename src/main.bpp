@@ -1,6 +1,8 @@
 // main.b - Main entry point for v3.8 modular compiler
 
 import std.io;
+import std.mem;
+import std.number;
 import std.str;
 import std.os;
 import std.path;
@@ -13,7 +15,9 @@ import compiler.runtime_api;
 import compiler.pass_runner;
 import compiler.annotations;
 import compiler.ast_dump;
+import compiler.timings;
 import llvm.contract_adapter;
+import types;
 import codegen;
 import opt;
 
@@ -30,14 +34,28 @@ struct MainCliParseResult {
     public ok: u64;
     public filename: u64;
     public target_override: u64;
-    public ast_filter_func_ptr: u64;
-    public ast_filter_func_len: u64;
-    public ast_filter_module_ptr: u64;
-    public ast_filter_module_len: u64;
+    public ast_filter_func_name: []u8;
+    public ast_filter_module_name: []u8;
     public ast_filter_no_std: u64;
+    public timings_json_path: []u8;
 }
 struct MainOutputPaths { public asm_path: u64; public obj_path: u64; public exe_path: u64; }
 struct MainLLVMPaths { public ll_path: u64; public obj_path: u64; public exe_path: u64; }
+
+func number_from_i8(v: i8) -> Number { var out: Number = Number { 1 }; out.set_i64((i64)v); return out; }
+func number_from_i16(v: i16) -> Number { var out: Number = Number { 1 }; out.set_i64((i64)v); return out; }
+func number_from_i32(v: i32) -> Number { var out: Number = Number { 1 }; out.set_i64((i64)v); return out; }
+func number_from_i64(v: i64) -> Number { var out: Number = Number { 1 }; out.set_i64(v); return out; }
+func number_from_u8(v: u8) -> Number { var out: Number = Number { 1 }; out.set_u64((u64)v); return out; }
+func number_from_u16(v: u16) -> Number { var out: Number = Number { 1 }; out.set_u64((u64)v); return out; }
+func number_from_u32(v: u32) -> Number { var out: Number = Number { 1 }; out.set_u64((u64)v); return out; }
+func number_from_u64(v: u64) -> Number { var out: Number = Number { 1 }; out.set_u64(v); return out; }
+func number_from_f64(v: f64) -> Number { return number_make_real(v); }
+func number_from_rational(num: Number, den: Number) -> Number { return number_make_rational(num, den); }
+func number_from_decimal(coeff: Number, scale: u64) -> Number { return number_make_decimal(coeff, scale); }
+func number_from_bigfloat(mant: Number, exp: i64, precision: u64) -> Number { return number_make_bigfloat(mant, exp, precision); }
+func number_cmp_ptr(lhs: *Number, rhs: *Number) -> i64 { return lhs.cmp_ptr(rhs); }
+func number_eq_cmp_ptr(lhs: *Number, rhs: *Number) -> i64 { return lhs.eq_cmp_ptr(rhs); }
 
 impl Argv6 {
     public constructor() {
@@ -116,7 +134,7 @@ impl MainLLVMPaths {
 }
 
 func main_print_usage() -> u64 {
-    emit("Usage: bppc [-O0|-O1] [-dump-ast|-dump-ast-graph|-dump-ast-json|-dump-ir|-dump-ssa|-dump-llvm-contract|-dump-llvm-proto|-dump-llvm-ll|-llvm-build|-asm] [--ast-func <name>] [--ast-module <module>] [--ast-no-std] [--target <linux-x86_64|windows-x86_64>] [--symbolic-report] [--strict-std-complexity-summary] <source.bpp>\n");
+    emit("Usage: bppc [-O0|-O1|-O2|-O3|-Os] [-dump-ast|-dump-ast-graph|-dump-ast-json|-dump-ir|-dump-ir-json|-dump-ssa|-dump-ssa-json|-dump-machine-ir|-dump-machine-ir-json|-dump-llvm-contract|-dump-llvm-proto|-dump-llvm-ll|-llvm-build|-asm|--emit-source-map|--emit-json|--opt-report] [--views <ast,ir,ssa,asm>] [--ast-func <name>] [--ast-module <module>] [--ast-no-std] [--target <linux-x86_64|windows-x86_64>] [--timings-json <path>] [--symbolic-report] [--strict-std-complexity-summary] <source.bpp>\n");
     return 0;
 }
 
@@ -145,11 +163,10 @@ func main_parse_cli(argc: u64, argv_ptr: *u64) -> MainCliParseResult {
     result.ok = 0;
     result.filename = 0;
     result.target_override = 0;
-    result.ast_filter_func_ptr = 0;
-    result.ast_filter_func_len = 0;
-    result.ast_filter_module_ptr = 0;
-    result.ast_filter_module_len = 0;
+    result.ast_filter_func_name = slice(0, 0);
+    result.ast_filter_module_name = slice(0, 0);
     result.ast_filter_no_std = 0;
+    result.timings_json_path = slice(0, 0);
 
     // Default flags (avoid uninitialized globals affecting codegen)
     opt_init_defaults();
@@ -171,14 +188,46 @@ func main_parse_cli(argc: u64, argv_ptr: *u64) -> MainCliParseResult {
             opt_set_level(0);
             continue;
         }
+        if (str_eq(slice(arg, arg_len), slice("-O2", str_len("-O2")))) {
+            opt_set_level(2);
+            continue;
+        }
+        if (str_eq(slice(arg, arg_len), slice("-O3", str_len("-O3")))) {
+            opt_set_level(3);
+            continue;
+        }
+        if (str_eq(slice(arg, arg_len), slice("-Os", str_len("-Os")))) {
+            opt_set_level(2);
+            continue;
+        }
         if (str_eq(slice(arg, arg_len), slice("-dump-ir", str_len("-dump-ir")))) {
             opt_set_ir_mode(IR_3ADDR);
             opt_set_output_mode(OUT_IR);
             continue;
         }
+        if (str_eq(slice(arg, arg_len), slice("-dump-ir-json", str_len("-dump-ir-json")))) {
+            opt_set_ir_mode(IR_3ADDR);
+            opt_set_output_mode(OUT_IR_JSON);
+            continue;
+        }
         if (str_eq(slice(arg, arg_len), slice("-dump-ssa", str_len("-dump-ssa")))) {
             opt_set_ir_mode(IR_SSA);
             opt_set_output_mode(OUT_IR);
+            continue;
+        }
+        if (str_eq(slice(arg, arg_len), slice("-dump-ssa-json", str_len("-dump-ssa-json")))) {
+            opt_set_ir_mode(IR_SSA);
+            opt_set_output_mode(OUT_IR_JSON);
+            continue;
+        }
+        if (str_eq(slice(arg, arg_len), slice("-dump-machine-ir", str_len("-dump-machine-ir")))) {
+            opt_set_ir_mode(IR_MACHINE);
+            opt_set_output_mode(OUT_IR);
+            continue;
+        }
+        if (str_eq(slice(arg, arg_len), slice("-dump-machine-ir-json", str_len("-dump-machine-ir-json")))) {
+            opt_set_ir_mode(IR_MACHINE);
+            opt_set_output_mode(OUT_IR_JSON);
             continue;
         }
         if (str_eq(slice(arg, arg_len), slice("-dump-ast", str_len("-dump-ast")))) {
@@ -209,6 +258,10 @@ func main_parse_cli(argc: u64, argv_ptr: *u64) -> MainCliParseResult {
             opt_set_output_mode(OUT_LLVM_BUILD);
             continue;
         }
+        if (str_eq(slice(arg, arg_len), slice("--opt-report", str_len("--opt-report")))) {
+            opt_set_output_mode(OUT_OPT_REPORT);
+            continue;
+        }
         if (str_eq(slice(arg, arg_len), slice("--ast-func", str_len("--ast-func"))) || str_eq(slice(arg, arg_len), slice("--graph-func", str_len("--graph-func")))) {
             if (i + 1 >= argc) {
                 emit_stderr("[ERROR] missing value for ");
@@ -217,18 +270,20 @@ func main_parse_cli(argc: u64, argv_ptr: *u64) -> MainCliParseResult {
                 return result;
             }
             i = i + 1;
-            result.ast_filter_func_ptr = argv_ptr[i];
-            result.ast_filter_func_len = str_len(result.ast_filter_func_ptr);
+            var filter_func_arg: u64 = argv_ptr[i];
+            var filter_func_arg_len: u64 = str_len(filter_func_arg);
+            var filter_func_name: []u8 = slice(filter_func_arg, filter_func_arg_len);
+            result.ast_filter_func_name = filter_func_name;
             continue;
         }
         if (main_has_prefix(arg, arg_len, "--ast-func=", 11) != 0) {
-            result.ast_filter_func_ptr = arg + 11;
-            result.ast_filter_func_len = arg_len - 11;
+            var ast_func_name: []u8 = slice(arg + 11, arg_len - 11);
+            result.ast_filter_func_name = ast_func_name;
             continue;
         }
         if (main_has_prefix(arg, arg_len, "--graph-func=", 13) != 0) {
-            result.ast_filter_func_ptr = arg + 13;
-            result.ast_filter_func_len = arg_len - 13;
+            var graph_func_name: []u8 = slice(arg + 13, arg_len - 13);
+            result.ast_filter_func_name = graph_func_name;
             continue;
         }
         if (str_eq(slice(arg, arg_len), slice("--ast-module", str_len("--ast-module"))) || str_eq(slice(arg, arg_len), slice("--graph-module", str_len("--graph-module")))) {
@@ -239,18 +294,20 @@ func main_parse_cli(argc: u64, argv_ptr: *u64) -> MainCliParseResult {
                 return result;
             }
             i = i + 1;
-            result.ast_filter_module_ptr = argv_ptr[i];
-            result.ast_filter_module_len = str_len(result.ast_filter_module_ptr);
+            var filter_module_arg: u64 = argv_ptr[i];
+            var filter_module_arg_len: u64 = str_len(filter_module_arg);
+            var filter_module_name: []u8 = slice(filter_module_arg, filter_module_arg_len);
+            result.ast_filter_module_name = filter_module_name;
             continue;
         }
         if (main_has_prefix(arg, arg_len, "--ast-module=", 13) != 0) {
-            result.ast_filter_module_ptr = arg + 13;
-            result.ast_filter_module_len = arg_len - 13;
+            var ast_module_name: []u8 = slice(arg + 13, arg_len - 13);
+            result.ast_filter_module_name = ast_module_name;
             continue;
         }
         if (main_has_prefix(arg, arg_len, "--graph-module=", 15) != 0) {
-            result.ast_filter_module_ptr = arg + 15;
-            result.ast_filter_module_len = arg_len - 15;
+            var graph_module_name: []u8 = slice(arg + 15, arg_len - 15);
+            result.ast_filter_module_name = graph_module_name;
             continue;
         }
         if (str_eq(slice(arg, arg_len), slice("--ast-no-std", str_len("--ast-no-std"))) || str_eq(slice(arg, arg_len), slice("--graph-no-std", str_len("--graph-no-std")))) {
@@ -259,6 +316,46 @@ func main_parse_cli(argc: u64, argv_ptr: *u64) -> MainCliParseResult {
         }
         if (str_eq(slice(arg, arg_len), slice("-asm", str_len("-asm")))) {
             opt_set_output_mode(OUT_ASM);
+            continue;
+        }
+        if (str_eq(slice(arg, arg_len), slice("--emit-source-map", str_len("--emit-source-map")))) {
+            opt_set_output_mode(OUT_SOURCE_MAP);
+            continue;
+        }
+        if (str_eq(slice(arg, arg_len), slice("--emit-json", str_len("--emit-json")))) {
+            opt_set_output_mode(OUT_UNIFIED_JSON);
+            continue;
+        }
+        if (str_eq(slice(arg, arg_len), slice("--views", str_len("--views")))) {
+            if (i + 1 >= argc) {
+                emit_stderr("[ERROR] missing value for --views\n");
+                return result;
+            }
+            i = i + 1;
+            continue;
+        }
+        if (main_has_prefix(arg, arg_len, "--views=", 8) != 0) {
+            continue;
+        }
+        if (str_eq(slice(arg, arg_len), slice("--source-map-user-only", str_len("--source-map-user-only")))) {
+            opt_source_map_set_user_only(1);
+            continue;
+        }
+        if (str_eq(slice(arg, arg_len), slice("--source-map-include-std", str_len("--source-map-include-std")))) {
+            opt_source_map_set_user_only(0);
+            continue;
+        }
+        if (str_eq(slice(arg, arg_len), slice("--source-map-file", str_len("--source-map-file")))) {
+            if (i + 1 >= argc) {
+                emit_stderr("[ERROR] missing value for --source-map-file\n");
+                return result;
+            }
+            i = i + 1;
+            opt_source_map_set_file(argv_ptr[i], str_len(argv_ptr[i]));
+            continue;
+        }
+        if (main_has_prefix(arg, arg_len, "--source-map-file=", 18) != 0) {
+            opt_source_map_set_file(arg + 18, arg_len - 18);
             continue;
         }
         if (str_eq(slice(arg, arg_len), slice("--target", str_len("--target")))) {
@@ -281,6 +378,23 @@ func main_parse_cli(argc: u64, argv_ptr: *u64) -> MainCliParseResult {
             var parsed_target2: u64 = main_parse_target_or_report(target_arg, target_len);
             if (parsed_target2 == 0) { return result; }
             result.target_override = parsed_target2;
+            continue;
+        }
+        if (str_eq(slice(arg, arg_len), slice("--timings-json", str_len("--timings-json")))) {
+            if (i + 1 >= argc) {
+                emit_stderr("[ERROR] missing value for --timings-json\n");
+                return result;
+            }
+            i = i + 1;
+            var timings_path_ptr: u64 = argv_ptr[i];
+            var timings_path_len: u64 = str_len(timings_path_ptr);
+            var timings_path: []u8 = slice(timings_path_ptr, timings_path_len);
+            result.timings_json_path = timings_path;
+            continue;
+        }
+        if (main_has_prefix(arg, arg_len, "--timings-json=", 15) != 0) {
+            var timings_eq_path: []u8 = slice(arg + 15, arg_len - 15);
+            result.timings_json_path = timings_eq_path;
             continue;
         }
         if (str_eq(slice(arg, arg_len), slice("--symbolic-report", str_len("--symbolic-report")))) {
@@ -314,17 +428,21 @@ func main_parse_cli(argc: u64, argv_ptr: *u64) -> MainCliParseResult {
 func main_run_compile_pipeline(filename: u64, filename_len: u64) -> *AstProgram {
     var cctx: *CompilerCtx = compiler_ctx_current();
     var bootstrap_errors: u64 = 0;
+    var phase_started: u64 = timings_now_ms();
     if (!load_std_prelude_with_ctx(cctx)) {
         emit_stderr("[ERROR] failed to load std prelude\n");
         bootstrap_errors = bootstrap_errors + 1;
     }
+    timings_add_preprocess(timings_elapsed_ms(phase_started));
 
+    phase_started = timings_now_ms();
     if (!load_module_with_ctx(cctx, filename, filename_len)) {
         emit_stderr("[ERROR] failed to load module: ");
         emit_stderr_len(filename, filename_len);
         emit_stderr("\n");
         bootstrap_errors = bootstrap_errors + 1;
     }
+    timings_add_parse(timings_elapsed_ms(phase_started));
 
     var passes: *Vec<u64> = default_passes_with_ctx(cctx);
 
@@ -332,6 +450,7 @@ func main_run_compile_pipeline(filename: u64, filename_len: u64) -> *AstProgram 
     var total_pipeline_errors: u64 = 0;
     for (var i: u64 = 0; i < pass_count; i++) {
         var pass_id: u64 = passes.get(i);
+        phase_started = timings_now_ms();
         diag_reset();
         if (run_pass_with_ctx(cctx, pass_id) != 0) {
             emit_stderr("[ERROR] compiler pipeline failed at pass: ");
@@ -339,6 +458,17 @@ func main_run_compile_pipeline(filename: u64, filename_len: u64) -> *AstProgram 
             emit_stderr("\n");
             total_pipeline_errors = total_pipeline_errors + 1;
             break;
+        }
+        var pass_ms: u64 = timings_elapsed_ms(phase_started);
+        if (pass_id == COMPILER_PASS_VALIDATE_DIRECT_IMPL_CALLS ||
+            pass_id == COMPILER_PASS_VALIDATE_IMPL_OVERRIDES ||
+            pass_id == COMPILER_PASS_FINALIZE_ABST_METHODS ||
+            pass_id == COMPILER_PASS_FINALIZE_TRAITS ||
+            pass_id == COMPILER_PASS_APPLY_ANNOTATIONS ||
+            pass_id == COMPILER_PASS_VALIDATE_CONTRACT_PRESERVATION) {
+            timings_add_validation(pass_ms);
+        } else {
+            timings_add_lowering(pass_ms);
         }
         if (diag_has_errors() != 0) {
             emit_stderr("[ERROR] compiler pipeline diagnostics in pass: ");
@@ -529,15 +659,16 @@ func main_run_nasm(asm_path: u64, obj_path: u64) -> u64 {
 func main_run_ld(obj_path: u64, exe_path: u64) -> u64 {
     if (os_host_is_windows() != 0) {
         var out_arg: u64 = str_concat("/out:", 5, exe_path, str_len(exe_path));
-        var link_argv: *Argv8 = new Argv8{};
+        var link_argv: *Argv10 = new Argv10{};
         link_argv.a0 = (u64)"link.exe";
         link_argv.a1 = (u64)"/nologo";
-        link_argv.a2 = (u64)"/subsystem:console";
-        link_argv.a3 = (u64)"/entry:mainCRTStartup";
-        link_argv.a4 = out_arg;
-        link_argv.a5 = obj_path;
-        link_argv.a6 = (u64)"kernel32.lib";
-        link_argv.a7 = 0;
+        link_argv.a2 = (u64)"/Brepro";
+        link_argv.a3 = (u64)"/subsystem:console";
+        link_argv.a4 = (u64)"/entry:mainCRTStartup";
+        link_argv.a5 = out_arg;
+        link_argv.a6 = obj_path;
+        link_argv.a7 = (u64)"kernel32.lib";
+        link_argv.a8 = 0;
         var link_status: i64 = 0;
 
         var ld_override2: u64 = ld_path_with_ctx(compiler_ctx_current());
@@ -668,7 +799,7 @@ func main_run_clang_ir(ll_path: u64, exe_path: u64) -> u64 {
         emit_stderr("[ERROR] -llvm-build is not wired for Windows host execution yet\n");
         return 1;
     }
-    var clang_argv: *Argv8 = new Argv8{};
+    var clang_argv: *Argv10 = new Argv10{};
     clang_argv.a0 = (u64)"clang";
     clang_argv.a1 = (u64)"-x";
     clang_argv.a2 = (u64)"ir";
@@ -677,6 +808,7 @@ func main_run_clang_ir(ll_path: u64, exe_path: u64) -> u64 {
     clang_argv.a5 = ll_path;
     clang_argv.a6 = (u64)"-o";
     clang_argv.a7 = exe_path;
+    clang_argv.a8 = 0;
 
     var clang_status: i64 = os_execute((u64)"/usr/bin/clang", (u64)clang_argv);
     if (main_status_exec_not_found(clang_status) != 0) {
@@ -777,9 +909,72 @@ func main_emit_and_run(base_name: u64, base_len: u64, merged_prog: *AstProgram) 
     return 0;
 }
 
+func main_emit_source_map_stdout(merged_prog: *AstProgram) -> u64 {
+    diag_reset();
+    if (opt_source_map_user_only() != 0 && opt_source_map_file_ptr() != 0) {
+        asm_source_capture_set_filter_file(opt_source_map_file_ptr(), opt_source_map_file_len());
+    }
+    asm_source_capture_start(1);
+    program_with_sigs(merged_prog, get_func_sigs());
+    asm_source_capture_stop();
+    asm_source_capture_clear_filter();
+    if (diag_has_errors() != 0) {
+        emit_stderr("[ERROR] ASM source map generation failed (");
+        emit_u64_stderr(diag_count());
+        emit_stderr(" error(s))\n");
+        return 1;
+    }
+    asm_source_capture_dump_json();
+    return 0;
+}
+
+func main_emit_unified_json_stdout(merged_prog: *AstProgram, ast_filter: *AstDumpFilter, source_file: u64, source_file_len: u64) -> u64 {
+    emit("{\"schemaVersion\":1,\"sourceRangeSemantics\":{\"endColumn\":\"exclusive\",\"columnEncoding\":\"byte\",\"offsetEncoding\":\"byte\"},\"views\":{\"ast\":");
+    ast_dump_program_json_filtered(merged_prog, ast_filter);
+
+    emit(",\"ssa\":");
+    var old_ir_mode: u64 = opt_get_ir_mode();
+    opt_set_ir_mode(IR_SSA);
+    diag_reset();
+    program_with_sigs_ir_json(merged_prog, get_func_sigs());
+    opt_set_ir_mode(old_ir_mode);
+    if (diag_has_errors() != 0) {
+        emit_stderr("[ERROR] unified JSON SSA generation failed (");
+        emit_u64_stderr(diag_count());
+        emit_stderr(" error(s))\n");
+        return 1;
+    }
+
+    emit(",\"asm\":");
+    diag_reset();
+    if (opt_source_map_user_only() != 0) {
+        if (opt_source_map_file_ptr() != 0) {
+            asm_source_capture_set_filter_file(opt_source_map_file_ptr(), opt_source_map_file_len());
+        } else {
+            asm_source_capture_set_filter_file(source_file, source_file_len);
+        }
+    }
+    asm_source_capture_start(1);
+    program_with_sigs(merged_prog, get_func_sigs());
+    asm_source_capture_stop();
+    asm_source_capture_clear_filter();
+    if (diag_has_errors() != 0) {
+        emit_stderr("[ERROR] unified JSON ASM generation failed (");
+        emit_u64_stderr(diag_count());
+        emit_stderr(" error(s))\n");
+        return 1;
+    }
+    asm_source_capture_dump_json();
+    emit("}}\n");
+    return 0;
+}
+
 
 func main(argc: u64, argv: u64) -> u64 {
     init_stack_trace();
+    bpp_gc_set_auto(0, 0);
+    bpp_gc_set_edge_tracking(0);
+    bpp_gc_set_root_slot_tracking(0);
 
     var argv_ptr: *u64 = (*u64)argv;
 
@@ -788,9 +983,16 @@ func main(argc: u64, argv: u64) -> u64 {
         main_print_usage();
         return 1;
     }
+    if (cli.timings_json_path.ptr != 0) {
+        timings_enable(cli.timings_json_path);
+    }
+    defer timings_write_json();
     var filename: u64 = cli.filename;
 
     var filename_len: u64 = str_len(filename);
+    if (opt_source_map_user_only() != 0 && opt_source_map_file_ptr() == 0) {
+        opt_source_map_set_file(filename, filename_len);
+    }
 
     if (setup_paths_with_compiler(filename, filename_len) == 0) {
         return 1;
@@ -814,10 +1016,10 @@ func main(argc: u64, argv: u64) -> u64 {
     var base_name: u64 = path_basename_noext(filename, filename_len);
     var base_len: u64 = str_len(base_name);
     var ast_filter: AstDumpFilter;
-    ast_filter.func_ptr = cli.ast_filter_func_ptr;
-    ast_filter.func_len = cli.ast_filter_func_len;
-    ast_filter.module_ptr = cli.ast_filter_module_ptr;
-    ast_filter.module_len = cli.ast_filter_module_len;
+    var ast_filter_func_name: []u8 = cli.ast_filter_func_name;
+    var ast_filter_module_name: []u8 = cli.ast_filter_module_name;
+    ast_filter.func_name = ast_filter_func_name;
+    ast_filter.module_name = ast_filter_module_name;
     ast_filter.no_std = cli.ast_filter_no_std;
 
     if (out_mode == OUT_EXEC && main_host_allows_target(target) == 0) {
@@ -843,6 +1045,16 @@ func main(argc: u64, argv: u64) -> u64 {
             program_with_sigs_ir(merged_prog, get_func_sigs());
             if (diag_has_errors() != 0) {
                 emit_stderr("[ERROR] IR generation failed (");
+                emit_u64_stderr(diag_count());
+                emit_stderr(" error(s))\n");
+                return 1;
+            }
+            break;
+        case OUT_IR_JSON:
+            diag_reset();
+            program_with_sigs_ir_json(merged_prog, get_func_sigs());
+            if (diag_has_errors() != 0) {
+                emit_stderr("[ERROR] IR JSON generation failed (");
                 emit_u64_stderr(diag_count());
                 emit_stderr(" error(s))\n");
                 return 1;
@@ -887,6 +1099,19 @@ func main(argc: u64, argv: u64) -> u64 {
                 return 1;
             }
             break;
+        case OUT_OPT_REPORT:
+            diag_reset();
+            if (annotation_dump_llvm_ll_skeleton_stdout(merged_prog) == 0) {
+                emit_stderr("[ERROR] optimization report generation failed\n");
+                return 1;
+            }
+            if (diag_has_errors() != 0) {
+                emit_stderr("[ERROR] optimization report generation failed (");
+                emit_u64_stderr(diag_count());
+                emit_stderr(" error(s))\n");
+                return 1;
+            }
+            break;
         case OUT_LLVM_BUILD:
             diag_reset();
             if (main_emit_llvm_and_run(base_name, base_len, merged_prog) != 0) {
@@ -906,6 +1131,16 @@ func main(argc: u64, argv: u64) -> u64 {
                 emit_stderr("[ERROR] ASM generation failed (");
                 emit_u64_stderr(diag_count());
                 emit_stderr(" error(s))\n");
+                return 1;
+            }
+            break;
+        case OUT_SOURCE_MAP:
+            if (main_emit_source_map_stdout(merged_prog) != 0) {
+                return 1;
+            }
+            break;
+        case OUT_UNIFIED_JSON:
+            if (main_emit_unified_json_stdout(merged_prog, &ast_filter, filename, filename_len) != 0) {
                 return 1;
             }
             break;

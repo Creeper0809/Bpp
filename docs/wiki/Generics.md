@@ -42,7 +42,8 @@ func size_of_buf<const N: u64>() -> u64 {
 var sz: u64 = size_of_buf<4>();
 ```
 
-실제 사용 구문은 현재 파서/테스트 케이스(`test/source/10_generics.bpp`, `11_const_generics_sizeof.bpp`) 기준으로 따르십시오.
+실제 사용 구문은 현재 파서/테스트 케이스(`test/source/01_generics.bpp`,
+`test/source/40_core_runtime_bundle_success.bpp`) 기준으로 따르십시오.
 
 ### Generic Struct Usage
 
@@ -69,11 +70,13 @@ var p: Pair<i64>;
 var s: u64 = size_of_buf<"x">();
 ```
 
-## Constraints (v11)
+## Constraints
 
 - generic은 선언/호출/인스턴스화가 모두 맞아야 합니다.
 - 일부 조합(특히 고차 제네릭, 복합 타입 조합)은 제한될 수 있습니다.
 - generic 함수/구조체는 이름 mangling과 인스턴스 캐시를 사용합니다.
+- module import, generic impl method, trait/vtable generic object는
+  `test/source/42_container_module_runtime_bundle_success.bpp`에서 함께 고정됩니다.
 
 ## Cautions
 

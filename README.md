@@ -5,11 +5,11 @@
 ## Platform Support
 
 - ✅ **Linux** (x86-64, fully supported)
-- 🚧 **Windows** (x86-64, hosted pipeline in progress)
+- ✅ **Windows** (x86-64, native assembly backend)
   - CMake toolchain bootstrap (`nasm`) ✅
   - Linker detection with install guidance (`link.exe` / `lld-link`) ✅
-  - Windows runner scripts and CI smoke execution ✅
-  - Full self-host/runtime parity with Linux ⏳
+  - Stage 0/1/2 self-hosting and deterministic equality check ✅
+  - Required hosted compiler tests in CI ✅
 
 ## Why?
 
@@ -65,23 +65,54 @@ sudo cmake --install build-linux
 bpp hello.bpp
 ```
 
+### Linux Release Package
+
+GitHub bootstrap releases also publish a user-facing SDK tarball:
+
+```text
+bpp-<version>-linux-x86_64.tar.gz
+```
+
+It contains `bin/bpp`, the matching self-hosted compiler binary under
+`libexec/bpp`, and the matching standard library under `share/bpp/src/std`.
+Install it with:
+
+```bash
+tar -xzf bpp-<version>-linux-x86_64.tar.gz
+cd bpp-<version>-linux-x86_64
+./install.sh
+```
+
+Useful install options:
+
+```bash
+./install.sh --add-path
+./install.sh --install-deps
+./install.sh --prefix /opt/bpp
+```
+
+The native backend still requires `nasm` and `ld` from the system toolchain.
+
 ### Windows
 ```powershell
 # Configure (auto-download NASM when missing)
 cmake -S . -B build-win -DBPP_BOOTSTRAP_NASM=ON
 
 # Verify toolchain and run Windows executable smoke test
-cmake --build build-win --target toolchain-check windows-smoke
+cmake --build build-win --target toolchain-check windows-smoke --config Release
 
-# Optional: run hosted Windows test pipeline when a Windows stage compiler exists
-.\build_and_test.ps1
+# Build Stage 0/1/2 and run hosted Windows tests
+cmake --build build-win --target bpp-selfhost --config Release
 ```
 
-`--target windows-x86_64` is wired through the front-end and Windows runner.
-The hosted Windows path is still being rebuilt, but the runtime/link entry
-plumbing now follows the Windows target path instead of the Linux default.
-On Windows, `build_and_test.ps1` now rebuilds `stage0.exe` and `stage1.exe`
-from the seed compiler before invoking the test runner.
+`--target windows-x86_64` selects the Win64 ABI and `kernel32.dll` runtime.
+`build_and_test.ps1` accepts or downloads a PE bootstrap compiler, rebuilds
+Stage 0/1/2, requires Stage 1 and Stage 2 to match, and runs compiler/runtime
+tests under a 4 GiB per-process Job Object limit. Windows users do not need WSL.
+
+The Windows native assembly backend is supported; hosted `-llvm-build` remains
+unavailable. See `docs/windows_support.md` for bootstrap and troubleshooting
+details.
 
 If `link.exe` is missing, install Visual Studio Build Tools:
 https://aka.ms/vs/17/release/vs_BuildTools.exe
@@ -95,5 +126,9 @@ bash test/run_regression.sh
 
 ```powershell
 # Windows
-.\test\run_tests.ps1 -CompilerPath .\bin\v11_stage1.exe
+.\test\run_tests.ps1 -CompilerPath .\bin\stage1.exe
 ```
+
+The Windows runner uses the same native `nossa/ssa` and `O0/O1` test matrix
+and per-fixture `Mode`/`Opt` directives as the Linux runner. Hosted LLVM-only
+fixtures remain skipped on Windows.

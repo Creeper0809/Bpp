@@ -40,7 +40,18 @@ func generic_type_f64() -> *TypeInfo {
     return generic_make_typeinfo_from_fields(TYPE_F64, 0, 0, slice(0, 0), slice(0, 0), 0, 0, 0, 0, slice(0, 0));
 }
 
+func generic_current_module_uses_primitive_literal_default() -> u64 {
+    var module_name: []u8 = g_compiler_ctx.current_module;
+    if (module_name.ptr == 0 || module_name.len < 4) { return 0; }
+    if (str_eq(slice(module_name.ptr, 4), slice("std/", 4)) != 0) { return 1; }
+    if (str_eq(slice(module_name.ptr, 4), slice("std.", 4)) != 0) { return 1; }
+    return 0;
+}
+
 func generic_type_number() -> *TypeInfo {
+    if (generic_current_module_uses_primitive_literal_default() != 0) {
+        return generic_type_u64();
+    }
     var number_ti: *TypeInfo = lower_make_number_struct_typeinfo();
     if (number_ti != 0) { return number_ti; }
     return generic_type_u64();
@@ -67,15 +78,50 @@ func generic_number_unary_result_op(op: u64) -> u64 {
     return 0;
 }
 
+func generic_expr_is_integer_literal(expr: *AstNode) -> u64 {
+    if (expr == 0) { return 0; }
+    var kind: u64 = ast_kind(expr);
+    if (kind == AST_LITERAL) { return 1; }
+    if (kind == AST_UNARY) {
+        var un: *AstUnary = (*AstUnary)expr;
+        if (un.op != TOKEN_PLUS && un.op != TOKEN_MINUS && un.op != TOKEN_TILDE) { return 0; }
+        return generic_expr_is_integer_literal(un.operand);
+    }
+    if (kind == AST_BINARY) {
+        var bin: *AstBinary = (*AstBinary)expr;
+        if (generic_number_binary_result_op(bin.op) == 0) { return 0; }
+        if (generic_expr_is_integer_literal(bin.left) == 0) { return 0; }
+        if (generic_expr_is_integer_literal(bin.right) == 0) { return 0; }
+        return 1;
+    }
+    return 0;
+}
+
+func generic_type_is_integer_scalar(ti: *TypeInfo) -> u64 {
+    if (ti == 0 || ti.ptr_depth != 0) { return 0; }
+    return lower_type_kind_is_integer(ti.type_kind);
+}
+
+func generic_type_clone_local(ti: *TypeInfo) -> *TypeInfo {
+    if (ti == 0) { return generic_type_u64(); }
+    return generic_make_typeinfo_from_fields(
+        ti.type_kind,
+        ti.ptr_depth,
+        ti.is_tagged,
+        ti.struct_name,
+        ti.tag_layout,
+        ti.elem_type_kind,
+        ti.elem_ptr_depth,
+        ti.array_len,
+        ti.array_len_is_param,
+        ti.array_len_param
+    );
+}
+
 func generic_infer_binary_expr_type(bin: *AstBinary, symtab: *HashMap<u64, *TypeInfo>) -> *TypeInfo {
     if (bin == 0) { return generic_type_u64(); }
     var left_ti: *TypeInfo = generic_infer_expr_type(bin.left, symtab);
     var right_ti: *TypeInfo = generic_infer_expr_type(bin.right, symtab);
-
-    if (generic_number_binary_result_op(bin.op) != 0 &&
-        (lower_is_number_struct_type(left_ti) != 0 || lower_is_number_struct_type(right_ti) != 0)) {
-        return generic_type_number();
-    }
 
     var left_is_f64: u64 = 0;
     var right_is_f64: u64 = 0;
@@ -84,6 +130,24 @@ func generic_infer_binary_expr_type(bin: *AstBinary, symtab: *HashMap<u64, *Type
     if (left_is_f64 != 0 || right_is_f64 != 0) {
         if (bin.op == TOKEN_PLUS || bin.op == TOKEN_MINUS || bin.op == TOKEN_STAR || bin.op == TOKEN_SLASH) {
             return generic_type_f64();
+        }
+    }
+
+    if (generic_number_binary_result_op(bin.op) != 0) {
+        var left_is_number: u64 = lower_is_number_struct_type(left_ti);
+        var right_is_number: u64 = lower_is_number_struct_type(right_ti);
+        if (left_is_number != 0 || right_is_number != 0) {
+            if (right_is_number != 0 &&
+                generic_expr_is_integer_literal(bin.right) != 0 &&
+                generic_type_is_integer_scalar(left_ti) != 0) {
+                return generic_type_clone_local(left_ti);
+            }
+            if (left_is_number != 0 &&
+                generic_expr_is_integer_literal(bin.left) != 0 &&
+                generic_type_is_integer_scalar(right_ti) != 0) {
+                return generic_type_clone_local(right_ti);
+            }
+            return generic_type_number();
         }
     }
 
@@ -105,15 +169,15 @@ func generic_infer_unary_expr_type(un: *AstUnary, symtab: *HashMap<u64, *TypeInf
 
 func generic_infer_member_access_type(member: *AstMemberAccess, symtab: *HashMap<u64, *TypeInfo>) -> *TypeInfo {
     var obj_ti: *TypeInfo = generic_infer_expr_type(member.object, symtab);
-    if (ast_kind(member.object) == AST_IDENT && member.parent_ptr == 0) {
+    if (ast_kind(member.object) == AST_IDENT && u8_slice_ptr(member.parent) == 0) {
         var scope_id: *AstIdent = (*AstIdent)member.object;
-        var scoped_const: *ConstResult = (*ConstResult)sym_find_scoped_const(slice(scope_id.name_ptr, scope_id.name_len), slice(member.member_ptr, member.member_len));
+        var scoped_const: *ConstResult = (*ConstResult)sym_find_scoped_const(scope_id.name, member.member);
         if (scoped_const != 0 && scoped_const.found != 0) {
             return generic_type_u64();
         }
     }
     if (obj_ti == 0 || obj_ti.type_kind != TYPE_STRUCT) { return generic_type_u64(); }
-    var field_ti: *TypeInfo = generic_find_struct_field_type(slice(obj_ti.struct_name_ptr, obj_ti.struct_name_len), slice(member.parent_ptr, member.parent_len), slice(member.member_ptr, member.member_len));
+    var field_ti: *TypeInfo = generic_find_struct_field_type(obj_ti.struct_name, member.parent, member.member);
     if (field_ti != 0) { return field_ti; }
     return generic_type_u64();
 }
@@ -124,16 +188,16 @@ func generic_infer_try_type(tr: *AstTry, symtab: *HashMap<u64, *TypeInfo>) -> *T
     if (opt_ti.type_kind != TYPE_STRUCT || opt_ti.ptr_depth != 0) { return generic_type_u64(); }
     var try_fields: CompilerTryFieldNames = try_field_names_from_typeinfo(opt_ti);
     if (try_fields.found != 0) {
-        var vt: *TypeInfo = generic_find_struct_field_type(slice(opt_ti.struct_name_ptr, opt_ti.struct_name_len), slice(0, 0), slice(try_fields.value_ptr, try_fields.value_len));
+        var vt: *TypeInfo = generic_find_struct_field_type(opt_ti.struct_name, slice(0, 0), try_fields.value);
         if (vt != 0) { return vt; }
     }
     return generic_type_u64();
 }
 
 func generic_infer_call_return_type(call: *AstCall) -> *TypeInfo {
-    var resolved_ptr: u64 = call.name_ptr;
-    var resolved_len: u64 = call.name_len;
-    var resolved: *NameInfo = resolve_name(slice(call.name_ptr, call.name_len));
+    var resolved_ptr: u64 = u8_slice_ptr(call.name);
+    var resolved_len: u64 = u8_slice_len(call.name);
+    var resolved: *NameInfo = resolve_name(call.name);
     if (resolved != 0) {
         resolved_ptr = resolved.ptr;
         resolved_len = resolved.len;
@@ -142,9 +206,92 @@ func generic_infer_call_return_type(call: *AstCall) -> *TypeInfo {
         var n: u64 = g_compiler_ctx.all_func_sigs.len();
         for (var i: u64 = 0; i < n; i++) {
             var fn: *AstFunc = g_compiler_ctx.all_func_sigs.get(i);
-            if (str_eq(slice(fn.name_ptr, fn.name_len), slice(resolved_ptr, resolved_len))) {
-                return generic_make_typeinfo_from_fields(fn.ret_type, fn.ret_ptr_depth, fn.ret_is_tagged, slice(fn.ret_struct_name_ptr, fn.ret_struct_name_len), slice(fn.ret_tag_layout_ptr, fn.ret_tag_layout_len), 0, 0, 0, 0, slice(0, 0));
+            if (str_eq(fn.name, slice(resolved_ptr, resolved_len)) != 0 ||
+                str_eq(fn.name, call.name) != 0) {
+                return generic_make_typeinfo_from_func_return(fn);
             }
+        }
+    }
+    return generic_type_u64();
+}
+
+func generic_collect_call_arg_types(
+    args: *Vec<*AstNode>,
+    symtab: *HashMap<u64, *TypeInfo>
+) -> *Vec<*TypeInfo> {
+    if (args == 0) {
+        return new Vec<*TypeInfo>{heap_alloc((0) * sizeof(*TypeInfo)), 0, (0)};
+    }
+    var n: u64 = args.len();
+    var out: *Vec<*TypeInfo> =
+        new Vec<*TypeInfo>{heap_alloc((n) * sizeof(*TypeInfo)), 0, (n)};
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        out.push(generic_infer_expr_type(args.get(i), symtab));
+    }
+    return out;
+}
+
+func generic_make_typeinfo_from_func_return(fn: *AstFunc) -> *TypeInfo {
+    if (fn == 0) { return generic_type_u64(); }
+    return generic_make_typeinfo_from_fields(
+        fn.ret_type,
+        fn.ret_ptr_depth,
+        fn.ret_is_tagged,
+        fn.ret_struct_name,
+        fn.ret_tag_layout,
+        0,
+        0,
+        0,
+        0,
+        slice(0, 0)
+    );
+}
+
+func generic_find_func_signature_by_name(name: []u8) -> *AstFunc {
+    if (g_compiler_ctx.all_func_sigs == 0) { return 0; }
+    var n: u64 = g_compiler_ctx.all_func_sigs.len();
+    for (var i: u64 = 0; i < n; i = i + 1) {
+        var fn: *AstFunc = g_compiler_ctx.all_func_sigs.get(i);
+        if (fn != 0 && str_eq(fn.name, slice(name.ptr, name.len)) != 0) {
+            return fn;
+        }
+    }
+    return 0;
+}
+
+func generic_infer_method_call_type(
+    mc: *AstMethodCall,
+    symtab: *HashMap<u64, *TypeInfo>
+) -> *TypeInfo {
+    if (mc == 0) { return generic_type_u64(); }
+    var recv_ti: *TypeInfo = generic_infer_expr_type(mc.receiver, symtab);
+    if (recv_ti == 0 || recv_ti.type_kind != TYPE_STRUCT) {
+        return generic_type_u64();
+    }
+
+    var arg_count_hint: u64 = 0;
+    if (mc.args_vec != 0) { arg_count_hint = mc.args_vec.len(); }
+    var arg_types: *Vec<*TypeInfo> =
+        generic_collect_call_arg_types(mc.args_vec, symtab);
+
+    var resolved: CompilerMethodResolveResult =
+        sym_resolve_method_overload_with_count_fallback(
+            recv_ti.struct_name,
+            mc.method,
+            arg_types,
+            arg_count_hint
+        );
+    if (resolved.found != 0 && resolved.fn != 0) {
+        return generic_make_typeinfo_from_func_return(resolved.fn);
+    }
+
+    var method_name: *NameInfo =
+        build_method_name(recv_ti.struct_name, mc.method);
+    if (method_name != 0) {
+        var fn_sig: *AstFunc =
+            generic_find_func_signature_by_name(slice(method_name.ptr, method_name.len));
+        if (fn_sig != 0) {
+            return generic_make_typeinfo_from_func_return(fn_sig);
         }
     }
     return generic_type_u64();
@@ -154,7 +301,7 @@ func generic_infer_expr_type(expr: *AstNode, symtab: *HashMap<u64, *TypeInfo>) -
     var kind: u64 = ast_kind(expr);
     match (kind) {
         case AST_LITERAL:
-            return generic_type_u64();
+            return generic_type_number();
         case AST_STRING:
             return generic_type_u8_ptr();
         case AST_BINARY:
@@ -167,12 +314,12 @@ func generic_infer_expr_type(expr: *AstNode, symtab: *HashMap<u64, *TypeInfo>) -
             var id: *AstIdent = (*AstIdent)expr;
             var t_ptr: *TypeInfo = 0;
             if (symtab != 0) {
-                t_ptr = symtab.get(slice(id.name_ptr, id.name_len));
+                t_ptr = symtab.get(id.name);
             }
             if (t_ptr != 0) { return t_ptr; }
-            var ginfo: *GlobalInfo = sym_find_global_info(slice(id.name_ptr, id.name_len));
+            var ginfo: *GlobalInfo = sym_find_global_info(id.name);
             if (ginfo == 0) {
-                var resolved: *NameInfo = resolve_name(slice(id.name_ptr, id.name_len));
+                var resolved: *NameInfo = resolve_name(id.name);
                 if (resolved != 0) {
                     ginfo = sym_find_global_info(slice(resolved.ptr, resolved.len));
                 }
@@ -180,11 +327,11 @@ func generic_infer_expr_type(expr: *AstNode, symtab: *HashMap<u64, *TypeInfo>) -
             if (ginfo != 0) {
                 if (ginfo.typeinfo_ptr != 0) { return ginfo.typeinfo_ptr; }
             }
-            var const_res: *ConstResult = (*ConstResult)sym_find_const(slice(id.name_ptr, id.name_len));
+            var const_res: *ConstResult = (*ConstResult)sym_find_const(id.name);
             if (const_res != 0 && const_res.found != 0) {
                 return generic_type_u64();
             }
-            if (sym_func_exists(slice(id.name_ptr, id.name_len)) != 0) {
+            if (sym_func_exists(id.name) != 0) {
                 return generic_make_typeinfo_from_fields(TYPE_FUNC, 0, 0, slice(0, 0), slice(0, 0), 0, 0, 0, 0, slice(0, 0));
             }
             return generic_type_unknown();
@@ -193,24 +340,24 @@ func generic_infer_expr_type(expr: *AstNode, symtab: *HashMap<u64, *TypeInfo>) -
         case AST_ADDR_OF:
             var a: *AstAddrOf = (*AstAddrOf)expr;
             var base_t: *TypeInfo = generic_infer_expr_type(a.operand, symtab);
-            return generic_make_typeinfo_from_fields(base_t.type_kind, base_t.ptr_depth + 1, base_t.is_tagged, slice(base_t.struct_name_ptr, base_t.struct_name_len), slice(base_t.tag_layout_ptr, base_t.tag_layout_len), base_t.elem_type_kind, base_t.elem_ptr_depth, base_t.array_len, base_t.array_len_is_param, slice(base_t.array_len_param_ptr, base_t.array_len_param_len));
+            return generic_make_typeinfo_from_fields(base_t.type_kind, base_t.ptr_depth + 1, base_t.is_tagged, base_t.struct_name, base_t.tag_layout, base_t.elem_type_kind, base_t.elem_ptr_depth, base_t.array_len, base_t.array_len_is_param, base_t.array_len_param);
         case AST_DEREF:
             var d: *AstDeref = (*AstDeref)expr;
             var dt: *TypeInfo = generic_infer_expr_type(d.operand, symtab);
             if (dt.ptr_depth == 0) { return generic_type_u64(); }
-            return generic_make_typeinfo_from_fields(dt.type_kind, dt.ptr_depth - 1, dt.is_tagged, slice(dt.struct_name_ptr, dt.struct_name_len), slice(dt.tag_layout_ptr, dt.tag_layout_len), dt.elem_type_kind, dt.elem_ptr_depth, dt.array_len, dt.array_len_is_param, slice(dt.array_len_param_ptr, dt.array_len_param_len));
+            return generic_make_typeinfo_from_fields(dt.type_kind, dt.ptr_depth - 1, dt.is_tagged, dt.struct_name, dt.tag_layout, dt.elem_type_kind, dt.elem_ptr_depth, dt.array_len, dt.array_len_is_param, dt.array_len_param);
         case AST_CAST:
             var c: *AstCast = (*AstCast)expr;
-            return generic_make_typeinfo_from_fields(c.target_type, c.target_ptr_depth, c.target_is_tagged, slice(c.struct_name_ptr, c.struct_name_len), slice(c.tag_layout_ptr, c.tag_layout_len), 0, 0, 0, 0, slice(0, 0));
+            return generic_make_typeinfo_from_fields(c.target_type, c.target_ptr_depth, c.target_is_tagged, c.struct_name, c.tag_layout, 0, 0, 0, 0, slice(0, 0));
         case AST_INDEX:
         case AST_SAFE_INDEX:
             var ix: *AstIndex = (*AstIndex)expr;
             var bt: *TypeInfo = generic_infer_expr_type(ix.base, symtab);
             if (bt.type_kind == TYPE_ARRAY || bt.type_kind == TYPE_SLICE) {
-                return generic_make_typeinfo_from_fields(bt.elem_type_kind, bt.elem_ptr_depth, 0, slice(bt.struct_name_ptr, bt.struct_name_len), slice(0, 0), 0, 0, 0, 0, slice(0, 0));
+                return generic_make_typeinfo_from_fields(bt.elem_type_kind, bt.elem_ptr_depth, 0, bt.struct_name, slice(0, 0), 0, 0, 0, 0, slice(0, 0));
             }
             if (bt.ptr_depth > 0) {
-                return generic_make_typeinfo_from_fields(bt.type_kind, bt.ptr_depth - 1, bt.is_tagged, slice(bt.struct_name_ptr, bt.struct_name_len), slice(bt.tag_layout_ptr, bt.tag_layout_len), bt.elem_type_kind, bt.elem_ptr_depth, bt.array_len, bt.array_len_is_param, slice(bt.array_len_param_ptr, bt.array_len_param_len));
+                return generic_make_typeinfo_from_fields(bt.type_kind, bt.ptr_depth - 1, bt.is_tagged, bt.struct_name, bt.tag_layout, bt.elem_type_kind, bt.elem_ptr_depth, bt.array_len, bt.array_len_is_param, bt.array_len_param);
             }
             return generic_type_u64();
         case AST_MEMBER_ACCESS:
@@ -226,15 +373,15 @@ func generic_infer_expr_type(expr: *AstNode, symtab: *HashMap<u64, *TypeInfo>) -
             return generic_type_f64();
         case AST_STACK_CTOR:
             var sc3: *AstStackCtor = (*AstStackCtor)expr;
-            return generic_make_typeinfo_from_fields(sc3.type_kind, sc3.ptr_depth, sc3.is_tagged, slice(sc3.struct_name_ptr, sc3.struct_name_len), slice(sc3.tag_layout_ptr, sc3.tag_layout_len), sc3.elem_type_kind, sc3.elem_ptr_depth, sc3.array_len, sc3.array_len_is_param, slice(sc3.array_len_param_ptr, sc3.array_len_param_len));
+            return generic_make_typeinfo_from_fields(sc3.type_kind, sc3.ptr_depth, sc3.is_tagged, sc3.struct_name, sc3.tag_layout, sc3.elem_type_kind, sc3.elem_ptr_depth, sc3.array_len, sc3.array_len_is_param, sc3.array_len_param);
         case AST_NEW:
             var nw3: *AstNew = (*AstNew)expr;
-            return generic_make_typeinfo_from_fields(nw3.type_kind, nw3.ptr_depth + 1, nw3.is_tagged, slice(nw3.struct_name_ptr, nw3.struct_name_len), slice(nw3.tag_layout_ptr, nw3.tag_layout_len), nw3.elem_type_kind, nw3.elem_ptr_depth, nw3.array_len, nw3.array_len_is_param, slice(nw3.array_len_param_ptr, nw3.array_len_param_len));
+            return generic_make_typeinfo_from_fields(nw3.type_kind, nw3.ptr_depth + 1, nw3.is_tagged, nw3.struct_name, nw3.tag_layout, nw3.elem_type_kind, nw3.elem_ptr_depth, nw3.array_len, nw3.array_len_is_param, nw3.array_len_param);
         case AST_GENERIC_STRUCT_LITERAL:
             var gsl: *AstGenericStructLiteral = (*AstGenericStructLiteral)expr;
-            var tpl: *GenericStructTemplate = sym_find_generic_struct_template_by_name(slice(gsl.name_ptr, gsl.name_len));
+            var tpl: *GenericStructTemplate = sym_find_generic_struct_template_by_name(gsl.name);
             if (tpl == 0) {
-                var resolved_name: *NameInfo = resolve_name(slice(gsl.name_ptr, gsl.name_len));
+                var resolved_name: *NameInfo = resolve_name(gsl.name);
                 if (resolved_name != 0) {
                     tpl = sym_find_generic_struct_template_by_name(slice(resolved_name.ptr, resolved_name.len));
                 }
@@ -248,29 +395,33 @@ func generic_infer_expr_type(expr: *AstNode, symtab: *HashMap<u64, *TypeInfo>) -
         case AST_CALL:
             var call_expr: *AstCall = (*AstCall)expr;
             if (symtab != 0) {
-                var local_call_ti: *TypeInfo = symtab.get(slice(call_expr.name_ptr, call_expr.name_len));
+                var local_call_ti: *TypeInfo = symtab.get(call_expr.name);
                 if (local_call_ti != 0) {
                     // Local symbol call (fn ptr / closure handle / shadowing value):
                     // do not resolve via free-function tables by suffix.
                     return generic_type_u64();
                 }
             }
-            var call_resolved_ptr: u64 = call_expr.name_ptr;
-            var call_resolved_len: u64 = call_expr.name_len;
-            var call_resolved: *NameInfo = resolve_name(slice(call_expr.name_ptr, call_expr.name_len));
+            var call_resolved_ptr: u64 = u8_slice_ptr(call_expr.name);
+            var call_resolved_len: u64 = u8_slice_len(call_expr.name);
+            var call_resolved: *NameInfo = resolve_name(call_expr.name);
             if (call_resolved != 0) {
                 call_resolved_ptr = call_resolved.ptr;
                 call_resolved_len = call_resolved.len;
             }
             var call_ginfo: *GlobalInfo = sym_find_global_info(slice(call_resolved_ptr, call_resolved_len));
-            if (call_ginfo == 0 && (call_resolved_ptr != call_expr.name_ptr || call_resolved_len != call_expr.name_len)) {
-                call_ginfo = sym_find_global_info(slice(call_expr.name_ptr, call_expr.name_len));
+            if (call_ginfo == 0 && (call_resolved_ptr != u8_slice_ptr(call_expr.name) || call_resolved_len != u8_slice_len(call_expr.name))) {
+                call_ginfo = sym_find_global_info(call_expr.name);
             }
             if (call_ginfo != 0) {
                 if (call_ginfo.typeinfo_ptr != 0) { return call_ginfo.typeinfo_ptr; }
                 return generic_type_u64();
             }
             return generic_infer_call_return_type(call_expr);
+        case AST_METHOD_CALL:
+        case AST_SAFE_METHOD_CALL:
+            var mc_expr: *AstMethodCall = (*AstMethodCall)expr;
+            return generic_infer_method_call_type(mc_expr, symtab);
         default:
             return generic_type_u64();
     }
@@ -282,7 +433,7 @@ func generic_collect_var_decls(stmt: *AstNode, symtab: *HashMap<u64, *TypeInfo>)
         case AST_VAR_DECL:
             var vd: *AstVarDecl = (*AstVarDecl)stmt;
             var t_ptr: *TypeInfo = generic_make_typeinfo_from_vardecl(vd);
-            symtab.put(slice(vd.name_ptr, vd.name_len), t_ptr);
+            symtab.put(vd.name, t_ptr);
             break;
         case AST_BLOCK:
             var blk: *AstBlock = (*AstBlock)stmt;
@@ -334,7 +485,7 @@ func generic_build_symtab_for_func(fn: *AstFunc) -> *HashMap<u64, *TypeInfo> {
         for (var i: u64 = 0; i < n; i++) {
             var p: *Param = params.get(i);
             var t_ptr: *TypeInfo = generic_make_typeinfo_from_param(p);
-            symtab.put(slice(p.name_ptr, p.name_len), t_ptr);
+            symtab.put(p.name, t_ptr);
         }
     }
     if (fn.body != 0) {
@@ -394,16 +545,16 @@ func generic_clone_expr_generic_call(gc: *AstGenericCall, bindings: *Vec<*Generi
         if (ga.kind == GENERIC_KIND_TYPE) {
             var ti: *TypeInfo = ga.type_ptr;
             if (ti.type_kind == TYPE_GENERIC) {
-                var chk: *GenericBinding = generic_find_binding(bindings, GENERIC_KIND_TYPE, slice(ti.struct_name_ptr, ti.struct_name_len));
+                var chk: *GenericBinding = generic_find_binding(bindings, GENERIC_KIND_TYPE, ti.struct_name);
                 if (chk == 0 && GENERIC_DEBUG != 0) {
                     emit_stderr("[DEBUG] Missing binding for generic arg in call: ");
-                    emit_stderr_len(gc.name_ptr, gc.name_len);
+                    emit_stderr_len(u8_slice_ptr(gc.name), u8_slice_len(gc.name));
                     emit_stderr(" arg=");
-                    emit_stderr_len(ti.struct_name_ptr, ti.struct_name_len);
+                    emit_stderr_len(u8_slice_ptr(ti.struct_name), u8_slice_len(ti.struct_name));
                     emit_stderr("\n");
                 }
             }
-            ng.type_ptr = generic_subst_typeinfo(ti.type_kind, ti.ptr_depth, ti.is_tagged, slice(ti.struct_name_ptr, ti.struct_name_len), slice(ti.tag_layout_ptr, ti.tag_layout_len), ti.elem_type_kind, ti.elem_ptr_depth, ti.array_len, ti.array_len_is_param, slice(ti.array_len_param_ptr, ti.array_len_param_len), ti.elem_typeinfo, bindings);
+            ng.type_ptr = generic_subst_typeinfo(ti.type_kind, ti.ptr_depth, ti.is_tagged, ti.struct_name, ti.tag_layout, ti.elem_type_kind, ti.elem_ptr_depth, ti.array_len, ti.array_len_is_param, ti.array_len_param, ti.elem_typeinfo, bindings);
         } else {
             ng.type_ptr = 0;
         }
@@ -411,32 +562,32 @@ func generic_clone_expr_generic_call(gc: *AstGenericCall, bindings: *Vec<*Generi
     }
     var args_g: *Vec<*AstNode> = generic_clone_args_vec(gc.args_vec, bindings);
     var arg_names: *Vec<*NameInfo> = generic_clone_arg_names(gc.arg_names_vec);
-    return (*AstNode)ast_generic_call_with_origin_named(slice(gc.name_ptr, gc.name_len), gargs, args_g, arg_names, gc.origin);
+    return (*AstNode)ast_generic_call_with_origin_named(gc.name, gargs, args_g, arg_names, gc.origin);
 }
 
 func generic_clone_expr_new(nw: *AstNew, bindings: *Vec<*GenericBinding>) -> *AstNode {
-    var sub3: *TypeInfo = generic_subst_typeinfo(nw.type_kind, nw.ptr_depth, nw.is_tagged, slice(nw.struct_name_ptr, nw.struct_name_len), slice(nw.tag_layout_ptr, nw.tag_layout_len), nw.elem_type_kind, nw.elem_ptr_depth, nw.array_len, nw.array_len_is_param, slice(nw.array_len_param_ptr, nw.array_len_param_len), nw.elem_typeinfo, bindings);
+    var sub3: *TypeInfo = generic_subst_typeinfo(nw.type_kind, nw.ptr_depth, nw.is_tagged, nw.struct_name, nw.tag_layout, nw.elem_type_kind, nw.elem_ptr_depth, nw.array_len, nw.array_len_is_param, nw.array_len_param, nw.elem_typeinfo, bindings);
     if (sub3.elem_typeinfo == 0) {
         sub3.elem_typeinfo = nw.elem_typeinfo;
     }
     var lit2: *AstNode = generic_clone_expr(nw.literal_expr, bindings);
     var args4: *Vec<*AstNode> = generic_clone_args_vec(nw.ctor_args_vec, bindings);
     if (sub3.type_kind == TYPE_STRUCT) {
-        generic_clone_maybe_instantiate_ctor_template(slice(sub3.struct_name_ptr, sub3.struct_name_len), args4);
+        generic_clone_maybe_instantiate_ctor_template(sub3.struct_name, args4);
     }
-    return (*AstNode)ast_new(sub3.type_kind, sub3.ptr_depth, sub3.is_tagged, slice(sub3.struct_name_ptr, sub3.struct_name_len), slice(sub3.tag_layout_ptr, sub3.tag_layout_len), sub3.elem_type_kind, sub3.elem_ptr_depth, sub3.array_len, sub3.array_len_is_param, slice(sub3.array_len_param_ptr, sub3.array_len_param_len), sub3.elem_typeinfo, lit2, args4);
+    return (*AstNode)ast_new(sub3.type_kind, sub3.ptr_depth, sub3.is_tagged, sub3.struct_name, sub3.tag_layout, sub3.elem_type_kind, sub3.elem_ptr_depth, sub3.array_len, sub3.array_len_is_param, sub3.array_len_param, sub3.elem_typeinfo, lit2, args4);
 }
 
 func generic_clone_expr_stack_ctor(sc: *AstStackCtor, bindings: *Vec<*GenericBinding>) -> *AstNode {
-    var sub_sc: *TypeInfo = generic_subst_typeinfo(sc.type_kind, sc.ptr_depth, sc.is_tagged, slice(sc.struct_name_ptr, sc.struct_name_len), slice(sc.tag_layout_ptr, sc.tag_layout_len), sc.elem_type_kind, sc.elem_ptr_depth, sc.array_len, sc.array_len_is_param, slice(sc.array_len_param_ptr, sc.array_len_param_len), sc.elem_typeinfo, bindings);
+    var sub_sc: *TypeInfo = generic_subst_typeinfo(sc.type_kind, sc.ptr_depth, sc.is_tagged, sc.struct_name, sc.tag_layout, sc.elem_type_kind, sc.elem_ptr_depth, sc.array_len, sc.array_len_is_param, sc.array_len_param, sc.elem_typeinfo, bindings);
     if (sub_sc.elem_typeinfo == 0) {
         sub_sc.elem_typeinfo = sc.elem_typeinfo;
     }
     var args_sc: *Vec<*AstNode> = generic_clone_args_vec(sc.ctor_args_vec, bindings);
     if (sub_sc.type_kind == TYPE_STRUCT) {
-        generic_clone_maybe_instantiate_ctor_template(slice(sub_sc.struct_name_ptr, sub_sc.struct_name_len), args_sc);
+        generic_clone_maybe_instantiate_ctor_template(sub_sc.struct_name, args_sc);
     }
-    return (*AstNode)ast_stack_ctor(sub_sc.type_kind, sub_sc.ptr_depth, sub_sc.is_tagged, slice(sub_sc.struct_name_ptr, sub_sc.struct_name_len), slice(sub_sc.tag_layout_ptr, sub_sc.tag_layout_len), sub_sc.elem_type_kind, sub_sc.elem_ptr_depth, sub_sc.array_len, sub_sc.array_len_is_param, slice(sub_sc.array_len_param_ptr, sub_sc.array_len_param_len), sub_sc.elem_typeinfo, args_sc);
+    return (*AstNode)ast_stack_ctor(sub_sc.type_kind, sub_sc.ptr_depth, sub_sc.is_tagged, sub_sc.struct_name, sub_sc.tag_layout, sub_sc.elem_type_kind, sub_sc.elem_ptr_depth, sub_sc.array_len, sub_sc.array_len_is_param, sub_sc.array_len_param, sub_sc.elem_typeinfo, args_sc);
 }
 
 func generic_clone_expr(node: *AstNode, bindings: *Vec<*GenericBinding>) -> *AstNode {
@@ -448,13 +599,13 @@ func generic_clone_expr(node: *AstNode, bindings: *Vec<*GenericBinding>) -> *Ast
         case AST_LITERAL:
             return ast_literal(nref.literal.value);
         case AST_FLOAT:
-            return ast_float(slice(nref.float_lit.str_ptr, nref.float_lit.str_len));
+            return ast_float(nref.float_lit.str);
         case AST_IDENT:
-            return ast_ident(slice(nref.ident.name_ptr, nref.ident.name_len));
+            return ast_ident(nref.ident.name);
         case AST_SUPER:
             return (*AstNode)ast_super();
         case AST_STRING:
-            return ast_string(slice(nref.string_lit.str_ptr, nref.string_lit.str_len));
+            return ast_string(nref.string_lit.str);
         case AST_BINARY:
             return ast_binary(
                 nref.binary.op,
@@ -466,7 +617,7 @@ func generic_clone_expr(node: *AstNode, bindings: *Vec<*GenericBinding>) -> *Ast
         case AST_CALL:
             var args: *Vec<*AstNode> = generic_clone_args_vec(nref.call.args_vec, bindings);
             var arg_names: *Vec<*NameInfo> = generic_clone_arg_names(nref.call.arg_names_vec);
-            return (*AstNode)ast_call_with_origin_named(slice(nref.call.name_ptr, nref.call.name_len), args, arg_names, nref.call.origin);
+            return (*AstNode)ast_call_with_origin_named(nref.call.name, args, arg_names, nref.call.origin);
         case AST_GENERIC_CALL:
             return generic_clone_expr_generic_call(nref.generic_call, bindings);
         case AST_GENERIC_STRUCT_LITERAL:
@@ -479,14 +630,14 @@ func generic_clone_expr(node: *AstNode, bindings: *Vec<*GenericBinding>) -> *Ast
                 ng2.value = ga2.value;
                 if (ga2.kind == GENERIC_KIND_TYPE) {
                     var ti3: *TypeInfo = ga2.type_ptr;
-                    ng2.type_ptr = generic_subst_typeinfo(ti3.type_kind, ti3.ptr_depth, ti3.is_tagged, slice(ti3.struct_name_ptr, ti3.struct_name_len), slice(ti3.tag_layout_ptr, ti3.tag_layout_len), ti3.elem_type_kind, ti3.elem_ptr_depth, ti3.array_len, ti3.array_len_is_param, slice(ti3.array_len_param_ptr, ti3.array_len_param_len), ti3.elem_typeinfo, bindings);
+                    ng2.type_ptr = generic_subst_typeinfo(ti3.type_kind, ti3.ptr_depth, ti3.is_tagged, ti3.struct_name, ti3.tag_layout, ti3.elem_type_kind, ti3.elem_ptr_depth, ti3.array_len, ti3.array_len_is_param, ti3.array_len_param, ti3.elem_typeinfo, bindings);
                 } else {
                     ng2.type_ptr = 0;
                 }
                 gargs2.push(ng2);
             }
             var vals2: *Vec<*AstNode> = generic_clone_args_vec(nref.generic_struct_lit.values_vec, bindings);
-            return (*AstNode)ast_generic_struct_literal(slice(nref.generic_struct_lit.name_ptr, nref.generic_struct_lit.name_len), gargs2, vals2);
+            return (*AstNode)ast_generic_struct_literal(nref.generic_struct_lit.name, gargs2, vals2);
         case AST_STATIC_GENERIC_CALL:
             var sg_gargs: *Vec<*GenericArg> = new Vec<*GenericArg>{heap_alloc((4) * sizeof(*GenericArg)), 0, (4)};
             var sg_n: u64 = nref.static_generic_call.generic_args_vec.len();
@@ -497,7 +648,7 @@ func generic_clone_expr(node: *AstNode, bindings: *Vec<*GenericBinding>) -> *Ast
                 sg_ng.value = sg_ga.value;
                 if (sg_ga.kind == GENERIC_KIND_TYPE) {
                     var sg_ti: *TypeInfo = sg_ga.type_ptr;
-                    sg_ng.type_ptr = generic_subst_typeinfo(sg_ti.type_kind, sg_ti.ptr_depth, sg_ti.is_tagged, slice(sg_ti.struct_name_ptr, sg_ti.struct_name_len), slice(sg_ti.tag_layout_ptr, sg_ti.tag_layout_len), sg_ti.elem_type_kind, sg_ti.elem_ptr_depth, sg_ti.array_len, sg_ti.array_len_is_param, slice(sg_ti.array_len_param_ptr, sg_ti.array_len_param_len), sg_ti.elem_typeinfo, bindings);
+                    sg_ng.type_ptr = generic_subst_typeinfo(sg_ti.type_kind, sg_ti.ptr_depth, sg_ti.is_tagged, sg_ti.struct_name, sg_ti.tag_layout, sg_ti.elem_type_kind, sg_ti.elem_ptr_depth, sg_ti.array_len, sg_ti.array_len_is_param, sg_ti.array_len_param, sg_ti.elem_typeinfo, bindings);
                 } else {
                     sg_ng.type_ptr = 0;
                 }
@@ -506,8 +657,8 @@ func generic_clone_expr(node: *AstNode, bindings: *Vec<*GenericBinding>) -> *Ast
             var sg_args: *Vec<*AstNode> = generic_clone_args_vec(nref.static_generic_call.args_vec, bindings);
             var sg_arg_names: *Vec<*NameInfo> = generic_clone_arg_names(nref.static_generic_call.arg_names_vec);
             return (*AstNode)ast_static_generic_call_named(
-                slice(nref.static_generic_call.struct_name_ptr, nref.static_generic_call.struct_name_len),
-                slice(nref.static_generic_call.method_ptr, nref.static_generic_call.method_len),
+                nref.static_generic_call.struct_name,
+                nref.static_generic_call.method,
                 sg_gargs,
                 sg_args,
                 sg_arg_names
@@ -519,47 +670,47 @@ func generic_clone_expr(node: *AstNode, bindings: *Vec<*GenericBinding>) -> *Ast
         case AST_DEREF8:
             return ast_deref8(generic_clone_expr(nref.deref8.operand, bindings));
         case AST_CAST:
-            var sub: *TypeInfo = generic_subst_typeinfo(nref.cast_expr.target_type, nref.cast_expr.target_ptr_depth, nref.cast_expr.target_is_tagged, slice(nref.cast_expr.struct_name_ptr, nref.cast_expr.struct_name_len), slice(nref.cast_expr.tag_layout_ptr, nref.cast_expr.tag_layout_len), 0, 0, 0, 0, slice(0, 0), 0, bindings);
+            var sub: *TypeInfo = generic_subst_typeinfo(nref.cast_expr.target_type, nref.cast_expr.target_ptr_depth, nref.cast_expr.target_is_tagged, nref.cast_expr.struct_name, nref.cast_expr.tag_layout, 0, 0, 0, 0, slice(0, 0), 0, bindings);
             var ti: *TypeInfo = sub;
-            return ast_cast_ex(generic_clone_expr(nref.cast_expr.expr, bindings), ti.type_kind, ti.ptr_depth, ti.is_tagged, slice(ti.struct_name_ptr, ti.struct_name_len), slice(ti.tag_layout_ptr, ti.tag_layout_len));
+            return ast_cast_ex(generic_clone_expr(nref.cast_expr.expr, bindings), ti.type_kind, ti.ptr_depth, ti.is_tagged, ti.struct_name, ti.tag_layout);
         case AST_MEMBER_ACCESS:
-            if (nref.member_access.parent_ptr != 0) {
+            if (u8_slice_ptr(nref.member_access.parent) != 0) {
                 return ast_member_access_scoped(
                     generic_clone_expr(nref.member_access.object, bindings),
-                    slice(nref.member_access.parent_ptr, nref.member_access.parent_len),
-                    slice(nref.member_access.member_ptr, nref.member_access.member_len)
+                    nref.member_access.parent,
+                    nref.member_access.member
                 );
             }
-            return ast_member_access(generic_clone_expr(nref.member_access.object, bindings), slice(nref.member_access.member_ptr, nref.member_access.member_len));
+            return ast_member_access(generic_clone_expr(nref.member_access.object, bindings), nref.member_access.member);
         case AST_SAFE_MEMBER_ACCESS:
-            if (nref.member_access.parent_ptr != 0) {
+            if (u8_slice_ptr(nref.member_access.parent) != 0) {
                 return ast_safe_member_access_scoped(
                     generic_clone_expr(nref.member_access.object, bindings),
-                    slice(nref.member_access.parent_ptr, nref.member_access.parent_len),
-                    slice(nref.member_access.member_ptr, nref.member_access.member_len)
+                    nref.member_access.parent,
+                    nref.member_access.member
                 );
             }
-            return ast_safe_member_access(generic_clone_expr(nref.member_access.object, bindings), slice(nref.member_access.member_ptr, nref.member_access.member_len));
+            return ast_safe_member_access(generic_clone_expr(nref.member_access.object, bindings), nref.member_access.member);
         case AST_METHOD_CALL:
             var args2: *Vec<*AstNode> = generic_clone_args_vec(nref.method_call.args_vec, bindings);
             var arg_names2: *Vec<*NameInfo> = generic_clone_arg_names(nref.method_call.arg_names_vec);
-            return (*AstNode)ast_method_call_named(generic_clone_expr(nref.method_call.receiver, bindings), slice(nref.method_call.method_ptr, nref.method_call.method_len), args2, arg_names2);
+            return (*AstNode)ast_method_call_named(generic_clone_expr(nref.method_call.receiver, bindings), nref.method_call.method, args2, arg_names2);
         case AST_SAFE_METHOD_CALL:
             var sargs2: *Vec<*AstNode> = generic_clone_args_vec(nref.method_call.args_vec, bindings);
             var sarg_names2: *Vec<*NameInfo> = generic_clone_arg_names(nref.method_call.arg_names_vec);
-            return (*AstNode)ast_safe_method_call_named(generic_clone_expr(nref.method_call.receiver, bindings), slice(nref.method_call.method_ptr, nref.method_call.method_len), sargs2, sarg_names2);
+            return (*AstNode)ast_safe_method_call_named(generic_clone_expr(nref.method_call.receiver, bindings), nref.method_call.method, sargs2, sarg_names2);
         case AST_TRY:
             return ast_try(generic_clone_expr(nref.try_expr.operand, bindings));
         case AST_STRUCT_LITERAL:
             var vals: *Vec<*AstNode> = generic_clone_args_vec(nref.struct_lit.values_vec, bindings);
             return ast_struct_literal(nref.struct_lit.struct_def, vals);
         case AST_SIZEOF:
-            var sub2: *TypeInfo = generic_subst_typeinfo(nref.sizeof_type.type_kind, nref.sizeof_type.ptr_depth, 0, slice(nref.sizeof_type.struct_name_ptr, nref.sizeof_type.struct_name_len), slice(0, 0), nref.sizeof_type.elem_type_kind, nref.sizeof_type.elem_ptr_depth, nref.sizeof_type.array_len, nref.sizeof_type.array_len_is_param, slice(nref.sizeof_type.array_len_param_ptr, nref.sizeof_type.array_len_param_len), nref.sizeof_type.elem_typeinfo, bindings);
+            var sub2: *TypeInfo = generic_subst_typeinfo(nref.sizeof_type.type_kind, nref.sizeof_type.ptr_depth, 0, nref.sizeof_type.struct_name, slice(0, 0), nref.sizeof_type.elem_type_kind, nref.sizeof_type.elem_ptr_depth, nref.sizeof_type.array_len, nref.sizeof_type.array_len_is_param, nref.sizeof_type.array_len_param, nref.sizeof_type.elem_typeinfo, bindings);
             var ti2: *TypeInfo = sub2;
             if (ti2.elem_typeinfo == 0) {
                 ti2.elem_typeinfo = nref.sizeof_type.elem_typeinfo;
             }
-            return ast_sizeof(ti2.type_kind, ti2.ptr_depth, slice(ti2.struct_name_ptr, ti2.struct_name_len), ti2.elem_type_kind, ti2.elem_ptr_depth, ti2.array_len, ti2.array_len_is_param, slice(ti2.array_len_param_ptr, ti2.array_len_param_len), ti2.elem_typeinfo);
+            return ast_sizeof(ti2.type_kind, ti2.ptr_depth, ti2.struct_name, ti2.elem_type_kind, ti2.elem_ptr_depth, ti2.array_len, ti2.array_len_is_param, ti2.array_len_param, ti2.elem_typeinfo);
         case AST_SIZEOF_EXPR:
             return ast_sizeof_expr(generic_clone_expr(nref.sizeof_expr.expr, bindings));
         case AST_INDEX:
@@ -589,23 +740,19 @@ func generic_clone_stmt(node: *AstNode, bindings: *Vec<*GenericBinding>) -> *Ast
         case AST_RETURN:
             return ast_return(generic_clone_expr(nref.ret_stmt.expr, bindings));
         case AST_VAR_DECL:
-            var ti: *TypeInfo = generic_subst_typeinfo(nref.var_decl.type_kind, nref.var_decl.ptr_depth, nref.var_decl.is_tagged, slice(nref.var_decl.struct_name_ptr, nref.var_decl.struct_name_len), slice(nref.var_decl.tag_layout_ptr, nref.var_decl.tag_layout_len), nref.var_decl.elem_type_kind, nref.var_decl.elem_ptr_depth, nref.var_decl.array_len, nref.var_decl.array_len_is_param, slice(nref.var_decl.array_len_param_ptr, nref.var_decl.array_len_param_len), nref.var_decl.elem_typeinfo, bindings);
-            var decl: *AstVarDecl = ast_var_decl(slice(nref.var_decl.name_ptr, nref.var_decl.name_len), ti.type_kind, ti.ptr_depth, generic_clone_expr(nref.var_decl.init_expr, bindings));
+            var ti: *TypeInfo = generic_subst_typeinfo(nref.var_decl.type_kind, nref.var_decl.ptr_depth, nref.var_decl.is_tagged, nref.var_decl.struct_name, nref.var_decl.tag_layout, nref.var_decl.elem_type_kind, nref.var_decl.elem_ptr_depth, nref.var_decl.array_len, nref.var_decl.array_len_is_param, nref.var_decl.array_len_param, nref.var_decl.elem_typeinfo, bindings);
+            var decl: *AstVarDecl = ast_var_decl(nref.var_decl.name, ti.type_kind, ti.ptr_depth, generic_clone_expr(nref.var_decl.init_expr, bindings));
             decl.is_tagged = ti.is_tagged;
-            decl.struct_name_ptr = ti.struct_name_ptr;
-            decl.struct_name_len = ti.struct_name_len;
-            if ((decl.struct_name_ptr == 0 || decl.struct_name_len == 0) && nref.var_decl.struct_name_ptr != 0 && nref.var_decl.struct_name_len != 0) {
-                decl.struct_name_ptr = nref.var_decl.struct_name_ptr;
-                decl.struct_name_len = nref.var_decl.struct_name_len;
+            decl.struct_name = ti.struct_name;
+            if ((u8_slice_ptr(decl.struct_name) == 0 || u8_slice_len(decl.struct_name) == 0) && u8_slice_ptr(nref.var_decl.struct_name) != 0 && u8_slice_len(nref.var_decl.struct_name) != 0) {
+                decl.struct_name = nref.var_decl.struct_name;
             }
-            decl.tag_layout_ptr = ti.tag_layout_ptr;
-            decl.tag_layout_len = ti.tag_layout_len;
+            decl.tag_layout = ti.tag_layout;
             decl.elem_type_kind = ti.elem_type_kind;
             decl.elem_ptr_depth = ti.elem_ptr_depth;
             decl.array_len = ti.array_len;
             decl.array_len_is_param = ti.array_len_is_param;
-            decl.array_len_param_ptr = ti.array_len_param_ptr;
-            decl.array_len_param_len = ti.array_len_param_len;
+            decl.array_len_param = ti.array_len_param;
             if (ti.elem_typeinfo != 0) {
                 decl.elem_typeinfo = ti.elem_typeinfo;
             } else {
@@ -659,7 +806,7 @@ func generic_clone_stmt(node: *AstNode, bindings: *Vec<*GenericBinding>) -> *Ast
             for (var i2: u64 = 0; i2 < tn; i2++) { text_vec.push(nref.asm_stmt.text_vec.get(i2)); }
             return ast_asm(text_vec);
         case AST_ALIAS:
-            return (*AstNode)ast_alias(slice(nref.alias_stmt.reg_ptr, nref.alias_stmt.reg_len), slice(nref.alias_stmt.name_ptr, nref.alias_stmt.name_len));
+            return (*AstNode)ast_alias(nref.alias_stmt.reg, nref.alias_stmt.name);
         case AST_DEFER:
             return (*AstNode)ast_defer(generic_clone_stmt(nref.defer_stmt.stmt, bindings));
         case AST_DELETE:
@@ -675,10 +822,9 @@ func generic_clone_func(template_ptr: *AstFunc, bindings: *Vec<*GenericBinding>,
     var pn: u64 = fn.params_vec.len();
     for (var i: u64 = 0; i < pn; i++) {
         var p: *Param = fn.params_vec.get(i);
-        var ti: *TypeInfo = generic_subst_typeinfo(p.type_kind, p.ptr_depth, p.is_tagged, slice(p.struct_name_ptr, p.struct_name_len), slice(p.tag_layout_ptr, p.tag_layout_len), p.elem_type_kind, p.elem_ptr_depth, p.array_len, p.array_len_is_param, slice(p.array_len_param_ptr, p.array_len_param_len), p.elem_typeinfo, bindings);
+        var ti: *TypeInfo = generic_subst_typeinfo(p.type_kind, p.ptr_depth, p.is_tagged, p.struct_name, p.tag_layout, p.elem_type_kind, p.elem_ptr_depth, p.array_len, p.array_len_is_param, p.array_len_param, p.elem_typeinfo, bindings);
         var np: *Param = new Param{};
-        np.name_ptr = p.name_ptr;
-        np.name_len = p.name_len;
+        np.name = p.name;
         np.fill_from_typeinfo(ti);
         if (np.elem_typeinfo == 0) {
             np.elem_typeinfo = p.elem_typeinfo;
@@ -686,9 +832,9 @@ func generic_clone_func(template_ptr: *AstFunc, bindings: *Vec<*GenericBinding>,
         params_out.push(np);
     }
 
-    var rt: *TypeInfo = generic_subst_typeinfo(fn.ret_type, fn.ret_ptr_depth, fn.ret_is_tagged, slice(fn.ret_struct_name_ptr, fn.ret_struct_name_len), slice(fn.ret_tag_layout_ptr, fn.ret_tag_layout_len), 0, 0, 0, 0, slice(0, 0), 0, bindings);
+    var rt: *TypeInfo = generic_subst_typeinfo(fn.ret_type, fn.ret_ptr_depth, fn.ret_is_tagged, fn.ret_struct_name, fn.ret_tag_layout, 0, 0, 0, 0, slice(0, 0), 0, bindings);
     var body_out: *AstNode = generic_clone_stmt(fn.body, bindings);
-    var fn_out: *AstFunc = ast_func_ex(slice(new_name.ptr, new_name.len), params_out, rt.type_kind, rt.ptr_depth, rt.is_tagged, slice(rt.struct_name_ptr, rt.struct_name_len), slice(rt.tag_layout_ptr, rt.tag_layout_len), body_out);
+    var fn_out: *AstFunc = ast_func_ex(slice(new_name.ptr, new_name.len), params_out, rt.type_kind, rt.ptr_depth, rt.is_tagged, rt.struct_name, rt.tag_layout, body_out);
     fn_out.annotations_vec = fn.annotations_vec;
     return fn_out;
 }
@@ -699,10 +845,9 @@ func generic_clone_func_sig(template_ptr: *AstFunc, bindings: *Vec<*GenericBindi
     var pn: u64 = fn.params_vec.len();
     for (var i: u64 = 0; i < pn; i++) {
         var p: *Param = fn.params_vec.get(i);
-        var ti: *TypeInfo = generic_subst_typeinfo(p.type_kind, p.ptr_depth, p.is_tagged, slice(p.struct_name_ptr, p.struct_name_len), slice(p.tag_layout_ptr, p.tag_layout_len), p.elem_type_kind, p.elem_ptr_depth, p.array_len, p.array_len_is_param, slice(p.array_len_param_ptr, p.array_len_param_len), p.elem_typeinfo, bindings);
+        var ti: *TypeInfo = generic_subst_typeinfo(p.type_kind, p.ptr_depth, p.is_tagged, p.struct_name, p.tag_layout, p.elem_type_kind, p.elem_ptr_depth, p.array_len, p.array_len_is_param, p.array_len_param, p.elem_typeinfo, bindings);
         var np: *Param = new Param{};
-        np.name_ptr = p.name_ptr;
-        np.name_len = p.name_len;
+        np.name = p.name;
         np.fill_from_typeinfo(ti);
         if (np.elem_typeinfo == 0) {
             np.elem_typeinfo = p.elem_typeinfo;
@@ -710,22 +855,20 @@ func generic_clone_func_sig(template_ptr: *AstFunc, bindings: *Vec<*GenericBindi
         params_out.push(np);
     }
 
-    var rt: *TypeInfo = generic_subst_typeinfo(fn.ret_type, fn.ret_ptr_depth, fn.ret_is_tagged, slice(fn.ret_struct_name_ptr, fn.ret_struct_name_len), slice(fn.ret_tag_layout_ptr, fn.ret_tag_layout_len), 0, 0, 0, 0, slice(0, 0), 0, bindings);
-    var fn_out: *AstFunc = ast_func_ex(slice(new_name.ptr, new_name.len), params_out, rt.type_kind, rt.ptr_depth, rt.is_tagged, slice(rt.struct_name_ptr, rt.struct_name_len), slice(rt.tag_layout_ptr, rt.tag_layout_len), 0);
+    var rt: *TypeInfo = generic_subst_typeinfo(fn.ret_type, fn.ret_ptr_depth, fn.ret_is_tagged, fn.ret_struct_name, fn.ret_tag_layout, 0, 0, 0, 0, slice(0, 0), 0, bindings);
+    var fn_out: *AstFunc = ast_func_ex(slice(new_name.ptr, new_name.len), params_out, rt.type_kind, rt.ptr_depth, rt.is_tagged, rt.struct_name, rt.tag_layout, 0);
     fn_out.annotations_vec = fn.annotations_vec;
     return fn_out;
 }
 
 func generic_get_or_create_instance(tpl_ptr: *GenericFuncTemplate, bindings: *Vec<*GenericBinding>) -> *NameInfo {
     var tpl: *GenericFuncTemplate = tpl_ptr;
-    var base_ptr: u64 = tpl.mangled_ptr;
-    var base_len: u64 = tpl.mangled_len;
-    if (base_ptr == 0) {
-        base_ptr = tpl.name_ptr;
-        base_len = tpl.name_len;
+    var base_name: []u8 = tpl.mangled_name;
+    if (base_name.ptr == 0) {
+        base_name = tpl.name;
     }
 
-    var name_info: *NameInfo = generic_mangle_name(slice(base_ptr, base_len), tpl.params_vec, bindings);
+    var name_info: *NameInfo = generic_mangle_name(base_name, tpl.params_vec, bindings);
     var inst_ptr: u64 = name_info.ptr;
     var inst_len: u64 = name_info.len;
 
@@ -737,7 +880,7 @@ func generic_get_or_create_instance(tpl_ptr: *GenericFuncTemplate, bindings: *Ve
     var def_src: *AstFunc = tpl.func_def;
     if (def_src == 0 && tpl.func_sig != 0) { def_src = tpl.func_sig; }
     if (def_src == 0) {
-        generic_diag_error_name("G1000", "Missing generic function body", "function: ", slice(tpl.name_ptr, tpl.name_len));
+        generic_diag_error_name("G1000", "Missing generic function body", "function: ", tpl.name);
         return 0;
     }
 
@@ -750,7 +893,7 @@ func generic_get_or_create_instance(tpl_ptr: *GenericFuncTemplate, bindings: *Ve
     // Preserve impl-method owner/access metadata for instantiated names.
     // Without this, private member access checks inside generic impl methods
     // lose their owner context during codegen.
-    sym_copy_impl_method_metadata_if_needed(base_ptr, base_len, inst_ptr, inst_len);
+    sym_copy_impl_method_metadata_if_needed(base_name.ptr, base_name.len, inst_ptr, inst_len);
     if (sym_is_impl_method(slice(inst_ptr, inst_len)) != 0) {
         sym_register_impl_method_func(slice(inst_ptr, inst_len), fn_new);
     }
@@ -762,8 +905,9 @@ func generic_get_or_create_instance(tpl_ptr: *GenericFuncTemplate, bindings: *Ve
     g_compiler_ctx.generic_instantiations.put(slice(inst_ptr, inst_len), 1);
 
     // Map new function to template module
-    if (g_compiler_ctx.func_module_map != 0 && tpl.mangled_ptr != 0) {
-        var mod_info: *NameInfo = g_compiler_ctx.func_module_map.get(slice(tpl.mangled_ptr, tpl.mangled_len));
+    var tpl_mangled: []u8 = tpl.mangled_name;
+    if (g_compiler_ctx.func_module_map != 0 && tpl_mangled.ptr != 0) {
+        var mod_info: *NameInfo = g_compiler_ctx.func_module_map.get(tpl_mangled);
         if (mod_info != 0) {
             g_compiler_ctx.func_module_map.put(slice(inst_ptr, inst_len), mod_info);
         }
@@ -772,19 +916,27 @@ func generic_get_or_create_instance(tpl_ptr: *GenericFuncTemplate, bindings: *Ve
     return name_info;
 }
 
-func generic_bound_extract_struct_name(arg_ti: *TypeInfo, out_ptr: *u64, out_len: *u64) -> u64 {
-    if (arg_ti == 0) { return 0; }
+struct GenericBoundStructName {
+    public kind: u64;
+    public name: []u8;
+}
+
+func generic_bound_extract_struct_name(arg_ti: *TypeInfo) -> GenericBoundStructName {
+    var result: GenericBoundStructName;
+    result.kind = 0;
+    result.name = slice(0, 0);
+    if (arg_ti == 0) { return result; }
     if (arg_ti.type_kind == TYPE_STRUCT) {
-        *out_ptr = arg_ti.struct_name_ptr;
-        *out_len = arg_ti.struct_name_len;
-        return 1;
+        result.kind = 1;
+        result.name = arg_ti.struct_name;
+        return result;
     }
     if (arg_ti.type_kind == TYPE_TRAIT) {
-        *out_ptr = arg_ti.struct_name_ptr;
-        *out_len = arg_ti.struct_name_len;
-        return 2;
+        result.kind = 2;
+        result.name = arg_ti.struct_name;
+        return result;
     }
-    return 0;
+    return result;
 }
 
 func typeinfo_equal_assoc(lhs: *TypeInfo, rhs: *TypeInfo) -> u64 {
@@ -794,19 +946,19 @@ func typeinfo_equal_assoc(lhs: *TypeInfo, rhs: *TypeInfo) -> u64 {
     }
     if (generic_type_equal(lhs, rhs) == 0) { return 0; }
     if (lhs.type_kind == TYPE_STRUCT || lhs.type_kind == TYPE_TRAIT || lhs.type_kind == TYPE_GENERIC || lhs.type_kind == TYPE_ARRAY || lhs.type_kind == TYPE_SLICE) {
-        if (str_eq(slice(lhs.struct_name_ptr, lhs.struct_name_len), slice(rhs.struct_name_ptr, rhs.struct_name_len)) == 0) {
+        if (str_eq(lhs.struct_name, rhs.struct_name) == 0) {
             return 0;
         }
     }
     if (lhs.is_tagged != rhs.is_tagged) { return 0; }
     if (lhs.is_tagged != 0) {
-        if (str_eq(slice(lhs.tag_layout_ptr, lhs.tag_layout_len), slice(rhs.tag_layout_ptr, rhs.tag_layout_len)) == 0) {
+        if (str_eq(lhs.tag_layout, rhs.tag_layout) == 0) {
             return 0;
         }
     }
     if (lhs.array_len_is_param != rhs.array_len_is_param) { return 0; }
     if (lhs.array_len_is_param != 0) {
-        if (str_eq(slice(lhs.array_len_param_ptr, lhs.array_len_param_len), slice(rhs.array_len_param_ptr, rhs.array_len_param_len)) == 0) {
+        if (str_eq(lhs.array_len_param, rhs.array_len_param) == 0) {
             return 0;
         }
     }
@@ -819,7 +971,7 @@ func trait_assoc_decl_exists(trait_def: *TraitDef, name: []u8) -> u64 {
     for (var i: u64 = 0; i < n; i++) {
         var assoc: *TraitAssocType = trait_def.assoc_types_vec.get(i);
         if (assoc == 0) { continue; }
-        if (str_eq(slice(assoc.name_ptr, assoc.name_len), slice(name.ptr, name.len)) != 0) {
+        if (str_eq(assoc.name, slice(name.ptr, name.len)) != 0) {
             return 1;
         }
     }
@@ -832,7 +984,7 @@ func trait_impl_find_assoc_binding(impl_info: *TraitImpl, name: []u8) -> *TraitA
     for (var i: u64 = 0; i < n; i++) {
         var binding: *TraitAssocBinding = impl_info.assoc_bindings_vec.get(i);
         if (binding == 0) { continue; }
-        if (str_eq(slice(binding.name_ptr, binding.name_len), slice(name.ptr, name.len)) != 0) {
+        if (str_eq(binding.name, slice(name.ptr, name.len)) != 0) {
             return binding;
         }
     }
@@ -843,59 +995,57 @@ func generic_validate_assoc_bounds(gp: *GenericParam, candidate_kind: u64, candi
     if (gp == 0) { return 1; }
     var assoc_n: u64 = 0;
     if (gp.assoc_bindings != 0) { assoc_n = gp.assoc_bindings.len(); }
-    if (assoc_n == 0 && (gp.assoc_name_ptr == 0 || gp.assoc_name_len == 0 || gp.assoc_type_ptr == 0)) {
+    if (assoc_n == 0 && (u8_slice_ptr(gp.assoc_name) == 0 || u8_slice_len(gp.assoc_name) == 0 || gp.assoc_type_ptr == 0)) {
         return 1;
     }
 
     if (candidate_kind != 1) {
-        generic_diag_error_name("G1001", "generic associated type bound requires concrete struct argument", "parameter: ", slice(gp.name_ptr, gp.name_len));
+        generic_diag_error_name("G1001", "generic associated type bound requires concrete struct argument", "parameter: ", gp.name);
         return 0;
     }
 
-    var trait_def: *TraitDef = sym_get_trait_def(slice(gp.bound_trait_ptr, gp.bound_trait_len));
+    var trait_def: *TraitDef = sym_get_trait_def(gp.bound_trait);
     if (trait_def == 0) {
-        generic_diag_error_name("G1002", "trait definition missing while validating associated bound", "trait: ", slice(gp.bound_trait_ptr, gp.bound_trait_len));
+        generic_diag_error_name("G1002", "trait definition missing while validating associated bound", "trait: ", gp.bound_trait);
         return 0;
     }
     if (impl_info == 0) {
         diag_emit_error_tag("generic", "G1003", "generic associated type bound not satisfied");
         diag_emit_labelled_name("type: ", slice(candidate.ptr, candidate.len));
-        diag_emit_labelled_name("trait: ", slice(gp.bound_trait_ptr, gp.bound_trait_len));
+        diag_emit_labelled_name("trait: ", gp.bound_trait);
         return 0;
     }
 
     var checks: u64 = assoc_n;
     if (checks == 0) { checks = 1; }
     for (var i: u64 = 0; i < checks; i++) {
-        var assoc_name_ptr: u64 = gp.assoc_name_ptr;
-        var assoc_name_len: u64 = gp.assoc_name_len;
+        var assoc_name: []u8 = gp.assoc_name;
         var assoc_type: *TypeInfo = gp.assoc_type_ptr;
         if (assoc_n != 0) {
             var req: *GenericAssocBinding = gp.assoc_bindings.get(i);
-            assoc_name_ptr = req.name_ptr;
-            assoc_name_len = req.name_len;
+            assoc_name = req.name;
             assoc_type = req.type_ptr;
         }
 
-        if (assoc_name_ptr == 0 || assoc_name_len == 0 || assoc_type == 0) { continue; }
+        if (u8_slice_ptr(assoc_name) == 0 || u8_slice_len(assoc_name) == 0 || assoc_type == 0) { continue; }
 
-        if (trait_assoc_decl_exists(trait_def, slice(assoc_name_ptr, assoc_name_len)) == 0) {
+        if (trait_assoc_decl_exists(trait_def, assoc_name) == 0) {
             diag_emit_error_tag("generic", "G1004", "unknown associated type in generic bound");
-            diag_emit_labelled_member("associated type: ", slice(gp.bound_trait_ptr, gp.bound_trait_len), slice(assoc_name_ptr, assoc_name_len));
+            diag_emit_labelled_member("associated type: ", gp.bound_trait, assoc_name);
             return 0;
         }
 
-        var impl_binding: *TraitAssocBinding = trait_impl_find_assoc_binding(impl_info, slice(assoc_name_ptr, assoc_name_len));
+        var impl_binding: *TraitAssocBinding = trait_impl_find_assoc_binding(impl_info, assoc_name);
         if (impl_binding == 0 || impl_binding.type_ptr == 0) {
             diag_emit_error_tag("generic", "G1005", "generic associated type bound not satisfied: missing impl binding");
-            diag_emit_labelled_member("binding: ", slice(gp.bound_trait_ptr, gp.bound_trait_len), slice(assoc_name_ptr, assoc_name_len));
+            diag_emit_labelled_member("binding: ", gp.bound_trait, assoc_name);
             diag_emit_labelled_name("type: ", slice(candidate.ptr, candidate.len));
             return 0;
         }
 
         if (typeinfo_equal_assoc(impl_binding.type_ptr, assoc_type) == 0) {
             diag_emit_error_tag("generic", "G1006", "generic associated type bound not satisfied: associated type mismatch");
-            diag_emit_labelled_member("binding: ", slice(gp.bound_trait_ptr, gp.bound_trait_len), slice(assoc_name_ptr, assoc_name_len));
+            diag_emit_labelled_member("binding: ", gp.bound_trait, assoc_name);
             diag_emit_labelled_name("type: ", slice(candidate.ptr, candidate.len));
             return 0;
         }
@@ -905,39 +1055,38 @@ func generic_validate_assoc_bounds(gp: *GenericParam, candidate_kind: u64, candi
 
 func generic_validate_type_bound(gp: *GenericParam, arg_ti: *TypeInfo) -> u64 {
     if (gp == 0 || arg_ti == 0) { return 1; }
-    if (gp.bound_trait_ptr == 0 || gp.bound_trait_len == 0) { return 1; }
+    if (u8_slice_ptr(gp.bound_trait) == 0 || u8_slice_len(gp.bound_trait) == 0) { return 1; }
 
-    var candidate_ptr: u64 = 0;
-    var candidate_len: u64 = 0;
-    var kind: u64 = generic_bound_extract_struct_name(arg_ti, &candidate_ptr, &candidate_len);
-    if (kind == 0 || candidate_ptr == 0 || candidate_len == 0) {
+    var candidate: GenericBoundStructName = generic_bound_extract_struct_name(arg_ti);
+    var kind: u64 = candidate.kind;
+    if (kind == 0 || u8_slice_ptr(candidate.name) == 0 || u8_slice_len(candidate.name) == 0) {
         diag_emit_error_tag("generic", "G1007", "generic bound requires struct/trait type argument");
-        diag_emit_labelled_name("parameter: ", slice(gp.name_ptr, gp.name_len));
-        diag_emit_labelled_name("trait: ", slice(gp.bound_trait_ptr, gp.bound_trait_len));
+        diag_emit_labelled_name("parameter: ", gp.name);
+        diag_emit_labelled_name("trait: ", gp.bound_trait);
         return 0;
     }
 
     if (kind == 2) {
-        if (str_eq(slice(candidate_ptr, candidate_len), slice(gp.bound_trait_ptr, gp.bound_trait_len)) != 0) {
-            if (generic_validate_assoc_bounds(gp, kind, slice(candidate_ptr, candidate_len), 0) == 0) {
+        if (str_eq(candidate.name, gp.bound_trait) != 0) {
+            if (generic_validate_assoc_bounds(gp, kind, candidate.name, 0) == 0) {
                 return 0;
             }
             return 1;
         }
         diag_emit_error_tag("generic", "G1008", "generic trait argument does not satisfy bound");
-        diag_emit_labelled_name("expected trait: ", slice(gp.bound_trait_ptr, gp.bound_trait_len));
-        diag_emit_labelled_name("got trait: ", slice(candidate_ptr, candidate_len));
+        diag_emit_labelled_name("expected trait: ", gp.bound_trait);
+        diag_emit_labelled_name("got trait: ", candidate.name);
         return 0;
     }
 
-    var impl_info: *TraitImpl = trait_find_trait_impl(slice(gp.bound_trait_ptr, gp.bound_trait_len), slice(candidate_ptr, candidate_len));
+    var impl_info: *TraitImpl = trait_find_trait_impl(gp.bound_trait, candidate.name);
     if (impl_info == 0) {
         diag_emit_error_tag("generic", "G1009", "generic bound not satisfied");
-        diag_emit_labelled_name("type: ", slice(candidate_ptr, candidate_len));
-        diag_emit_labelled_name("trait: ", slice(gp.bound_trait_ptr, gp.bound_trait_len));
+        diag_emit_labelled_name("type: ", candidate.name);
+        diag_emit_labelled_name("trait: ", gp.bound_trait);
         return 0;
     }
-    if (generic_validate_assoc_bounds(gp, kind, slice(candidate_ptr, candidate_len), impl_info) == 0) {
+    if (generic_validate_assoc_bounds(gp, kind, candidate.name, impl_info) == 0) {
         return 0;
     }
     return 1;
@@ -964,11 +1113,11 @@ func generic_build_bindings_core(params_vec: *Vec<*GenericParam>, gargs: *Vec<*G
         var ga: *GenericArg = gargs.get(i);
         if (gp.kind == GENERIC_KIND_TYPE) {
             if (ga.kind != GENERIC_KIND_TYPE) {
-                generic_diag_error_name("G1012", "Expected type generic argument", "parameter: ", slice(gp.name_ptr, gp.name_len));
+                generic_diag_error_name("G1012", "Expected type generic argument", "parameter: ", gp.name);
                 return 0;
             }
-            if (generic_bind_type(bindings, slice(gp.name_ptr, gp.name_len), ga.type_ptr) != 0) {
-                generic_diag_error_name("G1013", "Conflicting generic type bindings", "parameter: ", slice(gp.name_ptr, gp.name_len));
+            if (generic_bind_type(bindings, gp.name, ga.type_ptr) != 0) {
+                generic_diag_error_name("G1013", "Conflicting generic type bindings", "parameter: ", gp.name);
                 return 0;
             }
             if (generic_validate_type_bound(gp, ga.type_ptr) == 0) {
@@ -977,12 +1126,12 @@ func generic_build_bindings_core(params_vec: *Vec<*GenericParam>, gargs: *Vec<*G
             }
         } else {
             if (ga.kind != GENERIC_KIND_VALUE) {
-                generic_diag_error_name("G1014", "Expected value generic argument", "parameter: ", slice(gp.name_ptr, gp.name_len));
+                generic_diag_error_name("G1014", "Expected value generic argument", "parameter: ", gp.name);
                 return 0;
             }
             if (generic_value_arg_fits_declared_type(ga.value, gp.value_type_kind) == 0) {
                 diag_emit_error_tag("generic", "G1015", "value generic argument out of range for declared type");
-                diag_emit_labelled_name("parameter: ", slice(gp.name_ptr, gp.name_len));
+                diag_emit_labelled_name("parameter: ", gp.name);
                 diag_emit_labelled_u64("value: ", ga.value);
                 emit_stderr("[NOTE] declared type: ");
                 generic_emit_value_type_name(gp.value_type_kind);
@@ -993,8 +1142,8 @@ func generic_build_bindings_core(params_vec: *Vec<*GenericParam>, gargs: *Vec<*G
                 diag_error("Compilation failed");
                 return 0;
             }
-            if (generic_bind_value(bindings, slice(gp.name_ptr, gp.name_len), ga.value) != 0) {
-                generic_diag_error_name("G1016", "Conflicting generic value bindings", "parameter: ", slice(gp.name_ptr, gp.name_len));
+            if (generic_bind_value(bindings, gp.name, ga.value) != 0) {
+                generic_diag_error_name("G1016", "Conflicting generic value bindings", "parameter: ", gp.name);
                 return 0;
             }
         }
@@ -1019,18 +1168,15 @@ func generic_clone_struct(template_def: *AstStructDef, bindings: *Vec<*GenericBi
     var n: u64 = fields_in.len();
     for (var i: u64 = 0; i < n; i++) {
         var f: *FieldDesc = fields_in.get(i);
-        var ti: *TypeInfo = generic_subst_typeinfo(f.type_kind, f.ptr_depth, f.is_tagged, slice(f.struct_name_ptr, f.struct_name_len), slice(f.tag_layout_ptr, f.tag_layout_len), f.elem_type_kind, f.elem_ptr_depth, f.array_len, 0, slice(0, 0), f.elem_typeinfo, bindings);
+        var ti: *TypeInfo = generic_subst_typeinfo(f.type_kind, f.ptr_depth, f.is_tagged, f.struct_name, f.tag_layout, f.elem_type_kind, f.elem_ptr_depth, f.array_len, 0, slice(0, 0), f.elem_typeinfo, bindings);
         var nf: *FieldDesc = new FieldDesc{};
         nf.access = ACCESS_PUBLIC;
-        nf.name_ptr = f.name_ptr;
-        nf.name_len = f.name_len;
+        nf.name = f.name;
         nf.type_kind = ti.type_kind;
-        nf.struct_name_ptr = ti.struct_name_ptr;
-        nf.struct_name_len = ti.struct_name_len;
+        nf.struct_name = ti.struct_name;
         nf.ptr_depth = ti.ptr_depth;
         nf.is_tagged = ti.is_tagged;
-        nf.tag_layout_ptr = ti.tag_layout_ptr;
-        nf.tag_layout_len = ti.tag_layout_len;
+        nf.tag_layout = ti.tag_layout;
         nf.bit_width = f.bit_width;
         nf.elem_type_kind = ti.elem_type_kind;
         nf.elem_ptr_depth = ti.elem_ptr_depth;
@@ -1041,15 +1187,12 @@ func generic_clone_struct(template_def: *AstStructDef, bindings: *Vec<*GenericBi
             nf.elem_typeinfo = f.elem_typeinfo;
         }
         nf.access = f.access;
-        nf.owner_struct_ptr = new_name.ptr;
-        nf.owner_struct_len = new_name.len;
+        nf.owner_struct = new_name;
         nf.annotations_vec = f.annotations_vec;
         nf.setter_hook_mode = f.setter_hook_mode;
         nf.getter_hook_mode = f.getter_hook_mode;
-        nf.setter_hook_ptr = f.setter_hook_ptr;
-        nf.setter_hook_len = f.setter_hook_len;
-        nf.getter_hook_ptr = f.getter_hook_ptr;
-        nf.getter_hook_len = f.getter_hook_len;
+        nf.setter_hook = f.setter_hook;
+        nf.getter_hook = f.getter_hook;
         fields_out.push(nf);
     }
     var parents_out: *Vec<*ParentDesc> = 0;
@@ -1060,8 +1203,7 @@ func generic_clone_struct(template_def: *AstStructDef, bindings: *Vec<*GenericBi
         for (var pi: u64 = 0; pi < pn; pi++) {
             var parent_in: *ParentDesc = parents_in.get(pi);
             var parent_out: *ParentDesc = new ParentDesc{};
-            parent_out.name_ptr = parent_in.name_ptr;
-            parent_out.name_len = parent_in.name_len;
+            parent_out.name = parent_in.name;
             parent_out.struct_def = parent_in.struct_def;
             parents_out.push(parent_out);
         }
@@ -1074,8 +1216,7 @@ func generic_clone_struct(template_def: *AstStructDef, bindings: *Vec<*GenericBi
         for (var ti: u64 = 0; ti < tn; ti++) {
             var t_in: *TraitRef = traits_in.get(ti);
             var t_out: *TraitRef = new TraitRef{};
-            t_out.name_ptr = t_in.name_ptr;
-            t_out.name_len = t_in.name_len;
+            t_out.name = t_in.name;
             t_out.trait_def = t_in.trait_def;
             traits_out.push(t_out);
         }
@@ -1085,7 +1226,7 @@ func generic_clone_struct(template_def: *AstStructDef, bindings: *Vec<*GenericBi
 
 func generic_struct_get_or_create_instance(tpl_ptr: *GenericStructTemplate, bindings: *Vec<*GenericBinding>) -> *NameInfo {
     var tpl: *GenericStructTemplate = tpl_ptr;
-    var name_info: *NameInfo = generic_mangle_name(slice(tpl.name_ptr, tpl.name_len), tpl.params_vec, bindings);
+    var name_info: *NameInfo = generic_mangle_name(tpl.name, tpl.params_vec, bindings);
     var inst_ptr: u64 = name_info.ptr;
     var inst_len: u64 = name_info.len;
 
@@ -1099,7 +1240,7 @@ func generic_struct_get_or_create_instance(tpl_ptr: *GenericStructTemplate, bind
 
     var def_src: *AstStructDef = tpl.struct_def;
     if (def_src == 0) {
-        generic_diag_error_name("G1017", "Missing generic struct template", "struct: ", slice(tpl.name_ptr, tpl.name_len));
+        generic_diag_error_name("G1017", "Missing generic struct template", "struct: ", tpl.name);
         return 0;
     }
 
@@ -1121,7 +1262,7 @@ func generic_build_bindings_by_infer(tpl_ptr: *GenericFuncTemplate, call_args: *
     var def_src: *AstFunc = tpl.func_def;
     if (def_src == 0) { def_src = tpl.func_sig; }
     if (def_src == 0) {
-        generic_diag_error_name("G1018", "Missing generic signature for inference", "function: ", slice(tpl.name_ptr, tpl.name_len));
+        generic_diag_error_name("G1018", "Missing generic signature for inference", "function: ", tpl.name);
         return 0;
     }
     var fn: *AstFunc = def_src;
@@ -1130,7 +1271,7 @@ func generic_build_bindings_by_infer(tpl_ptr: *GenericFuncTemplate, call_args: *
     var an: u64 = call_args.len();
     if (pn != an) {
         diag_emit_error_tag("generic", "G1019", "Generic inference argument count mismatch");
-        diag_emit_labelled_name("function: ", slice(tpl.name_ptr, tpl.name_len));
+        diag_emit_labelled_name("function: ", tpl.name);
         diag_emit_labelled_u64("expected args: ", pn);
         diag_emit_labelled_u64("got args: ", an);
         diag_error("Compilation failed");
@@ -1141,7 +1282,7 @@ func generic_build_bindings_by_infer(tpl_ptr: *GenericFuncTemplate, call_args: *
         var p: *Param = params.get(i);
         var arg_expr: *AstNode = call_args.get(i);
         var arg_ti: *TypeInfo = generic_infer_expr_type(arg_expr, symtab);
-        if (generic_infer_from_typeinfo(p.type_kind, p.ptr_depth, slice(p.struct_name_ptr, p.struct_name_len), p.elem_type_kind, p.elem_ptr_depth, p.array_len, p.array_len_is_param, slice(p.array_len_param_ptr, p.array_len_param_len), arg_ti, bindings) != 0) {
+        if (generic_infer_from_typeinfo(p.type_kind, p.ptr_depth, p.struct_name, p.elem_type_kind, p.elem_ptr_depth, p.array_len, p.array_len_is_param, p.array_len_param, arg_ti, bindings) != 0) {
             return 0;
         }
     }
@@ -1152,9 +1293,9 @@ func generic_build_bindings_by_infer(tpl_ptr: *GenericFuncTemplate, call_args: *
         for (var gi: u64 = 0; gi < gn; gi++) {
             var gp: *GenericParam = gps.get(gi);
             if (gp == 0 || gp.kind != GENERIC_KIND_TYPE) { continue; }
-            var bound: *GenericBinding = generic_find_binding(bindings, GENERIC_KIND_TYPE, slice(gp.name_ptr, gp.name_len));
+            var bound: *GenericBinding = generic_find_binding(bindings, GENERIC_KIND_TYPE, gp.name);
             if (bound == 0 || bound.type == 0) {
-                generic_diag_error_name("G1020", "generic inference could not bind type parameter", "parameter: ", slice(gp.name_ptr, gp.name_len));
+                generic_diag_error_name("G1020", "generic inference could not bind type parameter", "parameter: ", gp.name);
                 return 0;
             }
             if (generic_validate_type_bound(gp, bound.type) == 0) {
@@ -1233,12 +1374,12 @@ func generic_find_method_template_for_struct(struct_slice: []u8, method: []u8) -
     return sym_find_generic_template_by_name(slice(alt_name.ptr, alt_name.len));
 }
 
-func generic_try_instantiate_method_template(mc: *AstMethodCall, args: *Vec<*AstNode>, recv_ti: *TypeInfo, symtab: *HashMap<u64, *TypeInfo>) -> u64 {
+func generic_try_instantiate_method_template(mc: *AstMethodCall, args: *Vec<*AstNode>, recv_ti: *TypeInfo, symtab: *HashMap<u64, *TypeInfo>) -> *NameInfo {
     if (recv_ti == 0 || recv_ti.type_kind != TYPE_STRUCT) { return 0; }
 
-    var struct_ptr: u64 = recv_ti.struct_name_ptr;
-    var struct_len: u64 = recv_ti.struct_name_len;
-    var tpl_ptr: *GenericFuncTemplate = generic_find_method_template_for_struct(slice(struct_ptr, struct_len), slice(mc.method_ptr, mc.method_len));
+    var struct_ptr: u64 = u8_slice_ptr(recv_ti.struct_name);
+    var struct_len: u64 = u8_slice_len(recv_ti.struct_name);
+    var tpl_ptr: *GenericFuncTemplate = generic_find_method_template_for_struct(slice(struct_ptr, struct_len), mc.method);
     if (tpl_ptr == 0) { return 0; }
 
     var base_len: u64 = sym_find_generic_suffix_index(slice(struct_ptr, struct_len));
@@ -1257,7 +1398,7 @@ func generic_try_instantiate_method_template(mc: *AstMethodCall, args: *Vec<*Ast
         bindings = generic_build_bindings_by_infer(tpl_ptr, infer_args, symtab);
     }
     if (bindings != 0) {
-        generic_get_or_create_instance(tpl_ptr, bindings);
+        return generic_get_or_create_instance(tpl_ptr, bindings);
     }
     return 0;
 }
@@ -1270,8 +1411,7 @@ const COMPILER_AST_WALK_FIND_SUPER_CTOR = 4;
 
 struct CompilerAstWalker {
     public mode: u64;
-    public owner_ptr: u64;
-    public owner_len: u64;
+    public owner: []u8;
     public super_allowed: u64;
     public found: u64;
 }

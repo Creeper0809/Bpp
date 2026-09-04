@@ -2,11 +2,25 @@
 name: CI
 on:
   push:
-    branches: ["**"]
+    branches: ["main", "dev"]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      full_benchmarks:
+        description: "Run separated benchmark job"
+        type: boolean
+        default: false
+      full_fuzz:
+        description: "Run separated fuzz smoke job"
+        type: boolean
+        default: false
+
+concurrency:
+  group: ci-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: true
 
 jobs:
-  linux:
+  linux-bootstrap:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -16,10 +30,139 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y nasm binutils coreutils
 
-      - name: Build and test (Linux)
+      - name: Self-host Linux compiler
+        env:
+          BUILD_AND_TEST_PROFILE: full
+          BUILD_SKIP_TESTS: "1"
+          TEST_SKIP_LLVM_BUILD: "1"
+          TEST_JOBS: "4"
+          TEST_PROGRESS: "1"
         run: |
           chmod +x build_and_test.sh test/run_tests.sh
           bash build_and_test.sh
+
+      - name: Upload verified Linux compiler
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-selfhost-compiler
+          path: |
+            bin/stage1
+            build/*_stage1.asm
+            build/*_stage2.asm
+          if-no-files-found: error
+          retention-days: 1
+
+  windows-seed:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download verified Linux bootstrap seed
+        run: |
+          version="$(sed -n 's/^VERSION=//p' config.ini | head -n1 | tr -d '[:space:]')"
+          asset="bpp-bootstrap-${version}-linux-x86_64"
+          base="https://github.com/${{ github.repository }}/releases/download/bootstrap-${version}"
+          curl -fsSL "$base/$asset" -o "$asset"
+          curl -fsSL "$base/$asset.sha256" -o "$asset.sha256"
+          sha256sum -c "$asset.sha256"
+          chmod +x "$asset"
+          echo "BPP_BASE_COMPILER=$PWD/$asset" >> "$GITHUB_ENV"
+
+      - name: Install cross-bootstrap dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nasm binutils coreutils binutils-mingw-w64-x86-64 mingw-w64-x86-64-dev
+
+      - name: Cross-build Windows bootstrap seed
+        run: |
+          chmod +x tools/build_windows_bootstrap.sh
+          tools/build_windows_bootstrap.sh "$PWD/build/windows-ci-seed/bpp-windows-seed.exe"
+
+      - name: Upload Windows bootstrap seed
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-cross-bootstrap
+          path: build/windows-ci-seed/bpp-windows-seed.exe
+          if-no-files-found: error
+          retention-days: 1
+
+  linux-validation:
+    needs: linux-bootstrap
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nasm binutils coreutils clang
+
+      - name: Download verified Linux compiler
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-selfhost-compiler
+          path: .
+
+      - name: Full compiler tests (Linux)
+        env:
+          TEST_PROFILE: full
+          TEST_SKIP_LLVM_BUILD: "1"
+          TEST_JOBS: "4"
+          TEST_QUIET: "1"
+          TEST_PROGRESS: "1"
+          COMPILE_FAIL_SINGLE_VARIANT: "0"
+          STRESS_RUNS: "0"
+          STABILITY_RUNS: "0"
+          TEST_SHARD_COUNT: "4"
+          TEST_SHARD_INDEX: ${{ matrix.shard }}
+          TEST_RESULT_JSON: build/test-results/linux-shard-${{ matrix.shard }}.json
+        run: |
+          chmod +x bin/stage1 test/run_tests.sh
+          bash test/run_tests.sh bin/stage1
+
+      - name: Upload Linux shard result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-test-shard-${{ matrix.shard }}
+          path: build/test-results/linux-shard-${{ matrix.shard }}.json
+          if-no-files-found: error
+          retention-days: 14
+
+  linux-integration:
+    needs: linux-bootstrap
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nasm binutils coreutils clang
+
+      - name: Download verified Linux compiler
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-selfhost-compiler
+          path: .
+
+      - name: Focused LLVM smoke tests (Linux)
+        env:
+          TEST_NAME_FILTER: "31_llvm_ll|32_llvm_ll|33_llvm_build|45_llvm_build|46_llvm_build|47_llvm_build"
+          TEST_PROFILE: quick
+          TEST_SKIP_LLVM_BUILD: "0"
+          TEST_JOBS: "4"
+          TEST_QUIET: "1"
+          TEST_PROGRESS: "1"
+          STRESS_RUNS: "0"
+          STABILITY_RUNS: "0"
+        run: |
+          chmod +x bin/stage1 test/run_tests.sh test/run_regression.sh
+          bash test/run_tests.sh bin/stage1
 
       - name: Diagnostics + manifest regression (Linux)
         run: |
@@ -31,19 +174,26 @@ jobs:
           cmake -S . -B build-linux
           cmake --build build-linux --target toolchain-check
           cmake --install build-linux --prefix "$PWD/.local"
-          ./.local/bin/bpp test/source/05_pointers_arrays.bpp
+          ./.local/bin/bpp test/source/01_generics.bpp
 
-  windows:
+  windows-selfhost:
+    needs: windows-seed
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Download cross-built Windows seed
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-cross-bootstrap
+          path: build/windows-ci-seed
 
       - name: Setup MSVC developer command prompt
         uses: ilammy/msvc-dev-cmd@v1
 
       - name: Configure toolchain with CMake
         run: |
-          cmake -S . -B build-win -DBPP_BOOTSTRAP_NASM=ON
+          cmake -S . -B build-win -DBPP_BOOTSTRAP_NASM=ON -DBPP_BOOTSTRAP_COMPILER=OFF
 
       - name: Export resolved toolchain paths
         shell: pwsh
@@ -63,13 +213,186 @@ jobs:
         run: |
           ./build_and_test.ps1 -ToolchainOnly -NasmPath "$env:BPP_NASM_EXECUTABLE" -LinkerPath "$env:BPP_LINKER_EXECUTABLE"
 
-      - name: Optional full Windows compiler test (requires stage compiler exe)
+      - name: Windows deterministic self-host
         shell: pwsh
         run: |
-          $compilerExe = Get-ChildItem "./bin" -Filter "*_stage1.exe" -File -ErrorAction SilentlyContinue |
-            Sort-Object Name | Select-Object -Last 1
-          if ($compilerExe) {
-            ./build_and_test.ps1 -CompilerPath $compilerExe.FullName -NasmPath "$env:BPP_NASM_EXECUTABLE" -LinkerPath "$env:BPP_LINKER_EXECUTABLE"
-          } else {
-            Write-Warning "Skipping full Windows compiler tests: no bin/*_stage1.exe found."
+          $compilerExe = (Resolve-Path "build/windows-ci-seed/bpp-windows-seed.exe").Path
+          ./build_and_test.ps1 `
+            -CompilerPath $compilerExe `
+            -NasmPath "$env:BPP_NASM_EXECUTABLE" `
+            -LinkerPath "$env:BPP_LINKER_EXECUTABLE" `
+            -SkipTests
+
+      - name: Upload verified Windows compiler
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-selfhost-compiler
+          path: bin/v13_stage1.exe
+          if-no-files-found: error
+          retention-days: 1
+
+  windows-validation:
+    needs: windows-selfhost
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download verified Windows compiler
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-selfhost-compiler
+          path: bin
+
+      - name: Setup MSVC developer command prompt
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Configure toolchain with CMake
+        run: |
+          cmake -S . -B build-win -DBPP_BOOTSTRAP_NASM=ON -DBPP_BOOTSTRAP_COMPILER=OFF
+
+      - name: Export resolved toolchain paths
+        shell: pwsh
+        run: |
+          Get-Content build-win/bpp_toolchain.env | ForEach-Object {
+            if ($_ -match '^(.*?)=(.*)$') {
+              "$($matches[1])=$($matches[2])" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            }
           }
+
+      - name: Full Windows compiler tests (shard ${{ matrix.shard }}/8)
+        shell: pwsh
+        run: |
+          ./test/run_tests.ps1 `
+            -CompilerPath "bin/v13_stage1.exe" `
+            -NasmPath "$env:BPP_NASM_EXECUTABLE" `
+            -LinkerPath "$env:BPP_LINKER_EXECUTABLE" `
+            -Jobs 1 `
+            -ShardCount 8 `
+            -ShardIndex ${{ matrix.shard }} `
+            -TimingJsonPath "build/timings/windows-tests-${{ matrix.shard }}.json" `
+            -Quiet
+
+      - name: Publish Windows timing summary
+        if: always()
+        shell: pwsh
+        run: |
+          ./tools/write_windows_timing_summary.ps1 `
+            -TimingJsonPath "build/timings/windows-tests-${{ matrix.shard }}.json" `
+            -Title "Windows CI shard ${{ matrix.shard }}/4 timing"
+
+      - name: Upload Windows timing data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-verification-timings-${{ matrix.shard }}
+          path: build/timings
+          if-no-files-found: warn
+          retention-days: 14
+
+  validation-gate:
+    if: always()
+    needs:
+      - linux-bootstrap
+      - windows-seed
+      - linux-validation
+      - linux-integration
+      - windows-selfhost
+      - windows-validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every bootstrap and validation job
+        env:
+          LINUX_BOOTSTRAP: ${{ needs.linux-bootstrap.result }}
+          WINDOWS_SEED: ${{ needs.windows-seed.result }}
+          LINUX_VALIDATION: ${{ needs.linux-validation.result }}
+          LINUX_INTEGRATION: ${{ needs.linux-integration.result }}
+          WINDOWS_SELFHOST: ${{ needs.windows-selfhost.result }}
+          WINDOWS_VALIDATION: ${{ needs.windows-validation.result }}
+        run: |
+          for result in "$LINUX_BOOTSTRAP" "$WINDOWS_SEED" "$LINUX_VALIDATION" "$LINUX_INTEGRATION" "$WINDOWS_SELFHOST" "$WINDOWS_VALIDATION"; do
+            test "$result" = success
+          done
+
+  performance:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.full_benchmarks }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install benchmark dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nasm binutils coreutils clang
+
+      - name: Build fast stage compiler
+        env:
+          BUILD_AND_TEST_PROFILE: fast
+          TEST_SKIP_LLVM_BUILD: "1"
+          TEST_JOBS: "4"
+          TEST_PROGRESS: "1"
+        run: |
+          chmod +x build_and_test.sh test/run_tests.sh
+          bash build_and_test.sh
+
+      - name: Run microbenchmarks
+        env:
+          COMPILER: ${{ github.workspace }}/bin/stage1
+          RUNS: "5"
+          OPT_LEVELS: "O1 O2"
+          OUT_DIR: ${{ github.workspace }}/build/microbench-ci
+        run: |
+          chmod +x bench/run_microbench.sh bench/run_tagged_pointer_fastpaths.sh bench/run_incremental_cache_probe.sh
+          bash bench/run_microbench.sh
+          OUT_DIR=${{ github.workspace }}/build/incremental-cache-ci bash bench/run_incremental_cache_probe.sh
+
+      - name: Upload benchmark reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: microbench-reports
+          path: |
+            build/microbench-ci/bench_report.tsv
+            build/microbench-ci/optimization_report.tsv
+            build/microbench-ci/comparison_report.tsv
+            build/microbench-ci/optimization_thresholds.tsv
+            build/incremental-cache-ci/incremental_cache_report.tsv
+
+  fuzz:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.full_fuzz }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install fuzz dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nasm binutils coreutils
+
+      - name: Build fast stage compiler
+        env:
+          BUILD_AND_TEST_PROFILE: fast
+          TEST_SKIP_LLVM_BUILD: "1"
+          TEST_JOBS: "4"
+          TEST_PROGRESS: "1"
+        run: |
+          chmod +x build_and_test.sh test/run_tests.sh
+          bash build_and_test.sh
+
+      - name: Run differential fuzz smoke
+        env:
+          COMPILER: ${{ github.workspace }}/bin/stage1
+          COUNT: "100"
+          OUT_DIR: ${{ github.workspace }}/build/fuzz-smoke-ci
+        run: |
+          chmod +x test/fuzz_smoke.sh
+          bash test/fuzz_smoke.sh
+
+      - name: Upload fuzz reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-smoke-reports
+          path: |
+            build/fuzz-smoke-ci/fuzz_smoke_report.tsv

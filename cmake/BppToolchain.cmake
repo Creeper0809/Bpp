@@ -87,43 +87,108 @@ function(bpp_resolve_nasm OUT_VAR)
     set(${OUT_VAR} "${_nasm_exe}" PARENT_SCOPE)
 endfunction()
 
+function(bpp_is_host_bootstrap_compiler CANDIDATE OUT_VAR)
+    if(NOT EXISTS "${CANDIDATE}" OR IS_DIRECTORY "${CANDIDATE}")
+        set(${OUT_VAR} FALSE PARENT_SCOPE)
+        return()
+    endif()
+
+    file(READ "${CANDIDATE}" _bpp_magic LIMIT 4 HEX)
+    string(TOUPPER "${_bpp_magic}" _bpp_magic)
+    if(WIN32)
+        string(LENGTH "${_bpp_magic}" _bpp_magic_len)
+        if(_bpp_magic_len LESS 4)
+            set(${OUT_VAR} FALSE PARENT_SCOPE)
+            return()
+        endif()
+        string(SUBSTRING "${_bpp_magic}" 0 4 _bpp_prefix)
+        if(_bpp_prefix STREQUAL "4D5A")
+            set(_bpp_matches TRUE)
+        else()
+            set(_bpp_matches FALSE)
+        endif()
+    elseif(UNIX)
+        if(_bpp_magic STREQUAL "7F454C46")
+            set(_bpp_matches TRUE)
+        else()
+            set(_bpp_matches FALSE)
+        endif()
+    else()
+        set(_bpp_matches TRUE)
+    endif()
+    set(${OUT_VAR} ${_bpp_matches} PARENT_SCOPE)
+endfunction()
+
 function(bpp_resolve_local_bootstrap_compiler ROOT_DIR VERSION_HINT OUT_VAR)
     set(_candidates)
-    if(VERSION_HINT)
+    if(WIN32 AND VERSION_HINT)
+        list(APPEND _candidates
+            "${ROOT_DIR}/bin/${VERSION_HINT}_stage1.exe"
+            "${ROOT_DIR}/bin/${VERSION_HINT}_base.exe"
+        )
+        list(APPEND _candidates
+            "${ROOT_DIR}/bin/stage1.exe"
+            "${ROOT_DIR}/bin/bootstrap.exe"
+        )
+    elseif(VERSION_HINT)
         list(APPEND _candidates
             "${ROOT_DIR}/bin/${VERSION_HINT}_stage1"
-            "${ROOT_DIR}/bin/${VERSION_HINT}_stage1.exe"
             "${ROOT_DIR}/bin/${VERSION_HINT}_base"
-            "${ROOT_DIR}/bin/${VERSION_HINT}_base.exe"
+        )
+        list(APPEND _candidates
+            "${ROOT_DIR}/bin/stage1"
+            "${ROOT_DIR}/bin/bootstrap"
+        )
+    elseif(WIN32)
+        list(APPEND _candidates
+            "${ROOT_DIR}/bin/stage1.exe"
+            "${ROOT_DIR}/bin/bootstrap.exe"
+        )
+    else()
+        list(APPEND _candidates
+            "${ROOT_DIR}/bin/stage1"
+            "${ROOT_DIR}/bin/bootstrap"
         )
     endif()
 
-    list(APPEND _candidates
-        "${ROOT_DIR}/bin/stage1"
-        "${ROOT_DIR}/bin/stage1.exe"
-        "${ROOT_DIR}/bin/bootstrap"
-        "${ROOT_DIR}/bin/bootstrap.exe"
-    )
-
     foreach(_candidate IN LISTS _candidates)
-        if(EXISTS "${_candidate}")
+        bpp_is_host_bootstrap_compiler("${_candidate}" _candidate_is_native)
+        if(_candidate_is_native)
             set(${OUT_VAR} "${_candidate}" PARENT_SCOPE)
             return()
         endif()
     endforeach()
 
-    file(GLOB _stage1_candidates
-        "${ROOT_DIR}/bin/*_stage1"
-        "${ROOT_DIR}/bin/*_stage1.exe"
-    )
-    if(_stage1_candidates)
-        list(SORT _stage1_candidates)
-        list(GET _stage1_candidates -1 _latest_stage1)
-        set(${OUT_VAR} "${_latest_stage1}" PARENT_SCOPE)
-        return()
+    if(WIN32)
+        file(GLOB _stage1_candidates "${ROOT_DIR}/bin/*_stage1.exe")
+    else()
+        file(GLOB _stage1_candidates "${ROOT_DIR}/bin/*_stage1")
     endif()
+    list(SORT _stage1_candidates)
+    list(REVERSE _stage1_candidates)
+    foreach(_latest_stage1 IN LISTS _stage1_candidates)
+        bpp_is_host_bootstrap_compiler("${_latest_stage1}" _candidate_is_native)
+        if(_candidate_is_native)
+            set(${OUT_VAR} "${_latest_stage1}" PARENT_SCOPE)
+            return()
+        endif()
+    endforeach()
 
     set(${OUT_VAR} "" PARENT_SCOPE)
+endfunction()
+
+function(bpp_validate_explicit_bootstrap_compiler CANDIDATE)
+    bpp_is_host_bootstrap_compiler("${CANDIDATE}" _candidate_is_native)
+    if(NOT _candidate_is_native)
+        if(WIN32)
+            set(_expected_format "PE/COFF Windows executable")
+        else()
+            set(_expected_format "ELF executable")
+        endif()
+        message(FATAL_ERROR
+            "BPP_BASE_COMPILER is not a host-native ${_expected_format}: ${CANDIDATE}"
+        )
+    endif()
 endfunction()
 
 function(bpp_download_bootstrap_compiler OUT_VAR)
@@ -146,59 +211,99 @@ function(bpp_download_bootstrap_compiler OUT_VAR)
     endif()
 
     set(_tools_dir "${CMAKE_BINARY_DIR}/_tools")
-    set(_downloaded_path "${_tools_dir}/${_asset_name}")
-    set(_bootstrap_url "${BPP_BOOTSTRAP_BASE_URL}/${BPP_BOOTSTRAP_REPOSITORY}/releases/download/${BPP_BOOTSTRAP_RELEASE_TAG}/${_asset_name}")
 
-    if(NOT EXISTS "${_downloaded_path}")
-        file(MAKE_DIRECTORY "${_tools_dir}")
-        message(STATUS "Downloading BPP bootstrap compiler from ${_bootstrap_url}")
-
-        if(_asset_sha)
-            file(DOWNLOAD
-                "${_bootstrap_url}"
-                "${_downloaded_path}"
-                SHOW_PROGRESS
-                TLS_VERIFY ON
-                EXPECTED_HASH "SHA256=${_asset_sha}"
-                STATUS _download_status
-            )
-        else()
-            file(DOWNLOAD
-                "${_bootstrap_url}"
-                "${_downloaded_path}"
-                SHOW_PROGRESS
-                TLS_VERIFY ON
-                STATUS _download_status
-            )
-        endif()
-
-        list(GET _download_status 0 _download_code)
-        list(GET _download_status 1 _download_message)
-        if(NOT _download_code EQUAL 0)
-            file(REMOVE "${_downloaded_path}")
+    set(_release_candidates "${BPP_BOOTSTRAP_RELEASE_TAG}")
+    set(_asset_candidates "${_asset_name}")
+    if(NOT _asset_sha
+       AND BPP_BOOTSTRAP_RELEASE_TAG MATCHES "^bootstrap-v([0-9]+)$"
+       AND _asset_name MATCHES "^bpp-bootstrap-v([0-9]+)-")
+        set(_fallback_version "${CMAKE_MATCH_1}")
+        math(EXPR _fallback_version "${_fallback_version} - 1")
+        while(_fallback_version GREATER 0)
+            list(APPEND _release_candidates "bootstrap-v${_fallback_version}")
             if(WIN32)
-                message(STATUS "Windows bootstrap compiler asset is not available yet: ${_bootstrap_url}")
-                set(${OUT_VAR} "" PARENT_SCOPE)
-                return()
+                list(APPEND _asset_candidates "bpp-bootstrap-v${_fallback_version}-windows-x86_64.exe")
+            else()
+                list(APPEND _asset_candidates "bpp-bootstrap-v${_fallback_version}-linux-x86_64")
             endif()
-            message(FATAL_ERROR "Failed to download BPP bootstrap compiler: ${_download_message}")
+            math(EXPR _fallback_version "${_fallback_version} - 1")
+        endwhile()
+    endif()
+
+    list(LENGTH _release_candidates _candidate_count)
+    math(EXPR _candidate_last "${_candidate_count} - 1")
+    foreach(_candidate_index RANGE 0 ${_candidate_last})
+        list(GET _release_candidates ${_candidate_index} _candidate_release)
+        list(GET _asset_candidates ${_candidate_index} _candidate_asset)
+        set(_downloaded_path "${_tools_dir}/${_candidate_asset}")
+        set(_bootstrap_url "${BPP_BOOTSTRAP_BASE_URL}/${BPP_BOOTSTRAP_REPOSITORY}/releases/download/${_candidate_release}/${_candidate_asset}")
+
+        if(NOT EXISTS "${_downloaded_path}")
+            file(MAKE_DIRECTORY "${_tools_dir}")
+            message(STATUS "Downloading BPP bootstrap compiler from ${_bootstrap_url}")
+
+            if(_asset_sha AND _candidate_index EQUAL 0)
+                file(DOWNLOAD
+                    "${_bootstrap_url}"
+                    "${_downloaded_path}"
+                    SHOW_PROGRESS
+                    TLS_VERIFY ON
+                    EXPECTED_HASH "SHA256=${_asset_sha}"
+                    STATUS _download_status
+                )
+            else()
+                file(DOWNLOAD
+                    "${_bootstrap_url}"
+                    "${_downloaded_path}"
+                    SHOW_PROGRESS
+                    TLS_VERIFY ON
+                    STATUS _download_status
+                )
+            endif()
+
+            list(GET _download_status 0 _download_code)
+            list(GET _download_status 1 _download_message)
+            if(NOT _download_code EQUAL 0)
+                file(REMOVE "${_downloaded_path}")
+                message(STATUS "BPP bootstrap compiler asset is not available yet: ${_bootstrap_url} (${_download_message})")
+                continue()
+            endif()
         endif()
-    endif()
 
-    if(NOT WIN32)
-        file(CHMOD "${_downloaded_path}" PERMISSIONS
-            OWNER_READ OWNER_WRITE OWNER_EXECUTE
-            GROUP_READ GROUP_EXECUTE
-            WORLD_READ WORLD_EXECUTE
-        )
-    endif()
+        if(NOT WIN32)
+            file(CHMOD "${_downloaded_path}" PERMISSIONS
+                OWNER_READ OWNER_WRITE OWNER_EXECUTE
+                GROUP_READ GROUP_EXECUTE
+                WORLD_READ WORLD_EXECUTE
+            )
+        endif()
 
-    set(${OUT_VAR} "${_downloaded_path}" PARENT_SCOPE)
+        bpp_is_host_bootstrap_compiler("${_downloaded_path}" _download_is_native)
+        if(NOT _download_is_native)
+            file(REMOVE "${_downloaded_path}")
+            message(STATUS "Ignoring bootstrap asset with the wrong host format: ${_bootstrap_url}")
+            continue()
+        endif()
+
+        if(NOT _candidate_index EQUAL 0)
+            message(STATUS "Using previous BPP bootstrap compiler: ${_candidate_release}/${_candidate_asset}")
+        endif()
+        set(${OUT_VAR} "${_downloaded_path}" PARENT_SCOPE)
+        return()
+    endforeach()
+
+    if(WIN32)
+        message(STATUS "Windows bootstrap compiler asset is not available yet.")
+    else()
+        message(STATUS "Linux bootstrap compiler asset is not available yet.")
+    endif()
+    set(${OUT_VAR} "" PARENT_SCOPE)
 endfunction()
 
 function(bpp_resolve_bootstrap_compiler ROOT_DIR VERSION_HINT OUT_VAR)
     if(DEFINED ENV{BPP_BASE_COMPILER} AND NOT "$ENV{BPP_BASE_COMPILER}" STREQUAL "")
         if(EXISTS "$ENV{BPP_BASE_COMPILER}")
+            bpp_validate_explicit_bootstrap_compiler("$ENV{BPP_BASE_COMPILER}")
             set(${OUT_VAR} "$ENV{BPP_BASE_COMPILER}" PARENT_SCOPE)
             return()
         endif()
