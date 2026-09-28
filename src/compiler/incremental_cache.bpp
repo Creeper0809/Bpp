@@ -1,0 +1,700 @@
+// Conservative function-fragment cache for legacy native code generation.
+// A manifest is reusable only when the compiler/options identity and the exact
+// non-function-body semantic environment match. Individual functions then use
+// exact source-span and finalized-signature keys.
+import compiler;
+import compiler.artifact_cache;
+import compiler.symbol_runtime;
+import compiler.timings;
+import ast;
+import types;
+import std.hashmap;
+import std.io;
+import std.mem;
+import std.os;
+import std.str;
+import std.vec;
+
+const INCREMENTAL_CACHE_MAGIC = 0x314e554650504242;
+const INCREMENTAL_CACHE_END = 0x31444e4643505042;
+const INCREMENTAL_SEMANTIC_MAGIC = 0x314d455350504242;
+const INCREMENTAL_SEMANTIC_END = 0x31444e5343505042;
+const INCREMENTAL_CACHE_FORMAT = 2;
+const INCREMENTAL_CACHE_MAX_BYTES = 335544320;
+const INCREMENTAL_CACHE_MAX_KEY = 67108864;
+
+struct IncrementalBytes {
+    public data: u64;
+    public length: u64;
+    public capacity: u64;
+    public ok: u64;
+}
+
+struct IncrementalRange {
+    public start: u64;
+    public end: u64;
+    public body_start: u64;
+}
+
+struct IncrementalEntry {
+    public key_data: u64;
+    public key_len: u64;
+    public payload_data: u64;
+    public payload_len: u64;
+    public label_start: u64;
+    public label_delta: u64;
+    public owned: u64;
+}
+
+var g_incremental_enabled: u64;
+var g_incremental_environment: IncrementalBytes;
+var g_incremental_path: u64;
+var g_incremental_semantic_path: u64;
+var g_incremental_semantic_id_a: u64;
+var g_incremental_semantic_id_b: u64;
+var g_incremental_semantic_valid: u64;
+var g_incremental_record: u64;
+var g_incremental_record_len: u64;
+var g_incremental_prior_entries: *Vec<*IncrementalEntry>;
+var g_incremental_entries: *Vec<*IncrementalEntry>;
+var g_incremental_map: *HashMap<u64, *IncrementalEntry>;
+
+func incremental_bytes_init(out: *IncrementalBytes) -> u64 {
+    out.data = 0;
+    out.length = 0;
+    out.capacity = 0;
+    out.ok = 1;
+    return 0;
+}
+
+func incremental_bytes_release(out: *IncrementalBytes) -> u64 {
+    if (out.data != 0) { heap_free(out.data); }
+    incremental_bytes_init(out);
+    return 0;
+}
+
+func incremental_bytes_reserve(out: *IncrementalBytes, add_len: u64) -> u64 {
+    if (out.ok == 0) { return 0; }
+    if (add_len > INCREMENTAL_CACHE_MAX_KEY || out.length > INCREMENTAL_CACHE_MAX_KEY - add_len) {
+        out.ok = 0;
+        return 0;
+    }
+    var required: u64 = out.length + add_len;
+    if (required <= out.capacity) { return 1; }
+    var next_cap: u64 = out.capacity * 2;
+    if (next_cap < 4096) { next_cap = 4096; }
+    while (next_cap < required) { next_cap = next_cap * 2; }
+    if (next_cap > INCREMENTAL_CACHE_MAX_KEY) { next_cap = INCREMENTAL_CACHE_MAX_KEY; }
+    if (next_cap < required) { out.ok = 0; return 0; }
+    var next: u64 = heap_alloc(next_cap);
+    if (next == 0) { out.ok = 0; return 0; }
+    if (out.length != 0) { memcopy(next, out.data, out.length); }
+    if (out.data != 0) { heap_free(out.data); }
+    out.data = next;
+    out.capacity = next_cap;
+    return 1;
+}
+
+func incremental_bytes_append_raw(out: *IncrementalBytes, data: u64, length: u64) -> u64 {
+    if (incremental_bytes_reserve(out, length) == 0) { return 0; }
+    if (length != 0) { memcopy(out.data + out.length, data, length); }
+    out.length = out.length + length;
+    return 1;
+}
+
+func incremental_bytes_append_part(out: *IncrementalBytes, data: u64, length: u64) -> u64 {
+    if (incremental_bytes_reserve(out, 8 + length) == 0) { return 0; }
+    *((*u64)(out.data + out.length)) = length;
+    out.length = out.length + 8;
+    if (length != 0) { memcopy(out.data + out.length, data, length); }
+    out.length = out.length + length;
+    return 1;
+}
+
+func incremental_bytes_append_u64(out: *IncrementalBytes, value: u64) -> u64 {
+    return incremental_bytes_append_part(out, (u64)&value, sizeof(u64));
+}
+
+func incremental_append_name_vec(out: *IncrementalBytes, names: *Vec<*NameInfo>) -> u64 {
+    var count: u64 = 0;
+    if (names != 0) { count = names.len(); }
+    incremental_bytes_append_u64(out, count);
+    for (var i: u64 = 0; i < count; i++) {
+        var info: *NameInfo = names.get(i);
+        if (info == 0) { incremental_bytes_append_part(out, 0, 0); }
+        else { incremental_bytes_append_part(out, info.ptr, info.len); }
+    }
+    return out.ok;
+}
+
+func incremental_append_typeinfo(out: *IncrementalBytes, ti: *TypeInfo, depth: u64) -> u64 {
+    if (ti == 0) { return incremental_bytes_append_u64(out, 0); }
+    if (depth >= 12) { out.ok = 0; return 0; }
+    incremental_bytes_append_u64(out, 1);
+    incremental_bytes_append_u64(out, ti.type_kind);
+    incremental_bytes_append_u64(out, ti.ptr_depth);
+    incremental_bytes_append_u64(out, ti.is_tagged);
+    incremental_bytes_append_part(out, ti.struct_name.ptr, ti.struct_name.len);
+    incremental_bytes_append_part(out, ti.tag_layout.ptr, ti.tag_layout.len);
+    incremental_bytes_append_u64(out, ti.elem_type_kind);
+    incremental_bytes_append_u64(out, ti.elem_ptr_depth);
+    incremental_bytes_append_u64(out, ti.array_len);
+    incremental_bytes_append_u64(out, ti.array_len_is_param);
+    incremental_bytes_append_part(out, ti.array_len_param.ptr, ti.array_len_param.len);
+    incremental_bytes_append_u64(out, ti.fn_is_variadic);
+    incremental_bytes_append_u64(out, ti.number_storage_kind);
+    incremental_append_typeinfo(out, ti.elem_typeinfo, depth + 1);
+    var params_count: u64 = 0;
+    if (ti.fn_params_vec != 0) { params_count = ti.fn_params_vec.len(); }
+    incremental_bytes_append_u64(out, params_count);
+    for (var i: u64 = 0; i < params_count; i++) {
+        incremental_append_typeinfo(out, ti.fn_params_vec.get(i), depth + 1);
+    }
+    incremental_append_typeinfo(out, ti.fn_ret_typeinfo, depth + 1);
+    return out.ok;
+}
+
+func incremental_append_param(out: *IncrementalBytes, p: *Param) -> u64 {
+    if (p == 0) { out.ok = 0; return 0; }
+    incremental_bytes_append_part(out, p.name.ptr, p.name.len);
+    incremental_bytes_append_u64(out, p.type_kind);
+    incremental_bytes_append_u64(out, p.ptr_depth);
+    incremental_bytes_append_u64(out, p.is_tagged);
+    incremental_bytes_append_part(out, p.struct_name.ptr, p.struct_name.len);
+    incremental_bytes_append_part(out, p.tag_layout.ptr, p.tag_layout.len);
+    incremental_bytes_append_u64(out, p.elem_type_kind);
+    incremental_bytes_append_u64(out, p.elem_ptr_depth);
+    incremental_bytes_append_u64(out, p.array_len);
+    incremental_bytes_append_u64(out, p.array_len_is_param);
+    incremental_bytes_append_part(out, p.array_len_param.ptr, p.array_len_param.len);
+    incremental_bytes_append_u64(out, p.is_variadic);
+    incremental_bytes_append_u64(out, p.has_default);
+    incremental_append_typeinfo(out, p.elem_typeinfo, 0);
+    return out.ok;
+}
+
+func incremental_append_func_signature(out: *IncrementalBytes, fn: *AstFunc) -> u64 {
+    if (fn == 0) { out.ok = 0; return 0; }
+    incremental_bytes_append_part(out, fn.name.ptr, fn.name.len);
+    var module_info: *NameInfo = sym_get_func_module(fn.name);
+    if (module_info == 0) { incremental_bytes_append_part(out, 0, 0); }
+    else { incremental_bytes_append_part(out, module_info.ptr, module_info.len); }
+    incremental_bytes_append_u64(out, fn.ret_type);
+    incremental_bytes_append_u64(out, fn.ret_ptr_depth);
+    incremental_bytes_append_u64(out, fn.ret_is_tagged);
+    incremental_bytes_append_part(out, fn.ret_struct_name.ptr, fn.ret_struct_name.len);
+    incremental_bytes_append_part(out, fn.ret_tag_layout.ptr, fn.ret_tag_layout.len);
+    incremental_bytes_append_part(out, fn.impl_owner.ptr, fn.impl_owner.len);
+    incremental_bytes_append_u64(out, fn.impl_method_access);
+    incremental_bytes_append_part(out, fn.impl_original_name.ptr, fn.impl_original_name.len);
+    incremental_bytes_append_u64(out, fn.impl_is_override);
+    incremental_bytes_append_u64(out, fn.stack_noescape_summary_state);
+    incremental_bytes_append_u64(out, fn.stack_noescape_param_bits);
+    incremental_append_typeinfo(out, fn.ret_typeinfo, 0);
+    incremental_append_name_vec(out, fn.annotations_vec);
+    var param_count: u64 = 0;
+    if (fn.params_vec != 0) { param_count = fn.params_vec.len(); }
+    incremental_bytes_append_u64(out, param_count);
+    for (var i: u64 = 0; i < param_count; i++) { incremental_append_param(out, fn.params_vec.get(i)); }
+    return out.ok;
+}
+
+func incremental_find_body_start(source: u64, start: u64, end: u64) -> u64 {
+    var bytes: *u8 = (*u8)source;
+    var paren_depth: u64 = 0;
+    var bracket_depth: u64 = 0;
+    var quote: u64 = 0;
+    var escaped: u64 = 0;
+    var line_comment: u64 = 0;
+    var block_comment: u64 = 0;
+    var i: u64 = start;
+    while (i < end) {
+        var c: u64 = bytes[i];
+        var next: u64 = 0;
+        if (i + 1 < end) { next = bytes[i + 1]; }
+        if (line_comment != 0) {
+            if (c == 10 || c == 13) { line_comment = 0; }
+            i = i + 1;
+            continue;
+        }
+        if (block_comment != 0) {
+            if (c == 42 && next == 47) { block_comment = 0; i = i + 2; }
+            else { i = i + 1; }
+            continue;
+        }
+        if (quote != 0) {
+            if (escaped != 0) { escaped = 0; }
+            else if (c == 92) { escaped = 1; }
+            else if (c == quote) { quote = 0; }
+            i = i + 1;
+            continue;
+        }
+        if (c == 47 && next == 47) { line_comment = 1; i = i + 2; continue; }
+        if (c == 47 && next == 42) { block_comment = 1; i = i + 2; continue; }
+        if (c == 34 || c == 39) { quote = c; i = i + 1; continue; }
+        if (c == 40) { paren_depth = paren_depth + 1; }
+        else if (c == 41 && paren_depth != 0) { paren_depth = paren_depth - 1; }
+        else if (c == 91) { bracket_depth = bracket_depth + 1; }
+        else if (c == 93 && bracket_depth != 0) { bracket_depth = bracket_depth - 1; }
+        else if (c == 123 && paren_depth == 0 && bracket_depth == 0) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+func incremental_collect_ranges(program: *AstProgram, path: *NameInfo, source: *NameInfo) -> *Vec<*IncrementalRange> {
+    var ranges: *Vec<*IncrementalRange> = new Vec<*IncrementalRange>{heap_alloc((16) * sizeof(*IncrementalRange)), 0, (16)};
+    if (program == 0 || program.funcs_vec == 0 || path == 0 || source == 0) { return ranges; }
+    var count: u64 = program.funcs_vec.len();
+    for (var i: u64 = 0; i < count; i++) {
+        var fn: *AstFunc = program.funcs_vec.get(i);
+        var file_ptr: u64 = 0;
+        var file_len: u64 = 0;
+        var start_line: u64 = 0;
+        var start_col: u64 = 0;
+        var end_line: u64 = 0;
+        var end_col: u64 = 0;
+        if (fn == 0 || ast_source_span_get((u64)fn, &file_ptr, &file_len, &start_line, &start_col, &end_line, &end_col) == 0) { continue; }
+        if (file_len != path.len || str_eq(slice(file_ptr, file_len), slice(path.ptr, path.len)) == 0) { continue; }
+        var range_id: u64 = 0;
+        var start: u64 = 0;
+        var end: u64 = 0;
+        if (ast_source_span_get_extra((u64)fn, &range_id, &start, &end) == 0 || end <= start || end > source.len) { continue; }
+        var body_start: u64 = incremental_find_body_start(source.ptr, start, end);
+        if (body_start == 0 - 1 || body_start >= end) { continue; }
+        var duplicate: u64 = 0;
+        for (var ri: u64 = 0; ri < ranges.len(); ri++) {
+            var existing: *IncrementalRange = ranges.get(ri);
+            if (existing.start == start && existing.end == end) { duplicate = 1; break; }
+        }
+        if (duplicate == 0) { ranges.push(new IncrementalRange{start, end, body_start}); }
+    }
+    for (var si: u64 = 1; si < ranges.len(); si++) {
+        var current: *IncrementalRange = ranges.get(si);
+        var pos: u64 = si;
+        while (pos != 0 && ranges.get(pos - 1).start > current.start) {
+            ranges.set(pos, ranges.get(pos - 1));
+            pos = pos - 1;
+        }
+        ranges.set(pos, current);
+    }
+    return ranges;
+}
+
+func incremental_release_ranges(ranges: *Vec<*IncrementalRange>) -> u64 {
+    if (ranges == 0) { return 0; }
+    for (var i: u64 = 0; i < ranges.len(); i++) { heap_free((u64)ranges.get(i)); }
+    ranges.release_buffer();
+    heap_free((u64)ranges);
+    return 0;
+}
+
+func incremental_append_module_surface(out: *IncrementalBytes, program: *AstProgram, path: *NameInfo, source: *NameInfo) -> u64 {
+    incremental_bytes_append_part(out, path.ptr, path.len);
+    var ranges: *Vec<*IncrementalRange> = incremental_collect_ranges(program, path, source);
+    var valid: u64 = 1;
+    for (var i: u64 = 1; i < ranges.len(); i++) {
+        if (ranges.get(i).start < ranges.get(i - 1).end) { valid = 0; break; }
+    }
+    if (valid == 0 || ranges.len() == 0) {
+        incremental_bytes_append_part(out, source.ptr, source.len);
+        incremental_release_ranges(ranges);
+        return out.ok;
+    }
+    incremental_bytes_append_u64(out, ranges.len());
+    var cursor: u64 = 0;
+    for (var ri: u64 = 0; ri < ranges.len(); ri++) {
+        var range: *IncrementalRange = ranges.get(ri);
+        var header_end: u64 = range.body_start + 1;
+        if (header_end < cursor || header_end > source.len || range.end > source.len) { out.ok = 0; break; }
+        incremental_bytes_append_part(out, source.ptr + cursor, header_end - cursor);
+        incremental_bytes_append_u64(out, 0x59444f424e554646);
+        cursor = range.end;
+    }
+    if (out.ok != 0) { incremental_bytes_append_part(out, source.ptr + cursor, source.len - cursor); }
+    incremental_release_ranges(ranges);
+    return out.ok;
+}
+
+func incremental_append_struct_surface(out: *IncrementalBytes, def: *AstStructDef) -> u64 {
+    if (def == 0) { out.ok = 0; return 0; }
+    incremental_bytes_append_part(out, def.name.ptr, def.name.len);
+    incremental_bytes_append_u64(out, def.is_packed);
+    incremental_bytes_append_u64(out, def.is_union);
+    incremental_append_name_vec(out, def.annotations_vec);
+    var parents: u64 = 0;
+    if (def.parents_vec != 0) { parents = def.parents_vec.len(); }
+    incremental_bytes_append_u64(out, parents);
+    for (var pi: u64 = 0; pi < parents; pi++) {
+        var parent: *ParentDesc = def.parents_vec.get(pi);
+        incremental_bytes_append_part(out, parent.name.ptr, parent.name.len);
+    }
+    var traits: u64 = 0;
+    if (def.traits_vec != 0) { traits = def.traits_vec.len(); }
+    incremental_bytes_append_u64(out, traits);
+    for (var ti: u64 = 0; ti < traits; ti++) {
+        var trait_ref: *TraitRef = def.traits_vec.get(ti);
+        incremental_bytes_append_part(out, trait_ref.name.ptr, trait_ref.name.len);
+    }
+    var fields: u64 = 0;
+    if (def.fields_vec != 0) { fields = def.fields_vec.len(); }
+    incremental_bytes_append_u64(out, fields);
+    for (var fi: u64 = 0; fi < fields; fi++) {
+        var field: *FieldDesc = def.fields_vec.get(fi);
+        incremental_bytes_append_part(out, field.name.ptr, field.name.len);
+        incremental_bytes_append_u64(out, field.type_kind);
+        incremental_bytes_append_part(out, field.struct_name.ptr, field.struct_name.len);
+        incremental_bytes_append_u64(out, field.ptr_depth);
+        incremental_bytes_append_u64(out, field.is_tagged);
+        incremental_bytes_append_part(out, field.tag_layout.ptr, field.tag_layout.len);
+        incremental_bytes_append_u64(out, field.bit_width);
+        incremental_bytes_append_u64(out, field.offset);
+        incremental_bytes_append_u64(out, field.elem_type_kind);
+        incremental_bytes_append_u64(out, field.elem_ptr_depth);
+        incremental_bytes_append_u64(out, field.array_len);
+        incremental_bytes_append_u64(out, field.access);
+        incremental_bytes_append_part(out, field.owner_struct.ptr, field.owner_struct.len);
+        incremental_bytes_append_u64(out, field.setter_hook_mode);
+        incremental_bytes_append_u64(out, field.getter_hook_mode);
+        incremental_bytes_append_part(out, field.setter_hook.ptr, field.setter_hook.len);
+        incremental_bytes_append_part(out, field.getter_hook.ptr, field.getter_hook.len);
+        incremental_append_typeinfo(out, field.elem_typeinfo, 0);
+        incremental_append_name_vec(out, field.annotations_vec);
+    }
+    return out.ok;
+}
+
+func incremental_build_environment(program: *AstProgram, out: *IncrementalBytes) -> u64 {
+    incremental_bytes_init(out);
+    var ctx: *CompilerCtx = compiler_ctx_current();
+    if (ctx == 0 || ctx.loaded_modules_vec == 0 || ctx.module_source_cache == 0 || program == 0) { out.ok = 0; return 0; }
+    incremental_bytes_append_u64(out, INCREMENTAL_CACHE_FORMAT);
+    var module_count: u64 = ctx.loaded_modules_vec.len();
+    incremental_bytes_append_u64(out, module_count);
+    for (var mi: u64 = 0; mi < module_count; mi++) {
+        var path: *NameInfo = ctx.loaded_modules_vec.get(mi);
+        var source: *NameInfo = ctx.module_source_cache.get(slice(path.ptr, path.len));
+        if (path == 0 || source == 0) { out.ok = 0; return 0; }
+        incremental_append_module_surface(out, program, path, source);
+    }
+    var funcs: u64 = 0;
+    if (program.funcs_vec != 0) { funcs = program.funcs_vec.len(); }
+    incremental_bytes_append_u64(out, funcs);
+    for (var fi: u64 = 0; fi < funcs; fi++) { incremental_append_func_signature(out, program.funcs_vec.get(fi)); }
+    var structs: u64 = 0;
+    if (program.structs_vec != 0) { structs = program.structs_vec.len(); }
+    incremental_bytes_append_u64(out, structs);
+    for (var si: u64 = 0; si < structs; si++) { incremental_append_struct_surface(out, program.structs_vec.get(si)); }
+    var globals: u64 = 0;
+    if (program.globals_vec != 0) { globals = program.globals_vec.len(); }
+    incremental_bytes_append_u64(out, globals);
+    for (var gi: u64 = 0; gi < globals; gi++) {
+        var global: *GlobalInfo = program.globals_vec.get(gi);
+        incremental_bytes_append_part(out, global.name.ptr, global.name.len);
+        incremental_append_typeinfo(out, global.typeinfo_ptr, 0);
+        incremental_bytes_append_u64(out, global.init_kind);
+        incremental_bytes_append_u64(out, global.init_value);
+        incremental_bytes_append_part(out, global.init_name.ptr, global.init_name.len);
+        incremental_append_name_vec(out, global.annotations_vec);
+    }
+    var consts: u64 = 0;
+    if (program.consts_vec != 0) { consts = program.consts_vec.len(); }
+    incremental_bytes_append_u64(out, consts);
+    for (var ci: u64 = 0; ci < consts; ci++) {
+        var c: *AstConstDecl = program.consts_vec.get(ci);
+        incremental_bytes_append_part(out, c.name.ptr, c.name.len);
+        incremental_bytes_append_u64(out, c.value);
+    }
+    return out.ok;
+}
+
+func incremental_cache_make_function_key(fn: *AstFunc, out_len: *u64) -> u64 {
+    if (g_incremental_enabled == 0 || fn == 0 || out_len == 0) { return 0; }
+    var file_ptr: u64 = 0;
+    var file_len: u64 = 0;
+    var start_line: u64 = 0;
+    var start_col: u64 = 0;
+    var end_line: u64 = 0;
+    var end_col: u64 = 0;
+    if (ast_source_span_get((u64)fn, &file_ptr, &file_len, &start_line, &start_col, &end_line, &end_col) == 0) { return 0; }
+    var range_id: u64 = 0;
+    var start: u64 = 0;
+    var end: u64 = 0;
+    if (ast_source_span_get_extra((u64)fn, &range_id, &start, &end) == 0 || end <= start) { return 0; }
+    var ctx: *CompilerCtx = compiler_ctx_current();
+    var source: *NameInfo = ctx.module_source_cache.get(slice(file_ptr, file_len));
+    if (source == 0 || end > source.len) { return 0; }
+    var key: IncrementalBytes;
+    incremental_bytes_init(&key);
+    incremental_bytes_append_u64(&key, INCREMENTAL_CACHE_FORMAT);
+    incremental_bytes_append_part(&key, file_ptr, file_len);
+    incremental_bytes_append_part(&key, source.ptr + start, end - start);
+    incremental_append_func_signature(&key, fn);
+    if (key.ok == 0 || key.length == 0) { incremental_bytes_release(&key); return 0; }
+    *out_len = key.length;
+    return key.data;
+}
+
+func incremental_semantic_load() -> u64 {
+    var length: u64 = 0;
+    var data: u64 = artifact_cache_read(g_incremental_semantic_path, INCREMENTAL_CACHE_MAX_BYTES, &length);
+    if (data == 0 || length < 64) { if (data != 0) { heap_free(data); } return 0; }
+    var header: *u64 = (*u64)data;
+    var base_len: u64 = header[2];
+    var env_len: u64 = header[3];
+    if (header[0] != INCREMENTAL_SEMANTIC_MAGIC || header[1] != INCREMENTAL_CACHE_FORMAT ||
+        header[4] != g_incremental_semantic_id_a || header[5] != g_incremental_semantic_id_b) { heap_free(data); return 0; }
+    if (base_len != artifact_cache_base_identity_length() || base_len > length - 64 || env_len > length - 64 - base_len || length != 64 + base_len + env_len) { heap_free(data); return 0; }
+    var footer: *u64 = (*u64)(data + length - 16);
+    if (footer[1] != INCREMENTAL_SEMANTIC_END || io_content_hash_extend(14695981039346656037, data + 48, length - 64) != footer[0]) { heap_free(data); return 0; }
+    var cursor: u64 = data + 48;
+    if (str_eq(slice(cursor, base_len), slice(artifact_cache_base_identity_data(), base_len)) == 0) { heap_free(data); return 0; }
+    cursor = cursor + base_len;
+    if (env_len != g_incremental_environment.length || str_eq(slice(cursor, env_len), slice(g_incremental_environment.data, env_len)) == 0) { heap_free(data); return 0; }
+    heap_free(data);
+    g_incremental_semantic_valid = 1;
+    return 1;
+}
+
+func incremental_semantic_publish() -> u64 {
+    if (g_incremental_semantic_valid != 0) { return 1; }
+    var base_len: u64 = artifact_cache_base_identity_length();
+    var total: u64 = 64 + base_len + g_incremental_environment.length;
+    if (total > INCREMENTAL_CACHE_MAX_BYTES) { return 0; }
+    var data: u64 = heap_alloc(total);
+    if (data == 0) { return 0; }
+    var header: *u64 = (*u64)data;
+    header[0] = INCREMENTAL_SEMANTIC_MAGIC;
+    header[1] = INCREMENTAL_CACHE_FORMAT;
+    header[2] = base_len;
+    header[3] = g_incremental_environment.length;
+    header[4] = g_incremental_semantic_id_a;
+    header[5] = g_incremental_semantic_id_b;
+    var cursor: u64 = data + 48;
+    memcopy(cursor, artifact_cache_base_identity_data(), base_len);
+    cursor = cursor + base_len;
+    memcopy(cursor, g_incremental_environment.data, g_incremental_environment.length);
+    cursor = cursor + g_incremental_environment.length;
+    var footer: *u64 = (*u64)cursor;
+    footer[0] = io_content_hash_extend(14695981039346656037, data + 48, cursor - data - 48);
+    footer[1] = INCREMENTAL_SEMANTIC_END;
+    var pid: u64 = artifact_cache_hex(os_process_id());
+    var stamp: u64 = artifact_cache_hex(os_monotonic_ms());
+    var suffix: u64 = str_concat3(pid, 16, ".", 1, stamp, 16);
+    var temp: u64 = str_concat3(g_incremental_semantic_path, str_len(g_incremental_semantic_path), ".tmp.", 5, suffix, 33);
+    heap_free(pid); heap_free(stamp); heap_free(suffix);
+    var fd: i64 = (i64)sys_open(temp, OS_O_WRONLY + OS_O_CREAT + OS_O_TRUNC, 384);
+    var written: u64 = 0;
+    if (fd >= 0) { written = io_write_all((u64)fd, data, total); sys_close((u64)fd); }
+    heap_free(data);
+    if (written != 0 && os_rename_replace(temp, g_incremental_semantic_path) != 0) {
+        heap_free(temp);
+        g_incremental_semantic_valid = 1;
+        return 1;
+    }
+    os_remove_file(temp);
+    heap_free(temp);
+    return 0;
+}
+
+func incremental_manifest_load() -> u64 {
+    var length: u64 = 0;
+    var data: u64 = artifact_cache_read(g_incremental_path, INCREMENTAL_CACHE_MAX_BYTES, &length);
+    if (data == 0 || length < 64) { if (data != 0) { heap_free(data); } return 0; }
+    var header: *u64 = (*u64)data;
+    var count: u64 = header[4];
+    if (header[0] != INCREMENTAL_CACHE_MAGIC || header[1] != INCREMENTAL_CACHE_FORMAT ||
+        header[2] != g_incremental_semantic_id_a || header[3] != g_incremental_semantic_id_b || header[5] != 0) { heap_free(data); return 0; }
+    var footer: *u64 = (*u64)(data + length - 16);
+    if (footer[1] != INCREMENTAL_CACHE_END || io_content_hash_extend(14695981039346656037, data + 48, length - 64) != footer[0]) { heap_free(data); return 0; }
+    var cursor: u64 = data + 48;
+    var end: u64 = data + length - 16;
+    if (count > (end - cursor) / 32) { heap_free(data); return 0; }
+    var entries_start: u64 = cursor;
+    for (var i: u64 = 0; i < count; i++) {
+        if (end - cursor < 32) { heap_free(data); return 0; }
+        var key_len: u64 = *((*u64)cursor);
+        var payload_len: u64 = *((*u64)(cursor + 8));
+        cursor = cursor + 32;
+        if (key_len == 0 || payload_len == 0 || key_len > end - cursor || payload_len > end - cursor - key_len) { heap_free(data); return 0; }
+        cursor = cursor + key_len + payload_len;
+    }
+    if (cursor != end) { heap_free(data); return 0; }
+    cursor = entries_start;
+    for (var ei: u64 = 0; ei < count; ei++) {
+        var parsed_key_len: u64 = *((*u64)cursor);
+        var parsed_payload_len: u64 = *((*u64)(cursor + 8));
+        var parsed_label_start: u64 = *((*u64)(cursor + 16));
+        var parsed_label_delta: u64 = *((*u64)(cursor + 24));
+        cursor = cursor + 32;
+        var entry: *IncrementalEntry = new IncrementalEntry{cursor, parsed_key_len, cursor + parsed_key_len, parsed_payload_len, parsed_label_start, parsed_label_delta, 0};
+        g_incremental_prior_entries.push(entry);
+        g_incremental_map.put(slice(entry.key_data, entry.key_len), entry);
+        cursor = cursor + parsed_key_len + parsed_payload_len;
+    }
+    g_incremental_record = data;
+    g_incremental_record_len = length;
+    artifact_cache_note("function manifest hit");
+    return 1;
+}
+
+func incremental_cache_begin(program: *AstProgram, use_ssa: u64) -> u64 {
+    incremental_cache_end(0);
+    if (use_ssa != 0 || asm_source_capture_is_enabled() != 0 || artifact_cache_incremental_enabled() == 0) { return 0; }
+    if (incremental_build_environment(program, &g_incremental_environment) == 0) {
+        incremental_bytes_release(&g_incremental_environment);
+        return 0;
+    }
+    g_incremental_prior_entries = new Vec<*IncrementalEntry>{heap_alloc((32) * sizeof(*IncrementalEntry)), 0, (32)};
+    g_incremental_entries = new Vec<*IncrementalEntry>{heap_alloc((32) * sizeof(*IncrementalEntry)), 0, (32)};
+    g_incremental_map = new HashMap<u64, *IncrementalEntry>{0, 0, 0};
+    g_incremental_map.ensure_capacity(256);
+    g_incremental_semantic_id_a = io_content_hash_extend(14695981039346656037, artifact_cache_base_identity_data(), artifact_cache_base_identity_length());
+    g_incremental_semantic_id_a = io_content_hash_extend(g_incremental_semantic_id_a, g_incremental_environment.data, g_incremental_environment.length);
+    g_incremental_semantic_id_b = io_content_hash_extend(7809847782465536322, artifact_cache_base_identity_data(), artifact_cache_base_identity_length());
+    g_incremental_semantic_id_b = io_content_hash_extend(g_incremental_semantic_id_b, g_incremental_environment.data, g_incremental_environment.length);
+    var semantic_key: [2]u64;
+    semantic_key[0] = g_incremental_semantic_id_a;
+    semantic_key[1] = g_incremental_semantic_id_b;
+    g_incremental_path = artifact_cache_path_for_key(
+        (u64)&semantic_key,
+        16,
+        (u64)".bppfun",
+        7
+    );
+    g_incremental_semantic_path = artifact_cache_path_for_key(
+        (u64)&semantic_key,
+        16,
+        (u64)".bppsem",
+        7
+    );
+    g_incremental_enabled = 1;
+    if (incremental_semantic_load() != 0) { incremental_manifest_load(); }
+    return 1;
+}
+
+func incremental_cache_lookup(key: u64, key_len: u64, current_label: u64, out_data: *u64, out_len: *u64, out_label_delta: *u64) -> u64 {
+    if (g_incremental_enabled == 0 || key == 0 || key_len == 0 || g_incremental_map == 0) { return 0; }
+    var entry: *IncrementalEntry = g_incremental_map.get(slice(key, key_len));
+    var usable: u64 = entry != 0 && entry.label_start == current_label;
+    timings_note_incremental_lookup(usable);
+    if (usable == 0) { return 0; }
+    g_incremental_entries.push(entry);
+    if (out_data != 0) { *out_data = entry.payload_data; }
+    if (out_len != 0) { *out_len = entry.payload_len; }
+    if (out_label_delta != 0) { *out_label_delta = entry.label_delta; }
+    return 1;
+}
+
+func incremental_cache_store(key: u64, key_len: u64, payload: u64, payload_len: u64, label_start: u64, label_delta: u64) -> u64 {
+    if (g_incremental_enabled == 0 || key == 0 || key_len == 0 || payload == 0 || payload_len == 0) { return 0; }
+    if (key_len > INCREMENTAL_CACHE_MAX_KEY || payload_len > INCREMENTAL_CACHE_MAX_BYTES) { return 0; }
+    var entry: *IncrementalEntry = new IncrementalEntry{key, key_len, payload, payload_len, label_start, label_delta, 1};
+    g_incremental_entries.push(entry);
+    timings_note_incremental_store();
+    return 1;
+}
+
+func incremental_manifest_publish() -> u64 {
+    if (g_incremental_enabled == 0 || g_incremental_entries == 0 || g_incremental_entries.len() == 0) { return 0; }
+    if (incremental_semantic_publish() == 0) { return 0; }
+    var total: u64 = 64;
+    for (var i: u64 = 0; i < g_incremental_entries.len(); i++) {
+        var entry: *IncrementalEntry = g_incremental_entries.get(i);
+        if (entry == 0 || entry.key_len == 0 || entry.payload_len == 0 || entry.key_len > INCREMENTAL_CACHE_MAX_BYTES - 32) { return 0; }
+        var add: u64 = 32 + entry.key_len;
+        if (entry.payload_len > INCREMENTAL_CACHE_MAX_BYTES - add || total > INCREMENTAL_CACHE_MAX_BYTES - add - entry.payload_len) { return 0; }
+        total = total + add + entry.payload_len;
+    }
+    var data: u64 = heap_alloc(total);
+    if (data == 0) { return 0; }
+    var header: *u64 = (*u64)data;
+    header[0] = INCREMENTAL_CACHE_MAGIC;
+    header[1] = INCREMENTAL_CACHE_FORMAT;
+    header[2] = g_incremental_semantic_id_a;
+    header[3] = g_incremental_semantic_id_b;
+    header[4] = g_incremental_entries.len();
+    header[5] = 0;
+    var cursor: u64 = data + 48;
+    for (var ei: u64 = 0; ei < g_incremental_entries.len(); ei++) {
+        var current: *IncrementalEntry = g_incremental_entries.get(ei);
+        *((*u64)cursor) = current.key_len;
+        *((*u64)(cursor + 8)) = current.payload_len;
+        *((*u64)(cursor + 16)) = current.label_start;
+        *((*u64)(cursor + 24)) = current.label_delta;
+        cursor = cursor + 32;
+        memcopy(cursor, current.key_data, current.key_len);
+        cursor = cursor + current.key_len;
+        memcopy(cursor, current.payload_data, current.payload_len);
+        cursor = cursor + current.payload_len;
+    }
+    var footer: *u64 = (*u64)cursor;
+    footer[0] = io_content_hash_extend(14695981039346656037, data + 48, cursor - data - 48);
+    footer[1] = INCREMENTAL_CACHE_END;
+    cursor = cursor + 16;
+    if (cursor != data + total) { heap_free(data); return 0; }
+    var pid: u64 = artifact_cache_hex(os_process_id());
+    var stamp: u64 = artifact_cache_hex(os_monotonic_ms());
+    var suffix: u64 = str_concat3(pid, 16, ".", 1, stamp, 16);
+    var temp: u64 = str_concat3(g_incremental_path, str_len(g_incremental_path), ".tmp.", 5, suffix, 33);
+    heap_free(pid); heap_free(stamp); heap_free(suffix);
+    var fd: i64 = (i64)sys_open(temp, OS_O_WRONLY + OS_O_CREAT + OS_O_TRUNC, 384);
+    var written: u64 = 0;
+    if (fd >= 0) {
+        written = io_write_all((u64)fd, data, total);
+        sys_close((u64)fd);
+    }
+    heap_free(data);
+    if (written != 0 && os_rename_replace(temp, g_incremental_path) != 0) {
+        heap_free(temp);
+        artifact_cache_note("function manifest stored");
+        return 1;
+    }
+    os_remove_file(temp);
+    heap_free(temp);
+    return 0;
+}
+
+func incremental_cache_release_state() -> u64 {
+    if (g_incremental_map != 0) { g_incremental_map.release_buffer(); heap_free((u64)g_incremental_map); }
+    if (g_incremental_entries != 0) {
+        for (var j: u64 = 0; j < g_incremental_entries.len(); j++) {
+            var entry: *IncrementalEntry = g_incremental_entries.get(j);
+            if (entry != 0 && entry.owned != 0) {
+                if (entry.key_data != 0) { heap_free(entry.key_data); }
+                if (entry.payload_data != 0) { heap_free(entry.payload_data); }
+                heap_free((u64)entry);
+            }
+        }
+        g_incremental_entries.release_buffer();
+        heap_free((u64)g_incremental_entries);
+    }
+    if (g_incremental_prior_entries != 0) {
+        for (var i: u64 = 0; i < g_incremental_prior_entries.len(); i++) { heap_free((u64)g_incremental_prior_entries.get(i)); }
+        g_incremental_prior_entries.release_buffer();
+        heap_free((u64)g_incremental_prior_entries);
+    }
+    if (g_incremental_record != 0) { heap_free(g_incremental_record); }
+    if (g_incremental_path != 0) { heap_free(g_incremental_path); }
+    if (g_incremental_semantic_path != 0) { heap_free(g_incremental_semantic_path); }
+    incremental_bytes_release(&g_incremental_environment);
+    g_incremental_enabled = 0;
+    g_incremental_path = 0;
+    g_incremental_semantic_path = 0;
+    g_incremental_semantic_id_a = 0;
+    g_incremental_semantic_id_b = 0;
+    g_incremental_semantic_valid = 0;
+    g_incremental_record = 0;
+    g_incremental_record_len = 0;
+    g_incremental_prior_entries = 0;
+    g_incremental_entries = 0;
+    g_incremental_map = 0;
+    return 0;
+}
+
+func incremental_cache_end(success: u64) -> u64 {
+    var stored: u64 = 0;
+    if (success != 0) { stored = incremental_manifest_publish(); }
+    incremental_cache_release_state();
+    return stored;
+}

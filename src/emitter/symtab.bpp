@@ -32,7 +32,7 @@ func symtab_new() -> *Symtab {
     name_to_offset_map.ensure_capacity(128);
     var name_to_type_map: *HashMap<u64, *TypeInfo> = new HashMap<u64, *TypeInfo>{0, 0, 0};
     name_to_type_map.ensure_capacity(128);
-    return new Symtab{names_vec, offsets_vec, types_vec, 0, 0, name_to_offset_map, name_to_type_map};
+    return new Symtab{names_vec, offsets_vec, types_vec, 0, 0, name_to_offset_map, name_to_type_map, 0, 0};
 }
 
 func symtab_reset_offset_cache(symtab: *Symtab) -> u64 {
@@ -63,7 +63,39 @@ func symtab_reset_type_cache(symtab: *Symtab) -> u64 {
     return 0;
 }
 
+func symtab_release_entries(symtab: *Symtab) -> u64 {
+    if (symtab == 0) { return 0; }
+    var names: *Vec<*NameInfo> = symtab.names_vec;
+    var types: *Vec<*TypeInfo> = symtab.types_vec;
+    var name_count: u64 = names.len();
+    var type_count: u64 = types.len();
+    for (var i: u64 = 0; i < name_count; i++) {
+        var name_info: *NameInfo = names.get(i);
+        if (name_info != 0) { free((u64)name_info); }
+    }
+    for (var j: u64 = 0; j < type_count; j++) {
+        var type_info: *TypeInfo = types.get(j);
+        if (type_info != 0) { free((u64)type_info); }
+    }
+    return 0;
+}
+
+func symtab_release_owned_name_buffers(symtab: *Symtab) -> u64 {
+    if (symtab == 0 || symtab.owned_name_buffers == 0) { return 0; }
+    var buffers: *Vec<u64> = symtab.owned_name_buffers;
+    var n: u64 = buffers.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var ptr: u64 = buffers.get(i);
+        if (ptr != 0) { free(ptr); }
+    }
+    buffers.clear();
+    return 0;
+}
+
 func symtab_clear(symtab: *Symtab) -> u64 {
+    if (symtab == 0) { return 0; }
+    symtab_release_entries(symtab);
+    symtab_release_owned_name_buffers(symtab);
     var symtab_u64: *u64 = (*u64)symtab;
     symtab_u64[3] = 0;
     symtab_u64[4] = 0;
@@ -76,6 +108,39 @@ func symtab_clear(symtab: *Symtab) -> u64 {
     types.clear();
     symtab_reset_offset_cache(symtab);
     symtab_reset_type_cache(symtab);
+    symtab.type_generation = symtab.type_generation + 1;
+    if (symtab.type_generation == 0) { symtab.type_generation = 1; }
+    return 0;
+}
+
+func symtab_release(symtab: *Symtab) -> u64 {
+    if (symtab == 0) { return 0; }
+    symtab_clear(symtab);
+    if (symtab.names_vec != 0) {
+        symtab.names_vec.release_buffer();
+        free((u64)symtab.names_vec);
+    }
+    if (symtab.offsets_vec != 0) {
+        symtab.offsets_vec.release_buffer();
+        free((u64)symtab.offsets_vec);
+    }
+    if (symtab.types_vec != 0) {
+        symtab.types_vec.release_buffer();
+        free((u64)symtab.types_vec);
+    }
+    if (symtab.name_to_offset_map != 0) {
+        symtab.name_to_offset_map.release_buffer();
+        free((u64)symtab.name_to_offset_map);
+    }
+    if (symtab.name_to_type_map != 0) {
+        symtab.name_to_type_map.release_buffer();
+        free((u64)symtab.name_to_type_map);
+    }
+    if (symtab.owned_name_buffers != 0) {
+        symtab.owned_name_buffers.release_buffer();
+        free((u64)symtab.owned_name_buffers);
+    }
+    free((u64)symtab);
     return 0;
 }
 
@@ -100,11 +165,21 @@ func symtab_add(symtab: *Symtab, name: []u8, type_kind: u64, ptr_depth: u64, siz
     if (name.ptr != 0 && name.len != 0) {
         if (symtab.name_to_offset_map != 0) { symtab.name_to_offset_map.put(slice(name.ptr, name.len), offset); }
         if (symtab.name_to_type_map != 0) { symtab.name_to_type_map.put(slice(name.ptr, name.len), type_info); }
+        symtab.type_generation = symtab.type_generation + 1;
+        if (symtab.type_generation == 0) { symtab.type_generation = 1; }
     }
     
     symtab_u64[3] = symtab.count + 1;
     
     return offset;
+}
+
+func symtab_add_owned_name(symtab: *Symtab, name: []u8, type_kind: u64, ptr_depth: u64, size: u64) -> u64 {
+    if (symtab.owned_name_buffers == 0) {
+        symtab.owned_name_buffers = new Vec<u64>{heap_alloc((16) * sizeof(u64)), 0, (16)};
+    }
+    if (name.ptr != 0) { symtab.owned_name_buffers.push(name.ptr); }
+    return symtab_add(symtab, name, type_kind, ptr_depth, size);
 }
 
 func symtab_find(symtab: *Symtab, name: []u8) -> u64 {
@@ -170,7 +245,7 @@ func symtab_update_type(symtab: *Symtab, name: []u8, type_kind: u64, ptr_depth: 
     var types: *Vec<*TypeInfo> = symtab.types_vec;
     var count: u64 = symtab.count;
     
-    if (count == 0) { return; }
+    if (count == 0) { return 0; }
 
     for (var idx: i64 = (i64)count - 1; idx >= 0; idx = idx - 1) {
         var i: u64 = (u64)idx;
@@ -183,7 +258,9 @@ func symtab_update_type(symtab: *Symtab, name: []u8, type_kind: u64, ptr_depth: 
             type_info.type_kind = type_kind;
             type_info.ptr_depth = ptr_depth;
             if (symtab.name_to_type_map != 0) { symtab.name_to_type_map.put(slice(name.ptr, name.len), type_info); }
-            return;
+            symtab.type_generation = symtab.type_generation + 1;
+            if (symtab.type_generation == 0) { symtab.type_generation = 1; }
+            return 0;
         }
 
     }

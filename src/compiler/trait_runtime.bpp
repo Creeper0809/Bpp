@@ -5,6 +5,7 @@ import compiler.core_utils;
 import compiler.symbol_runtime;
 import compiler.struct_layout;
 import compiler.generic.engine;
+import emitter.typeinfo;
 import std.io;
 import std.str;
 import std.vec;
@@ -44,7 +45,8 @@ func trait_find_downcast_check_info(src_struct: []u8, target_struct: []u8) -> Co
     if (struct_is_same_or_descendant(slice(target_struct.ptr, target_struct.len), slice(src_struct.ptr, src_struct.len)) == 0) { return info; }
 
     var src_def: *AstStructDef = get_struct_def(slice(src_struct.ptr, src_struct.len));
-    if (src_def == 0 || src_def.fields_vec == 0) { return info; }
+    var target_def: *AstStructDef = get_struct_def(slice(target_struct.ptr, target_struct.len));
+    if (src_def == 0 || target_def == 0 || src_def.fields_vec == 0) { return info; }
 
     var fields: *Vec<*FieldDesc> = src_def.fields_vec;
     var n: u64 = fields.len();
@@ -56,7 +58,7 @@ func trait_find_downcast_check_info(src_struct: []u8, target_struct: []u8) -> Co
 
         var trait_ptr: u64 = u8_slice_ptr(fd.name) + 7;
         var trait_len: u64 = u8_slice_len(fd.name) - 7;
-        var target_impl: *TraitImpl = trait_find_trait_impl(slice(trait_ptr, trait_len), slice(target_struct.ptr, target_struct.len));
+        var target_impl: *TraitImpl = trait_find_trait_impl_for_struct_def(slice(trait_ptr, trait_len), target_def);
         if (target_impl == 0) { continue; }
         if (u8_slice_ptr(target_impl.vtable_global) == 0 || u8_slice_len(target_impl.vtable_global) == 0) { continue; }
 
@@ -100,11 +102,46 @@ func trait_build_trait_thunk_name(trait_slice: []u8, struct_slice: []u8, method:
     return module_util_name_concat6(slice("__thunk_", 8), slice(trait_slice.ptr, trait_slice.len), slice("__", 2), slice(struct_slice.ptr, struct_slice.len), slice("__", 2), slice(method.ptr, method.len));
 }
 
+func trait_impl_vptr_trait_name(impl_info: *TraitImpl) -> []u8 {
+    if (impl_info != 0 && impl_info.canonical_trait_name.ptr != 0 && impl_info.canonical_trait_name.len != 0) {
+        return impl_info.canonical_trait_name;
+    }
+    if (impl_info != 0) { return impl_info.trait_name; }
+    return slice(0, 0);
+}
+
+func trait_find_trait_impl_for_struct_def(trait_slice: []u8, struct_def: *AstStructDef) -> *TraitImpl {
+    if (struct_def == 0 || g_compiler_ctx.all_trait_impls_vec == 0) { return 0; }
+    var n: u64 = g_compiler_ctx.all_trait_impls_vec.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var ti: *TraitImpl = g_compiler_ctx.all_trait_impls_vec.get(i);
+        if (ti == 0 || trait_impl_matches_struct_def(ti, struct_def) == 0) { continue; }
+        if (ti.canonical_trait_name.ptr != 0 && ti.canonical_trait_name.len != 0 &&
+            str_eq(ti.canonical_trait_name, slice(trait_slice.ptr, trait_slice.len)) != 0) {
+            return ti;
+        }
+        if (str_eq(ti.trait_name, slice(trait_slice.ptr, trait_slice.len)) == 0) { continue; }
+        if (g_compiler_ctx.current_module.ptr != 0 && g_compiler_ctx.current_module.len != 0 &&
+            ti.module.ptr != 0 && ti.module.len != 0 &&
+            str_eq(ti.module, g_compiler_ctx.current_module) == 0) { continue; }
+        return ti;
+    }
+    return 0;
+}
+
 func trait_find_trait_impl(trait_slice: []u8, struct_slice: []u8) -> *TraitImpl {
     if (g_compiler_ctx.all_trait_impls_vec == 0) { return 0; }
     var n: u64 = g_compiler_ctx.all_trait_impls_vec.len();
     for (var i: u64 = 0; i < n; i++) {
         var ti: *TraitImpl = g_compiler_ctx.all_trait_impls_vec.get(i);
+        if (ti.canonical_trait_name.ptr != 0 && ti.canonical_struct_name.ptr != 0 &&
+            str_eq(ti.canonical_trait_name, slice(trait_slice.ptr, trait_slice.len)) != 0 &&
+            str_eq(ti.canonical_struct_name, slice(struct_slice.ptr, struct_slice.len)) != 0) {
+            return ti;
+        }
+        if (g_compiler_ctx.current_module.ptr != 0 && g_compiler_ctx.current_module.len != 0 &&
+            ti.module.ptr != 0 && ti.module.len != 0 &&
+            str_eq(ti.module, g_compiler_ctx.current_module) == 0) { continue; }
         if (str_eq(ti.trait_name, slice(trait_slice.ptr, trait_slice.len)) &&
             str_eq(ti.impl_struct_name, slice(struct_slice.ptr, struct_slice.len))) {
             return ti;
@@ -301,7 +338,9 @@ func trait_build_trait_thunk_func(thunk_name: []u8, trait_def: *TraitDef, trait_
     }
 
     var body: *AstNode = (*AstNode)ast_block(stmts);
-    return ast_func_ex(slice(thunk_name.ptr, thunk_name.len), params_out, trait_sig.ret_type, trait_sig.ret_ptr_depth, trait_sig.ret_is_tagged, trait_sig.ret_struct_name, trait_sig.ret_tag_layout, body);
+    var thunk: *AstFunc = ast_func_ex(slice(thunk_name.ptr, thunk_name.len), params_out, trait_sig.ret_type, trait_sig.ret_ptr_depth, trait_sig.ret_is_tagged, trait_sig.ret_struct_name, trait_sig.ret_tag_layout, body);
+    thunk.ret_typeinfo = ast_func_return_type(trait_sig);
+    return thunk;
 }
 
 func trait_validate_struct_trait_inheritance(sd: *AstStructDef) -> u64 {
@@ -361,7 +400,8 @@ func trait_get_impl_trait_and_struct(impl_info: *TraitImpl) -> CompilerImplTrait
     pair.struct_def = 0;
     if (impl_info == 0) { return pair; }
 
-    var trait_def: *TraitDef = sym_get_trait_def(impl_info.trait_name);
+    var trait_def: *TraitDef = impl_info.resolved_trait_def;
+    if (trait_def == 0) { trait_def = sym_get_trait_def(impl_info.trait_name); }
     if (trait_def == 0) {
         emit_stderr("[ERROR] Trait not found for impl: ");
         emit_stderr_len(u8_slice_ptr(impl_info.trait_name), u8_slice_len(impl_info.trait_name));
@@ -370,7 +410,8 @@ func trait_get_impl_trait_and_struct(impl_info: *TraitImpl) -> CompilerImplTrait
         return pair;
     }
 
-    var struct_def: *AstStructDef = get_struct_def(impl_info.impl_struct_name);
+    var struct_def: *AstStructDef = impl_info.resolved_struct_def;
+    if (struct_def == 0) { struct_def = get_struct_def(impl_info.impl_struct_name); }
     if (struct_def == 0) {
         emit_stderr("[ERROR] Struct not found for trait impl: ");
         emit_stderr_len(u8_slice_ptr(impl_info.impl_struct_name), u8_slice_len(impl_info.impl_struct_name));
@@ -436,8 +477,9 @@ func trait_get_or_create_vtable_struct(trait_def: *TraitDef, trait_slice: []u8) 
 }
 
 func trait_get_trait_impl_vptr_offset(impl_info: *TraitImpl, struct_def: *AstStructDef, vtable_name: []u8) -> u64 {
-    struct_insert_vptr_field(struct_def, impl_info.trait_name, slice(vtable_name.ptr, vtable_name.len));
-    var vptr_name: *NameInfo = trait_build_vptr_field_name(impl_info.trait_name);
+    var vptr_trait_name: []u8 = trait_impl_vptr_trait_name(impl_info);
+    struct_insert_vptr_field(struct_def, vptr_trait_name, slice(vtable_name.ptr, vtable_name.len));
+    var vptr_name: *NameInfo = trait_build_vptr_field_name(vptr_trait_name);
     var vptr_offset: u64 = struct_find_field_offset(struct_def, slice(vptr_name.ptr, vptr_name.len));
     if (vptr_offset == COMPILER_NOT_FOUND_U64) {
         emit_stderr("[ERROR] vptr field not found for trait impl: ");
@@ -519,7 +561,7 @@ func trait_validate_trait_impl_signature(trait_method: *TraitMethod, trait_sig: 
             ok = 0;
         }
         var ip: *Param = impl_sig.params_vec.get(pi);
-        if (tp.type_kind != ip.type_kind || tp.ptr_depth != ip.ptr_depth) {
+        if (typeinfo_equal(typeinfo_from_param(tp), typeinfo_from_param(ip)) == 0 || tp.is_variadic != ip.is_variadic) {
             trait_diag_error("[ERROR] Trait impl param type mismatch: ", trait_method.name);
             ok = 0;
         }
@@ -531,7 +573,7 @@ func trait_validate_trait_impl_signature(trait_method: *TraitMethod, trait_sig: 
         }
     }
 
-    if (trait_sig.ret_type != impl_sig.ret_type || trait_sig.ret_ptr_depth != impl_sig.ret_ptr_depth) {
+    if (typeinfo_equal(ast_func_return_type(trait_sig), ast_func_return_type(impl_sig)) == 0) {
         trait_diag_error("[ERROR] Trait impl return type mismatch: ", trait_method.name);
         ok = 0;
     }
@@ -545,18 +587,19 @@ func trait_validate_trait_impl_signature(trait_method: *TraitMethod, trait_sig: 
 }
 
 func trait_register_trait_thunk(impl_info: *TraitImpl, trait_def: *TraitDef, trait_method: *TraitMethod, impl_method: *TraitImplMethod, vptr_offset: u64, values: *Vec<*AstNode>) -> u64 {
-    var thunk_name: *NameInfo = trait_build_trait_thunk_name(impl_info.trait_name, impl_info.impl_struct_name, trait_method.name);
+    var thunk_name: *NameInfo = trait_build_trait_thunk_name(impl_info.canonical_trait_name, impl_info.canonical_struct_name, trait_method.name);
     var thunk_fn: *AstFunc = trait_build_trait_thunk_func(slice(thunk_name.ptr, thunk_name.len), trait_def, trait_method, impl_method, impl_info.impl_struct_name, vptr_offset);
     g_compiler_ctx.all_funcs.push(thunk_fn);
     g_compiler_ctx.all_func_sigs.push(thunk_fn);
-    sym_register_impl_method_ex(slice(thunk_name.ptr, thunk_name.len), impl_info.impl_struct_name, ACCESS_PUBLIC);
+    sym_assign_func_module(thunk_fn.name, impl_info.module);
+    sym_register_impl_method_ex(slice(thunk_name.ptr, thunk_name.len), impl_info.canonical_struct_name, ACCESS_PUBLIC);
     sym_register_impl_method_func(slice(thunk_name.ptr, thunk_name.len), thunk_fn);
     values.push((*AstNode)ast_ident(slice(thunk_name.ptr, thunk_name.len)));
     return 0;
 }
 
 func trait_register_trait_vtable_global(impl_info: *TraitImpl, vtable_name: []u8, vtable_struct_def: *AstStructDef, values: *Vec<*AstNode>) -> u64 {
-    var vtable_global: *NameInfo = trait_build_vtable_global_name(impl_info.trait_name, impl_info.impl_struct_name);
+    var vtable_global: *NameInfo = trait_build_vtable_global_name(impl_info.canonical_trait_name, impl_info.canonical_struct_name);
     impl_info.vtable_global = slice(vtable_global.ptr, vtable_global.len);
 
     var vtable_lit: *AstStructLiteral = ast_struct_literal(vtable_struct_def, values);
@@ -570,13 +613,14 @@ func trait_register_trait_vtable_global(impl_info: *TraitImpl, vtable_name: []u8
     ginfo.init_kind = GLOBAL_INIT_EXPR;
     ginfo.init_expr = (u64)vtable_lit;
     g_compiler_ctx.all_globals.push(ginfo);
+    sym_assign_global_module(ginfo.name, impl_info.module);
     return 0;
 }
 func trait_build_trait_default_impl_func(impl_info: *TraitImpl, trait_method: *TraitMethod, trait_sig: *AstFunc) -> *AstFunc {
     if (impl_info == 0 || trait_method == 0 || trait_sig == 0 || trait_sig.body == 0) { return 0; }
     if (trait_sig.params_vec == 0 || trait_sig.params_vec.len() == 0) { return 0; }
 
-    var fn_name: *NameInfo = build_method_name(impl_info.impl_struct_name, trait_method.name);
+    var fn_name: *NameInfo = build_method_name(impl_info.canonical_struct_name, trait_method.name);
     var params_out: *Vec<*Param> = new Vec<*Param>{heap_alloc((trait_sig.params_vec.len()) * sizeof(*Param)), 0, (trait_sig.params_vec.len())};
     var pn: u64 = trait_sig.params_vec.len();
     for (var i: u64 = 0; i < pn; i++) {
@@ -592,7 +636,9 @@ func trait_build_trait_default_impl_func(impl_info: *TraitImpl, trait_method: *T
         params_out.push(dst);
     }
 
-    return ast_func_ex(slice(fn_name.ptr, fn_name.len), params_out, trait_sig.ret_type, trait_sig.ret_ptr_depth, trait_sig.ret_is_tagged, trait_sig.ret_struct_name, trait_sig.ret_tag_layout, trait_sig.body);
+    var default_fn: *AstFunc = ast_func_ex(slice(fn_name.ptr, fn_name.len), params_out, trait_sig.ret_type, trait_sig.ret_ptr_depth, trait_sig.ret_is_tagged, trait_sig.ret_struct_name, trait_sig.ret_tag_layout, trait_sig.body);
+    default_fn.ret_typeinfo = ast_func_return_type(trait_sig);
+    return default_fn;
 }
 
 func trait_register_trait_default_impl_method(impl_info: *TraitImpl, trait_method: *TraitMethod, trait_sig: *AstFunc) -> *TraitImplMethod {
@@ -600,7 +646,8 @@ func trait_register_trait_default_impl_method(impl_info: *TraitImpl, trait_metho
     if (fn == 0) { return 0; }
     g_compiler_ctx.all_funcs.push(fn);
     g_compiler_ctx.all_func_sigs.push(fn);
-    sym_register_impl_method_ex(fn.name, impl_info.impl_struct_name, ACCESS_PUBLIC);
+    sym_assign_func_module(fn.name, impl_info.module);
+    sym_register_impl_method_ex(fn.name, impl_info.canonical_struct_name, ACCESS_PUBLIC);
     sym_register_impl_method_func(fn.name, fn);
 
     var impl_method: *TraitImplMethod = new TraitImplMethod{};
@@ -614,13 +661,33 @@ func trait_register_trait_default_impl_method(impl_info: *TraitImpl, trait_metho
 
 func trait_finalize_single_trait_impl(impl_info: *TraitImpl) -> u64 {
     if (impl_info == 0) { return 0; }
+    var prev_module_ptr: u64 = g_compiler_ctx.current_module.ptr;
+    var prev_module_len: u64 = g_compiler_ctx.current_module.len;
+    if (impl_info.module.ptr != 0 && impl_info.module.len != 0) {
+        g_compiler_ctx.current_module = slice(impl_info.module.ptr, impl_info.module.len);
+    }
     var impl_types: CompilerImplTraitStruct = trait_get_impl_trait_and_struct(impl_info);
     var trait_def: *TraitDef = impl_types.trait_def;
     var struct_def: *AstStructDef = impl_types.struct_def;
-    if (trait_def == 0 || struct_def == 0) { return 0; }
+    if (trait_def == 0 || struct_def == 0) {
+        g_compiler_ctx.current_module = slice(prev_module_ptr, prev_module_len);
+        return 0;
+    }
+    impl_info.resolved_trait_def = trait_def;
+    impl_info.resolved_struct_def = struct_def;
+    if (impl_info.canonical_trait_name.ptr == 0 || impl_info.canonical_trait_name.len == 0) {
+        impl_info.canonical_trait_name = trait_def.mangled_name;
+    }
+    if (impl_info.canonical_trait_name.ptr == 0 || impl_info.canonical_trait_name.len == 0) {
+        impl_info.canonical_trait_name = trait_def.name;
+    }
+    if (impl_info.canonical_struct_name.ptr == 0 || impl_info.canonical_struct_name.len == 0) {
+        var canonical_struct: *NameInfo = sym_get_struct_canonical_name(struct_def);
+        impl_info.canonical_struct_name = slice(canonical_struct.ptr, canonical_struct.len);
+    }
     trait_validate_trait_impl_assoc_bindings(impl_info, trait_def);
 
-    var vtable_info: CompilerVtableStructInfo = trait_get_or_create_vtable_struct(trait_def, impl_info.trait_name);
+    var vtable_info: CompilerVtableStructInfo = trait_get_or_create_vtable_struct(trait_def, impl_info.canonical_trait_name);
     var vtable_name: []u8 = vtable_info.vtable_name;
     var vtable_struct_def: *AstStructDef = vtable_info.vtable_struct_def;
     if (vtable_struct_def == 0) {
@@ -628,12 +695,16 @@ func trait_finalize_single_trait_impl(impl_info: *TraitImpl) -> u64 {
         emit_stderr_len(u8_slice_ptr(impl_info.trait_name), u8_slice_len(impl_info.trait_name));
         emit_stderr("\n");
         diag_note_error();
+        g_compiler_ctx.current_module = slice(prev_module_ptr, prev_module_len);
         return 0;
     }
     impl_info.vtable_struct_def = vtable_struct_def;
 
     var vptr_offset: u64 = trait_get_trait_impl_vptr_offset(impl_info, struct_def, vtable_name);
-    if (is_not_found_u64(vptr_offset) != 0) { return 0; }
+    if (is_not_found_u64(vptr_offset) != 0) {
+        g_compiler_ctx.current_module = slice(prev_module_ptr, prev_module_len);
+        return 0;
+    }
 
     var method_count: u64 = trait_def.methods_vec.len();
     var values: *Vec<*AstNode> = new Vec<*AstNode>{heap_alloc((method_count) * sizeof(*AstNode)), 0, (method_count)};
@@ -658,6 +729,8 @@ func trait_finalize_single_trait_impl(impl_info: *TraitImpl) -> u64 {
         }
         if (impl_method == 0) {
             trait_diag_error("[ERROR] Trait method not implemented: ", trait_method.name);
+            diag_emit_labelled_name("trait: ", impl_info.canonical_trait_name);
+            diag_emit_labelled_name("implementing struct: ", impl_info.canonical_struct_name);
             continue;
         }
 
@@ -671,5 +744,16 @@ func trait_finalize_single_trait_impl(impl_info: *TraitImpl) -> u64 {
     }
 
     trait_register_trait_vtable_global(impl_info, vtable_name, vtable_struct_def, values);
+    g_compiler_ctx.current_module = slice(prev_module_ptr, prev_module_len);
     return 0;
+}
+
+func trait_impl_matches_struct_def(impl_info: *TraitImpl, struct_def: *AstStructDef) -> u64 {
+    if (impl_info == 0 || struct_def == 0) { return 0; }
+    if (impl_info.resolved_struct_def != 0) {
+        return impl_info.resolved_struct_def == struct_def;
+    }
+    if (str_eq(impl_info.impl_struct_name, struct_def.name) == 0) { return 0; }
+    if (impl_info.module.ptr == 0 || impl_info.module.len == 0) { return 1; }
+    return sym_struct_belongs_to_module(struct_def, impl_info.module);
 }

@@ -10,6 +10,7 @@ import lexer;
 import ast;
 import compiler;
 import compiler.core_utils;
+import compiler.ast_lowering;
 import compiler.generic.engine;
 import compiler.enum_runtime;
 import compiler.symbol_runtime;
@@ -439,7 +440,11 @@ func match_expr_lower_if_chain(p: *Parser, scrutinee_expr: *AstNode, arms: *Vec<
     var fn_body_stmts: *Vec<*AstNode> = new Vec<*AstNode>{heap_alloc((4) * sizeof(*AstNode)), 0, (4)};
     fn_body_stmts.push((*AstNode)tmp_decl);
     if (chain != 0) { fn_body_stmts.push(chain); }
-    fn_body_stmts.push((*AstNode)ast_return((*AstNode)ast_literal(0)));
+    // Exhaustive source matches must not manufacture a result for an invalid
+    // runtime enum tag. Trap instead of silently returning numeric zero.
+    var panic_args: *Vec<*AstNode> = new Vec<*AstNode>{0, 0, 0};
+    panic_args.push(lower_make_ast_string_literal(slice("invalid match expression value", 30)));
+    fn_body_stmts.push((*AstNode)ast_expr_stmt((*AstNode)ast_call(slice("panic", 5), panic_args)));
     return (*AstNode)ast_block(fn_body_stmts);
 }
 
@@ -468,8 +473,10 @@ func match_expr_parse_primary(p: *Parser) -> *AstNode {
     var ret_is_tagged: u64 = 0;
     var ret_struct_name: []u8 = slice(0, 0);
     var ret_tag_layout: []u8 = slice(0, 0);
+    var ret_typeinfo: *TypeInfo = 0;
     if (match_tok(p, TOKEN_ARROW)) {
         var ret_ti: *TypeInfo = type_parse_ex(p);
+        ret_typeinfo = ast_normalize_return_type(ret_ti);
         ret_type = ret_ti.type_kind;
         ret_ptr_depth = ret_ti.ptr_depth;
         ret_is_tagged = ret_ti.is_tagged;
@@ -537,18 +544,20 @@ func match_expr_parse_primary(p: *Parser) -> *AstNode {
         fn_params.push(lambda_make_env_param(env_struct));
 
         scrutinee_expr = lambda_rewrite_expr_captures_env(p, scrutinee_expr, captures, slice("__env", 5));
-        var cvn2: u64 = case_value_nodes.len();
-        for (var i: u64 = 0; i < cvn2; i++) {
-            case_value_nodes.set(i, lambda_rewrite_expr_captures_env(p, case_value_nodes.get(i), captures, slice("__env", 5)));
-        }
-        var an: u64 = arm_expr_nodes.len();
-        for (var ai: u64 = 0; ai < an; ai++) {
-            arm_expr_nodes.set(ai, lambda_rewrite_expr_captures_env(p, arm_expr_nodes.get(ai), captures, slice("__env", 5)));
+        for (var ai: u64 = 0; ai < arms.len(); ai++) {
+            var captured_arm: *ParseMatchExprArm = arms.get(ai);
+            captured_arm.value_expr = lambda_rewrite_expr_captures_env(p, captured_arm.value_expr, captures, slice("__env", 5));
+            if (captured_arm.values_vec != 0) {
+                for (var vi: u64 = 0; vi < captured_arm.values_vec.len(); vi++) {
+                    captured_arm.values_vec.set(vi, lambda_rewrite_expr_captures_env(p, captured_arm.values_vec.get(vi), captures, slice("__env", 5)));
+                }
+            }
         }
     }
 
     var fn_body: *AstNode = match_expr_lower_if_chain(p, scrutinee_expr, arms, slice(tmp_name.ptr, tmp_name.len));
     var fn: *AstFunc = ast_func_ex(slice(fn_name.ptr, fn_name.len), fn_params, ret_type, ret_ptr_depth, ret_is_tagged, ret_struct_name, ret_tag_layout, fn_body);
+    fn.ret_typeinfo = ret_typeinfo;
     generated_funcs_push(p, (u64)fn);
 
     if (has_captures == 0) {
@@ -572,7 +581,7 @@ func match_expr_parse_primary(p: *Parser) -> *AstNode {
         bind_params.push(lambda_make_capture_param(p, cap, slice(bind_param_name.ptr, bind_param_name.len)));
 
         var cap_slot: []u8 = cap.slot_name;
-        var env_target: *AstNode = (*AstNode)ast_member_access((*AstNode)ast_deref((*AstNode)ast_ident(slice("__env_obj", 9))), cap_slot);
+        var env_target: *AstNode = (*AstNode)ast_member_access((*AstNode)ast_ident(slice("__env_obj", 9)), cap_slot);
         bind_stmts.push((*AstNode)ast_assign(
             env_target,
             (*AstNode)ast_ident(slice(bind_param_name.ptr, bind_param_name.len))
@@ -591,7 +600,8 @@ func match_expr_parse_primary(p: *Parser) -> *AstNode {
         (*AstNode)ast_call_with_origin_named(slice(fn_name.ptr, fn_name.len), call_args, 0, AST_CALL_ORIGIN_DIRECT)
     ));
     var bind_body: *AstNode = (*AstNode)ast_block(bind_stmts);
-    var bind_fn: *AstFunc = ast_func_ex(slice(bind_name.ptr, bind_name.len), bind_params, TYPE_U64, 0, 0, slice(0, 0), slice(0, 0), bind_body);
+    var bind_fn: *AstFunc = ast_func_ex(slice(bind_name.ptr, bind_name.len), bind_params, ret_type, ret_ptr_depth, ret_is_tagged, ret_struct_name, ret_tag_layout, bind_body);
+    bind_fn.ret_typeinfo = ret_typeinfo;
     generated_funcs_push(p, (u64)bind_fn);
     return (*AstNode)ast_call_with_origin_named(slice(bind_name.ptr, bind_name.len), bind_call_args, 0, AST_CALL_ORIGIN_DIRECT);
 }

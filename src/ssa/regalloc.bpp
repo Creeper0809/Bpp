@@ -1203,7 +1203,7 @@ func regalloc_interval_for_reg(fn: *SSAFunction, max_reg: u64, reg: u64, arena: 
     return 0;
 }
 
-func regalloc_spill_uncolored_batch(ctx: *SSAContext, fn: *SSAFunction, colors: *Vec<u64>, max_reg: u64, arena: *BppScratchArena, slot_ids: *u64, slot_start: *u64, slot_end: *u64, slot_count_ptr: *u64, next_spill_slot_ptr: *u64, slot_cap: u64) -> u64 {
+func regalloc_spill_uncolored_batch(ctx: *SSAContext, fn: *SSAFunction, colors: *Vec<u64>, max_reg: u64, arena: *BppScratchArena, next_spill_slot_ptr: *u64) -> u64 {
     if (ctx == 0 || fn == 0 || colors == 0 || max_reg == 0) { return 0; }
     var bytes: u64 = (max_reg + 1) * sizeof(u64);
     var start_u64: *u64 = (*u64)bpp_scratch_arena_alloc_zero(arena, bytes);
@@ -1213,25 +1213,112 @@ func regalloc_spill_uncolored_batch(ctx: *SSAContext, fn: *SSAFunction, colors: 
     var remat_u64: *u64 = (*u64)bpp_scratch_arena_alloc_zero(arena, bytes);
     regalloc_scan_intervals(fn, max_reg, start_u64, end_u64, use_u64, def_u64, remat_u64);
 
+    var slots: *u64 = (*u64)bpp_scratch_arena_alloc_zero(arena, bytes);
     var spilled: u64 = 0;
     for (var reg: u64 = 1; reg <= max_reg; reg++) {
         if (colors.get(reg) != 0) { continue; }
         if (start_u64[reg] == 0 && end_u64[reg] == 0) { continue; }
-        var spill_slot: u64 = regalloc_pick_spill_slot(
-            slot_ids,
-            slot_start,
-            slot_end,
-            slot_count_ptr,
-            next_spill_slot_ptr,
-            start_u64[reg],
-            end_u64[reg],
-            slot_cap
-        );
-        if (regalloc_spill_one(ctx, fn, reg, spill_slot) != 0) {
-            spilled = spilled + 1;
+        // Spilled call operands retain a memory use until the call. Do not
+        // reuse slots using stale register intervals from earlier rewrites.
+        var spill_slot: u64 = *next_spill_slot_ptr;
+        *next_spill_slot_ptr = spill_slot + 1;
+        slots[reg] = spill_slot;
+        spilled = spilled + 1;
+    }
+    if (spilled == 0) { return 0; }
+    // Only original instructions and vregs participate in this batch. Newly
+    // inserted reload/store temps are colored by the next allocation attempt.
+    var next_temp: u64 = max_reg + 1;
+    var changed: u64 = 0;
+    var blocks: []*SSABlock = fn.blocks;
+    for (var bi: u64 = 0; bi < slice_len(blocks); bi++) {
+        var block: *SSABlock = blocks[bi];
+        if (block == 0) { continue; }
+        var inst: *SSAInstruction = block.inst_head;
+        while (inst != 0) {
+            var next: *SSAInstruction = inst.next;
+            changed = changed + regalloc_spill_batch_sources(ctx, block, inst, slots, max_reg, &next_temp);
+            var dest: u64 = inst.dest;
+            if (dest != 0 && dest <= max_reg && slots[dest] != 0) {
+                changed = changed + regalloc_replace_inst_def(ctx, block, inst, dest, slots[dest], &next_temp);
+            }
+            var op: u64 = op_of(inst);
+            if (op == SSA_OP_CALL || op == SSA_OP_CALL_PTR) {
+                var secondary: u64 = operand_value(inst.src2);
+                if (operand_is_const(inst.src2) == 0 && secondary != 0 && secondary <= max_reg && slots[secondary] != 0) {
+                    changed = changed + regalloc_replace_inst_def(ctx, block, inst, secondary, slots[secondary], &next_temp);
+                }
+            }
+            inst = next;
         }
     }
+    if (changed == 0) { return 0; }
+    fn.opt_regalloc3_engine_count = fn.opt_regalloc3_engine_count + spilled;
+    fn.opt_regalloc3_detail_count = fn.opt_regalloc3_detail_count + changed;
     return spilled;
+}
+
+func regalloc_spill_batch_args(args: *Vec<u64>, nargs: u64, slots: *u64, max_reg: u64) -> u64 {
+    if (args == 0) { return 0; }
+    var changed: u64 = 0;
+    var n: u64 = call_args_len(args, nargs);
+    for (var i: u64 = 0; i < n; i++) {
+        var reg: u64 = args.get(i);
+        if (reg != 0 && reg <= max_reg && slots[reg] != 0) {
+            args.set(i, SSA_CALL_ARG_SLOT_FLAG | slots[reg]);
+            changed = changed + 1;
+        }
+    }
+    return changed;
+}
+
+func regalloc_spill_batch_source(ctx: *SSAContext, block: *SSABlock, inst: *SSAInstruction, slots: *u64, max_reg: u64, reg: u64, next_temp: *u64) -> u64 {
+    if (reg == 0 || reg > max_reg || slots[reg] == 0) { return 0; }
+    // Replaces all occurrences, so x+x and shared slice ptr/len need one load.
+    return regalloc_replace_inst_sources(ctx, block, inst, reg, slots[reg], next_temp);
+}
+
+func regalloc_spill_batch_sources(ctx: *SSAContext, block: *SSABlock, inst: *SSAInstruction, slots: *u64, max_reg: u64, next_temp: *u64) -> u64 {
+    var op: u64 = op_of(inst);
+    var info_ptr: u64 = ssa_inst_aux_ptr(inst);
+    var changed: u64 = 0;
+    if (info_ptr != 0 && op == SSA_OP_CALL) {
+        var direct: *SSACallInfo = (*SSACallInfo)info_ptr;
+        return regalloc_spill_batch_args(direct.args_vec, direct.nargs, slots, max_reg);
+    }
+    if (info_ptr != 0 && op == SSA_OP_CALL_PTR) {
+        var indirect: *SSACallPtrInfo = (*SSACallPtrInfo)info_ptr;
+        changed = regalloc_spill_batch_args(indirect.args_vec, indirect.nargs, slots, max_reg);
+        return changed + regalloc_spill_batch_source(ctx, block, inst, slots, max_reg, indirect.callee_reg, next_temp);
+    }
+    if (info_ptr != 0 && op == SSA_OP_CALL_SLICE_STORE) {
+        var slice_call: *SSACallSliceStoreInfo = (*SSACallSliceStoreInfo)info_ptr;
+        if (slice_call.is_ptr > 1) {
+            var legacy: *SSACallInfo = (*SSACallInfo)info_ptr;
+            changed = regalloc_spill_batch_args(legacy.args_vec, legacy.nargs, slots, max_reg);
+        } else {
+            changed = regalloc_spill_batch_args(slice_call.args_vec, slice_call.nargs, slots, max_reg);
+            if (slice_call.is_ptr == 1) {
+                changed = changed + regalloc_spill_batch_source(ctx, block, inst, slots, max_reg, slice_call.callee_reg, next_temp);
+            }
+        }
+    }
+    if (op == SSA_OP_CALL || op == SSA_OP_CALL_PTR) { return changed; }
+    if (operand_is_const(inst.src1) == 0) {
+        changed = changed + regalloc_spill_batch_source(ctx, block, inst, slots, max_reg, operand_value(inst.src1), next_temp);
+    }
+    if (operand_is_const(inst.src2) == 0) {
+        changed = changed + regalloc_spill_batch_source(ctx, block, inst, slots, max_reg, operand_value(inst.src2), next_temp);
+    }
+    if (op == SSA_OP_RET_SLICE_HEAP && inst.ret_slice_heap_valid != 0) {
+        if (inst.ret_slice_heap_ptr_is_reg != 0) {
+            changed = changed + regalloc_spill_batch_source(ctx, block, inst, slots, max_reg, inst.ret_slice_heap_ptr_val, next_temp);
+        }
+        if (inst.ret_slice_heap_len_is_reg != 0) {
+            changed = changed + regalloc_spill_batch_source(ctx, block, inst, slots, max_reg, inst.ret_slice_heap_len_val, next_temp);
+        }
+    }
+    return changed;
 }
 
 func regalloc_intervals_overlap(a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> u64 {
@@ -1365,6 +1452,10 @@ func regalloc_call_uses_reg(op: u64, info_ptr: u64, reg: u64) -> u64 {
     if (op == SSA_OP_CALL_SLICE_STORE) {
         var info_s: *SSACallSliceStoreInfo = (*SSACallSliceStoreInfo)info_ptr;
         if (info_s == 0) { return 0; }
+        if (info_s.is_ptr > 1) {
+            var legacy: *SSACallInfo = (*SSACallInfo)info_ptr;
+            return regalloc_args_use_reg(legacy.args_vec, legacy.nargs, reg);
+        }
         if (info_s.is_ptr != 0 && info_s.callee_reg == reg) { return 1; }
         return regalloc_args_use_reg(info_s.args_vec, info_s.nargs, reg);
     }
@@ -1392,6 +1483,10 @@ func regalloc_replace_call_reg(op: u64, info_ptr: u64, reg: u64, repl: u64) -> u
     if (op == SSA_OP_CALL_SLICE_STORE) {
         var info_s: *SSACallSliceStoreInfo = (*SSACallSliceStoreInfo)info_ptr;
         if (info_s == 0) { return 0; }
+        if (info_s.is_ptr > 1) {
+            var legacy: *SSACallInfo = (*SSACallInfo)info_ptr;
+            return regalloc_replace_args_reg(legacy.args_vec, legacy.nargs, reg, repl);
+        }
         var changed2: u64 = 0;
         if (info_s.is_ptr != 0 && info_s.callee_reg == reg) {
             info_s.callee_reg = repl;
@@ -1409,6 +1504,8 @@ func regalloc_inst_sources_use_reg(inst: *SSAInstruction, reg: u64) -> u64 {
     if (op == SSA_OP_CALL || op == SSA_OP_CALL_PTR || op == SSA_OP_CALL_SLICE_STORE) {
         if (regalloc_call_uses_reg(op, ssa_inst_aux_ptr(inst), reg) != 0) { return 1; }
     }
+    // CALL.src2 is the second result, not an input operand.
+    if (op == SSA_OP_CALL || op == SSA_OP_CALL_PTR) { return 0; }
     if (regalloc_operand_uses_reg(inst.src1, reg) != 0) { return 1; }
     if (regalloc_operand_uses_reg(inst.src2, reg) != 0) { return 1; }
     if (op == SSA_OP_RET_SLICE_HEAP) {
@@ -1417,9 +1514,34 @@ func regalloc_inst_sources_use_reg(inst: *SSAInstruction, reg: u64) -> u64 {
     return 0;
 }
 
+func regalloc_spill_call_args(inst: *SSAInstruction, reg: u64, slot: u64) -> u64 {
+    var op: u64 = op_of(inst);
+    var info_ptr: u64 = ssa_inst_aux_ptr(inst);
+    if (info_ptr == 0) { return 0; }
+    var memory_arg: u64 = SSA_CALL_ARG_SLOT_FLAG | slot;
+    if (op == SSA_OP_CALL) {
+        var direct: *SSACallInfo = (*SSACallInfo)info_ptr;
+        return regalloc_replace_args_reg(direct.args_vec, direct.nargs, reg, memory_arg);
+    }
+    if (op == SSA_OP_CALL_PTR) {
+        var indirect: *SSACallPtrInfo = (*SSACallPtrInfo)info_ptr;
+        return regalloc_replace_args_reg(indirect.args_vec, indirect.nargs, reg, memory_arg);
+    }
+    if (op == SSA_OP_CALL_SLICE_STORE) {
+        var slice_call: *SSACallSliceStoreInfo = (*SSACallSliceStoreInfo)info_ptr;
+        if (slice_call.is_ptr > 1) {
+            var legacy_call: *SSACallInfo = (*SSACallInfo)info_ptr;
+            return regalloc_replace_args_reg(legacy_call.args_vec, legacy_call.nargs, reg, memory_arg);
+        }
+        return regalloc_replace_args_reg(slice_call.args_vec, slice_call.nargs, reg, memory_arg);
+    }
+    return 0;
+}
+
 func regalloc_replace_inst_sources(ctx: *SSAContext, block: *SSABlock, inst: *SSAInstruction, reg: u64, slot: u64, next_temp_ptr: *u64) -> u64 {
     if (ctx == 0 || block == 0 || inst == 0 || next_temp_ptr == 0) { return 0; }
-    if (regalloc_inst_sources_use_reg(inst, reg) == 0) { return 0; }
+    var spilled_args: u64 = regalloc_spill_call_args(inst, reg, slot);
+    if (regalloc_inst_sources_use_reg(inst, reg) == 0) { return spilled_args; }
     var tmp: u64 = *next_temp_ptr;
     *next_temp_ptr = tmp + 1;
     var load_inst: *SSAInstruction = create_inst(ctx, SSA_OP_LOAD, tmp, operand_const(slot), 0);
@@ -1429,8 +1551,10 @@ func regalloc_replace_inst_sources(ctx: *SSAContext, block: *SSABlock, inst: *SS
     if (op == SSA_OP_CALL || op == SSA_OP_CALL_PTR || op == SSA_OP_CALL_SLICE_STORE) {
         regalloc_replace_call_reg(op, ssa_inst_aux_ptr(inst), reg, tmp);
     }
-    regalloc_replace_operand_reg(&inst.src1, reg, tmp);
-    regalloc_replace_operand_reg(&inst.src2, reg, tmp);
+    if (op != SSA_OP_CALL && op != SSA_OP_CALL_PTR) {
+        regalloc_replace_operand_reg(&inst.src1, reg, tmp);
+        regalloc_replace_operand_reg(&inst.src2, reg, tmp);
+    }
     if (op == SSA_OP_RET_SLICE_HEAP) {
         ret_slice_heap_remap_single((u64)inst, reg, tmp);
     }
@@ -1448,10 +1572,15 @@ func regalloc_replace_inst_def(ctx: *SSAContext, block: *SSABlock, inst: *SSAIns
     if (ctx == 0 || block == 0 || inst == 0 || reg == 0 || next_temp_ptr == 0) { return 0; }
     var op: u64 = op_of(inst);
     if (regalloc_inst_can_define(op) == 0) { return 0; }
-    if (inst.dest != reg) { return 0; }
+    var secondary: u64 = 0;
+    if (op == SSA_OP_CALL || op == SSA_OP_CALL_PTR) {
+        secondary = regalloc_operand_uses_reg(inst.src2, reg);
+    }
+    if (inst.dest != reg && secondary == 0) { return 0; }
     var tmp: u64 = *next_temp_ptr;
     *next_temp_ptr = tmp + 1;
-    inst.dest = tmp;
+    if (secondary != 0) { inst.src2 = operand_reg(tmp); }
+    else { inst.dest = tmp; }
     var store_inst: *SSAInstruction = create_inst(ctx, SSA_OP_STORE, 0, operand_const(slot), operand_reg(tmp));
     regalloc_insert_after_inst(block, inst, store_inst);
     return 1;
@@ -1543,15 +1672,13 @@ func regalloc_mark_auto_backend_deferred(fn: *SSAFunction) -> u64 {
     return 0;
 }
 
-func map_fn_once(fn: *SSAFunction, k: u64, arena: *BppScratchArena) -> u64 {
-    var max_reg: u64 = calc_max_reg(fn);
+func map_fn_colors(fn: *SSAFunction, colors: *Vec<u64>, max_reg: u64, arena: *BppScratchArena) -> u64 {
     if (max_reg == 0) {
         fn.regalloc_failed = 0;
         fn.regalloc_done = 1;
         return 0;
     }
 
-    var colors: *Vec<u64> = regalloc_color_fn(fn, k, arena);
     if (colors == 0) {
         fn.regalloc_failed = 1;
         fn.regalloc_done = 0;
@@ -1583,10 +1710,6 @@ func map_fn_once(fn: *SSAFunction, k: u64, arena: *BppScratchArena) -> u64 {
 
     if (failed != 0) {
         regalloc_map_free(map, arena);
-        if (SSA_REGALLOC_RELEASE_SCRATCH != 0) {
-            colors.release_buffer();
-            free((u64)colors);
-        }
         fn.regalloc_failed = 1;
         fn.regalloc_done = 0;
         fn.reg_map_data = 0;
@@ -1598,10 +1721,6 @@ func map_fn_once(fn: *SSAFunction, k: u64, arena: *BppScratchArena) -> u64 {
     fn.reg_map_len = max_reg + 1;
     fn.regalloc_failed = 0;
     fn.regalloc_done = 1;
-    if (SSA_REGALLOC_RELEASE_SCRATCH != 0) {
-        colors.release_buffer();
-        free((u64)colors);
-    }
     return map;
 }
 
@@ -1612,11 +1731,6 @@ func map_fn(ctx: *SSAContext, fn: *SSAFunction, k: u64, arena: *BppScratchArena)
     var next_spill_slot: u64 = regalloc_max_pseudo_var_id(fn);
     if (initial_max_reg > next_spill_slot) { next_spill_slot = initial_max_reg; }
     next_spill_slot = next_spill_slot + 1;
-    var slot_cap: u64 = 64;
-    var slot_ids: *u64 = (*u64)bpp_scratch_arena_alloc_zero(arena, slot_cap * sizeof(u64));
-    var slot_start: *u64 = (*u64)bpp_scratch_arena_alloc_zero(arena, slot_cap * sizeof(u64));
-    var slot_end: *u64 = (*u64)bpp_scratch_arena_alloc_zero(arena, slot_cap * sizeof(u64));
-    var slot_count: u64 = 0;
     // Each successful rewrite removes at least one pressure-causing interval.
     // Scale the retry budget with the input function instead of imposing a
     // small correctness cutoff on otherwise valid SSA.
@@ -1624,7 +1738,9 @@ func map_fn(ctx: *SSAContext, fn: *SSAFunction, k: u64, arena: *BppScratchArena)
     for (var attempt: u64 = 0; attempt < spill_budget; attempt++) {
         var attempt_mark: BppScratchArenaMark;
         if (arena != 0) { bpp_scratch_arena_mark_into(arena, &attempt_mark); }
-        var map: u64 = map_fn_once(fn, k, arena);
+        var max_reg: u64 = calc_max_reg(fn);
+        var colors: *Vec<u64> = regalloc_color_fn(fn, k, arena);
+        var map: u64 = map_fn_colors(fn, colors, max_reg, arena);
         if (fn.regalloc_failed == 0 && fn.regalloc_done != 0) {
             timings_add_regalloc_span(5, map_started);
             return map;
@@ -1638,10 +1754,8 @@ func map_fn(ctx: *SSAContext, fn: *SSAFunction, k: u64, arena: *BppScratchArena)
             break;
         }
 
-        var max_reg: u64 = calc_max_reg(fn);
-        var colors: *Vec<u64> = regalloc_color_fn(fn, k, arena);
         var spill_started: u64 = timings_profile_start();
-        var spilled: u64 = regalloc_spill_uncolored_batch(ctx, fn, colors, max_reg, arena, slot_ids, slot_start, slot_end, &slot_count, &next_spill_slot, slot_cap);
+        var spilled: u64 = regalloc_spill_uncolored_batch(ctx, fn, colors, max_reg, arena, &next_spill_slot);
         timings_add_regalloc_span(6, spill_started);
         if (arena != 0) { bpp_scratch_arena_rewind(arena, &attempt_mark); }
         if (spilled == 0) { break; }

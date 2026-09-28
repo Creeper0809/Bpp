@@ -1,0 +1,116 @@
+// Releasing tracked allocations must also release their GC bookkeeping records.
+// Mode: nossa
+// Opt: O0
+// Expect exit code: 0
+
+import std.mem;
+
+struct GcRecordProbe {
+    public value: u64;
+}
+
+func allocate_and_release() -> u64 {
+    var item: *GcRecordProbe = new GcRecordProbe{7};
+    free((u64)item);
+    return 0;
+}
+
+func probe_temporary_records() -> u64 {
+    bpp_gc_reset();
+    bpp_gc_set_auto(0, 0);
+    var first: u64 = bpp_gc_alloc_raw(8, 3);
+    var second: u64 = bpp_gc_alloc_raw(8, 3);
+    var frame: u64 = 16;
+    var collision: u64 = 32;
+    while (bpp_gc_temporary_frame_bucket(collision) != bpp_gc_temporary_frame_bucket(frame)) { collision = collision + 16; }
+    var outer: u64 = bpp_gc_temporary_mark();
+    if (bpp_gc_temporary_push(first, frame) != 1) { return 10; }
+    if (bpp_gc_temporary_push(first, frame) != 0) { return 11; }
+    var inner: u64 = bpp_gc_temporary_mark();
+    bpp_gc_temporary_push(second, frame);
+    bpp_gc_temporary_push(first, collision);
+    if (bpp_gc_temporary_release(frame, inner) != 1 || bpp_gc_temporary_root_count() != 2) { return 12; }
+    if (bpp_gc_temporary_points_to(bpp_gc_find_block(first)) != 1) { return 13; }
+    if (bpp_gc_temporary_points_to(bpp_gc_find_block(second)) != 0) { return 14; }
+    if (bpp_gc_temporary_release(collision, 0) != 1 || bpp_gc_temporary_root_count() != 1) { return 15; }
+    if (bpp_gc_temporary_release(frame, outer) != 1 || bpp_gc_temporary_root_count() != 0) { return 16; }
+    var allocations: u64 = bpp_gc_temporary_record_alloc_count();
+    var before: u64 = heap_profile_live_payload_byte_count();
+    for (var i: u64 = 0; i < 10000; i++) {
+        var mark: u64 = bpp_gc_temporary_mark();
+        bpp_gc_temporary_push(first, frame);
+        if (bpp_gc_temporary_release(frame, mark) != 1) { return 17; }
+    }
+    if (bpp_gc_temporary_record_alloc_count() != allocations) { return 18; }
+    if (heap_profile_live_payload_byte_count() != before) { return 19; }
+    for (var j: u64 = 1; j <= 200; j++) { bpp_gc_temporary_push(first, j * 16); }
+    for (var k: u64 = 1; k <= 200; k++) {
+        if (bpp_gc_temporary_release(k * 16, 0) != 1) { return 20; }
+    }
+    if (bpp_gc_temporary_root_count() != 0 || g_bpp_gc_temporary_pool_count > BPP_GC_TEMPORARY_POOL_LIMIT) { return 21; }
+    var reset_mark: u64 = bpp_gc_temporary_mark();
+    bpp_gc_reset();
+    if (g_bpp_gc_temporary_pool_count != 0 || bpp_gc_temporary_root_count() != 0) { return 22; }
+    bpp_gc_set_auto(0, 0);
+    var after_reset: u64 = bpp_gc_alloc_raw(8, 3);
+    bpp_gc_temporary_push(after_reset, frame);
+    if (bpp_gc_temporary_release(frame, reset_mark) != 1) { return 23; }
+    bpp_gc_reset();
+    return 0;
+}
+
+func probe_growing_block_index() -> u64 {
+    bpp_gc_reset();
+    bpp_gc_set_auto(0, 0);
+    var count: u64 = BPP_GC_BLOCK_INDEX_BUCKETS * 2 + 17;
+    var pointers: *u64 = (*u64)heap_alloc(count * sizeof(u64));
+    for (var i: u64 = 0; i < count; i++) {
+        pointers[i] = bpp_gc_alloc_raw(8, 3);
+        if (pointers[i] == 0) { return 30; }
+        var value: *u64 = (*u64)pointers[i];
+        value[0] = i + 71;
+    }
+    if (g_bpp_gc_block_index_buckets < count) { return 31; }
+    for (var j: u64 = 0; j < count; j++) {
+        var block: *BppGcBlock = bpp_gc_find_block(pointers[j]);
+        if (block == 0 || bpp_gc_block_raw(block) != pointers[j]) { return 32; }
+        var stored: *u64 = (*u64)pointers[j];
+        if (stored[0] != j + 71) { return 33; }
+    }
+    for (var k: u64 = 0; k < count; k = k + 2) { free(pointers[k]); }
+    for (var m: u64 = 0; m < count; m++) {
+        if (m % 2 == 0) {
+            if (bpp_gc_find_block(pointers[m]) != 0) { return 34; }
+        } else {
+            if (bpp_gc_find_block(pointers[m]) == 0) { return 35; }
+            free(pointers[m]);
+        }
+    }
+    if (bpp_gc_live_count() != 0) { return 36; }
+    heap_free((u64)pointers);
+    bpp_gc_reset();
+    if (g_bpp_gc_block_index != 0 || g_bpp_gc_block_index_buckets != 0) { return 37; }
+    return 0;
+}
+
+func main() -> u64 {
+    var growing_result: u64 = probe_growing_block_index();
+    if (growing_result != 0) { return growing_result; }
+    var temporary_result: u64 = probe_temporary_records();
+    if (temporary_result != 0) { return temporary_result; }
+    bpp_gc_set_auto(0, 0);
+    var tracked: u64 = bpp_gc_alloc_raw(8, 3);
+    if (bpp_gc_find_block(tracked) == 0) { return 2; }
+    var local: u64 = 0;
+    if (bpp_gc_find_block((u64)&local) != 0) { return 3; }
+    free(tracked);
+    if (bpp_gc_find_block(tracked) != 0) { return 4; }
+    allocate_and_release();
+    var before: u64 = heap_profile_live_payload_byte_count();
+    for (var i: u64 = 0; i < 64; i++) {
+        allocate_and_release();
+    }
+    var after: u64 = heap_profile_live_payload_byte_count();
+    if (after > before + 64) { return 1; }
+    return 0;
+}

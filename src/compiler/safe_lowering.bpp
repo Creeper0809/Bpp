@@ -1,0 +1,234 @@
+// Safe operations use ordinary typed calls, retaining the aggregate ABI and
+// lexical access rights. Only the receiver is eager; captured locals are
+// borrowed by address and read inside the present branch.
+import compiler;
+import compiler.core_utils;
+import compiler.ast_lowering;
+import compiler.generic.core;
+import compiler.generic.engine;
+import compiler.symbol_runtime;
+import emitter.typeinfo;
+import std.str;
+import std.vec;
+import std.hashmap;
+import ast;
+import types;
+
+func safe_lower_param(name: []u8, ti: *TypeInfo) -> *Param {
+    var param: *Param = new Param{};
+    param.name = name;
+    param.fill_from_typeinfo(ti);
+    return param;
+}
+
+func safe_lower_capture(walker: *CompilerAstWalker, name: []u8) -> *AstNode {
+    var ctx: *CompilerSafeCaptureCtx = walker.safe_capture;
+    var ti: *TypeInfo = ctx.source_types.get(name);
+    if (ti == 0) { return 0; }
+    var capture_name: *NameInfo = ctx.names.get(name);
+    if (capture_name == 0) {
+        capture_name = lower_exc_build_internal_name(slice("__safe_capture_", 15), ctx.params.len());
+        ctx.names.put(name, capture_name);
+        var pointer_ti: *TypeInfo = generic_type_clone_local(ti);
+        pointer_ti.ptr_depth = pointer_ti.ptr_depth + 1;
+        pointer_ti.is_tagged = 0;
+        pointer_ti.tag_layout = slice(0, 0);
+        var param: *Param = safe_lower_param(slice(capture_name.ptr, capture_name.len), pointer_ti);
+        ctx.params.push(param);
+        ctx.helper_types.put(param.name, pointer_ti);
+        ctx.args.push((*AstNode)ast_addr_of(ast_ident(name)));
+    }
+    return (*AstNode)ast_deref(ast_ident(slice(capture_name.ptr, capture_name.len)));
+}
+
+func safe_lower_type_args(ti: *TypeInfo) -> *Vec<*GenericArg> {
+    var args: *Vec<*GenericArg> = new Vec<*GenericArg>{0, 0, 0};
+    var arg: *GenericArg = new GenericArg{};
+    arg.kind = GENERIC_KIND_TYPE;
+    arg.type_ptr = ti;
+    args.push(arg);
+    return args;
+}
+
+func safe_lower_option_type(value: *TypeInfo) -> *TypeInfo {
+    var tpl: *GenericStructTemplate = lower_try_resolve_generic_struct_template(slice("Option", 6));
+    if (tpl == 0) {
+        diag_emit_error_tag("lowering", "safe-option", "safe value access requires Option<T>");
+        diag_error("Compilation failed");
+        return 0;
+    }
+    var bindings: *Vec<*GenericBinding> = generic_build_bindings_for_struct(tpl, safe_lower_type_args(value));
+    var name: *NameInfo = generic_struct_get_or_create_instance(tpl, bindings);
+    if (name == 0) { return 0; }
+    var result: *TypeInfo = typeinfo_new(TYPE_STRUCT, 0);
+    result.struct_name = slice(name.ptr, name.len);
+    result.struct_def = get_struct_def(result.struct_name);
+    return result;
+}
+
+func safe_lower_option_payload(ti: *TypeInfo) -> *TypeInfo {
+    if (ti == 0 || ti.type_kind != TYPE_STRUCT || ti.ptr_depth != 0) { return 0; }
+    var tpl: *GenericStructTemplate = lower_try_resolve_generic_struct_template(slice("Option", 6));
+    if (tpl == 0) { return 0; }
+    var base_name: []u8 = tpl.mangled_name;
+    if (base_name.ptr == 0) { base_name = tpl.name; }
+    var base_len: u64 = sym_find_generic_suffix_index(ti.struct_name);
+    if (str_eq(slice(ti.struct_name.ptr, base_len), base_name) == 0) { return 0; }
+    return generic_find_struct_field_type(ti.struct_name, slice(0, 0), slice("value", 5));
+}
+
+func safe_lower_infer_type(expr: *AstNode, symtab: *HashMap<u64, *TypeInfo>) -> *TypeInfo {
+    var kind: u64 = ast_kind(expr);
+    var receiver: *AstNode = 0;
+    if (kind == AST_SAFE_MEMBER_ACCESS) { receiver = ((*AstMemberAccess)expr).object; }
+    if (kind == AST_SAFE_METHOD_CALL) { receiver = ((*AstMethodCall)expr).receiver; }
+    if (kind == AST_SAFE_INDEX) { receiver = ((*AstIndex)expr).base; }
+    var receiver_ti: *TypeInfo = generic_infer_expr_type(receiver, symtab);
+    var payload: *TypeInfo = safe_lower_option_payload(receiver_ti);
+    if (payload != 0) { receiver_ti = payload; }
+    if (receiver_ti == 0 || receiver_ti.ptr_depth == 0) { return generic_type_unknown(); }
+    var typed_receiver: *AstNode = (*AstNode)ast_cast_typed((*AstNode)ast_literal(0), receiver_ti);
+    var operation: *AstNode = 0;
+    if (kind == AST_SAFE_MEMBER_ACCESS) {
+        var member: *AstMemberAccess = (*AstMemberAccess)expr;
+        var normal: *AstMemberAccess = ast_member_access_scoped(typed_receiver, member.parent, member.member);
+        normal.is_raw = member.is_raw;
+        operation = (*AstNode)normal;
+    }
+    if (kind == AST_SAFE_METHOD_CALL) {
+        var method: *AstMethodCall = (*AstMethodCall)expr;
+        operation = (*AstNode)ast_method_call(typed_receiver, method.method, method.args_vec);
+    }
+    if (kind == AST_SAFE_INDEX) {
+        var value: *TypeInfo = generic_type_clone_local(receiver_ti);
+        value.ptr_depth = value.ptr_depth - 1;
+        return safe_lower_option_type(value);
+    }
+    var result: *TypeInfo = generic_infer_expr_type(operation, symtab);
+    if (result == 0 || (result.type_kind == TYPE_VOID && result.ptr_depth == 0)) { return result; }
+    return safe_lower_option_type(result);
+}
+
+func safe_lower_option_call(name: []u8, value_ti: *TypeInfo, value: *AstNode) -> *AstNode {
+    var tpl: *GenericFuncTemplate = generic_resolve_template(name);
+    if (tpl == 0) {
+        diag_emit_error_tag("lowering", "safe-option", "missing Option constructor");
+        diag_error("Compilation failed");
+        return 0;
+    }
+    var bindings: *Vec<*GenericBinding> = generic_build_bindings_for_explicit(tpl, safe_lower_type_args(value_ti));
+    var instance: *NameInfo = generic_get_or_create_instance(tpl, bindings);
+    if (instance == 0) { return 0; }
+    var args: *Vec<*AstNode> = new Vec<*AstNode>{0, 0, 0};
+    if (value != 0) { args.push(value); }
+    return (*AstNode)ast_call(slice(instance.ptr, instance.len), args);
+}
+
+func safe_lower_operation(expr: *AstNode, source_types: *HashMap<u64, *TypeInfo>) -> *AstNode {
+    var kind: u64 = ast_kind(expr);
+    var receiver: *AstNode = 0;
+    if (kind == AST_SAFE_MEMBER_ACCESS) { receiver = ((*AstMemberAccess)expr).object; }
+    if (kind == AST_SAFE_METHOD_CALL) { receiver = ((*AstMethodCall)expr).receiver; }
+    if (kind == AST_SAFE_INDEX) { receiver = ((*AstIndex)expr).base; }
+    var receiver_ti: *TypeInfo = generic_infer_expr_type(receiver, source_types);
+    var payload_ti: *TypeInfo = safe_lower_option_payload(receiver_ti);
+    var target_ti: *TypeInfo = receiver_ti;
+    if (payload_ti != 0) { target_ti = payload_ti; }
+    if (target_ti == 0 || target_ti.ptr_depth == 0 ||
+        (kind != AST_SAFE_INDEX && target_ti.type_kind != TYPE_STRUCT && target_ti.type_kind != TYPE_TRAIT)) {
+        if (kind == AST_SAFE_INDEX) {
+            diag_emit_error_tag("lowering", "safe-receiver", "Safe index access requires pointer receiver or Option of a pointer");
+        } else {
+            diag_emit_error_tag("lowering", "safe-receiver", "safe operation requires a pointer receiver or Option of a pointer");
+        }
+        diag_error("Compilation failed");
+        return expr;
+    }
+
+    var params: *Vec<*Param> = new Vec<*Param>{0, 0, 0};
+    var args: *Vec<*AstNode> = new Vec<*AstNode>{0, 0, 0};
+    var helper_types: *HashMap<u64, *TypeInfo> = new HashMap<u64, *TypeInfo>{0, 0, 0};
+    var receiver_name: []u8 = slice("__safe_receiver", 15);
+    params.push(safe_lower_param(receiver_name, receiver_ti));
+    args.push(receiver);
+    helper_types.put(receiver_name, receiver_ti);
+    var receiver_ref: *AstNode = ast_ident(receiver_name);
+    var target: *AstNode = receiver_ref;
+    if (payload_ti != 0) { target = (*AstNode)ast_member_access(receiver_ref, slice("value", 5)); }
+
+    var capture_ctx: CompilerSafeCaptureCtx;
+    capture_ctx.source_types = source_types;
+    capture_ctx.helper_types = helper_types;
+    capture_ctx.names = new HashMap<u64, *NameInfo>{0, 0, 0};
+    capture_ctx.params = params;
+    capture_ctx.args = args;
+    var walker: CompilerAstWalker;
+    walker.mode = COMPILER_AST_WALK_SAFE_CAPTURE;
+    walker.safe_capture = &capture_ctx;
+    var operation: *AstNode = 0;
+    if (kind == AST_SAFE_MEMBER_ACCESS) {
+        var member: *AstMemberAccess = (*AstMemberAccess)expr;
+        var normal_member: *AstMemberAccess = ast_member_access_scoped(target, member.parent, member.member);
+        normal_member.is_raw = member.is_raw;
+        operation = (*AstNode)normal_member;
+    }
+    if (kind == AST_SAFE_METHOD_CALL) {
+        var method: *AstMethodCall = (*AstMethodCall)expr;
+        ast_walker_walk_args(&walker, method.args_vec);
+        var normal_method: *AstMethodCall = ast_method_call(target, method.method, method.args_vec);
+        normal_method.arg_names_vec = method.arg_names_vec;
+        operation = (*AstNode)normal_method;
+    }
+    if (kind == AST_SAFE_INDEX) {
+        var index: *AstIndex = (*AstIndex)expr;
+        operation = (*AstNode)ast_index(target, ast_walker_walk_expr(&walker, index.index));
+    }
+    var view: Symtab;
+    memset((u64)&view, 0, sizeof(Symtab));
+    view.name_to_type_map = helper_types;
+    var value_ti: *TypeInfo = get_expr_type_with_symtab(operation, &view);
+    if (value_ti == 0) {
+        diag_emit_error_tag("lowering", "safe-result", "cannot determine safe operation result type");
+        diag_emit_labelled_name("receiver type: ", target_ti.struct_name);
+        diag_emit_labelled_u64("operation kind: ", kind);
+        diag_error("Compilation failed");
+        return expr;
+    }
+    var is_void: u64 = value_ti.type_kind == TYPE_VOID && value_ti.ptr_depth == 0;
+    var result_ti: *TypeInfo = value_ti;
+    if (is_void == 0) { result_ti = safe_lower_option_type(value_ti); }
+    if (result_ti == 0) { return expr; }
+
+    var body: *Vec<*AstNode> = new Vec<*AstNode>{0, 0, 0};
+    var absent: *Vec<*AstNode> = new Vec<*AstNode>{0, 0, 0};
+    var absent_value: *AstNode = 0;
+    if (is_void == 0) { absent_value = safe_lower_option_call(slice("Option_none", 11), value_ti, 0); }
+    absent.push((*AstNode)ast_return(absent_value));
+    if (payload_ti != 0) {
+        var missing: *AstNode = (*AstNode)ast_binary(TOKEN_EQEQ, (*AstNode)ast_member_access(receiver_ref, slice("is_some", 7)), ast_literal(0));
+        body.push((*AstNode)ast_if(missing, (*AstNode)ast_block(absent), 0));
+    }
+    var address: *AstNode = (*AstNode)ast_cast_typed(target, typeinfo_new(TYPE_U64, 0));
+    if (target_ti.is_tagged != 0) {
+        address = (*AstNode)ast_binary(TOKEN_AMPERSAND, address, ast_literal(281474976710655));
+    }
+    var null_receiver: *AstNode = (*AstNode)ast_binary(TOKEN_EQEQ, address, ast_literal(0));
+    body.push((*AstNode)ast_if(null_receiver, (*AstNode)ast_block(absent), 0));
+    if (is_void != 0) {
+        body.push((*AstNode)ast_expr_stmt(operation));
+        body.push((*AstNode)ast_return(0));
+    } else {
+        body.push((*AstNode)ast_return(safe_lower_option_call(slice("Option_some", 11), value_ti, operation)));
+    }
+    var name: *NameInfo = lower_exc_build_internal_name(slice("__safe_access_", 14), g_compiler_ctx.all_funcs.len());
+    var helper: *AstFunc = ast_func_ex(slice(name.ptr, name.len), params, result_ti.type_kind, result_ti.ptr_depth, result_ti.is_tagged, result_ti.struct_name, result_ti.tag_layout, (*AstNode)ast_block(body));
+    helper.ret_typeinfo = result_ti;
+    sym_assign_func_module(helper.name, g_compiler_ctx.current_module);
+    var owner: []u8 = g_compiler_ctx.current_access_struct;
+    if (owner.ptr != 0 && g_compiler_ctx.impl_method_owner != 0) {
+        g_compiler_ctx.impl_method_owner.put(helper.name, new NameInfo{owner.ptr, owner.len});
+    }
+    g_compiler_ctx.all_funcs.push(helper);
+    g_compiler_ctx.all_func_sigs.push(helper);
+    return (*AstNode)ast_call(helper.name, args);
+}

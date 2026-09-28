@@ -6,6 +6,7 @@ import compiler.generic.engine;
 import compiler.symbol_runtime;
 import compiler.generic.core;
 import compiler.ast_lowering;
+import compiler.safe_lowering;
 import std.hashmap;
 import std.vec;
 import ast;
@@ -71,7 +72,9 @@ func generic_process_generic_call_expr_visitor(gc: *AstGenericCall, visitor: *Ge
         return ast_call_with_origin(gc.name, args_fallback2, gc.origin);
     }
     var args_new: *Vec<*AstNode> = generic_ast_visitor_walk_args(visitor, gc.args_vec);
-    return ast_call_with_origin(slice(name_info.ptr, name_info.len), args_new, gc.origin);
+    var instantiated_call: *AstCall = ast_call_with_origin_named(slice(name_info.ptr, name_info.len), args_new, gc.arg_names_vec, gc.origin);
+    lower_normalize_direct_call_args(instantiated_call);
+    return (*AstNode)instantiated_call;
 }
 
 func generic_process_call_expr_visitor(call: *AstCall, visitor: *GenericAstVisitor) -> *AstNode {
@@ -101,7 +104,9 @@ func generic_process_call_expr_visitor(call: *AstCall, visitor: *GenericAstVisit
     if (name_info2 == 0) {
         return (*AstNode)ast_call_with_origin_named(call.name, call.args_vec, call.arg_names_vec, call.origin);
     }
-    return (*AstNode)ast_call_with_origin_named(slice(name_info2.ptr, name_info2.len), call.args_vec, call.arg_names_vec, call.origin);
+    var instantiated_call2: *AstCall = ast_call_with_origin_named(slice(name_info2.ptr, name_info2.len), call.args_vec, call.arg_names_vec, call.origin);
+    lower_normalize_direct_call_args(instantiated_call2);
+    return (*AstNode)instantiated_call2;
 }
 
 func generic_process_method_call_expr_visitor(mc: *AstMethodCall, visitor: *GenericAstVisitor) -> u64 {
@@ -178,6 +183,21 @@ func generic_ast_visitor_walk_expr(visitor: *GenericAstVisitor, expr: *AstNode) 
             bin.left = generic_ast_visitor_walk_expr(visitor, bin.left);
             bin.right = generic_ast_visitor_walk_expr(visitor, bin.right);
             return expr;
+        case AST_TERNARY:
+            var ternary: *AstTernary = (*AstTernary)expr;
+            ternary.cond = generic_ast_visitor_walk_expr(visitor, ternary.cond);
+            ternary.then_expr = generic_ast_visitor_walk_expr(visitor, ternary.then_expr);
+            ternary.else_expr = generic_ast_visitor_walk_expr(visitor, ternary.else_expr);
+            return expr;
+        case AST_ASSIGN:
+            var assignment: *AstAssign = (*AstAssign)expr;
+            assignment.target = generic_ast_visitor_walk_expr(visitor, assignment.target);
+            assignment.value = generic_ast_visitor_walk_expr(visitor, assignment.value);
+            return expr;
+        case AST_STRUCT_LITERAL:
+            var literal: *AstStructLiteral = (*AstStructLiteral)expr;
+            literal.values_vec = generic_ast_visitor_walk_args(visitor, literal.values_vec);
+            return expr;
         case AST_UNARY:
             var un: *AstUnary = (*AstUnary)expr;
             un.operand = generic_ast_visitor_walk_expr(visitor, un.operand);
@@ -205,7 +225,7 @@ func generic_ast_visitor_walk_expr(visitor: *GenericAstVisitor, expr: *AstNode) 
         case AST_SAFE_MEMBER_ACCESS:
             var sma: *AstMemberAccess = (*AstMemberAccess)expr;
             sma.object = generic_ast_visitor_walk_expr(visitor, sma.object);
-            return expr;
+            return safe_lower_operation(expr, visitor.symtab);
         case AST_TRY:
             var tr2: *AstTry = (*AstTry)expr;
             tr2.operand = generic_ast_visitor_walk_expr(visitor, tr2.operand);
@@ -218,17 +238,25 @@ func generic_ast_visitor_walk_expr(visitor: *GenericAstVisitor, expr: *AstNode) 
             generic_process_method_call_expr_visitor((*AstMethodCall)expr, visitor);
             return expr;
         case AST_SAFE_METHOD_CALL:
-            generic_process_method_call_expr_visitor((*AstMethodCall)expr, visitor);
-            return expr;
+            var safe_method: *AstMethodCall = (*AstMethodCall)expr;
+            safe_method.receiver = generic_ast_visitor_walk_expr(visitor, safe_method.receiver);
+            safe_method.args_vec = generic_ast_visitor_walk_args(visitor, safe_method.args_vec);
+            return safe_lower_operation(expr, visitor.symtab);
         case AST_NEW:
             return generic_process_new_expr_visitor((*AstNew)expr, visitor);
         case AST_STACK_CTOR:
             return generic_process_stack_ctor_expr_visitor((*AstStackCtor)expr, visitor);
         case AST_INDEX:
-        case AST_SAFE_INDEX:
             return generic_process_index_expr_visitor((*AstIndex)expr, visitor);
+        case AST_SAFE_INDEX:
+            generic_process_index_expr_visitor((*AstIndex)expr, visitor);
+            return safe_lower_operation(expr, visitor.symtab);
         case AST_SLICE:
             return generic_process_slice_expr_visitor((*AstSlice)expr, visitor);
+        case AST_VARIADIC_PACK:
+            var pack: *AstVariadicPack = (*AstVariadicPack)expr;
+            pack.values_vec = generic_ast_visitor_walk_args(visitor, pack.values_vec);
+            return expr;
         case AST_CALL_PTR:
             return generic_process_call_ptr_expr_visitor((*AstCallPtr)expr, visitor);
         case AST_SIZEOF_EXPR:
@@ -281,6 +309,18 @@ func generic_ast_visitor_walk_stmt(visitor: *GenericAstVisitor, stmt: *AstNode) 
             wl.cond = generic_ast_visitor_walk_expr(visitor, wl.cond);
             generic_ast_visitor_walk_stmt(visitor, wl.body);
             return 0;
+        case AST_DO_WHILE:
+            var dw: *AstDoWhile = (*AstDoWhile)stmt;
+            generic_ast_visitor_walk_stmt(visitor, dw.body);
+            dw.cond = generic_ast_visitor_walk_expr(visitor, dw.cond);
+            return 0;
+        case AST_DEFER:
+            generic_ast_visitor_walk_stmt(visitor, ((*AstDefer)stmt).stmt);
+            return 0;
+        case AST_DELETE:
+            var deletion: *AstDelete = (*AstDelete)stmt;
+            deletion.expr = generic_ast_visitor_walk_expr(visitor, deletion.expr);
+            return 0;
         case AST_FOR:
             var fr: *AstFor = (*AstFor)stmt;
             generic_ast_visitor_walk_stmt(visitor, fr.init);
@@ -296,6 +336,7 @@ func generic_ast_visitor_walk_stmt(visitor: *GenericAstVisitor, stmt: *AstNode) 
             return 0;
         case AST_CASE:
             var cs: *AstCase = (*AstCase)stmt;
+            cs.value = generic_ast_visitor_walk_expr(visitor, cs.value);
             generic_ast_visitor_walk_stmt(visitor, cs.body);
             return 0;
         case AST_BLOCK:

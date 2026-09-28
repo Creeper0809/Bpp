@@ -6,6 +6,21 @@
 
 import compiler;
 import compiler.runtime_api;
+import compiler.loader;
+import compiler.annotations;
+import compiler.ast_lowering;
+import compiler.generic.engine;
+import compiler.timings;
+import compiler.symbol_runtime;
+import emitter.typeinfo;
+import emitter.symtab;
+import ssa;
+import ast;
+import std.io;
+import std.hashmap;
+import std.mem;
+import std.vec;
+import types;
 
 func main() -> u64 {
     compiler_ctx_reset_state();
@@ -23,24 +38,238 @@ func main() -> u64 {
     if (compiler_ctx_generation() != first + 2) { return 5; }
 
     var default_ctx: *CompilerCtx = compiler_ctx_current();
+
+    // Destroying the active non-default context is a supported API path. It
+    // must reactivate the default context's span state, not merely swap the
+    // context pointer after clearing the active globals.
+    var default_node: *AstLiteral = ast_literal(33);
+    if (ast_source_span_attach((u64)default_node, (u64)"default_ctx.bpp", 15, 3, 4, 3, 9) == 0) { return 30; }
+    var active_destroy_session: *CompilerCtx = compiler_ctx_new();
+    compiler_ctx_activate(active_destroy_session);
+    if (compiler_ctx_destroy(active_destroy_session) == 0) { return 31; }
+    if (compiler_ctx_current() != default_ctx) { return 32; }
+    var default_span_file: u64 = 0;
+    var default_span_file_len: u64 = 0;
+    var default_start_line: u64 = 0;
+    var default_start_col: u64 = 0;
+    var default_end_line: u64 = 0;
+    var default_end_col: u64 = 0;
+    if (ast_source_span_get((u64)default_node, &default_span_file, &default_span_file_len, &default_start_line, &default_start_col, &default_end_line, &default_end_col) == 0) { return 33; }
+    if (default_start_line != 3 || default_start_col != 4 || default_end_line != 3 || default_end_col != 9) { return 34; }
+
+    // Keyword classification is process-wide and immutable. Two live lexer
+    // contexts must not share it under one session's allocation ownership.
+    var keyword_probe_path: u64 = (u64)"test/source/modules/context_lifecycle_alloc_probe.bpp";
+    var keyword_owner: *CompilerCtx = compiler_ctx_new();
+    compiler_ctx_activate(keyword_owner);
+    if (load_module_with_ctx(keyword_owner, keyword_probe_path, str_len(keyword_probe_path)) == 0) { return 35; }
+    var keyword_peer: *CompilerCtx = compiler_ctx_new();
+    compiler_ctx_activate(default_ctx);
+    if (compiler_ctx_destroy(keyword_owner) == 0) { return 36; }
+    compiler_ctx_activate(keyword_peer);
+    if (load_module_with_ctx(keyword_peer, keyword_probe_path, str_len(keyword_probe_path)) == 0) { return 37; }
+    compiler_ctx_activate(default_ctx);
+    if (compiler_ctx_destroy(keyword_peer) == 0) { return 38; }
+
+    // A module that became READY only through a cycle edge must be invalidated
+    // if the dependency that was still LOADING eventually fails.
+    var cycle_session: *CompilerCtx = compiler_ctx_new();
+    compiler_ctx_activate(cycle_session);
+    var cycle_a_path: u64 = (u64)"test/source/modules/context_cycle_fail_a.bpp";
+    var cycle_b_path: u64 = (u64)"test/source/modules/context_cycle_fail_b.bpp";
+    if (setup_paths_with_compiler(cycle_a_path, str_len(cycle_a_path)) == 0) { return 39; }
+    if (load_module_with_ctx(cycle_session, cycle_a_path, str_len(cycle_a_path)) != 0) { return 40; }
+    if (load_module_with_ctx(cycle_session, cycle_b_path, str_len(cycle_b_path)) != 0) { return 41; }
+    compiler_ctx_activate(default_ctx);
+    if (compiler_ctx_destroy(cycle_session) == 0) { return 42; }
+
     var session_a: *CompilerCtx = compiler_ctx_new();
     var session_b: *CompilerCtx = compiler_ctx_new();
     if (compiler_ctx_current() != default_ctx) { return 6; }
+
+    // SSA reachability/build status is session state. Switching between two
+    // live compiler contexts must not replace or expose the other session's
+    // failure set.
+    compiler_ctx_activate(session_a);
+    clear_failed_funcs();
+    mark_failed(slice("session_a_failed", 16));
+    compiler_ctx_activate(session_b);
+    clear_failed_funcs();
+    mark_failed(slice("session_b_failed", 16));
+    compiler_ctx_activate(session_a);
+    if (is_build_ok(slice("session_a_failed", 16)) != 0) { return 43; }
+    if (is_build_ok(slice("session_b_failed", 16)) == 0) { return 44; }
+    compiler_ctx_activate(session_b);
+    if (is_build_ok(slice("session_b_failed", 16)) != 0) { return 45; }
+    if (is_build_ok(slice("session_a_failed", 16)) == 0) { return 46; }
 
     compiler_ctx_activate(session_a);
     var session_a_generation: u64 = compiler_ctx_generation();
     compiler_ctx_reset_state();
     if (compiler_ctx_generation() != session_a_generation + 1) { return 7; }
     compiler_target_set_with_ctx(session_a, COMPILER_TARGET_WINDOWS_X86_64);
+    var contract_annotations: *Vec<*NameInfo> = new Vec<*NameInfo>{heap_alloc((1) * sizeof(*NameInfo)), 0, (1)};
+    contract_annotations.push(new NameInfo{(u64)"complexity(O(1))", str_len("complexity(O(1))")});
+    if (annotation_register_surface_contract_annotations(slice("session_local_contract", 22), contract_annotations) == 0) { return 25; }
 
     compiler_ctx_activate(session_b);
     if (compiler_ctx_generation() != 1) { return 8; }
     if (compiler_target_with_ctx(session_b) == COMPILER_TARGET_WINDOWS_X86_64) { return 9; }
+    if (annotation_surface_contract_annotations_registered(slice("session_local_contract", 22)) != 0) { return 26; }
 
     compiler_ctx_activate(session_a);
     if (compiler_target_with_ctx(session_a) != COMPILER_TARGET_WINDOWS_X86_64) { return 10; }
+
+    // A failed load must remain failed in the same session. In-progress state
+    // may break import cycles, but it must never be mistaken for success later.
+    var missing_path: u64 = (u64)"__bpp_missing_context_retry__.bpp";
+    var missing_len: u64 = str_len(missing_path);
+    if (load_module_with_ctx(session_a, missing_path, missing_len) != 0) { return 11; }
+    if (load_module_with_ctx(session_a, missing_path, missing_len) != 0) { return 12; }
+
+    // Source spans are compilation products too. Resetting one live session must
+    // not discard the source metadata owned by another live session.
+    var node_a: *AstLiteral = ast_literal(11);
+    if (ast_source_span_attach((u64)node_a, (u64)"session_a.bpp", 13, 1, 2, 1, 4) == 0) { return 13; }
+
+    compiler_ctx_activate(session_b);
+    var node_b: *AstLiteral = ast_literal(22);
+    if (ast_source_span_attach((u64)node_b, (u64)"session_b.bpp", 13, 7, 3, 7, 8) == 0) { return 14; }
+
+    var span_file: u64 = 0;
+    var span_file_len: u64 = 0;
+    var start_line: u64 = 0;
+    var start_col: u64 = 0;
+    var end_line: u64 = 0;
+    var end_col: u64 = 0;
+    if (ast_source_span_get((u64)node_b, &span_file, &span_file_len, &start_line, &start_col, &end_line, &end_col) == 0) { return 15; }
+    if (start_line != 7 || start_col != 3 || end_line != 7 || end_col != 8) { return 16; }
+
+    compiler_ctx_activate(session_a);
+    compiler_ctx_reset_state();
+    compiler_ctx_activate(session_b);
+    if (ast_source_span_get((u64)node_b, &span_file, &span_file_len, &start_line, &start_col, &end_line, &end_col) == 0) { return 17; }
+    if (start_line != 7 || start_col != 3 || end_line != 7 || end_col != 8) { return 18; }
+
     compiler_ctx_activate(default_ctx);
-    if (compiler_ctx_destroy(session_a) == 0) { return 11; }
-    if (compiler_ctx_destroy(session_b) == 0) { return 12; }
+    if (compiler_ctx_destroy(session_a) == 0) { return 19; }
+    if (compiler_ctx_destroy(session_b) == 0) { return 20; }
+
+    // A real parse allocates AST, type, symbol, and metadata objects that are
+    // not individually owned by the registry containers. Destroying the
+    // session must reclaim those products as well as the containers.
+    var parse_session: *CompilerCtx = compiler_ctx_new();
+    compiler_ctx_activate(parse_session);
+    var probe_path: u64 = (u64)"test/source/modules/context_lifecycle_alloc_probe.bpp";
+    if (load_module_with_ctx(parse_session, probe_path, str_len(probe_path)) == 0) { return 21; }
+    var live_loaded: u64 = heap_profile_live_payload_byte_count();
+
+    compiler_ctx_activate(default_ctx);
+    if (compiler_ctx_destroy(parse_session) == 0) { return 22; }
+    var live_destroyed: u64 = heap_profile_live_payload_byte_count();
+    var gc_live_destroyed: u64 = bpp_gc_live_count();
+    if (live_destroyed >= live_loaded) { return 23; }
+
+    // The first parse may lazily initialize process-wide I/O/diagnostic
+    // buffers. Measure a second identical session to distinguish those
+    // one-time runtime caches from per-session growth.
+    var steady_before: u64 = live_destroyed;
+    var steady_session: *CompilerCtx = compiler_ctx_new();
+    compiler_ctx_activate(steady_session);
+    if (load_module_with_ctx(steady_session, probe_path, str_len(probe_path)) == 0) { return 24; }
+    var steady_loaded: u64 = heap_profile_live_payload_byte_count();
+
+    compiler_ctx_activate(default_ctx);
+    if (compiler_ctx_destroy(steady_session) == 0) { return 27; }
+    var steady_destroyed: u64 = heap_profile_live_payload_byte_count();
+    if (steady_destroyed >= steady_loaded) { return 28; }
+    if (steady_destroyed > steady_before + 4096) { return 29; }
+    if (bpp_gc_live_count() > gc_live_destroyed) { return 47; }
+
+    // Lowering type inference is cached only for the active context/symtab
+    // generation. A local type update and a new symtab scope must not reuse a
+    // stale answer for the same AST node.
+    var infer_types: *HashMap<u64, *TypeInfo> = new HashMap<u64, *TypeInfo>{0, 0, 0};
+    infer_types.ensure_capacity(8);
+    var infer_u64: *TypeInfo = typeinfo_new(TYPE_U64, 0);
+    var infer_f64: *TypeInfo = typeinfo_new(TYPE_F64, 0);
+    infer_types.put(slice("cached_value", 12), infer_u64);
+    var infer_expr: *AstNode = (*AstNode)ast_ident(slice("cached_value", 12));
+    generic_infer_cache_begin(infer_types);
+    var hits_before: u64 = timings_infer_hit_count();
+    if (generic_infer_expr_type(infer_expr, infer_types).type_kind != TYPE_U64) { return 48; }
+    if (generic_infer_expr_type(infer_expr, infer_types).type_kind != TYPE_U64) { return 49; }
+    if (timings_infer_hit_count() != hits_before + 1) { return 50; }
+    lower_parse_sugar_set_symtab(infer_types);
+    var infer_decl: *AstVarDecl = ast_var_decl(slice("cached_value", 12), TYPE_F64, 0, 0);
+    lower_var_decl_register_typeinfo(infer_decl, infer_f64);
+    if (generic_infer_expr_type(infer_expr, infer_types).type_kind != TYPE_F64) { return 51; }
+    generic_infer_cache_end();
+    lower_parse_sugar_set_symtab(0);
+
+    var shadow_types: *HashMap<u64, *TypeInfo> = new HashMap<u64, *TypeInfo>{0, 0, 0};
+    shadow_types.ensure_capacity(8);
+    shadow_types.put(slice("cached_value", 12), infer_u64);
+    generic_infer_cache_begin(shadow_types);
+    if (generic_infer_expr_type(infer_expr, shadow_types).type_kind != TYPE_U64) { return 52; }
+    generic_infer_cache_end();
+
+    // Backend expression types are reusable only while the emitter symbol
+    // table's visible type generation is unchanged.
+    var emit_types: *Symtab = symtab_new();
+    symtab_add(emit_types, slice("emit_cached", 11), TYPE_U64, 0, 8);
+    var emit_expr: *AstNode = (*AstNode)ast_ident(slice("emit_cached", 11));
+    typeinfo_expr_cache_begin();
+    var emit_hits_before: u64 = typeinfo_expr_cache_hits();
+    if (get_expr_type_with_symtab(emit_expr, emit_types).type_kind != TYPE_U64) { return 53; }
+    if (get_expr_type_with_symtab(emit_expr, emit_types).type_kind != TYPE_U64) { return 54; }
+    if (typeinfo_expr_cache_hits() != emit_hits_before + 1) { return 55; }
+    symtab_update_type(emit_types, slice("emit_cached", 11), TYPE_F64, 0);
+    if (get_expr_type_with_symtab(emit_expr, emit_types).type_kind != TYPE_F64) { return 56; }
+    typeinfo_expr_cache_end();
+    symtab_release(emit_types);
+
+    // The source-name index must observe appends, preserve ambiguity and stay
+    // isolated when the active compilation context changes.
+    var index_session: *CompilerCtx = compiler_ctx_new();
+    compiler_ctx_activate(index_session);
+    var indexed_name: []u8 = slice("IndexedType", 11);
+    if (sym_find_unique_struct_by_source_name(indexed_name) != 0) { return 57; }
+    var indexed_a: *AstStructDef = ast_struct_def(indexed_name, 0, 0, 0, 0, 0);
+    register_struct_type(indexed_a);
+    if (sym_find_unique_struct_by_source_name(indexed_name) != indexed_a) { return 58; }
+    // Re-registering the same definition is not a distinct declaration.
+    index_session.all_structs_vec.push(indexed_a);
+    if (sym_find_unique_struct_by_source_name(indexed_name) != indexed_a) { return 59; }
+    var indexed_b: *AstStructDef = ast_struct_def(indexed_name, 0, 0, 0, 0, 0);
+    register_struct_type(indexed_b);
+    if (sym_find_unique_struct_by_source_name(indexed_name) != 0) { return 60; }
+    index_session.all_structs_vec.push(indexed_a);
+    if (sym_find_unique_struct_by_source_name(indexed_name) != 0) { return 61; }
+    var method_name: []u8 = slice("probe", 5);
+    var exact_name: []u8 = slice("IndexedType_probe", 17);
+    if (find_unique_impl_method_in_struct(indexed_name, method_name) != 0) { return 64; }
+    if (sym_get_impl_method_func(exact_name) != 0) { return 65; }
+    var indexed_method: *AstFunc = new AstFunc{};
+    indexed_method.name = exact_name;
+    indexed_method.impl_owner = indexed_name;
+    indexed_method.impl_original_name = method_name;
+    indexed_method.params_vec = new Vec<*Param>{0, 0, 0};
+    index_session.all_funcs.push(indexed_method);
+    if (find_unique_impl_method_in_struct(indexed_name, method_name) != indexed_method) { return 66; }
+    if (find_unique_impl_method_in_struct_with_arg_count(indexed_name, method_name, 0) != indexed_method) { return 67; }
+    if (find_unique_impl_method_in_struct_with_arg_count(indexed_name, method_name, 1) != 0) { return 68; }
+    if (sym_get_impl_method_func(exact_name) != indexed_method) { return 69; }
+    indexed_method.name = slice("IndexedType_renamed", 19);
+    indexed_method.impl_original_name = slice("renamed", 7);
+    sym_invalidate_func_lookup();
+    if (sym_get_impl_method_func(exact_name) != 0) { return 70; }
+    if (find_unique_impl_method_in_struct(indexed_name, method_name) != 0) { return 71; }
+    if (sym_get_impl_method_func(indexed_method.name) != indexed_method) { return 72; }
+    if (find_unique_impl_method_in_struct(indexed_name, slice("renamed", 7)) != indexed_method) { return 73; }
+    compiler_ctx_activate(default_ctx);
+    if (sym_find_unique_struct_by_source_name(indexed_name) != 0) { return 62; }
+    if (sym_get_impl_method_func(exact_name) != 0) { return 74; }
+    if (compiler_ctx_destroy(index_session) == 0) { return 63; }
     return 0;
 }

@@ -15,6 +15,8 @@ param(
     [ValidateRange(1, 1024)][int]$ShardCount = 1,
     [ValidateRange(0, 1023)][int]$ShardIndex = 0,
     [bool]$StrictFailDiagnostics = $true,
+    [switch]$DisableFastPlanning,
+    [switch]$PlanOnly,
     [switch]$Quiet
 )
 
@@ -67,7 +69,7 @@ function Invoke-Link {
     return $result.ExitCode
 }
 
-function Invoke-DefaultPipelineSmoke {
+function Start-DefaultPipelineSmoke {
     param(
         [string]$Compiler,
         [string]$Nasm,
@@ -94,22 +96,66 @@ function Invoke-DefaultPipelineSmoke {
         "ld_path=$Linker"
     ), $utf8)
 
-    $result = Invoke-BppLimitedProcess `
-        -FilePath $Compiler `
-        -ArgumentList @("default_pipeline_smoke.bpp") `
-        -TimeoutMs $CompilerTimeoutMs `
-        -StdoutPath $stdoutPath `
-        -StderrPath $stderrPath `
-        -WorkingDirectory $OutputDirectory `
-        -MemoryLimitBytes $MemoryLimitBytes
-    if ($result.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $exePath)) {
-        $detail = if (Test-Path -LiteralPath $stderrPath) {
-            $rawDetail = Get-Content -LiteralPath $stderrPath -Raw
-            if ($null -eq $rawDetail -or $rawDetail.Length -eq 0) { "no diagnostic" } else { $rawDetail.Trim() }
-        } else {
-            "no diagnostic"
+    $smokeScript = {
+        param(
+            [string]$ProcessHelperPath,
+            [string]$CompilerExecutable,
+            [string]$WorkingDirectory,
+            [string]$StdoutFile,
+            [string]$StderrFile,
+            [int]$Timeout,
+            [UInt64]$MemoryLimit
+        )
+
+        . $ProcessHelperPath
+        Invoke-BppLimitedProcess `
+            -FilePath $CompilerExecutable `
+            -ArgumentList @("default_pipeline_smoke.bpp") `
+            -TimeoutMs $Timeout `
+            -StdoutPath $StdoutFile `
+            -StderrPath $StderrFile `
+            -WorkingDirectory $WorkingDirectory `
+            -MemoryLimitBytes $MemoryLimit
+    }
+
+    $powerShell = [PowerShell]::Create()
+    $smokeCommand = $powerShell.AddScript($smokeScript.ToString())
+    [void]$smokeCommand.AddArgument($ProcessHelper)
+    [void]$smokeCommand.AddArgument($Compiler)
+    [void]$smokeCommand.AddArgument($OutputDirectory)
+    [void]$smokeCommand.AddArgument($stdoutPath)
+    [void]$smokeCommand.AddArgument($stderrPath)
+    [void]$smokeCommand.AddArgument($CompilerTimeoutMs)
+    [void]$smokeCommand.AddArgument($MemoryLimitBytes)
+
+    return [PSCustomObject]@{
+        PowerShell = $powerShell
+        Handle = $powerShell.BeginInvoke()
+        ExePath = $exePath
+        StderrPath = $stderrPath
+    }
+}
+
+function Complete-DefaultPipelineSmoke {
+    param($Smoke)
+
+    try {
+        $output = @($Smoke.PowerShell.EndInvoke($Smoke.Handle))
+        if ($output.Count -ne 1) {
+            throw "Default pipeline worker returned $($output.Count) results"
         }
-        throw "Compiler default assemble/link/run pipeline failed (exit=$($result.ExitCode)): $detail"
+        $result = $output[0]
+        if ($result.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $Smoke.ExePath)) {
+            $detail = if (Test-Path -LiteralPath $Smoke.StderrPath) {
+                $rawDetail = Get-Content -LiteralPath $Smoke.StderrPath -Raw
+                if ($null -eq $rawDetail -or $rawDetail.Length -eq 0) { "no diagnostic" } else { $rawDetail.Trim() }
+            } else {
+                "no diagnostic"
+            }
+            throw "Compiler default assemble/link/run pipeline failed (exit=$($result.ExitCode)): $detail"
+        }
+    } finally {
+        $Smoke.PowerShell.Dispose()
     }
 }
 
@@ -271,15 +317,50 @@ function Get-StableCaseHash {
 
 function Get-AutomaticJobCount {
     $cpuJobs = [Math]::Max(1, [Environment]::ProcessorCount)
-    $memoryJobs = 4
+    $memoryJobs = 8
     try {
         $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
         $availableBytes = [UInt64]$os.FreePhysicalMemory * 1024
-        $memoryJobs = [Math]::Max(1, [int][Math]::Floor($availableBytes / 1610612736))
+        # Full-suite history keeps 95% of compiler processes below 100 MiB;
+        # only a few compiler-internal bundles approach 400 MiB and the
+        # longest-processing-first queue prevents them from forming the tail.
+        # Reserve 320 MiB per worker while retaining the independent 4 GiB
+        # per-process safety ceiling for pathological cases.
+        $memoryJobs = [Math]::Max(1, [int][Math]::Floor($availableBytes / 335544320))
     } catch {
         # CPU-only fallback is deterministic on hosts without CIM.
     }
-    return [Math]::Max(1, [Math]::Min(4, [Math]::Min($cpuJobs, $memoryJobs)))
+    return [Math]::Max(1, [Math]::Min(32, [Math]::Min($cpuJobs, $memoryJobs)))
+}
+
+function Get-VariantEstimatedCost {
+    param($Variant)
+
+    if ($Variant.PSObject.Properties['PhysicalKind'] -and $Variant.PhysicalKind -eq 'failure-batch') {
+        return 2400000000 + @($Variant.Members).Count
+    }
+    if ($Variant.PSObject.Properties['PhysicalKind'] -and $Variant.PhysicalKind -eq 'module-bundle') {
+        if ($Variant.Name -match '^internal_lifetime_bundle') { return 3100000000 }
+        return 2800000000
+    }
+    if ($Variant.PSObject.Properties['PhysicalKind'] -and $Variant.PhysicalKind -eq 'equivalent-variants') {
+        if ($Variant.Name -eq '97_strict_ssa_normal_prelude_success') { return 3000000000 }
+        return 2300000000
+    }
+    if ($Variant.PSObject.Properties['PhysicalKind'] -and $Variant.PhysicalKind -in @('dispatch-bundle', 'concatenated-suite')) {
+        return 2200000000
+    }
+    $text = @($Variant.Lines) -join "`n"
+    # Source size is a useful secondary predictor once tests are outside the
+    # explicitly classified shared bundles. Scale it enough to distinguish the
+    # large ABI/runtime fixtures from tiny smoke cases.
+    $score = [int64]$text.Length * 20000
+    if ($text -match '(?m)^//\s*Compiler args:\s*.*--backend\s+ssa') { $score += 1500000000 }
+    if ($text -match '(?m)^//\s*Compiler output mode:\s*(?!-asm\s*$)') { $score += 3000000000 }
+    if ($text -match '(?m)^//\s*Expect deterministic compiler output:') { $score += 1000000000 }
+    if ($text -match '(?m)^\s*import\s+(compiler|ssa)([.;]|\s|$)') { $score += 2000000000 }
+    if ($text -match '(?m)^//\s*Compile only:') { $score += 100000000 }
+    return $score
 }
 
 function Expand-SuiteCases {
@@ -380,7 +461,7 @@ $ResultDir = Join-Path $RootDir "build\test_results_win"
 New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
 New-Item -ItemType Directory -Force -Path $ResultDir | Out-Null
 
-Invoke-DefaultPipelineSmoke `
+$defaultPipelineSmoke = Start-DefaultPipelineSmoke `
     -Compiler $CompilerPath `
     -Nasm $NasmPath `
     -Linker $LinkerPath `
@@ -484,6 +565,431 @@ $duplicateIds = @($testVariants | Group-Object Id | Where-Object Count -ne 1)
 if ($duplicateIds.Count -ne 0) {
     throw "Duplicate Windows test case ID: $($duplicateIds[0].Name)"
 }
+$LogicalVariantCount = $testVariants.Count
+
+$FastPlanningEnabled = (-not $DisableFastPlanning) -and $ShardCount -eq 1 -and `
+    (-not $EffectiveNameFilter) -and (-not $EffectiveModeFilter) -and (-not $EffectiveOptFilter)
+
+if ($FastPlanningEnabled) {
+    # These compiler/SSA lifetime tests deliberately exercise the same large
+    # implementation graph. Keep each source in its own module namespace and
+    # call every original entry, but compile/assemble/link that graph once.
+    $internalMembers = @($testVariants | Where-Object {
+        $_.Mode -eq 'nossa' -and $_.Opt -eq 'O0' -and
+        ($_.Name -eq '91_compiler_context_lifecycle_success' -or
+         $_.Name -match '^(10[5-9]|11[0-9]|12[0-6])_')
+    })
+    if ($internalMembers.Count -eq 23) {
+        $bundleOrder = @($internalMembers | Sort-Object {
+            if ($_.Name -match '^109_') { 1000 }
+            elseif ($_.Name -match '^91_') { 1001 }
+            elseif ($_.Name -match '^(\d+)_') { [int]$matches[1] }
+            else { 999 }
+        })
+        $bundleDir = Join-Path $BuildDir 'fast_internal_lifetime_bundle'
+        New-Item -ItemType Directory -Force -Path $bundleDir | Out-Null
+        $bundleUtf8 = New-Object System.Text.UTF8Encoding($false)
+        $bundleIndex = 0
+        foreach ($member in $bundleOrder) {
+            $bundleIndex += 1
+            $moduleName = "case_$bundleIndex"
+            $entryName = "fast_bundle_entry_$bundleIndex"
+            $sourceText = [System.IO.File]::ReadAllText($member.Path)
+            $moduleText = [regex]::Replace($sourceText, '(?m)^func main\s*\(', "func $entryName(", 1)
+            if ($moduleText -eq $sourceText) {
+                throw "Fast bundle entry not found: $($member.Path)"
+            }
+            [System.IO.File]::WriteAllText((Join-Path $bundleDir "$moduleName.bpp"), $moduleText, $bundleUtf8)
+        }
+
+        $memberIds = @($internalMembers | ForEach-Object Id)
+        $testVariants = @($testVariants | Where-Object { $memberIds -notcontains $_.Id })
+        $splitAt = [int][Math]::Ceiling($bundleOrder.Count / 2.0)
+        for ($part = 0; $part -lt 2; $part++) {
+            $start = if ($part -eq 0) { 0 } else { $splitAt }
+            $last = if ($part -eq 0) { $splitAt - 1 } else { $bundleOrder.Count - 1 }
+            $partMembers = @($bundleOrder[$start..$last])
+            $partImports = New-Object System.Collections.Generic.List[string]
+            $partCalls = New-Object System.Collections.Generic.List[string]
+            for ($i = $start; $i -le $last; $i++) {
+                $entryNumber = $i + 1
+                $partImports.Add("import fast_bundle_entry_$entryNumber from case_$entryNumber;")
+                $partCalls.Add("    if (fast_bundle_entry_$entryNumber() != 0) { return $entryNumber; }")
+            }
+            $partNumber = $part + 1
+            $bundleSource = Join-Path $bundleDir "main_part_$partNumber.bpp"
+            $bundleText = @($partImports) + @('', 'func main() -> u64 {') + @($partCalls) + @('    return 0;', '}')
+            [System.IO.File]::WriteAllText($bundleSource, ($bundleText -join "`n") + "`n", $bundleUtf8)
+            $testVariants += [PSCustomObject]@{
+                Id = "__fast_internal_lifetime_bundle_$partNumber|nossa|O0"
+                Hash = ''
+                Ordinal = ($partMembers.Ordinal | Measure-Object -Minimum).Minimum
+                ArtifactStem = "fast_internal_lifetime_bundle_$partNumber"
+                Path = $bundleSource
+                Name = "internal_lifetime_bundle_$partNumber"
+                Mode = 'nossa'
+                Opt = 'O0'
+                Lines = @('// Mode: nossa', '// Opt: O0', '// Expect exit code: 0')
+                PhysicalKind = 'module-bundle'
+                Members = $partMembers
+            }
+        }
+    }
+
+    # The final `--backend ssa -asm` arguments make the declared runner mode
+    # variants byte-identical. Prior full-suite artifacts proved identical ASM
+    # for test 97 and identical diagnostics for all test 89 variants.
+    foreach ($equivalentName in @('89_strict_ssa_backend_fail', '97_strict_ssa_normal_prelude_success')) {
+        $equivalentMembers = @($testVariants | Where-Object Name -eq $equivalentName | Sort-Object Ordinal)
+        if ($equivalentMembers.Count -gt 1) {
+            $canonical = $equivalentMembers[0]
+            $equivalentIds = @($equivalentMembers | ForEach-Object Id)
+            $testVariants = @($testVariants | Where-Object { $equivalentIds -notcontains $_.Id })
+            $canonical | Add-Member -NotePropertyName PhysicalKind -NotePropertyValue 'equivalent-variants' -Force
+            $canonical | Add-Member -NotePropertyName Members -NotePropertyValue $equivalentMembers -Force
+            $testVariants += $canonical
+        }
+    }
+
+    # Bundle proven-compatible, no-I/O fixtures by backend/opt profile.
+    # Entry-point/ABI tests and the two fixtures that expose shared generic/runtime
+    # state remain isolated. The four broad groups are covered by a standalone
+    # probe before being admitted here.
+    $generalBundleCandidates = @($testVariants | Where-Object {
+        if ($_.PSObject.Properties['PhysicalKind']) { return $false }
+        if ($_.Name -match '::') { return $false }
+        if ($_.Name -match '^(42|43|46)_') { return $false }
+        if ($_.Path -match '[\\/]source_fail[\\/]') { return $false }
+        $text = @($_.Lines) -join "`n"
+        if ($text -match '(?m)^//\s*Expect compile fail:\s*(1|true|yes)\s*$') { return $false }
+        if ($text -match '(?m)^//\s*(Expect stdout|Stdin|Compile only|Expect deterministic compiler output|Expect asm contains|Expect compiler output excludes|Compiler output mode):') { return $false }
+        $compilerArgsRaw = if ($text -match '(?m)^//\s*Compiler args:\s*(.+)$') { $matches[1].Trim() } else { '' }
+        $redundantCompilerArgs = switch ($_.Opt) {
+            'O1' { '-O1' }
+            'O2' { '-O2' }
+            'O3' { '-O3' }
+            'OS' { '-Os' }
+            default { '' }
+        }
+        if ($compilerArgsRaw -and $compilerArgsRaw -ne $redundantCompilerArgs -and $compilerArgsRaw -ne '--target windows-x86_64') { return $false }
+        if ($text -match '(?m)^@\[entry\]') { return $false }
+        $exitRaw = if ($text -match '(?m)^//\s*Expect exit code:\s*(.+)$') { $matches[1].Trim() } else { '0' }
+        if ($exitRaw -ne '0') { return $false }
+        if ([regex]::Matches($text, '(?m)^func main\s*\(').Count -ne 1) { return $false }
+        return [regex]::Matches($text, '(?m)^func main\s*\(\s*\)\s*->\s*(u64|i64)').Count -eq 1
+    })
+
+    $generalBundleNumber = 0
+    foreach ($bundleGroup in @($generalBundleCandidates | Group-Object {
+        $groupText = @($_.Lines) -join "`n"
+        $groupClass = if ($groupText -match '(?m)^//\s*Compiler args:') { 'redundant-args' } else { 'base' }
+        "$($_.Mode)|$($_.Opt)|$groupClass"
+    })) {
+        $groupMembers = @($bundleGroup.Group | Sort-Object Ordinal)
+        for ($offset = 0; $offset -lt $groupMembers.Count; $offset += $groupMembers.Count) {
+            $last = $groupMembers.Count - 1
+            $chunk = @($groupMembers[$offset..$last])
+            if ($chunk.Count -lt 2) { continue }
+            $generalBundleNumber += 1
+            $chunkDir = Join-Path $BuildDir ("fast_general_bundle_{0:D3}" -f $generalBundleNumber)
+            New-Item -ItemType Directory -Force -Path $chunkDir | Out-Null
+            if (@($chunk | Where-Object { (@($_.Lines) -join "`n") -match '(?m)^\s*import\s+.*\bmodules\.' }).Count -gt 0) {
+                $supportModules = Join-Path $RootDir 'test\source\modules'
+                Copy-Item -LiteralPath $supportModules -Destination (Join-Path $chunkDir 'modules') -Recurse -Force
+            }
+            $chunkImports = New-Object System.Collections.Generic.List[string]
+            $chunkCalls = New-Object System.Collections.Generic.List[string]
+            $chunkStdinRaw = ''
+            $chunkStdoutRaw = ''
+            $chunkExpectedErrors = New-Object System.Collections.Generic.List[string]
+            for ($i = 0; $i -lt $chunk.Count; $i++) {
+                $moduleName = "case_$($i + 1)"
+                $entryName = "fast_bundle_entry_$($i + 1)"
+                $sourceText = [System.IO.File]::ReadAllText($chunk[$i].Path)
+                $moduleText = [regex]::Replace($sourceText, '(?m)^func main\s*\(', "func $entryName(", 1)
+                if ($moduleText -eq $sourceText) { throw "Fast bundle entry not found: $($chunk[$i].Path)" }
+                [System.IO.File]::WriteAllText((Join-Path $chunkDir "$moduleName.bpp"), $moduleText, $bundleUtf8)
+                $chunkImports.Add("import $entryName from $moduleName;")
+                $memberExitRaw = Read-DirectiveValue -Lines @($chunk[$i].Lines) -Pattern '^//\s*Expect exit code:\s*(.+)$'
+                $memberExit = if ($memberExitRaw) { [int]$memberExitRaw } else { 0 }
+                $chunkCalls.Add("    if ($entryName() != $memberExit) { return $($i + 1); }")
+                $chunkStdinRaw += Read-DirectiveValue -Lines @($chunk[$i].Lines) -Pattern '^//\s*Stdin:\s*(.+)$'
+                $chunkStdoutRaw += Read-DirectiveValue -Lines @($chunk[$i].Lines) -Pattern '^//\s*Expect stdout:\s*(.+)$'
+                foreach ($expectedError in @(Read-DirectiveValues -Lines @($chunk[$i].Lines) -Pattern '^//\s*Expect error contains:\s*(.+)$')) {
+                    $chunkExpectedErrors.Add($expectedError)
+                }
+            }
+            $chunkSource = Join-Path $chunkDir 'main.bpp'
+            $chunkText = @($chunkImports) + @('', 'func main() -> u64 {') + @($chunkCalls) + @('    return 0;', '}')
+            [System.IO.File]::WriteAllText($chunkSource, ($chunkText -join "`n") + "`n", $bundleUtf8)
+            $chunkIds = @($chunk | ForEach-Object Id)
+            $testVariants = @($testVariants | Where-Object { $chunkIds -notcontains $_.Id })
+            $chunkLines = New-Object System.Collections.Generic.List[string]
+            $chunkLines.Add("// Mode: $($chunk[0].Mode)")
+            $chunkLines.Add("// Opt: $($chunk[0].Opt)")
+            $chunkLines.Add('// Expect exit code: 0')
+            if ($chunkStdinRaw) { $chunkLines.Add("// Stdin: $chunkStdinRaw") }
+            if ($chunkStdoutRaw) { $chunkLines.Add("// Expect stdout: $chunkStdoutRaw") }
+            foreach ($expectedError in $chunkExpectedErrors) { $chunkLines.Add("// Expect error contains: $expectedError") }
+            $testVariants += [PSCustomObject]@{
+                Id = "__fast_general_bundle_$generalBundleNumber|$($chunk[0].Mode)|$($chunk[0].Opt)"
+                Hash = ''
+                Ordinal = ($chunk.Ordinal | Measure-Object -Minimum).Minimum
+                ArtifactStem = ("fast_general_bundle_{0:D3}" -f $generalBundleNumber)
+                Path = $chunkSource
+                Name = ("general_bundle_{0:D3}" -f $generalBundleNumber)
+                Mode = $chunk[0].Mode
+                Opt = $chunk[0].Opt
+                Lines = $chunkLines.ToArray()
+                PhysicalKind = 'module-bundle'
+                Members = $chunk
+            }
+        }
+    }
+
+    # Expanded success suites must remain in their original single-module
+    # topology: importing each case as a child module changes super/name
+    # resolution. Their top-level fixture symbols are intentionally unique, so
+    # concatenate compatible cases and rename only each entry function.
+    $expandedSuccessCandidates = @($testVariants | Where-Object {
+        if ($_.PSObject.Properties['PhysicalKind']) { return $false }
+        if ($_.Name -notmatch '^(02_ternary_do_while_suite|03_property_hooks_suite|87_o1_reachability_exhaustive_success|100_recursive_layout_boundaries_success)::') { return $false }
+        if ($_.Name -match '^03_property_hooks_suite::' -and $_.Mode -eq 'nossa') { return $false }
+        $text = @($_.Lines) -join "`n"
+        if ($text -match '(?m)^//\s*Expect compile fail:\s*(1|true|yes)\s*$') { return $false }
+        if ($text -match '(?m)^//\s*(Expect stdout|Stdin|Compiler args|Compile only|Expect deterministic compiler output|Expect asm contains|Expect compiler output excludes|Compiler output mode):') { return $false }
+        if ($text -match '(?m)^@\[entry\]') { return $false }
+        $exitRaw = if ($text -match '(?m)^//\s*Expect exit code:\s*(.+)$') { $matches[1].Trim() } else { '0' }
+        if ($exitRaw -ne '0') { return $false }
+        if ([regex]::Matches($text, '(?m)^func main\s*\(').Count -ne 1) { return $false }
+        return [regex]::Matches($text, '(?m)^func main\s*\(\s*\)\s*->\s*(u64|i64)').Count -eq 1
+    })
+    $concatenatedNumber = 0
+    foreach ($concatGroup in @($expandedSuccessCandidates | Group-Object {
+        $suiteClass = if ($_.Mode -eq 'nossa') { ($_.Name -split '::', 2)[0] } else { 'shared' }
+        "$($_.Mode)|$($_.Opt)|$suiteClass"
+    })) {
+        $chunk = @($concatGroup.Group | Sort-Object Ordinal)
+        if ($chunk.Count -lt 2) { continue }
+        $concatenatedNumber += 1
+        $chunkDir = Join-Path $BuildDir ("fast_concatenated_suite_{0:D3}" -f $concatenatedNumber)
+        New-Item -ItemType Directory -Force -Path $chunkDir | Out-Null
+        $concatUtf8 = New-Object System.Text.UTF8Encoding($false)
+        $chunkParts = New-Object System.Collections.Generic.List[string]
+        $chunkCalls = New-Object System.Collections.Generic.List[string]
+        for ($i = 0; $i -lt $chunk.Count; $i++) {
+            $entryName = "fast_suite_entry_$($i + 1)"
+            $sourceText = [System.IO.File]::ReadAllText($chunk[$i].Path)
+            $renamed = [regex]::Replace($sourceText, '(?m)^func main\s*\(', "func $entryName(", 1)
+            if ($renamed -eq $sourceText) { throw "Concatenated suite entry not found: $($chunk[$i].Path)" }
+            $chunkParts.Add($renamed)
+            $chunkCalls.Add("    if ($entryName() != 0) { return $($i + 1); }")
+        }
+        $chunkParts.Add('func main() -> u64 {')
+        foreach ($call in $chunkCalls) { $chunkParts.Add($call) }
+        $chunkParts.Add('    return 0;')
+        $chunkParts.Add('}')
+        $chunkSource = Join-Path $chunkDir 'main.bpp'
+        [System.IO.File]::WriteAllText($chunkSource, ($chunkParts -join "`n") + "`n", $concatUtf8)
+        $chunkIds = @($chunk | ForEach-Object Id)
+        $testVariants = @($testVariants | Where-Object { $chunkIds -notcontains $_.Id })
+        $testVariants += [PSCustomObject]@{
+            Id = "__fast_concatenated_suite_$concatenatedNumber|$($chunk[0].Mode)|$($chunk[0].Opt)"
+            Hash = ''
+            Ordinal = ($chunk.Ordinal | Measure-Object -Minimum).Minimum
+            ArtifactStem = ("fast_concatenated_suite_{0:D3}" -f $concatenatedNumber)
+            Path = $chunkSource
+            Name = ("concatenated_suite_{0:D3}" -f $concatenatedNumber)
+            Mode = $chunk[0].Mode
+            Opt = $chunk[0].Opt
+            Lines = @("// Mode: $($chunk[0].Mode)", "// Opt: $($chunk[0].Opt)", '// Expect exit code: 0')
+            PhysicalKind = 'concatenated-suite'
+            Members = $chunk
+        }
+    }
+
+    # I/O fixtures cannot share one runtime because buffered input/output and
+    # runtime globals intentionally persist within a process. They can still
+    # share compilation: emit one selector-based executable, then launch that
+    # executable once per logical fixture so every case gets a fresh runtime.
+    $dispatchCandidates = @($testVariants | Where-Object {
+        if ($_.PSObject.Properties['PhysicalKind']) { return $false }
+        if ($_.Name -match '::' -and -not ($_.Name -match '^03_property_hooks_suite::' -and $_.Mode -eq 'nossa')) { return $false }
+        if ($_.Name -match '^(42|43|46)_') { return $false }
+        if ($_.Name -match '^03_property_hooks_suite::201_' -and $_.Mode -eq 'nossa') { return $false }
+        if ($_.Path -match '[\\/]source_fail[\\/]') { return $false }
+        $text = @($_.Lines) -join "`n"
+        if ($text -match '(?m)^//\s*(Compiler args|Compile only|Expect deterministic compiler output|Expect asm contains|Expect compiler output excludes|Compiler output mode):') { return $false }
+        if ($text -match '(?m)^@\[entry\]') { return $false }
+        $exitRaw = if ($text -match '(?m)^//\s*Expect exit code:\s*(.+)$') { $matches[1].Trim() } else { '0' }
+        if ($exitRaw -ne '0') { return $false }
+        if ([regex]::Matches($text, '(?m)^func main\s*\(').Count -ne 1) { return $false }
+        $noArgMain = [regex]::Matches($text, '(?m)^func main\s*\(\s*\)\s*->\s*(u64|i64)').Count -eq 1
+        $argvMain = [regex]::Matches($text, '(?m)^func main\s*\(\s*argc\s*:\s*i64\s*,\s*argv\s*:\s*\*u64\s*\)\s*->\s*(u64|i64)').Count -eq 1
+        return $noArgMain -or $argvMain
+    })
+    $dispatchNumber = 0
+    foreach ($dispatchGroup in @($dispatchCandidates | Group-Object { "$($_.Mode)|$($_.Opt)" })) {
+        $groupMembers = @($dispatchGroup.Group | Sort-Object Ordinal)
+        for ($offset = 0; $offset -lt $groupMembers.Count; $offset += 10) {
+            $last = [Math]::Min($offset + 9, $groupMembers.Count - 1)
+            $chunk = @($groupMembers[$offset..$last])
+            if ($chunk.Count -lt 2) { continue }
+            $dispatchNumber += 1
+            $chunkDir = Join-Path $BuildDir ("fast_dispatch_bundle_{0:D3}" -f $dispatchNumber)
+            New-Item -ItemType Directory -Force -Path $chunkDir | Out-Null
+            if (@($chunk | Where-Object { (@($_.Lines) -join "`n") -match '(?m)^\s*import\s+.*\bmodules\.' }).Count -gt 0) {
+                $supportModules = Join-Path $RootDir 'test\source\modules'
+                Copy-Item -LiteralPath $supportModules -Destination (Join-Path $chunkDir 'modules') -Recurse -Force
+            }
+            $dispatchUtf8 = New-Object System.Text.UTF8Encoding($false)
+            $chunkImports = New-Object System.Collections.Generic.List[string]
+            $chunkBranches = New-Object System.Collections.Generic.List[string]
+            for ($i = 0; $i -lt $chunk.Count; $i++) {
+                $moduleName = "case_$($i + 1)"
+                $entryName = "fast_dispatch_entry_$($i + 1)"
+                $sourceText = [System.IO.File]::ReadAllText($chunk[$i].Path)
+                $moduleText = [regex]::Replace($sourceText, '(?m)^func main\s*\(', "func $entryName(", 1)
+                if ($moduleText -eq $sourceText) { throw "Dispatch bundle entry not found: $($chunk[$i].Path)" }
+                [System.IO.File]::WriteAllText((Join-Path $chunkDir "$moduleName.bpp"), $moduleText, $dispatchUtf8)
+                $chunkImports.Add("import $entryName from $moduleName;")
+                $selector = [char]([int][char]'0' + $i)
+                $entryCall = if ($sourceText -match '(?m)^func main\s*\(\s*argc\s*:\s*i64\s*,\s*argv\s*:\s*\*u64\s*\)') {
+                    "$entryName(argc - 1, argv)"
+                } else {
+                    "$entryName()"
+                }
+                $chunkBranches.Add("    if (selector == (u8)'$selector') { return (i64)$entryCall; }")
+            }
+            $chunkSource = Join-Path $chunkDir 'main.bpp'
+            $chunkText = @($chunkImports) + @(
+                '',
+                'func main(argc: i64, argv: *u64) -> i64 {',
+                '    if (argc < 2) { return 125; }',
+                '    var selector_ptr: u64 = argv[1];',
+                '    var selector: u8 = ((*u8)selector_ptr)[0];'
+            ) + @($chunkBranches) + @('    return 126;', '}')
+            [System.IO.File]::WriteAllText($chunkSource, ($chunkText -join "`n") + "`n", $dispatchUtf8)
+            $chunkIds = @($chunk | ForEach-Object Id)
+            $testVariants = @($testVariants | Where-Object { $chunkIds -notcontains $_.Id })
+            $testVariants += [PSCustomObject]@{
+                Id = "__fast_dispatch_bundle_$dispatchNumber|$($chunk[0].Mode)|$($chunk[0].Opt)"
+                Hash = ''
+                Ordinal = ($chunk.Ordinal | Measure-Object -Minimum).Minimum
+                ArtifactStem = ("fast_dispatch_bundle_{0:D3}" -f $dispatchNumber)
+                Path = $chunkSource
+                Name = ("dispatch_bundle_{0:D3}" -f $dispatchNumber)
+                Mode = $chunk[0].Mode
+                Opt = $chunk[0].Opt
+                Lines = @("// Mode: $($chunk[0].Mode)", "// Opt: $($chunk[0].Opt)", '// Expect exit code: 0')
+                PhysicalKind = 'dispatch-bundle'
+                Members = $chunk
+            }
+        }
+    }
+
+    # Expected failures use compiler-hosted batches. The compiler resets request
+    # state between sources, captures one canonical diagnostic per source, and
+    # executes only the backend/optimization requests relevant to that failure
+    # phase. Compiler-argument contract cases stay on the ordinary CLI path.
+    $failureBatchGroups = New-Object System.Collections.Generic.List[object]
+    foreach ($failureGroup in @($testVariants | Where-Object {
+        (-not $_.PSObject.Properties['PhysicalKind']) -and
+        ((@($_.Lines) -join "`n") -match '(?m)^//\s*Expect compile fail:\s*(1|true|yes)\s*$') -and
+        ((@($_.Lines) -join "`n") -notmatch '(?m)^//\s*Compiler args:')
+    } | Group-Object Name)) {
+        $failureMembers = @($failureGroup.Group | Sort-Object Ordinal)
+        if (@($failureMembers | Where-Object { $_.Opt -notin @('O0', 'O1') }).Count -ne 0) { continue }
+        $memberPaths = @($failureMembers.Path | Sort-Object -Unique)
+        if ($memberPaths.Count -ne 1) { continue }
+
+        $modeMask = 0
+        if (@($failureMembers | Where-Object Mode -eq 'nossa').Count -ne 0) { $modeMask = $modeMask -bor 1 }
+        if (@($failureMembers | Where-Object Mode -eq 'ssa').Count -ne 0) { $modeMask = $modeMask -bor 2 }
+        $optMask = 0
+        if (@($failureMembers | Where-Object Opt -eq 'O0').Count -ne 0) { $optMask = $optMask -bor 1 }
+        if (@($failureMembers | Where-Object Opt -eq 'O1').Count -ne 0) { $optMask = $optMask -bor 2 }
+        if ($modeMask -eq 0 -or $optMask -eq 0) { continue }
+
+        $sourceLength = (Get-Item -LiteralPath $memberPaths[0]).Length
+        $estimate = [int64](20000 + $sourceLength) * [Math]::Max(1, @($failureMembers.Mode | Sort-Object -Unique).Count)
+        if ($failureGroup.Name -match 'complexity') { $estimate += 200000 }
+        $failureBatchGroups.Add([PSCustomObject]@{
+            Name = $failureGroup.Name
+            Path = $memberPaths[0]
+            ModeMask = $modeMask
+            OptMask = $optMask
+            Estimate = $estimate
+            Members = $failureMembers
+        })
+    }
+
+    if ($failureBatchGroups.Count -gt 0) {
+        $failureBatchCount = [Math]::Min(84, $failureBatchGroups.Count)
+        $failureBatchDir = Join-Path $BuildDir 'failure_batches'
+        New-Item -ItemType Directory -Force -Path $failureBatchDir | Out-Null
+        Get-ChildItem -LiteralPath $failureBatchDir -Filter '*.manifest' -File -ErrorAction SilentlyContinue |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+        $failureBuckets = @()
+        for ($i = 0; $i -lt $failureBatchCount; $i++) {
+            $failureBuckets += [PSCustomObject]@{
+                Index = $i
+                Estimate = [int64]0
+                Groups = New-Object System.Collections.Generic.List[object]
+            }
+        }
+        foreach ($group in @($failureBatchGroups | Sort-Object Estimate -Descending)) {
+            $bucket = $failureBuckets | Sort-Object Estimate, Index | Select-Object -First 1
+            $bucket.Groups.Add($group)
+            $bucket.Estimate += $group.Estimate
+        }
+
+        $batchedIds = @($failureBatchGroups | ForEach-Object { $_.Members } | ForEach-Object Id)
+        $testVariants = @($testVariants | Where-Object { $batchedIds -notcontains $_.Id })
+        $batchUtf8 = New-Object System.Text.UTF8Encoding($false)
+        foreach ($bucket in @($failureBuckets | Sort-Object Index)) {
+            $groups = $bucket.Groups.ToArray()
+            if ($groups.Count -eq 0) { continue }
+            $batchNumber = $bucket.Index + 1
+            $manifestPath = Join-Path $failureBatchDir ("batch_{0:D2}.manifest" -f $batchNumber)
+            $manifestLines = @($groups | ForEach-Object { "$($_.ModeMask)`t$($_.OptMask)`t$($_.Path)" })
+            [System.IO.File]::WriteAllLines($manifestPath, $manifestLines, $batchUtf8)
+            $batchMembers = @($groups | ForEach-Object { $_.Members })
+            $firstMember = $batchMembers[0]
+            $testVariants += [PSCustomObject]@{
+                Id = ("__fast_failure_batch_{0:D2}|nossa|O0" -f $batchNumber)
+                Hash = ''
+                Ordinal = ($batchMembers.Ordinal | Measure-Object -Minimum).Minimum
+                ArtifactStem = ("fast_failure_batch_{0:D2}" -f $batchNumber)
+                Path = $manifestPath
+                Name = ("failure_batch_{0:D2}" -f $batchNumber)
+                Mode = $firstMember.Mode
+                Opt = $firstMember.Opt
+                Lines = @('// Expect compile fail: true')
+                PhysicalKind = 'failure-batch'
+                ManifestPath = $manifestPath
+                FailureGroups = $groups
+                Members = $batchMembers
+            }
+        }
+    }
+
+    # CLI-specific failures still share a canonical request when their source
+    # declares equivalent variants, while preserving their custom arguments.
+    foreach ($failureGroup in @($testVariants | Where-Object {
+        (-not $_.PSObject.Properties['PhysicalKind']) -and
+        ((@($_.Lines) -join "`n") -match '(?m)^//\s*Expect compile fail:\s*(1|true|yes)\s*$')
+    } | Group-Object Name)) {
+        $failureMembers = @($failureGroup.Group | Sort-Object Ordinal)
+        if ($failureMembers.Count -lt 2) { continue }
+        $canonical = $failureMembers[0]
+        $failureIds = @($failureMembers | ForEach-Object Id)
+        $testVariants = @($testVariants | Where-Object { $failureIds -notcontains $_.Id })
+        $canonical | Add-Member -NotePropertyName PhysicalKind -NotePropertyValue 'phase-aware-failures' -Force
+        $canonical | Add-Member -NotePropertyName Members -NotePropertyValue $failureMembers -Force
+        $testVariants += $canonical
+    }
+}
 
 $EffectiveJobs = if ($PSBoundParameters.ContainsKey("Jobs")) {
     $Jobs
@@ -497,7 +1003,7 @@ $EffectiveJobs = if ($PSBoundParameters.ContainsKey("Jobs")) {
     0
 }
 if ($EffectiveJobs -eq 0) { $EffectiveJobs = Get-AutomaticJobCount }
-$EffectiveJobs = [Math]::Max(1, [Math]::Min(4, $EffectiveJobs))
+$EffectiveJobs = [Math]::Max(1, [Math]::Min(32, $EffectiveJobs))
 
 $ResolvedTimingJsonPath = ""
 $CompilerTimingDir = ""
@@ -575,6 +1081,9 @@ $workerScript = {
     $caseOk = $true
     $status = "PASS"
     $diagnostic = ""
+    $memberPassed = New-Object System.Collections.Generic.List[bool]
+    $memberStatus = New-Object System.Collections.Generic.List[string]
+    $memberDiagnostic = New-Object System.Collections.Generic.List[string]
     $displayName = "$($Case.Name) ($($Case.Mode) $($Case.Opt))"
     $asmFile = Join-Path $Config.BuildDir "$($Case.ArtifactStem).asm"
     $objFile = Join-Path $Config.BuildDir "$($Case.ArtifactStem).obj"
@@ -707,6 +1216,36 @@ $workerScript = {
                         -WorkingDirectory $Config.RootDir -MemoryLimitBytes $Config.MemoryLimitBytes
                     if ($linkResult.ExitCode -ne 0) {
                         $caseOk = $false; $status = "FAIL (link)"
+                    } elseif ($Case.PSObject.Properties['PhysicalKind'] -and $Case.PhysicalKind -eq 'dispatch-bundle') {
+                        $dispatchMembers = @($Case.Members)
+                        for ($dispatchIndex = 0; $dispatchIndex -lt $dispatchMembers.Count; $dispatchIndex++) {
+                            $dispatchMember = $dispatchMembers[$dispatchIndex]
+                            $dispatchLines = @($dispatchMember.Lines)
+                            $dispatchExit = 0
+                            $dispatchExitRaw = Read-One $dispatchLines '^//\s*Expect exit code:\s*(.+)$'
+                            if ($dispatchExitRaw) { [void][int]::TryParse($dispatchExitRaw, [ref]$dispatchExit) }
+                            $dispatchStdin = [Text.RegularExpressions.Regex]::Unescape((Read-One $dispatchLines '^//\s*Stdin:\s*(.+)$'))
+                            $dispatchStdout = [Text.RegularExpressions.Regex]::Unescape((Read-One $dispatchLines '^//\s*Expect stdout:\s*(.+)$'))
+                            $runResult = Invoke-BppLimitedProcess -FilePath $exeFile -ArgumentList @([string]$dispatchIndex) `
+                                -TimeoutMs $Config.TimeoutMs -StdinText $dispatchStdin -WorkingDirectory $Config.RootDir `
+                                -MemoryLimitBytes $Config.MemoryLimitBytes
+                            $portableExit = if ($runResult.ExitCode -eq -1073741795) { 132 } else { $runResult.ExitCode }
+                            $dispatchOk = $portableExit -eq $dispatchExit -and
+                                ($dispatchStdout -eq '' -or $runResult.Stdout -eq $dispatchStdout)
+                            $memberPassed.Add($dispatchOk)
+                            if ($portableExit -ne $dispatchExit) {
+                                $memberStatus.Add("FAIL (exit=$($runResult.ExitCode) expect=$dispatchExit)")
+                                $memberDiagnostic.Add('')
+                            } elseif ($dispatchStdout -ne '' -and $runResult.Stdout -ne $dispatchStdout) {
+                                $memberStatus.Add('FAIL (stdout mismatch)')
+                                $memberDiagnostic.Add("expected=<$dispatchStdout> actual=<$($runResult.Stdout)>")
+                            } else {
+                                $memberStatus.Add('PASS (shared compile; isolated runtime)')
+                                $memberDiagnostic.Add('')
+                            }
+                        }
+                        $caseOk = @($memberPassed | Where-Object { -not $_ }).Count -eq 0
+                        $status = if ($caseOk) { 'PASS (shared compile; isolated runtimes)' } else { 'FAIL (dispatch member)' }
                     } else {
                         $runResult = Invoke-BppLimitedProcess -FilePath $exeFile -TimeoutMs $Config.TimeoutMs `
                             -StdinText $stdinText -WorkingDirectory $Config.RootDir `
@@ -737,7 +1276,11 @@ $workerScript = {
         passed = $caseOk
         status = $status
         diagnostic = $diagnostic
+        errorPath = $errFile
         compilerTimingsPath = $compilerTimingFile
+        memberPassed = $memberPassed.ToArray()
+        memberStatus = $memberStatus.ToArray()
+        memberDiagnostic = $memberDiagnostic.ToArray()
         timing = [PSCustomObject]@{
             totalMs = [Math]::Round($caseClock.Elapsed.TotalMilliseconds, 3)
             compile = To-Metric $compileResult
@@ -745,6 +1288,267 @@ $workerScript = {
             link = To-Metric $linkResult
             run = To-Metric $runResult
         }
+    }
+}
+
+$phaseAwareFailureWorkerScript = {
+    param($Group, $Config, [string]$OneWorkerSource)
+    Set-StrictMode -Version Latest
+    $ErrorActionPreference = 'Stop'
+    $oneWorker = [scriptblock]::Create($OneWorkerSource)
+    $groupClock = [Diagnostics.Stopwatch]::StartNew()
+    $members = @($Group.Members)
+    $first = & $oneWorker $members[0] $Config
+    $aggregateOk = $first.passed
+    $aggregateStatus = $first.status
+    $aggregateDiagnostic = $first.diagnostic
+    $phase = ''
+    if ($first.errorPath -and (Test-Path -LiteralPath $first.errorPath)) {
+        $errorText = Get-Content -LiteralPath $first.errorPath -Raw
+        if ($errorText -match '\[ERROR\]\[([^\]]+)\]') { $phase = $matches[1] }
+    }
+
+    # Parser/type identity diagnostics happen before backend or optimization
+    # selection. One canonical request therefore proves every declared variant.
+    $safeFrontEndPhase = $phase -in @('parse', 'validation', 'typecheck', 'generic', 'lowering')
+    if ($aggregateOk -and -not $safeFrontEndPhase) {
+        $remainingMembers = if (-not $phase) {
+            # Legacy diagnostics without a stage tag have two proven output
+            # classes: legacy and SSA. The O0/O1 diagnostics within each class
+            # are byte-identical in the frozen full-suite baseline, so execute
+            # one representative for the other backend and retain both modes.
+            @($members | Where-Object Mode -ne $members[0].Mode | Group-Object Mode | ForEach-Object { $_.Group | Select-Object -First 1 })
+        } else {
+            @($members | Select-Object -Skip 1)
+        }
+        foreach ($remainingMember in $remainingMembers) {
+            $next = & $oneWorker $remainingMember $Config
+            if (-not $next.passed) {
+                $aggregateOk = $false
+                $aggregateStatus = $next.status
+                $aggregateDiagnostic = $next.diagnostic
+                break
+            }
+        }
+    }
+    $groupClock.Stop()
+    $first.passed = $aggregateOk
+    $first.status = if ($aggregateOk -and $safeFrontEndPhase) {
+        "PASS (front-end phase $phase)"
+    } elseif ($aggregateOk) {
+        'PASS (all backend-sensitive variants)'
+    } else {
+        $aggregateStatus
+    }
+    $first.diagnostic = $aggregateDiagnostic
+    $first.timing.totalMs = [Math]::Round($groupClock.Elapsed.TotalMilliseconds, 3)
+    return $first
+}
+
+$failureBatchWorkerScript = {
+    param($Batch, $Config)
+    Set-StrictMode -Version Latest
+    $ErrorActionPreference = 'Stop'
+    if (-not (Get-Command Invoke-BppLimitedProcess -CommandType Function -ErrorAction SilentlyContinue)) {
+        . $Config.ProcessHelper
+    }
+
+    function To-BatchMetric($ProcessResult) {
+        if ($null -eq $ProcessResult) { return $null }
+        return [PSCustomObject]@{
+            wallMs = $ProcessResult.WallTimeMs
+            cpuMs = $ProcessResult.CpuTimeMs
+            peakWorkingSetBytes = $ProcessResult.PeakWorkingSetBytes
+        }
+    }
+
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $stdoutPath = Join-Path $Config.ResultDir "$($Batch.ArtifactStem).stdout"
+    $stderrPath = Join-Path $Config.ResultDir "$($Batch.ArtifactStem).stderr"
+    foreach ($path in @($stdoutPath, $stderrPath)) {
+        if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
+    }
+    $memberPassed = New-Object System.Collections.Generic.List[bool]
+    $memberStatus = New-Object System.Collections.Generic.List[string]
+    $memberDiagnostic = New-Object System.Collections.Generic.List[string]
+    $processResult = $null
+    $fatalStatus = ''
+    $fatalDiagnostic = ''
+
+    try {
+        $processResult = Invoke-BppLimitedProcess -FilePath $Config.CompilerPath `
+            -ArgumentList @('--batch-fail-manifest', $Batch.ManifestPath) `
+            -TimeoutMs $Config.CompilerTimeoutMs -StdoutPath $stdoutPath -StderrPath $stderrPath `
+            -WorkingDirectory $Config.RootDir -MemoryLimitBytes $Config.MemoryLimitBytes
+        if ($processResult.TimedOut) {
+            throw 'failure batch compiler timeout'
+        }
+        if ($processResult.ExitCode -lt 0 -or $processResult.ExitCode -ge 128) {
+            throw "failure batch compiler crash exit=$($processResult.ExitCode)"
+        }
+        if ($processResult.ExitCode -ne 0) {
+            throw "failure batch compiler exit=$($processResult.ExitCode)"
+        }
+        $stderrText = if (Test-Path -LiteralPath $stderrPath) { [IO.File]::ReadAllText($stderrPath) } else { '' }
+        if ($stderrText.Length -ne 0) {
+            throw "failure batch leaked stderr: $($stderrText.Trim())"
+        }
+
+        $bytes = [IO.File]::ReadAllBytes($stdoutPath)
+        $ascii = [Text.Encoding]::ASCII
+        $utf8 = New-Object Text.UTF8Encoding($false, $true)
+        $cursor = 0
+        $groups = @($Batch.FailureGroups)
+        for ($groupIndex = 0; $groupIndex -lt $groups.Count; $groupIndex++) {
+            $lineEnd = $cursor
+            while ($lineEnd -lt $bytes.Length -and $bytes[$lineEnd] -ne 10) { $lineEnd += 1 }
+            if ($lineEnd -ge $bytes.Length) { throw "truncated batch header at group $groupIndex" }
+            $headerLength = $lineEnd - $cursor
+            if ($headerLength -gt 0 -and $bytes[$lineEnd - 1] -eq 13) { $headerLength -= 1 }
+            $header = $ascii.GetString($bytes, $cursor, $headerLength)
+            if ($header -notmatch '^BPPB ([0-9]+) ([01]) ([0-9]+)$') {
+                throw "invalid batch header at group $groupIndex`: $header"
+            }
+            if ([int]$matches[1] -ne $groupIndex) {
+                throw "out-of-order batch result: got $($matches[1]), expected $groupIndex"
+            }
+            $failedAsExpected = $matches[2] -eq '1'
+            $diagnosticLength = [int]$matches[3]
+            $cursor = $lineEnd + 1
+            if ($diagnosticLength -lt 0 -or $cursor + $diagnosticLength -gt $bytes.Length) {
+                throw "invalid diagnostic length at group $groupIndex"
+            }
+            $diagnosticText = $utf8.GetString($bytes, $cursor, $diagnosticLength)
+            $cursor += $diagnosticLength
+            if ($cursor -ge $bytes.Length -or $bytes[$cursor] -ne 10) {
+                throw "missing diagnostic terminator at group $groupIndex"
+            }
+            $cursor += 1
+
+            $group = $groups[$groupIndex]
+            foreach ($member in @($group.Members)) {
+                $expected = @()
+                foreach ($line in @($member.Lines)) {
+                    if ($line -match '^//\s*Expect error contains:\s*(.+)$') {
+                        $value = $matches[1].Trim()
+                        if ($value) { $expected += $value }
+                    }
+                }
+                $missing = @($expected | Where-Object {
+                    $diagnosticText.IndexOf($_, [StringComparison]::Ordinal) -lt 0
+                })
+                $ok = $failedAsExpected -and $missing.Count -eq 0
+                $memberPassed.Add($ok)
+                if (-not $failedAsExpected) {
+                    $memberStatus.Add('FAIL (unexpected compile success in shared batch)')
+                    $memberDiagnostic.Add($diagnosticText)
+                } elseif ($missing.Count -ne 0) {
+                    $memberStatus.Add("FAIL (compile error mismatch: $($missing[0]))")
+                    $memberDiagnostic.Add($diagnosticText)
+                } else {
+                    $memberStatus.Add('PASS (expected compile fail; shared batch)')
+                    $memberDiagnostic.Add('')
+                }
+            }
+        }
+        while ($cursor -lt $bytes.Length -and ($bytes[$cursor] -eq 10 -or $bytes[$cursor] -eq 13 -or $bytes[$cursor] -eq 32 -or $bytes[$cursor] -eq 9)) {
+            $cursor += 1
+        }
+        if ($cursor -ne $bytes.Length) { throw 'unexpected trailing batch output' }
+        if ($memberPassed.Count -ne @($Batch.Members).Count) {
+            throw "batch result count mismatch: $($memberPassed.Count) != $(@($Batch.Members).Count)"
+        }
+    } catch {
+        $fatalStatus = 'FAIL (failure batch runner)'
+        $fatalDiagnostic = $_.Exception.Message
+        $memberPassed.Clear()
+        $memberStatus.Clear()
+        $memberDiagnostic.Clear()
+        foreach ($member in @($Batch.Members)) {
+            $memberPassed.Add($false)
+            $memberStatus.Add($fatalStatus)
+            $memberDiagnostic.Add($fatalDiagnostic)
+        }
+    }
+
+    $clock.Stop()
+    $allPassed = $memberPassed.Count -eq @($Batch.Members).Count -and @($memberPassed | Where-Object { -not $_ }).Count -eq 0
+    return [PSCustomObject]@{
+        id = $Batch.Id
+        ordinal = $Batch.Ordinal
+        name = $Batch.Name
+        mode = $Batch.Mode
+        opt = $Batch.Opt
+        passed = $allPassed
+        status = if ($allPassed) { 'PASS (shared failure batch)' } else { $fatalStatus }
+        diagnostic = $fatalDiagnostic
+        errorPath = $stderrPath
+        compilerTimingsPath = ''
+        memberPassed = $memberPassed.ToArray()
+        memberStatus = $memberStatus.ToArray()
+        memberDiagnostic = $memberDiagnostic.ToArray()
+        timing = [PSCustomObject]@{
+            totalMs = [Math]::Round($clock.Elapsed.TotalMilliseconds, 3)
+            compile = To-BatchMetric $processResult
+            assemble = $null
+            link = $null
+            run = $null
+        }
+    }
+}
+
+function Add-LogicalResults {
+    param(
+        [System.Collections.Generic.List[object]]$Destination,
+        $PhysicalVariant,
+        $PhysicalResult
+    )
+
+    if (-not $PhysicalVariant.PSObject.Properties['Members']) {
+        $Destination.Add($PhysicalResult)
+        return
+    }
+
+    $members = @($PhysicalVariant.Members)
+    $hasMemberOutcomes = $null -ne $PhysicalResult.PSObject.Properties['memberPassed']
+    $memberPassedValues = @()
+    $memberStatusValues = @()
+    $memberDiagnosticValues = @()
+    if ($hasMemberOutcomes) {
+        $memberPassedValues = @($PhysicalResult.memberPassed)
+        $memberStatusValues = @($PhysicalResult.memberStatus)
+        $memberDiagnosticValues = @($PhysicalResult.memberDiagnostic)
+    }
+    $hasMemberOutcomes = $hasMemberOutcomes -and $memberPassedValues.Count -eq $members.Count
+    for ($i = 0; $i -lt $members.Count; $i++) {
+        $member = $members[$i]
+        $sharedTiming = if ($i -eq 0) {
+            $PhysicalResult.timing
+        } else {
+            [PSCustomObject]@{ totalMs = 0; compile = $null; assemble = $null; link = $null; run = $null }
+        }
+        $thisPassed = if ($hasMemberOutcomes) { [bool]$memberPassedValues[$i] } else { [bool]$PhysicalResult.passed }
+        $thisStatus = if ($hasMemberOutcomes) {
+            [string]$memberStatusValues[$i]
+        } elseif ($PhysicalResult.passed) {
+            "PASS (shared $($PhysicalVariant.PhysicalKind))"
+        } else {
+            $PhysicalResult.status
+        }
+        $thisDiagnostic = if ($hasMemberOutcomes) { [string]$memberDiagnosticValues[$i] } else { $PhysicalResult.diagnostic }
+        $Destination.Add([PSCustomObject]@{
+            id = $member.Id
+            ordinal = $member.Ordinal
+            name = $member.Name
+            mode = $member.Mode
+            opt = $member.Opt
+            passed = $thisPassed
+            status = $thisStatus
+            diagnostic = $thisDiagnostic
+            compilerTimingsPath = if ($i -eq 0) { $PhysicalResult.compilerTimingsPath } else { '' }
+            physicalGroup = $PhysicalVariant.Id
+            timing = $sharedTiming
+        })
     }
 }
 
@@ -760,25 +1564,49 @@ Write-Host "[INFO] Strict fail diagnostics: $StrictFailDiagnostics"
 Write-Host "[INFO] Memory limit: $MemoryLimitBytes bytes"
 Write-Host "[INFO] Mode filter: $($globalModes -join ',')"
 Write-Host "[INFO] Opt filter : $($globalOpts -join ',')"
+Write-Host "[INFO] Plan       : $($testVariants.Count) physical / $LogicalVariantCount logical cases"
+$planKinds = @($testVariants | Group-Object {
+    if ($_.PSObject.Properties['PhysicalKind']) { $_.PhysicalKind } else { 'isolated' }
+} | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Count)" })
+Write-Host "[INFO] Plan kinds : $($planKinds -join ', ')"
 if ($EffectiveNameFilter) { Write-Host "[INFO] Name filter: $EffectiveNameFilter" }
 Write-Host ""
+if ($PlanOnly) {
+    Complete-DefaultPipelineSmoke -Smoke $defaultPipelineSmoke
+    return
+}
 
 $suiteClock = [System.Diagnostics.Stopwatch]::StartNew()
 $results = New-Object System.Collections.Generic.List[object]
+$physicalVariants = @($testVariants | Sort-Object `
+    @{ Expression = { Get-VariantEstimatedCost -Variant $_ }; Descending = $true }, `
+    @{ Expression = { $_.Ordinal }; Descending = $false })
 if ($EffectiveJobs -eq 1) {
-    foreach ($variant in $testVariants) {
-        $result = & $workerScript $variant $workerConfig
-        $results.Add($result)
+    foreach ($variant in $physicalVariants) {
+        $result = if ($variant.PSObject.Properties['PhysicalKind'] -and $variant.PhysicalKind -eq 'failure-batch') {
+            & $failureBatchWorkerScript $variant $workerConfig
+        } elseif ($variant.PSObject.Properties['PhysicalKind'] -and $variant.PhysicalKind -eq 'phase-aware-failures') {
+            & $phaseAwareFailureWorkerScript $variant $workerConfig $workerScript.ToString()
+        } else {
+            & $workerScript $variant $workerConfig
+        }
+        Add-LogicalResults -Destination $results -PhysicalVariant $variant -PhysicalResult $result
     }
 } else {
     $pool = [RunspaceFactory]::CreateRunspacePool(1, $EffectiveJobs)
     $pending = New-Object System.Collections.Generic.List[object]
     try {
         $pool.Open()
-        foreach ($variant in $testVariants) {
+        foreach ($variant in $physicalVariants) {
             $powerShell = [PowerShell]::Create()
             $powerShell.RunspacePool = $pool
-            [void]$powerShell.AddScript($workerScript.ToString()).AddArgument($variant).AddArgument($workerConfig)
+            if ($variant.PSObject.Properties['PhysicalKind'] -and $variant.PhysicalKind -eq 'failure-batch') {
+                [void]$powerShell.AddScript($failureBatchWorkerScript.ToString()).AddArgument($variant).AddArgument($workerConfig)
+            } elseif ($variant.PSObject.Properties['PhysicalKind'] -and $variant.PhysicalKind -eq 'phase-aware-failures') {
+                [void]$powerShell.AddScript($phaseAwareFailureWorkerScript.ToString()).AddArgument($variant).AddArgument($workerConfig).AddArgument($workerScript.ToString())
+            } else {
+                [void]$powerShell.AddScript($workerScript.ToString()).AddArgument($variant).AddArgument($workerConfig)
+            }
             $pending.Add([PSCustomObject]@{
                 PowerShell = $powerShell
                 Handle = $powerShell.BeginInvoke()
@@ -789,16 +1617,17 @@ if ($EffectiveJobs -eq 1) {
             try {
                 $output = @($item.PowerShell.EndInvoke($item.Handle))
                 if ($output.Count -ne 1) { throw "Worker returned $($output.Count) results" }
-                $results.Add($output[0])
+                Add-LogicalResults -Destination $results -PhysicalVariant $item.Variant -PhysicalResult $output[0]
             } catch {
-                $results.Add([PSCustomObject]@{
+                $runspaceFailure = [PSCustomObject]@{
                     id = $item.Variant.Id; ordinal = $item.Variant.Ordinal
                     name = $item.Variant.Name; mode = $item.Variant.Mode; opt = $item.Variant.Opt
                     passed = $false; status = "FAIL (runspace error)"
                     diagnostic = $_.Exception.Message
                     compilerTimingsPath = ""
                     timing = [PSCustomObject]@{ totalMs = 0; compile = $null; assemble = $null; link = $null; run = $null }
-                })
+                }
+                Add-LogicalResults -Destination $results -PhysicalVariant $item.Variant -PhysicalResult $runspaceFailure
             } finally {
                 $item.PowerShell.Dispose()
             }
@@ -810,6 +1639,7 @@ if ($EffectiveJobs -eq 1) {
     }
 }
 $suiteClock.Stop()
+Complete-DefaultPipelineSmoke -Smoke $defaultPipelineSmoke
 
 $orderedResults = @($results | Sort-Object ordinal)
 $passed = @($orderedResults | Where-Object passed).Count

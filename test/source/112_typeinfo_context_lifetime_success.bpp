@@ -1,0 +1,105 @@
+// Type-info lookup state must not leak, dangle, or cross compiler contexts.
+// Mode: nossa
+// Opt: O0
+// Expect exit code: 0
+
+import compiler;
+import emitter.typeinfo;
+import std.io;
+import std.vec;
+import types;
+
+func layout_probe_definition(field: *FieldDesc) -> *AstStructDef {
+    var sd: *AstStructDef = new AstStructDef{};
+    sd.name = slice("SameName", 8);
+    sd.fields_vec = new Vec<*FieldDesc>{heap_alloc(sizeof(*FieldDesc)), 0, 1};
+    sd.fields_vec.push(field);
+    return sd;
+}
+
+func probe_layout_metadata() -> u64 {
+    var scalar: *FieldDesc = new FieldDesc{};
+    scalar.type_kind = TYPE_U8;
+    var pointer: *FieldDesc = new FieldDesc{};
+    pointer.type_kind = TYPE_U64;
+    pointer.ptr_depth = 1;
+    var first: *AstStructDef = layout_probe_definition(scalar);
+    var second: *AstStructDef = layout_probe_definition(pointer);
+    var first_ti: *TypeInfo = typeinfo_make_struct(0, slice(0, 0), first);
+    var second_ti: *TypeInfo = typeinfo_make_struct(0, slice(0, 0), second);
+    var offsets: *Vec<u64> = new Vec<u64>{heap_alloc(8 * sizeof(u64)), 0, 8};
+    var empty: *AstStructDef = new AstStructDef{};
+    empty.fields_vec = new Vec<*FieldDesc>{0, 0, 0};
+    var array: *TypeInfo = typeinfo_make_array(0, TYPE_U8, 0, slice(0, 0), 0, 1000000000);
+    array.elem_typeinfo = typeinfo_make(TYPE_U8, 0);
+    typeinfo_layout_cache_begin();
+    if (sizeof_type_ex(first_ti) != 1 || sizeof_type_ex(second_ti) != 8) { return 10; }
+    if (_typeinfo_struct_size(empty) != 0 || _typeinfo_struct_size(empty) != 0) { return 11; }
+    if (typeinfo_has_gc_slots(first_ti) != 0 || typeinfo_has_gc_slots(second_ti) != 1) { return 12; }
+    typeinfo_collect_gc_slot_offsets(second_ti, 3, offsets);
+    if (offsets.len() != 1 || offsets.get(0) != 3) { return 13; }
+    offsets.clear();
+    typeinfo_collect_gc_slot_offsets(array, 0, offsets);
+    if (offsets.len() != 0 || typeinfo_has_gc_slots(array) != 0) { return 14; }
+    var before: u64 = heap_profile_live_payload_byte_count();
+    for (var i: u64 = 0; i < 128; i++) {
+        if (sizeof_type_ex(second_ti) != 8) { return 15; }
+        offsets.clear();
+        typeinfo_collect_gc_slot_offsets(second_ti, i, offsets);
+        if (offsets.len() != 1 || offsets.get(0) != i) { return 16; }
+    }
+    if (heap_profile_live_payload_byte_count() > before + 64) { return 17; }
+    // Explicit rebinding ends the finalized epoch; mutable descriptors can
+    // change only outside it, and the next epoch must recompute zero/nonzero.
+    typeinfo_set_structs(typeinfo_get_structs());
+    scalar.type_kind = TYPE_U64;
+    pointer.ptr_depth = 0;
+    typeinfo_layout_cache_begin();
+    if (sizeof_type_ex(first_ti) != 8 || typeinfo_has_gc_slots(second_ti) != 0) { return 18; }
+    offsets.clear();
+    typeinfo_collect_gc_slot_offsets(second_ti, 0, offsets);
+    if (offsets.len() != 0) { return 19; }
+    typeinfo_layout_cache_end();
+    return 0;
+}
+
+func main() -> u64 {
+    compiler_ctx_current();
+    var metadata_result: u64 = probe_layout_metadata();
+    if (metadata_result != 0) { return metadata_result; }
+    var funcs: *Vec<*AstFunc> = new Vec<*AstFunc>{heap_alloc(8 * sizeof(*AstFunc)), 0, 8};
+    typeinfo_set_funcs(funcs);
+    var before: u64 = heap_profile_live_payload_byte_count();
+    for (var i: u64 = 0; i < 32; i++) {
+        typeinfo_set_funcs(funcs);
+    }
+    var after: u64 = heap_profile_live_payload_byte_count();
+    if (after > before + 64) { return 1; }
+
+    var first: *CompilerCtx = compiler_ctx_new();
+    compiler_ctx_activate(first);
+    var structs: *Vec<*AstStructDef> = new Vec<*AstStructDef>{heap_alloc(8 * sizeof(*AstStructDef)), 0, 8};
+    typeinfo_set_structs(structs);
+
+    var second: *CompilerCtx = compiler_ctx_new();
+    compiler_ctx_activate(second);
+    if (typeinfo_get_structs() != 0) { return 2; }
+
+    compiler_ctx_activate(first);
+    var previous_scope: *HeapOwnedAllocList = compiler_ctx_owned_scope_enter(first);
+    var owned_funcs: *Vec<*AstFunc> = new Vec<*AstFunc>{heap_alloc(8 * sizeof(*AstFunc)), 0, 8};
+    typeinfo_set_funcs(owned_funcs);
+    typeinfo_layout_cache_begin();
+    var owned_field: *FieldDesc = new FieldDesc{};
+    owned_field.type_kind = TYPE_U64;
+    var owned_struct: *AstStructDef = layout_probe_definition(owned_field);
+    if (_typeinfo_struct_size(owned_struct) != 8) { return 20; }
+    compiler_ctx_owned_scope_leave(previous_scope);
+    compiler_ctx_destroy(first);
+
+    compiler_ctx_activate(second);
+    typeinfo_set_funcs(funcs);
+    if (typeinfo_get_structs() != 0) { return 3; }
+    compiler_ctx_destroy(second);
+    return 0;
+}

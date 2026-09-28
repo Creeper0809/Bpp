@@ -739,8 +739,12 @@ func resolve_name(name: []u8) -> *NameInfo {
 // ============================================
 
 func sym_reg_alias_reset() -> u64 {
-    g_compiler_ctx.reg_aliases = new HashMap<u64, *NameInfo>{0, 0, 0};
-    g_compiler_ctx.reg_aliases.ensure_capacity(64);
+    if (g_compiler_ctx.reg_aliases == 0) {
+        g_compiler_ctx.reg_aliases = new HashMap<u64, *NameInfo>{0, 0, 0};
+        g_compiler_ctx.reg_aliases.ensure_capacity(64);
+    } else {
+        g_compiler_ctx.reg_aliases.clear();
+    }
     return 0;
 }
 
@@ -1059,6 +1063,47 @@ func set_current_module_for_func(func_slice: []u8) -> u64 {
     return 0;
 }
 
+func sym_register_func_sig_module(fn: *AstFunc, module: []u8) -> u64 {
+    if (fn == 0 || module.ptr == 0 || module.len == 0) { return 0; }
+    if (g_compiler_ctx.func_sig_module_defs == 0) {
+        g_compiler_ctx.func_sig_module_defs = new Vec<*AstFunc>{heap_alloc((64) * sizeof(*AstFunc)), 0, (64)};
+    }
+    if (g_compiler_ctx.func_sig_module_names == 0) {
+        g_compiler_ctx.func_sig_module_names = new Vec<*NameInfo>{heap_alloc((64) * sizeof(*NameInfo)), 0, (64)};
+    }
+    var n: u64 = g_compiler_ctx.func_sig_module_defs.len();
+    for (var i: u64 = 0; i < n; i++) {
+        if (g_compiler_ctx.func_sig_module_defs.get(i) == fn) {
+            var existing_module: *NameInfo = g_compiler_ctx.func_sig_module_names.get(i);
+            existing_module.ptr = module.ptr;
+            existing_module.len = module.len;
+            return 1;
+        }
+    }
+    g_compiler_ctx.func_sig_module_defs.push(fn);
+    g_compiler_ctx.func_sig_module_names.push(new NameInfo{module.ptr, module.len});
+    return 1;
+}
+
+func set_current_module_for_func_def(fn: *AstFunc) -> u64 {
+    if (fn != 0 && g_compiler_ctx.func_sig_module_defs != 0 && g_compiler_ctx.func_sig_module_names != 0) {
+        var n: u64 = g_compiler_ctx.func_sig_module_defs.len();
+        for (var i: u64 = 0; i < n; i++) {
+            if (g_compiler_ctx.func_sig_module_defs.get(i) == fn) {
+                var module_info: *NameInfo = g_compiler_ctx.func_sig_module_names.get(i);
+                g_compiler_ctx.current_module = slice(module_info.ptr, module_info.len);
+                return 1;
+            }
+        }
+    }
+    if (fn == 0) {
+        g_compiler_ctx.current_module = slice(0, 0);
+        return 0;
+    }
+    set_current_module_for_func(fn.name);
+    return 0;
+}
+
 func set_current_module_for_global(name: []u8) -> u64 {
     g_compiler_ctx.current_module = slice(0, 0);
     if (g_compiler_ctx.global_module_map == 0) { return 0; }
@@ -1118,6 +1163,13 @@ func sym_ensure_global_module_map() -> *HashMap<u64, *NameInfo> {
     return g_compiler_ctx.global_module_map;
 }
 
+func sym_assign_global_module(target: []u8, module: []u8) -> u64 {
+    if (target.ptr == 0 || target.len == 0 || module.ptr == 0 || module.len == 0) { return 0; }
+    var global_map: *HashMap<u64, *NameInfo> = sym_ensure_global_module_map();
+    global_map.put(slice(target.ptr, target.len), new NameInfo{module.ptr, module.len});
+    return 1;
+}
+
 func sym_copy_impl_method_metadata_if_needed(orig: []u8, mangled: []u8) -> u64 {
     if (sym_is_impl_method(slice(orig.ptr, orig.len)) == 0) { return 0; }
     var access: u64 = sym_get_impl_method_access(slice(orig.ptr, orig.len));
@@ -1148,6 +1200,14 @@ func sym_register_module_exports_funcs(funcs: *Vec<*AstFunc>, module: []u8, pref
         var mangled_info: *NameInfo = sym_mangle_symbol_name(slice(orig_ptr, orig_len), slice(prefix.ptr, prefix.len), 1);
         fn.name = slice(mangled_info.ptr, mangled_info.len);
         sym_copy_impl_method_metadata_if_needed(slice(orig_ptr, orig_len), slice(mangled_info.ptr, mangled_info.len));
+        if (sym_is_impl_method(slice(orig_ptr, orig_len)) != 0) {
+            var source_owner: *NameInfo = sym_get_impl_method_owner(slice(orig_ptr, orig_len));
+            if (source_owner != 0 && source_owner.ptr != 0 && source_owner.len != 0) {
+                var canonical_owner: *NameInfo = sym_mangle_symbol_name(slice(source_owner.ptr, source_owner.len), slice(prefix.ptr, prefix.len), 0);
+                var method_access: u64 = sym_get_impl_method_access(slice(orig_ptr, orig_len));
+                sym_register_impl_method_ex(slice(mangled_info.ptr, mangled_info.len), slice(canonical_owner.ptr, canonical_owner.len), method_access);
+            }
+        }
 
         add_module_export(slice(module.ptr, module.len), slice(orig_ptr, orig_len), slice(mangled_info.ptr, mangled_info.len));
 
@@ -1199,9 +1259,37 @@ func sym_register_module_exports_globals(globals: *Vec<*GlobalInfo>, module: []u
     return 0;
 }
 
+func sym_register_module_exports_structs(structs: *Vec<*AstStructDef>, module: []u8, prefix: []u8) -> u64 {
+    if (structs == 0) { return 0; }
+    var n: u64 = structs.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var sd: *AstStructDef = structs.get(i);
+        if (sd == 0) { continue; }
+        var canonical: *NameInfo = sym_mangle_symbol_name(sd.name, prefix, 0);
+        g_compiler_ctx.all_structs.put(slice(canonical.ptr, canonical.len), sd);
+        sym_register_struct_module(sd, module);
+        add_module_export(module, sd.name, slice(canonical.ptr, canonical.len));
+
+        if (g_compiler_ctx.generic_struct_ptrs != 0) {
+            var tn: u64 = g_compiler_ctx.generic_struct_ptrs.len();
+            for (var ti: u64 = 0; ti < tn; ti++) {
+                var tpl: *GenericStructTemplate = g_compiler_ctx.generic_struct_ptrs.get(ti);
+                if (tpl != 0 && tpl.struct_def == sd) {
+                    tpl.module = slice(module.ptr, module.len);
+                    tpl.mangled_name = slice(canonical.ptr, canonical.len);
+                    g_compiler_ctx.generic_structs.put(slice(canonical.ptr, canonical.len), tpl);
+                    break;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
 func register_module_exports(prog: u64, module: []u8, prefix: []u8) -> u64 {
     var prog_info: *AstProgram = (*AstProgram)prog;
     var module_info: *NameInfo = new NameInfo{module.ptr, module.len};
+    sym_register_module_exports_structs(prog_info.structs_vec, slice(module.ptr, module.len), slice(prefix.ptr, prefix.len));
     sym_register_module_exports_funcs(prog_info.funcs_vec, slice(module.ptr, module.len), slice(prefix.ptr, prefix.len), module_info);
     sym_register_module_exports_consts(prog_info.consts_vec, slice(module.ptr, module.len), slice(prefix.ptr, prefix.len));
     sym_register_module_exports_globals(prog_info.globals_vec, slice(module.ptr, module.len), slice(prefix.ptr, prefix.len), module_info);
@@ -1213,10 +1301,161 @@ func register_module_exports(prog: u64, module: []u8, prefix: []u8) -> u64 {
 // Helper functions for parser
 // ============================================
 
+func module_structs_get(module: []u8) -> *HashMap<u64, *AstStructDef> {
+    if (g_compiler_ctx.module_structs == 0 || module.ptr == 0 || module.len == 0) { return 0; }
+    return g_compiler_ctx.module_structs.get(slice(module.ptr, module.len));
+}
+
+func module_structs_ensure(module: []u8) -> *HashMap<u64, *AstStructDef> {
+    if (module.ptr == 0 || module.len == 0) { return 0; }
+    if (g_compiler_ctx.module_structs == 0) {
+        g_compiler_ctx.module_structs = new HashMap<u64, *HashMap<u64, *AstStructDef>>{0, 0, 0};
+        g_compiler_ctx.module_structs.ensure_capacity(128);
+    }
+    var existing: *HashMap<u64, *AstStructDef> = g_compiler_ctx.module_structs.get(slice(module.ptr, module.len));
+    if (existing != 0) { return existing; }
+    var map: *HashMap<u64, *AstStructDef> = new HashMap<u64, *AstStructDef>{0, 0, 0};
+    map.ensure_capacity(64);
+    g_compiler_ctx.module_structs.put(slice(module.ptr, module.len), map);
+    return map;
+}
+
+func sym_register_struct_module(struct_def: *AstStructDef, module: []u8) -> u64 {
+    if (struct_def == 0 || module.ptr == 0 || module.len == 0) { return 0; }
+    var map: *HashMap<u64, *AstStructDef> = module_structs_ensure(module);
+    map.put(struct_def.name, struct_def);
+    if (g_compiler_ctx.struct_module_defs == 0) {
+        g_compiler_ctx.struct_module_defs = new Vec<*AstStructDef>{heap_alloc((64) * sizeof(*AstStructDef)), 0, (64)};
+    }
+    if (g_compiler_ctx.struct_module_names == 0) {
+        g_compiler_ctx.struct_module_names = new Vec<*NameInfo>{heap_alloc((64) * sizeof(*NameInfo)), 0, (64)};
+    }
+    var n: u64 = g_compiler_ctx.struct_module_defs.len();
+    for (var i: u64 = 0; i < n; i++) {
+        if (g_compiler_ctx.struct_module_defs.get(i) == struct_def) {
+            var existing_module: *NameInfo = g_compiler_ctx.struct_module_names.get(i);
+            existing_module.ptr = module.ptr;
+            existing_module.len = module.len;
+            return 1;
+        }
+    }
+    g_compiler_ctx.struct_module_defs.push(struct_def);
+    g_compiler_ctx.struct_module_names.push(new NameInfo{module.ptr, module.len});
+    return 1;
+}
+
+func sym_register_struct_visible_in_module(struct_def: *AstStructDef, module: []u8) -> u64 {
+    if (struct_def == 0 || module.ptr == 0 || module.len == 0) { return 0; }
+    var map: *HashMap<u64, *AstStructDef> = module_structs_ensure(module);
+    map.put(struct_def.name, struct_def);
+    return 1;
+}
+
+func sym_struct_belongs_to_module(struct_def: *AstStructDef, module: []u8) -> u64 {
+    if (struct_def == 0 || module.ptr == 0 || module.len == 0 ||
+        g_compiler_ctx.struct_module_defs == 0 || g_compiler_ctx.struct_module_names == 0) { return 0; }
+    var n: u64 = g_compiler_ctx.struct_module_defs.len();
+    for (var i: u64 = 0; i < n; i++) {
+        if (g_compiler_ctx.struct_module_defs.get(i) != struct_def) { continue; }
+        var owner: *NameInfo = g_compiler_ctx.struct_module_names.get(i);
+        if (owner != 0 && str_eq(slice(owner.ptr, owner.len), module) != 0) { return 1; }
+        return 0;
+    }
+    return 0;
+}
+
+func sym_get_struct_module(struct_def: *AstStructDef) -> *NameInfo {
+    if (struct_def == 0 || g_compiler_ctx.struct_module_defs == 0 || g_compiler_ctx.struct_module_names == 0) { return 0; }
+    var n: u64 = g_compiler_ctx.struct_module_defs.len();
+    for (var i: u64 = 0; i < n; i++) {
+        if (g_compiler_ctx.struct_module_defs.get(i) == struct_def) {
+            return g_compiler_ctx.struct_module_names.get(i);
+        }
+    }
+    return 0;
+}
+
+func sym_get_struct_canonical_name(struct_def: *AstStructDef) -> *NameInfo {
+    if (struct_def == 0) { return 0; }
+    var module_info: *NameInfo = sym_get_struct_module(struct_def);
+    if (module_info == 0 || module_info.ptr == 0 || module_info.len == 0) {
+        return new NameInfo{struct_def.name.ptr, struct_def.name.len};
+    }
+    var prefix: *NameInfo = module_util_module_prefix_from_id(slice(module_info.ptr, module_info.len));
+    return sym_mangle_symbol_name(struct_def.name, slice(prefix.ptr, prefix.len), 0);
+}
+
+func sym_get_struct_identity_from_name(name: []u8) -> *NameInfo {
+    var struct_def: *AstStructDef = get_struct_def(slice(name.ptr, name.len));
+    if (struct_def != 0) { return sym_get_struct_canonical_name(struct_def); }
+    if (g_compiler_ctx.current_module.ptr != 0 && g_compiler_ctx.current_module.len != 0) {
+        var prefix: *NameInfo = module_util_module_prefix_from_id(g_compiler_ctx.current_module);
+        if (name.len >= prefix.len + 2 && str_eq(slice(name.ptr, prefix.len), slice(prefix.ptr, prefix.len)) != 0) {
+            var name_bytes: []u8 = slice(name.ptr, name.len);
+            if (name_bytes[prefix.len] == 95 && name_bytes[prefix.len + 1] == 95) {
+                return new NameInfo{name.ptr, name.len};
+            }
+        }
+        return sym_mangle_symbol_name(name, slice(prefix.ptr, prefix.len), 0);
+    }
+    return new NameInfo{name.ptr, name.len};
+}
+
+func sym_ensure_struct_source_lookup() -> u64 {
+    var ctx: *CompilerCtx = g_compiler_ctx;
+    var src: *Vec<*AstStructDef> = ctx.all_structs_vec;
+    var n: u64 = 0;
+    if (src != 0) { n = src.len(); }
+    if (ctx.struct_source_lookup == 0 || ctx.struct_source_lookup_src != src ||
+        ctx.struct_source_lookup_src_len > n) {
+        if (ctx.struct_source_lookup != 0) {
+            ctx.struct_source_lookup.release_buffer();
+            free((u64)ctx.struct_source_lookup);
+        }
+        ctx.struct_source_lookup = new HashMap<u64, *AstStructDef>{0, 0, 0};
+        ctx.struct_source_lookup.ensure_capacity(n * 2 + 16);
+        ctx.struct_source_lookup_src = src;
+        ctx.struct_source_lookup_src_len = 0;
+    }
+    // Definitions are append-only and keep their source spelling. A present
+    // null entry means ambiguous, not absent: later duplicates cannot make an
+    // already ambiguous source name unique again.
+    for (var i: u64 = ctx.struct_source_lookup_src_len; i < n; i++) {
+        var candidate: *AstStructDef = src.get(i);
+        if (candidate == 0) { continue; }
+        if (ctx.struct_source_lookup.has(candidate.name) == 0) {
+            ctx.struct_source_lookup.put(candidate.name, candidate);
+        } else if (ctx.struct_source_lookup.get(candidate.name) != candidate) {
+            ctx.struct_source_lookup.put(candidate.name, 0);
+        }
+    }
+    ctx.struct_source_lookup_src_len = n;
+    return 0;
+}
+
+func sym_find_unique_struct_by_source_name(name: []u8) -> *AstStructDef {
+    if (name.ptr == 0 || name.len == 0 || g_compiler_ctx.all_structs_vec == 0) { return 0; }
+    sym_ensure_struct_source_lookup();
+    return g_compiler_ctx.struct_source_lookup.get(name);
+}
+
+func set_current_module_for_struct(struct_def: *AstStructDef) -> u64 {
+    g_compiler_ctx.current_module = slice(0, 0);
+    if (struct_def == 0 || g_compiler_ctx.struct_module_defs == 0 || g_compiler_ctx.struct_module_names == 0) { return 0; }
+    var n: u64 = g_compiler_ctx.struct_module_defs.len();
+    for (var i: u64 = 0; i < n; i++) {
+        if (g_compiler_ctx.struct_module_defs.get(i) == struct_def) {
+            var module_info: *NameInfo = g_compiler_ctx.struct_module_names.get(i);
+            g_compiler_ctx.current_module = slice(module_info.ptr, module_info.len);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 // Check if a name is a registered struct type
 func is_struct_type(name: []u8) -> u64 {
-    if (g_compiler_ctx.all_structs == 0) { return false; }
-    var struct_def: *AstStructDef = g_compiler_ctx.all_structs.get(slice(name.ptr, name.len));
+    var struct_def: *AstStructDef = get_struct_def(name);
     if (struct_def == 0) { return false; }
     return true;
 }
@@ -1224,7 +1463,53 @@ func is_struct_type(name: []u8) -> u64 {
 // Get struct definition by name
 func get_struct_def(name: []u8) -> *AstStructDef {
     if (g_compiler_ctx.all_structs == 0) { return 0; }
-    return g_compiler_ctx.all_structs.get(slice(name.ptr, name.len));
+    if (g_compiler_ctx.current_module.ptr != 0 && g_compiler_ctx.current_module.len != 0) {
+        var local_map: *HashMap<u64, *AstStructDef> = module_structs_get(g_compiler_ctx.current_module);
+        if (local_map != 0) {
+            var local_def: *AstStructDef = local_map.get(slice(name.ptr, name.len));
+            if (local_def != 0) { return local_def; }
+        }
+        var imported: *NameInfo = resolve_import_alias(g_compiler_ctx.current_module, name);
+        if (imported != 0) {
+            var imported_def: *AstStructDef = g_compiler_ctx.all_structs.get(slice(imported.ptr, imported.len));
+            if (imported_def != 0) { return imported_def; }
+        }
+        var prelude: *NameInfo = resolve_prelude_alias(name);
+        if (prelude != 0) {
+            var prelude_def: *AstStructDef = g_compiler_ctx.all_structs.get(slice(prelude.ptr, prelude.len));
+            if (prelude_def != 0) { return prelude_def; }
+        }
+        var canonical_def: *AstStructDef = g_compiler_ctx.all_structs.get(slice(name.ptr, name.len));
+        if (sym_struct_belongs_to_module(canonical_def, g_compiler_ctx.current_module) != 0) {
+            return canonical_def;
+        }
+        // The language has long allowed unique cross-module forward references
+        // (notably types <-> ast and compiler <-> source_cache cycles). Preserve
+        // that contract without reviving last-writer-wins collisions: a global
+        // source spelling is usable only when exactly one definition owns it.
+        return sym_find_unique_struct_by_source_name(name);
+    }
+    var direct_def: *AstStructDef = g_compiler_ctx.all_structs.get(slice(name.ptr, name.len));
+    var unique_def: *AstStructDef = sym_find_unique_struct_by_source_name(name);
+    if (unique_def != 0) { return unique_def; }
+    // A direct key whose declaration spelling differs from the lookup is a
+    // canonical module-qualified alias. Short source spellings are rejected
+    // when more than one concrete definition owns them.
+    if (direct_def != 0 && str_eq(direct_def.name, name) == 0) { return direct_def; }
+    return 0;
+}
+
+// Resolve either a source-visible type name in the active module or an exact
+// canonical type identity. Canonical identities are injective, so a direct
+// cross-module hit is safe only when the declaration spelling differs from
+// the requested key. Short names continue to obey scoped lookup rules.
+func sym_get_struct_def_by_identity(name: []u8) -> *AstStructDef {
+    var scoped_def: *AstStructDef = get_struct_def(slice(name.ptr, name.len));
+    if (scoped_def != 0) { return scoped_def; }
+    if (g_compiler_ctx.all_structs == 0) { return 0; }
+    var direct_def: *AstStructDef = g_compiler_ctx.all_structs.get(slice(name.ptr, name.len));
+    if (direct_def != 0 && str_eq(direct_def.name, name) == 0) { return direct_def; }
+    return 0;
 }
 
 // Register a struct type during parsing
@@ -1246,6 +1531,9 @@ func register_struct_type(struct_def: *AstStructDef) -> u64 {
         return 0;
     }
     g_compiler_ctx.all_structs.put(struct_name, struct_info);
+    if (g_compiler_ctx.current_module.ptr != 0 && g_compiler_ctx.current_module.len != 0) {
+        sym_register_struct_module(struct_info, g_compiler_ctx.current_module);
+    }
     g_compiler_ctx.all_structs_vec.push(struct_info);
 }
 
@@ -1263,16 +1551,40 @@ func sym_register_trait_def(trait_def: *TraitDef) -> u64 {
         g_compiler_ctx.all_traits_vec = new Vec<*TraitDef>{heap_alloc((16) * sizeof(*TraitDef)), 0, (16)};
     }
     var name: []u8 = trait_def.name;
-    var existing: *TraitDef = g_compiler_ctx.all_traits.get(name);
+    var module: []u8 = g_compiler_ctx.current_module;
+    var existing: *TraitDef = 0;
+    if (module.ptr != 0 && module.len != 0) {
+        var existing_count: u64 = g_compiler_ctx.all_traits_vec.len();
+        for (var ei: u64 = 0; ei < existing_count; ei++) {
+            var candidate: *TraitDef = g_compiler_ctx.all_traits_vec.get(ei);
+            if (candidate != 0 && str_eq(candidate.name, name) != 0 &&
+                str_eq(candidate.module, module) != 0) {
+                existing = candidate;
+                break;
+            }
+        }
+    } else {
+        existing = g_compiler_ctx.all_traits.get(name);
+    }
     if (existing != 0) {
         existing.name = name;
         existing.methods_vec = trait_def.methods_vec;
         existing.assoc_types_vec = trait_def.assoc_types_vec;
+        g_compiler_ctx.all_traits.put(name, existing);
+        if (existing.mangled_name.ptr != 0 && existing.mangled_name.len != 0) {
+            g_compiler_ctx.all_traits.put(existing.mangled_name, existing);
+        }
         return 0;
     }
     if (g_compiler_ctx.all_structs != 0) {
-        var struct_def: *AstStructDef = g_compiler_ctx.all_structs.get(name);
-        if (struct_def != 0) {
+        var conflicting_struct: *AstStructDef = 0;
+        if (module.ptr != 0 && module.len != 0) {
+            var local_structs: *HashMap<u64, *AstStructDef> = module_structs_get(module);
+            if (local_structs != 0) { conflicting_struct = local_structs.get(name); }
+        } else {
+            conflicting_struct = g_compiler_ctx.all_structs.get(name);
+        }
+        if (conflicting_struct != 0) {
             emit_stderr("[ERROR] Trait name conflicts with struct: ");
             emit_stderr_len(u8_slice_ptr(name), u8_slice_len(name));
             emit_stderr("\n");
@@ -1280,13 +1592,69 @@ func sym_register_trait_def(trait_def: *TraitDef) -> u64 {
             return 0;
         }
     }
+    trait_def.module = slice(module.ptr, module.len);
+    if (module.ptr != 0 && module.len != 0) {
+        var prefix: *NameInfo = module_util_module_prefix_from_id(module);
+        var canonical: *NameInfo = sym_mangle_symbol_name(name, slice(prefix.ptr, prefix.len), 0);
+        trait_def.mangled_name = slice(canonical.ptr, canonical.len);
+        g_compiler_ctx.all_traits.put(trait_def.mangled_name, trait_def);
+        var export_map: *HashMap<u64, *NameInfo> = module_export_map_get(module);
+        if (export_map == 0 || export_map.has(name) == 0) {
+            add_module_export(module, name, trait_def.mangled_name);
+        }
+    } else {
+        trait_def.mangled_name = slice(name.ptr, name.len);
+    }
     g_compiler_ctx.all_traits.put(name, trait_def);
     g_compiler_ctx.all_traits_vec.push(trait_def);
     return 0;
 }
 
+func sym_get_trait_def_in_module(name: []u8, module: []u8) -> *TraitDef {
+    if (g_compiler_ctx.all_traits_vec == 0 || module.ptr == 0 || module.len == 0) { return 0; }
+    var n: u64 = g_compiler_ctx.all_traits_vec.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var local_trait: *TraitDef = g_compiler_ctx.all_traits_vec.get(i);
+        if (local_trait != 0 && str_eq(local_trait.name, name) != 0 &&
+            str_eq(local_trait.module, module) != 0) {
+            return local_trait;
+        }
+    }
+    return 0;
+}
+
 func sym_get_trait_def(name: []u8) -> *TraitDef {
     if (g_compiler_ctx.all_traits == 0) { return 0; }
+    if (g_compiler_ctx.current_module.ptr != 0 && g_compiler_ctx.current_module.len != 0) {
+        var local_trait: *TraitDef = sym_get_trait_def_in_module(name, g_compiler_ctx.current_module);
+        if (local_trait != 0) { return local_trait; }
+        var imported: *NameInfo = resolve_import_alias(g_compiler_ctx.current_module, name);
+        if (imported != 0) {
+            var imported_trait: *TraitDef = g_compiler_ctx.all_traits.get(slice(imported.ptr, imported.len));
+            if (imported_trait != 0) { return imported_trait; }
+        }
+        var prelude: *NameInfo = resolve_prelude_alias(name);
+        if (prelude != 0) {
+            var prelude_trait: *TraitDef = g_compiler_ctx.all_traits.get(slice(prelude.ptr, prelude.len));
+            if (prelude_trait != 0) { return prelude_trait; }
+        }
+        var canonical_trait: *TraitDef = g_compiler_ctx.all_traits.get(slice(name.ptr, name.len));
+        if (canonical_trait != 0 && canonical_trait.mangled_name.ptr != 0 &&
+            str_eq(canonical_trait.mangled_name, name) != 0) {
+            return canonical_trait;
+        }
+        var unique: *TraitDef = 0;
+        if (g_compiler_ctx.all_traits_vec != 0) {
+            var unique_count: u64 = g_compiler_ctx.all_traits_vec.len();
+            for (var ui: u64 = 0; ui < unique_count; ui++) {
+                var unique_candidate: *TraitDef = g_compiler_ctx.all_traits_vec.get(ui);
+                if (unique_candidate == 0 || str_eq(unique_candidate.name, name) == 0) { continue; }
+                if (unique != 0 && unique != unique_candidate) { return 0; }
+                unique = unique_candidate;
+            }
+        }
+        return unique;
+    }
     return g_compiler_ctx.all_traits.get(slice(name.ptr, name.len));
 }
 
@@ -1298,6 +1666,9 @@ func sym_is_trait_name(name: []u8) -> u64 {
 
 func sym_register_trait_impl(trait_impl: *TraitImpl) -> u64 {
     if (trait_impl == 0) { return 0; }
+    if (trait_impl.module.ptr == 0 || trait_impl.module.len == 0) {
+        trait_impl.module = slice(g_compiler_ctx.current_module.ptr, g_compiler_ctx.current_module.len);
+    }
     if (g_compiler_ctx.all_trait_impls_vec == 0) {
         g_compiler_ctx.all_trait_impls_vec = new Vec<*TraitImpl>{heap_alloc((32) * sizeof(*TraitImpl)), 0, (32)};
     }
@@ -1351,10 +1722,28 @@ func sym_get_or_create_generic_struct_template(name: []u8, params_vec: *Vec<*Gen
         g_compiler_ctx.generic_structs = new HashMap<u64, *GenericStructTemplate>{0, 0, 0};
         g_compiler_ctx.generic_structs.ensure_capacity(64);
     }
-    var existing: *GenericStructTemplate = g_compiler_ctx.generic_structs.get(slice(name.ptr, name.len));
-    if (existing != 0) { return existing; }
+    if (g_compiler_ctx.current_module.ptr != 0 && g_compiler_ctx.current_module.len != 0 && g_compiler_ctx.generic_struct_ptrs != 0) {
+        var existing_count: u64 = g_compiler_ctx.generic_struct_ptrs.len();
+        for (var ei: u64 = 0; ei < existing_count; ei++) {
+            var existing_scoped: *GenericStructTemplate = g_compiler_ctx.generic_struct_ptrs.get(ei);
+            if (existing_scoped != 0 && str_eq(existing_scoped.name, name) != 0 &&
+                str_eq(existing_scoped.module, g_compiler_ctx.current_module) != 0) {
+                return existing_scoped;
+            }
+        }
+    } else {
+        var existing: *GenericStructTemplate = g_compiler_ctx.generic_structs.get(slice(name.ptr, name.len));
+        if (existing != 0) { return existing; }
+    }
 
     var tpl: *GenericStructTemplate = generic_struct_template_new(slice(name.ptr, name.len), params_vec);
+    tpl.module = slice(g_compiler_ctx.current_module.ptr, g_compiler_ctx.current_module.len);
+    if (tpl.module.ptr != 0 && tpl.module.len != 0) {
+        var prefix: *NameInfo = module_util_module_prefix_from_id(tpl.module);
+        var canonical: *NameInfo = sym_mangle_symbol_name(name, slice(prefix.ptr, prefix.len), 0);
+        tpl.mangled_name = slice(canonical.ptr, canonical.len);
+        g_compiler_ctx.generic_structs.put(slice(canonical.ptr, canonical.len), tpl);
+    }
     g_compiler_ctx.generic_structs.put(slice(name.ptr, name.len), tpl);
     return tpl;
 }
@@ -1364,8 +1753,20 @@ func sym_register_generic_struct_def(name: []u8, params_vec: *Vec<*GenericParam>
     var tpl: *GenericStructTemplate = sym_get_or_create_generic_struct_template(slice(name.ptr, name.len), params_vec);
     tpl.params_vec = params_vec;
     tpl.struct_def = struct_def;
+    if (tpl.module.ptr != 0 && tpl.module.len != 0 && tpl.mangled_name.ptr != 0 && tpl.mangled_name.len != 0) {
+        g_compiler_ctx.all_structs.put(tpl.mangled_name, struct_def);
+        var export_map: *HashMap<u64, *NameInfo> = module_export_map_get(tpl.module);
+        if (export_map == 0 || export_map.has(name) == 0) {
+            add_module_export(tpl.module, name, tpl.mangled_name);
+        }
+    }
     if (g_compiler_ctx.generic_struct_ptrs == 0) { g_compiler_ctx.generic_struct_ptrs = new Vec<*GenericStructTemplate>{heap_alloc((16) * sizeof(*GenericStructTemplate)), 0, (16)}; }
-    g_compiler_ctx.generic_struct_ptrs.push(tpl);
+    var already_registered: u64 = 0;
+    var template_count: u64 = g_compiler_ctx.generic_struct_ptrs.len();
+    for (var ti: u64 = 0; ti < template_count; ti++) {
+        if (g_compiler_ctx.generic_struct_ptrs.get(ti) == tpl) { already_registered = 1; break; }
+    }
+    if (already_registered == 0) { g_compiler_ctx.generic_struct_ptrs.push(tpl); }
     if (GENERIC_DEBUG != 0) {
         emit_stderr("[DEBUG] generic struct template: ");
         emit_stderr_len(name.ptr, name.len);
@@ -1376,6 +1777,22 @@ func sym_register_generic_struct_def(name: []u8, params_vec: *Vec<*GenericParam>
 
 func sym_find_generic_struct_template_by_name(name: []u8) -> *GenericStructTemplate {
     if (g_compiler_ctx.generic_structs == 0) { return 0; }
+    if (g_compiler_ctx.current_module.ptr != 0 && g_compiler_ctx.current_module.len != 0) {
+        var scoped_def: *AstStructDef = get_struct_def(name);
+        if (scoped_def != 0 && g_compiler_ctx.generic_struct_ptrs != 0) {
+            var n: u64 = g_compiler_ctx.generic_struct_ptrs.len();
+            for (var i: u64 = 0; i < n; i++) {
+                var scoped_tpl: *GenericStructTemplate = g_compiler_ctx.generic_struct_ptrs.get(i);
+                if (scoped_tpl != 0 && scoped_tpl.struct_def == scoped_def) { return scoped_tpl; }
+            }
+        }
+        var canonical_tpl: *GenericStructTemplate = g_compiler_ctx.generic_structs.get(slice(name.ptr, name.len));
+        if (canonical_tpl != 0 && canonical_tpl.mangled_name.ptr != 0 &&
+            str_eq(canonical_tpl.mangled_name, name) != 0) {
+            return canonical_tpl;
+        }
+        return 0;
+    }
     return g_compiler_ctx.generic_structs.get(slice(name.ptr, name.len));
 }
 
@@ -1865,6 +2282,10 @@ func sym_resolve_method_overload(struct_slice: []u8, method: []u8, arg_types: *V
     if (g_compiler_ctx.all_funcs == 0) { return result; }
     var candidates: *Vec<*AstFunc> = sym_method_overload_candidates(slice(method.ptr, method.len));
     if (candidates == 0) { return result; }
+    // The receiver is fixed across every overload candidate. Resolve it once
+    // in the caller's module, then use the same hierarchy for each match.
+    var receiver_def: *AstStructDef = get_struct_def(struct_slice);
+    if (receiver_def == 0) { return result; }
 
     var best_score: u64 = 0;
     var best_fn: *AstFunc = 0;
@@ -1883,7 +2304,7 @@ func sym_resolve_method_overload(struct_slice: []u8, method: []u8, arg_types: *V
         }
         if (str_eq(slice(cand_ptr, cand_len), slice(method.ptr, method.len)) == 0) { continue; }
 
-        var dist: u64 = sym_struct_distance_to_ancestor(slice(struct_slice.ptr, struct_slice.len), fn.impl_owner);
+        var dist: u64 = _compiler_struct_distance_to_ancestor(receiver_def, fn.impl_owner, 0);
         if (dist == COMPILER_INHERIT_DIST_NOT_FOUND) { continue; }
 
         var match_score: u64 = sym_method_match_score(fn, arg_types, arg_count_hint);
@@ -2070,6 +2491,17 @@ func sym_get_impl_method_func(name: []u8) -> *AstFunc {
         }
     }
     if (g_compiler_ctx.all_funcs == 0) { return 0; }
+    // Failed lookups are common while checking optional methods. Use the
+    // append-aware exact symbol index, not a scan of every unrelated function.
+    // Do not use sym_get_func here: alias resolution changes this API's key.
+    sym_ensure_func_lookup();
+    var indexed: *AstFunc = g_compiler_ctx.all_funcs_map.get(name);
+    if (indexed == 0) { return 0; }
+    if (indexed.impl_owner.ptr != 0 && indexed.impl_owner.len != 0 && str_eq(indexed.name, name) != 0) {
+        return indexed;
+    }
+    // Preserve first matching method semantics for a malformed mixed list or
+    // a symbol currently being renamed by an annotation pass.
     var n: u64 = g_compiler_ctx.all_funcs.len();
     for (var i: u64 = 0; i < n; i++) {
         var fn: *AstFunc = g_compiler_ctx.all_funcs.get(i);
@@ -2087,11 +2519,12 @@ func sym_abst_method_access_map_ensure(struct_slice: []u8) -> *HashMap<u64, u64>
         g_compiler_ctx.abst_methods_access = new HashMap<u64, *HashMap<u64, u64>>{0, 0, 0};
         g_compiler_ctx.abst_methods_access.ensure_capacity(32);
     }
-    var m: *HashMap<u64, u64> = g_compiler_ctx.abst_methods_access.get(slice(struct_slice.ptr, struct_slice.len));
+    var struct_key: *NameInfo = sym_get_struct_identity_from_name(struct_slice);
+    var m: *HashMap<u64, u64> = g_compiler_ctx.abst_methods_access.get(slice(struct_key.ptr, struct_key.len));
     if (m != 0) { return m; }
     var out: *HashMap<u64, u64> = new HashMap<u64, u64>{0, 0, 0};
     out.ensure_capacity(16);
-    g_compiler_ctx.abst_methods_access.put(slice(struct_slice.ptr, struct_slice.len), out);
+    g_compiler_ctx.abst_methods_access.put(slice(struct_key.ptr, struct_key.len), out);
     return out;
 }
 
@@ -2100,11 +2533,12 @@ func sym_abst_method_sigs_map_ensure(struct_slice: []u8) -> *HashMap<u64, *AstFu
         g_compiler_ctx.abst_methods_sigs = new HashMap<u64, *HashMap<u64, *AstFunc>>{0, 0, 0};
         g_compiler_ctx.abst_methods_sigs.ensure_capacity(32);
     }
-    var m: *HashMap<u64, *AstFunc> = g_compiler_ctx.abst_methods_sigs.get(slice(struct_slice.ptr, struct_slice.len));
+    var struct_key: *NameInfo = sym_get_struct_identity_from_name(struct_slice);
+    var m: *HashMap<u64, *AstFunc> = g_compiler_ctx.abst_methods_sigs.get(slice(struct_key.ptr, struct_key.len));
     if (m != 0) { return m; }
     var out: *HashMap<u64, *AstFunc> = new HashMap<u64, *AstFunc>{0, 0, 0};
     out.ensure_capacity(16);
-    g_compiler_ctx.abst_methods_sigs.put(slice(struct_slice.ptr, struct_slice.len), out);
+    g_compiler_ctx.abst_methods_sigs.put(slice(struct_key.ptr, struct_key.len), out);
     return out;
 }
 
@@ -2114,10 +2548,17 @@ func sym_register_abst_method_ex(struct_slice: []u8, method: []u8, sig: *AstFunc
         g_compiler_ctx.abst_methods = new HashMap<u64, *Vec<*NameInfo>>{0, 0, 0};
         g_compiler_ctx.abst_methods.ensure_capacity(32);
     }
-    var list: *Vec<*NameInfo> = g_compiler_ctx.abst_methods.get(slice(struct_slice.ptr, struct_slice.len));
+    var struct_key: *NameInfo = 0;
+    if (g_compiler_ctx.current_module.ptr != 0 && g_compiler_ctx.current_module.len != 0) {
+        var local_prefix: *NameInfo = module_util_module_prefix_from_id(g_compiler_ctx.current_module);
+        struct_key = sym_mangle_symbol_name(struct_slice, slice(local_prefix.ptr, local_prefix.len), 0);
+    } else {
+        struct_key = sym_get_struct_identity_from_name(struct_slice);
+    }
+    var list: *Vec<*NameInfo> = g_compiler_ctx.abst_methods.get(slice(struct_key.ptr, struct_key.len));
     if (list == 0) {
         list = new Vec<*NameInfo>{heap_alloc((4) * sizeof(*NameInfo)), 0, (4)};
-        g_compiler_ctx.abst_methods.put(slice(struct_slice.ptr, struct_slice.len), list);
+        g_compiler_ctx.abst_methods.put(slice(struct_key.ptr, struct_key.len), list);
     }
     var n: u64 = list.len();
     for (var i: u64 = 0; i < n; i++) {
@@ -2127,11 +2568,11 @@ func sym_register_abst_method_ex(struct_slice: []u8, method: []u8, sig: *AstFunc
     var name_info: *NameInfo = new NameInfo{method.ptr, method.len};
     list.push(name_info);
 
-    var access_map: *HashMap<u64, u64> = sym_abst_method_access_map_ensure(slice(struct_slice.ptr, struct_slice.len));
+    var access_map: *HashMap<u64, u64> = sym_abst_method_access_map_ensure(slice(struct_key.ptr, struct_key.len));
     access_map.put(slice(method.ptr, method.len), access);
 
     if (sig != 0) {
-        var sig_map: *HashMap<u64, *AstFunc> = sym_abst_method_sigs_map_ensure(slice(struct_slice.ptr, struct_slice.len));
+        var sig_map: *HashMap<u64, *AstFunc> = sym_abst_method_sigs_map_ensure(slice(struct_key.ptr, struct_key.len));
         sig_map.put(slice(method.ptr, method.len), sig);
     }
     return 0;
@@ -2139,12 +2580,14 @@ func sym_register_abst_method_ex(struct_slice: []u8, method: []u8, sig: *AstFunc
 
 func sym_get_abst_methods(struct_slice: []u8) -> *Vec<*NameInfo> {
     if (g_compiler_ctx.abst_methods == 0) { return 0; }
-    return g_compiler_ctx.abst_methods.get(slice(struct_slice.ptr, struct_slice.len));
+    var struct_key: *NameInfo = sym_get_struct_identity_from_name(struct_slice);
+    return g_compiler_ctx.abst_methods.get(slice(struct_key.ptr, struct_key.len));
 }
 
 func sym_get_abst_method_access(struct_slice: []u8, method: []u8) -> u64 {
     if (g_compiler_ctx.abst_methods_access == 0) { return ACCESS_PRIVATE; }
-    var access_map: *HashMap<u64, u64> = g_compiler_ctx.abst_methods_access.get(slice(struct_slice.ptr, struct_slice.len));
+    var struct_key: *NameInfo = sym_get_struct_identity_from_name(struct_slice);
+    var access_map: *HashMap<u64, u64> = g_compiler_ctx.abst_methods_access.get(slice(struct_key.ptr, struct_key.len));
     if (access_map == 0) { return ACCESS_PRIVATE; }
     if (access_map.has(slice(method.ptr, method.len)) == 0) { return ACCESS_PRIVATE; }
     return access_map.get(slice(method.ptr, method.len));
@@ -2152,7 +2595,8 @@ func sym_get_abst_method_access(struct_slice: []u8, method: []u8) -> u64 {
 
 func sym_get_abst_method_sig(struct_slice: []u8, method: []u8) -> *AstFunc {
     if (g_compiler_ctx.abst_methods_sigs == 0) { return 0; }
-    var sig_map: *HashMap<u64, *AstFunc> = g_compiler_ctx.abst_methods_sigs.get(slice(struct_slice.ptr, struct_slice.len));
+    var struct_key: *NameInfo = sym_get_struct_identity_from_name(struct_slice);
+    var sig_map: *HashMap<u64, *AstFunc> = g_compiler_ctx.abst_methods_sigs.get(slice(struct_key.ptr, struct_key.len));
     if (sig_map == 0) { return 0; }
     return sig_map.get(slice(method.ptr, method.len));
 }
@@ -2183,6 +2627,42 @@ func sym_can_access_private_member_from(caller_struct: []u8, owner_struct: []u8)
     var owner_base_len: u64 = sym_find_generic_suffix_index(slice(owner_struct.ptr, owner_struct.len));
     var caller_base_len: u64 = sym_find_generic_suffix_index(slice(caller_struct.ptr, caller_struct.len));
     if (str_eq(slice(owner_struct.ptr, owner_base_len), slice(caller_struct.ptr, caller_base_len)) != 0) { return true; }
+    var owner_def: *AstStructDef = sym_get_struct_def_by_identity(slice(owner_struct.ptr, owner_struct.len));
+    var caller_def: *AstStructDef = sym_get_struct_def_by_identity(slice(caller_struct.ptr, caller_struct.len));
+    if (owner_def != 0 && caller_def != 0 && owner_def == caller_def) { return true; }
+    return false;
+}
+
+func sym_get_abst_methods_for_struct(struct_def: *AstStructDef) -> *Vec<*NameInfo> {
+    if (struct_def == 0 || g_compiler_ctx.abst_methods == 0) { return 0; }
+    var struct_key: *NameInfo = sym_get_struct_canonical_name(struct_def);
+    return g_compiler_ctx.abst_methods.get(slice(struct_key.ptr, struct_key.len));
+}
+
+func sym_get_abst_method_access_for_struct(struct_def: *AstStructDef, method: []u8) -> u64 {
+    if (struct_def == 0 || g_compiler_ctx.abst_methods_access == 0) { return ACCESS_PRIVATE; }
+    var struct_key: *NameInfo = sym_get_struct_canonical_name(struct_def);
+    var access_map: *HashMap<u64, u64> = g_compiler_ctx.abst_methods_access.get(slice(struct_key.ptr, struct_key.len));
+    if (access_map == 0 || access_map.has(slice(method.ptr, method.len)) == 0) { return ACCESS_PRIVATE; }
+    return access_map.get(slice(method.ptr, method.len));
+}
+
+func sym_get_abst_method_sig_for_struct(struct_def: *AstStructDef, method: []u8) -> *AstFunc {
+    if (struct_def == 0 || g_compiler_ctx.abst_methods_sigs == 0) { return 0; }
+    var struct_key: *NameInfo = sym_get_struct_canonical_name(struct_def);
+    var sig_map: *HashMap<u64, *AstFunc> = g_compiler_ctx.abst_methods_sigs.get(slice(struct_key.ptr, struct_key.len));
+    if (sig_map == 0) { return 0; }
+    return sig_map.get(slice(method.ptr, method.len));
+}
+
+func sym_is_abst_method_for_struct(struct_def: *AstStructDef, method: []u8) -> u64 {
+    var list: *Vec<*NameInfo> = sym_get_abst_methods_for_struct(struct_def);
+    if (list == 0) { return false; }
+    var n: u64 = list.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var ni: *NameInfo = list.get(i);
+        if (str_eq(slice(ni.ptr, ni.len), slice(method.ptr, method.len))) { return true; }
+    }
     return false;
 }
 

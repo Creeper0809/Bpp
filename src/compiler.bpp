@@ -1,6 +1,7 @@
 // compiler.b - Compiler globals and driver helpers
 
 import std.io;
+import std.mem;
 import std.str;
 import std.path;
 import std.vec;
@@ -25,6 +26,8 @@ import compiler.trait_runtime;
 import compiler.virtual_dispatch_runtime;
 import compiler.call_utils;
 import compiler.ast_lowering;
+import compiler.safe_lowering;
+import emitter.typeinfo;
 
 const GENERIC_DEBUG = 0;
 const TRAIT_LOOKUP_DEBUG = 0;
@@ -155,6 +158,9 @@ struct CompilerCtx {
     public all_globals_map2_src_len: u64;
     public all_structs: *HashMap<u64, *AstStructDef>;
     public all_structs_vec: *Vec<*AstStructDef>;
+    public struct_source_lookup: *HashMap<u64, *AstStructDef>;
+    public struct_source_lookup_src: *Vec<*AstStructDef>;
+    public struct_source_lookup_src_len: u64;
     public all_traits: *HashMap<u64, *TraitDef>;
     public all_traits_vec: *Vec<*TraitDef>;
     public all_trait_impls_vec: *Vec<*TraitImpl>;
@@ -226,6 +232,40 @@ struct CompilerCtx {
     public generation: u64;
     public diag_count: u64;
     public diag_limit_reached: u64;
+    public ast_span_ctx: *AstSourceSpanCtx;
+    public module_structs: *HashMap<u64, *HashMap<u64, *AstStructDef>>;
+    public struct_module_defs: *Vec<*AstStructDef>;
+    public struct_module_names: *Vec<*NameInfo>;
+    public func_sig_module_defs: *Vec<*AstFunc>;
+    public func_sig_module_names: *Vec<*NameInfo>;
+    public owned_allocations: *HeapOwnedAllocList;
+    public complexity_surface_contract_map: *HashMap<u64, *Vec<*NameInfo>>;
+    public complexity_ssa_summary_map: *HashMap<u64, u64>;
+    public ssa_builder_failed_funcs: *HashMap<u64, u64>;
+    public ssa_used_name_membership: *HashMap<u64, u64>;
+    public codegen_used_name_membership: *HashMap<u64, u64>;
+    public codegen_used_func_index: *HashMap<u64, *AstFunc>;
+    public codegen_collect_used_symtab: *HashMap<u64, *TypeInfo>;
+    public codegen_used_closure_cursor: u64;
+    public codegen_trace_runtime_needed: u64;
+    public ssa_builder_diag_suppressed: u64;
+    public ssa_current_source_file_ptr: u64;
+    public ssa_current_source_file_len: u64;
+    public ssa_current_source_start_line: u64;
+    public ssa_current_source_start_col: u64;
+    public ssa_current_source_end_line: u64;
+    public ssa_current_source_end_col: u64;
+    public ssa_current_source_range_id: u64;
+    public ssa_current_source_start_offset: u64;
+    public ssa_current_source_end_offset: u64;
+    // Alternating logical-import and resolved-path entries. Kept outside the
+    // canonical ModuleCtx layout so older bootstrap compilers retain its ABI.
+    public module_resolution_witnesses: *Vec<*NameInfo>;
+    public generic_infer_cache_entries: u64;
+    public generic_infer_cache_symtab: u64;
+    public generic_infer_cache_epoch: u64;
+    public generic_infer_cache_generation: u64;
+    public generic_infer_cache_enabled: u64;
 }
 
 impl CompilerCtx {
@@ -237,6 +277,51 @@ impl CompilerCtx {
 
 var g_compiler_default_ctx: CompilerCtx;
 var g_compiler_ctx: *CompilerCtx = 0;
+var g_compiler_live_contexts: *Vec<u64>;
+
+func compiler_ctx_live_registry_ensure() -> u64 {
+    if (g_compiler_live_contexts != 0) { return 0; }
+    var previous_recording: u64 = heap_owned_alloc_recording_suspend();
+    g_compiler_live_contexts = new Vec<u64>{heap_alloc(8 * sizeof(u64)), 0, 8};
+    heap_owned_alloc_recording_restore(previous_recording);
+    return 0;
+}
+
+func compiler_ctx_live_registry_add(ctx: *CompilerCtx) -> u64 {
+    if (ctx == 0 || (u64)ctx == (u64)&g_compiler_default_ctx) { return 0; }
+    compiler_ctx_live_registry_ensure();
+    var n: u64 = g_compiler_live_contexts.len();
+    for (var i: u64 = 0; i < n; i++) {
+        if (g_compiler_live_contexts.get(i) == (u64)ctx) { return 0; }
+    }
+    var previous_recording: u64 = heap_owned_alloc_recording_suspend();
+    g_compiler_live_contexts.push((u64)ctx);
+    heap_owned_alloc_recording_restore(previous_recording);
+    return 0;
+}
+
+func compiler_ctx_live_registry_remove(ctx: *CompilerCtx) -> u64 {
+    if (ctx == 0 || g_compiler_live_contexts == 0) { return 0; }
+    var n: u64 = g_compiler_live_contexts.len();
+    for (var i: u64 = 0; i < n; i++) {
+        if (g_compiler_live_contexts.get(i) == (u64)ctx) {
+            g_compiler_live_contexts.set(i, 0);
+            return 0;
+        }
+    }
+    return 0;
+}
+
+func compiler_ctx_address_is_live(address: u64) -> u64 {
+    if (address == 0) { return 0; }
+    if (address == (u64)&g_compiler_default_ctx) { return 1; }
+    if (g_compiler_live_contexts == 0) { return 0; }
+    var n: u64 = g_compiler_live_contexts.len();
+    for (var i: u64 = 0; i < n; i++) {
+        if (g_compiler_live_contexts.get(i) == address) { return 1; }
+    }
+    return 0;
+}
 
 func compiler_ctx_current() -> *CompilerCtx {
     if (g_compiler_ctx == 0) { g_compiler_ctx = &g_compiler_default_ctx; }
@@ -251,12 +336,29 @@ func compiler_ctx_is_active(ctx: *CompilerCtx) -> u64 {
 
 func compiler_ctx_activate(ctx: *CompilerCtx) -> *CompilerCtx {
     var previous: *CompilerCtx = compiler_ctx_current();
-    if (ctx != 0) { g_compiler_ctx = ctx; }
+    if (ctx != 0 && (u64)ctx != (u64)previous) {
+        ast_source_span_ctx_save(previous.ast_span_ctx);
+        g_compiler_ctx = ctx;
+        ast_source_span_ctx_load(ctx.ast_span_ctx);
+    }
     return previous;
 }
 
 func compiler_ctx_generation() -> u64 {
     return compiler_ctx_current().generation;
+}
+
+func compiler_ctx_owned_scope_enter(ctx: *CompilerCtx) -> *HeapOwnedAllocList {
+    var previous: *HeapOwnedAllocList = heap_owned_alloc_scope_get();
+    if (ctx != 0 && ctx.initialized != 0) {
+        heap_owned_alloc_scope_set(ctx.owned_allocations);
+    }
+    return previous;
+}
+
+func compiler_ctx_owned_scope_leave(previous: *HeapOwnedAllocList) -> u64 {
+    heap_owned_alloc_scope_set(previous);
+    return 0;
 }
 
 // Vec and HashMap both use the same owned-buffer header layout. Keeping the
@@ -323,7 +425,17 @@ func compiler_ctx_release_source_cache(value: *HashMap<u64, *NameInfo>) -> u64 {
 func compiler_ctx_release_state(ctx: *CompilerCtx) -> u64 {
     if (ctx == 0 || ctx.initialized == 0) { return 0; }
 
-    if ((u64)ctx == (u64)g_compiler_ctx) { ast_source_span_reset(); }
+    // GC graph records are process-global, but their ordinary payloads can be
+    // owned by this compiler session. Remove those records before any direct
+    // container or arena release invalidates the payload addresses.
+    bpp_gc_forget_owned_allocations(ctx.owned_allocations);
+
+    if ((u64)ctx == (u64)g_compiler_ctx) {
+        ast_source_span_reset();
+        ast_source_span_ctx_save(ctx.ast_span_ctx);
+    }
+    ast_source_span_ctx_release(ctx.ast_span_ctx);
+    ctx.ast_span_ctx = 0;
 
     // Alias-only subcontexts never own their referenced tables.
     if (ctx.module_ctx != 0) { heap_free((u64)ctx.module_ctx); }
@@ -344,6 +456,7 @@ func compiler_ctx_release_state(ctx: *CompilerCtx) -> u64 {
     compiler_ctx_release_container((u64)ctx.all_globals_map2);
     compiler_ctx_release_container((u64)ctx.all_structs);
     compiler_ctx_release_container((u64)ctx.all_structs_vec);
+    compiler_ctx_release_container((u64)ctx.struct_source_lookup);
     compiler_ctx_release_container((u64)ctx.all_traits);
     compiler_ctx_release_container((u64)ctx.all_traits_vec);
     compiler_ctx_release_container((u64)ctx.all_trait_impls_vec);
@@ -374,6 +487,19 @@ func compiler_ctx_release_state(ctx: *CompilerCtx) -> u64 {
     compiler_ctx_release_nested_containers((u64)ctx.module_export_maps);
     compiler_ctx_release_container((u64)ctx.func_module_map);
     compiler_ctx_release_container((u64)ctx.global_module_map);
+    compiler_ctx_release_nested_containers((u64)ctx.module_structs);
+    compiler_ctx_release_container((u64)ctx.struct_module_defs);
+    compiler_ctx_release_container((u64)ctx.struct_module_names);
+    compiler_ctx_release_container((u64)ctx.func_sig_module_defs);
+    compiler_ctx_release_container((u64)ctx.func_sig_module_names);
+    compiler_ctx_release_container((u64)ctx.complexity_surface_contract_map);
+    compiler_ctx_release_container((u64)ctx.complexity_ssa_summary_map);
+    compiler_ctx_release_container((u64)ctx.ssa_builder_failed_funcs);
+    compiler_ctx_release_container((u64)ctx.ssa_used_name_membership);
+    compiler_ctx_release_container((u64)ctx.codegen_used_name_membership);
+    compiler_ctx_release_container((u64)ctx.codegen_used_func_index);
+    compiler_ctx_release_container((u64)ctx.codegen_collect_used_symtab);
+    compiler_ctx_release_container((u64)ctx.module_resolution_witnesses);
 
     compiler_ctx_release_container((u64)ctx.impl_methods);
     compiler_ctx_release_container((u64)ctx.impl_method_access);
@@ -393,6 +519,12 @@ func compiler_ctx_release_state(ctx: *CompilerCtx) -> u64 {
     // point into them during the rest of session teardown.
     compiler_ctx_release_source_cache(ctx.module_source_cache);
 
+    // Parser, type, lowering, and generated-AST nodes do not have individual
+    // destructors. Release the still-live allocations captured by this
+    // compiler session after all conventionally owned containers are gone.
+    heap_owned_alloc_list_release(ctx.owned_allocations);
+    ctx.owned_allocations = 0;
+
     ctx.module_ctx = 0;
     ctx.symbol_ctx = 0;
     ctx.initialized = 0;
@@ -405,6 +537,32 @@ func compiler_ctx_reset_active_state() -> u64 {
     compiler_ctx_release_state(g_compiler_ctx);
     g_compiler_ctx.diag_count = 0;
     g_compiler_ctx.diag_limit_reached = 0;
+    g_compiler_ctx.owned_allocations = heap_owned_alloc_list_new();
+    g_compiler_ctx.complexity_surface_contract_map = 0;
+    g_compiler_ctx.complexity_ssa_summary_map = 0;
+    g_compiler_ctx.ssa_builder_failed_funcs = 0;
+    g_compiler_ctx.ssa_used_name_membership = 0;
+    g_compiler_ctx.codegen_used_name_membership = 0;
+    g_compiler_ctx.codegen_used_func_index = 0;
+    g_compiler_ctx.codegen_collect_used_symtab = 0;
+    g_compiler_ctx.codegen_used_closure_cursor = 0;
+    g_compiler_ctx.codegen_trace_runtime_needed = 0;
+    g_compiler_ctx.ssa_builder_diag_suppressed = 0;
+    g_compiler_ctx.ssa_current_source_file_ptr = 0;
+    g_compiler_ctx.ssa_current_source_file_len = 0;
+    g_compiler_ctx.ssa_current_source_start_line = 0;
+    g_compiler_ctx.ssa_current_source_start_col = 0;
+    g_compiler_ctx.ssa_current_source_end_line = 0;
+    g_compiler_ctx.ssa_current_source_end_col = 0;
+    g_compiler_ctx.ssa_current_source_range_id = 0;
+    g_compiler_ctx.ssa_current_source_start_offset = 0;
+    g_compiler_ctx.ssa_current_source_end_offset = 0;
+    g_compiler_ctx.module_resolution_witnesses = new Vec<*NameInfo>{heap_alloc((64) * sizeof(*NameInfo)), 0, (64)};
+    g_compiler_ctx.generic_infer_cache_entries = 0;
+    g_compiler_ctx.generic_infer_cache_symtab = 0;
+    g_compiler_ctx.generic_infer_cache_epoch = 0;
+    g_compiler_ctx.generic_infer_cache_generation = 0;
+    g_compiler_ctx.generic_infer_cache_enabled = 0;
 
     // Module and symbol tables
     g_compiler_ctx.loaded_modules = new HashMap<u64, u64>{0, 0, 0};
@@ -435,6 +593,9 @@ func compiler_ctx_reset_active_state() -> u64 {
     g_compiler_ctx.all_structs = new HashMap<u64, *AstStructDef>{0, 0, 0};
     g_compiler_ctx.all_structs.ensure_capacity(64);
     g_compiler_ctx.all_structs_vec = new Vec<*AstStructDef>{heap_alloc((16) * sizeof(*AstStructDef)), 0, (16)};
+    g_compiler_ctx.struct_source_lookup = 0;
+    g_compiler_ctx.struct_source_lookup_src = 0;
+    g_compiler_ctx.struct_source_lookup_src_len = 0;
     g_compiler_ctx.all_traits = new HashMap<u64, *TraitDef>{0, 0, 0};
     g_compiler_ctx.all_traits.ensure_capacity(64);
     g_compiler_ctx.all_traits_vec = new Vec<*TraitDef>{heap_alloc((16) * sizeof(*TraitDef)), 0, (16)};
@@ -506,6 +667,12 @@ func compiler_ctx_reset_active_state() -> u64 {
     g_compiler_ctx.func_module_map.ensure_capacity(128);
     g_compiler_ctx.global_module_map = new HashMap<u64, *NameInfo>{0, 0, 0};
     g_compiler_ctx.global_module_map.ensure_capacity(128);
+    g_compiler_ctx.module_structs = new HashMap<u64, *HashMap<u64, *AstStructDef>>{0, 0, 0};
+    g_compiler_ctx.module_structs.ensure_capacity(128);
+    g_compiler_ctx.struct_module_defs = new Vec<*AstStructDef>{heap_alloc((64) * sizeof(*AstStructDef)), 0, (64)};
+    g_compiler_ctx.struct_module_names = new Vec<*NameInfo>{heap_alloc((64) * sizeof(*NameInfo)), 0, (64)};
+    g_compiler_ctx.func_sig_module_defs = new Vec<*AstFunc>{heap_alloc((64) * sizeof(*AstFunc)), 0, (64)};
+    g_compiler_ctx.func_sig_module_names = new Vec<*NameInfo>{heap_alloc((64) * sizeof(*NameInfo)), 0, (64)};
 
     // Impl and resolve helpers
     g_compiler_ctx.impl_methods = new HashMap<u64, u64>{0, 0, 0};
@@ -529,6 +696,8 @@ func compiler_ctx_reset_active_state() -> u64 {
     g_compiler_ctx.current_module = slice(0, 0);
     g_compiler_ctx.impl_prefix = slice(0, 0);
     g_compiler_ctx.current_access_struct = slice(0, 0);
+    g_compiler_ctx.ast_span_ctx = ast_source_span_ctx_new();
+    ast_source_span_ctx_load(g_compiler_ctx.ast_span_ctx);
 
     // 1st-phase subcontext split (aliases over canonical fields)
     g_compiler_ctx.module_ctx = new ModuleCtx{
@@ -574,7 +743,6 @@ func compiler_ctx_reset_active_state() -> u64 {
         g_compiler_ctx.all_traits_vec,
         g_compiler_ctx.all_trait_impls_vec
     };
-
     g_compiler_ctx.initialized = 1;
     g_compiler_ctx.generation = next_generation;
 
@@ -594,8 +762,21 @@ func compiler_ctx_reset_state() -> u64 {
 }
 
 func compiler_ctx_new() -> *CompilerCtx {
-    var ctx: *CompilerCtx = new CompilerCtx{};
+    // CompilerCtx has an explicit destroy path and must not become a GC object
+    // owned by whichever session happened to create it.
+    var previous_recording: u64 = heap_owned_alloc_recording_suspend();
+    var ctx: *CompilerCtx = (*CompilerCtx)heap_alloc(sizeof(CompilerCtx));
+    heap_owned_alloc_recording_restore(previous_recording);
+    // The heap deliberately poisons released payloads. CompilerCtx's empty
+    // constructor delegates initialization to reset, so a reused block must
+    // be cleared before activation: activation and release inspect pointer
+    // fields and the initialized flag before reset populates them.
+    var ctx_bytes: *u8 = (*u8)ctx;
+    for (var i: u64 = 0; i < sizeof(CompilerCtx); i++) {
+        ctx_bytes[i] = 0;
+    }
     compiler_ctx_reset_state_with_ctx(ctx);
+    compiler_ctx_live_registry_add(ctx);
     return ctx;
 }
 
@@ -604,14 +785,18 @@ func compiler_ctx_destroy(ctx: *CompilerCtx) -> u64 {
     if ((u64)ctx == (u64)&g_compiler_default_ctx) {
         return compiler_ctx_release_state(ctx);
     }
+    compiler_ctx_live_registry_remove(ctx);
     var was_active: u64 = (u64)ctx == (u64)g_compiler_ctx;
     compiler_ctx_release_state(ctx);
-    if (was_active != 0) { g_compiler_ctx = &g_compiler_default_ctx; }
+    if (was_active != 0) {
+        g_compiler_ctx = &g_compiler_default_ctx;
+        ast_source_span_ctx_load(g_compiler_default_ctx.ast_span_ctx);
+    }
     heap_free((u64)ctx);
     return 1;
 }
 
-const PRELUDE_MODULE_COUNT = 9;
+const PRELUDE_MODULE_COUNT = 10;
 
 // Generic function template (48 bytes)
 struct GenericFuncTemplate {
@@ -632,11 +817,13 @@ impl GenericFuncTemplate {
     }
 }
 
-// Generic struct template (24 bytes)
+// Generic struct template
 struct GenericStructTemplate {
     public name: []u8;
     public params_vec: *Vec<*GenericParam>;
     public struct_def: *AstStructDef;
+    public module: []u8;
+    public mangled_name: []u8;
 }
 
 impl GenericStructTemplate {
@@ -644,6 +831,8 @@ impl GenericStructTemplate {
         self.name = slice(0, 0);
         self.params_vec = 0;
         self.struct_def = 0;
+        self.module = slice(0, 0);
+        self.mangled_name = slice(0, 0);
     }
 }
 
@@ -688,6 +877,8 @@ func generic_struct_template_new(name: []u8, params_vec: *Vec<*GenericParam>) ->
     tpl.name = name;
     tpl.params_vec = params_vec;
     tpl.struct_def = 0;
+    tpl.module = slice(0, 0);
+    tpl.mangled_name = slice(0, 0);
     return tpl;
 }
 
@@ -844,7 +1035,8 @@ func _compiler_find_virtual_dispatch_trait_in_struct(struct_def: *AstStructDef, 
     }
 
     if (g_compiler_ctx.virtual_dispatch_traits != 0) {
-        var bucket: *HashMap<u64, *NameInfo> = g_compiler_ctx.virtual_dispatch_traits.get(struct_def.name);
+        var struct_identity: *NameInfo = sym_get_struct_canonical_name(struct_def);
+        var bucket: *HashMap<u64, *NameInfo> = g_compiler_ctx.virtual_dispatch_traits.get(slice(struct_identity.ptr, struct_identity.len));
         if (bucket != 0) {
             var found: *NameInfo = bucket.get(slice(method.ptr, method.len));
             if (found != 0) { return found; }
@@ -870,12 +1062,13 @@ func vdispatch_find_trait(struct_slice: []u8, method: []u8) -> *NameInfo {
 }
 
 func find_unique_impl_method_in_struct(struct_slice: []u8, method: []u8) -> *AstFunc {
-    if (g_compiler_ctx.all_funcs == 0) { return 0; }
+    var candidates: *Vec<*AstFunc> = sym_method_overload_candidates(method);
+    if (candidates == 0) { return 0; }
     var found: *AstFunc = 0;
     var found_count: u64 = 0;
-    var n: u64 = g_compiler_ctx.all_funcs.len();
+    var n: u64 = candidates.len();
     for (var i: u64 = 0; i < n; i++) {
-        var fn: *AstFunc = g_compiler_ctx.all_funcs.get(i);
+        var fn: *AstFunc = candidates.get(i);
         if (fn == 0) { continue; }
         if (u8_slice_ptr(fn.impl_owner) == 0 || u8_slice_len(fn.impl_owner) == 0) { continue; }
         if (str_eq(fn.impl_owner, slice(struct_slice.ptr, struct_slice.len)) == 0) { continue; }
@@ -900,12 +1093,13 @@ func find_unique_impl_method_in_struct(struct_slice: []u8, method: []u8) -> *Ast
 }
 
 func find_unique_impl_method_in_struct_with_arg_count(struct_slice: []u8, method: []u8, arg_count_hint: u64) -> *AstFunc {
-    if (g_compiler_ctx.all_funcs == 0) { return 0; }
+    var candidates: *Vec<*AstFunc> = sym_method_overload_candidates(method);
+    if (candidates == 0) { return 0; }
     var found: *AstFunc = 0;
     var found_count: u64 = 0;
-    var n: u64 = g_compiler_ctx.all_funcs.len();
+    var n: u64 = candidates.len();
     for (var i: u64 = 0; i < n; i++) {
-        var fn: *AstFunc = g_compiler_ctx.all_funcs.get(i);
+        var fn: *AstFunc = candidates.get(i);
         if (fn == 0) { continue; }
         if (u8_slice_ptr(fn.impl_owner) == 0 || u8_slice_len(fn.impl_owner) == 0) { continue; }
         if (str_eq(fn.impl_owner, slice(struct_slice.ptr, struct_slice.len)) == 0) { continue; }
@@ -950,13 +1144,14 @@ func _find_method_func_in_hierarchy(struct_def: *AstStructDef, method: []u8, dep
         return 0;
     }
 
-    var method_name: *NameInfo = build_method_name(struct_def.name, slice(method.ptr, method.len));
+    var struct_identity: *NameInfo = sym_get_struct_canonical_name(struct_def);
+    var method_name: *NameInfo = build_method_name(slice(struct_identity.ptr, struct_identity.len), slice(method.ptr, method.len));
     var fn: *AstFunc = sym_get_impl_method_func(slice(method_name.ptr, method_name.len));
     if (fn == 0) {
         fn = sym_get_func(slice(method_name.ptr, method_name.len));
     }
     if (fn == 0) {
-        fn = find_unique_impl_method_in_struct(struct_def.name, slice(method.ptr, method.len));
+        fn = find_unique_impl_method_in_struct(slice(struct_identity.ptr, struct_identity.len), slice(method.ptr, method.len));
     }
     if (fn != 0) { return fn; }
 
@@ -997,13 +1192,14 @@ func _find_method_func_in_hierarchy_with_arg_count(struct_def: *AstStructDef, me
         return 0;
     }
 
-    var method_name: *NameInfo = build_method_name(struct_def.name, slice(method.ptr, method.len));
+    var struct_identity: *NameInfo = sym_get_struct_canonical_name(struct_def);
+    var method_name: *NameInfo = build_method_name(slice(struct_identity.ptr, struct_identity.len), slice(method.ptr, method.len));
     var fn: *AstFunc = sym_get_impl_method_func(slice(method_name.ptr, method_name.len));
     if (fn == 0) {
         fn = sym_get_func(slice(method_name.ptr, method_name.len));
     }
     if (fn == 0) {
-        fn = find_unique_impl_method_in_struct_with_arg_count(struct_def.name, slice(method.ptr, method.len), arg_count_hint);
+        fn = find_unique_impl_method_in_struct_with_arg_count(slice(struct_identity.ptr, struct_identity.len), slice(method.ptr, method.len), arg_count_hint);
     }
     if (fn != 0) { return fn; }
 
@@ -1035,10 +1231,37 @@ func find_method_func_in_hierarchy_with_arg_count(struct_def: *AstStructDef, met
     return _find_method_func_in_hierarchy_with_arg_count(struct_def, slice(method.ptr, method.len), arg_count_hint, 0);
 }
 
+func _compiler_find_parent_def_identity(struct_def: *AstStructDef, parent_def: *AstStructDef, depth: u64) -> *AstStructDef {
+    if (struct_def == 0 || parent_def == 0) { return 0; }
+    if (depth > 64) {
+        diag_emit_error_tag("compiler", "inheritance", "Inheritance depth exceeded");
+        diag_emit_help("check for cyclic inheritance or an unexpectedly deep parent chain");
+        diag_error("Compiler error");
+        return 0;
+    }
+    if (struct_def == parent_def) { return struct_def; }
+    if (struct_def.parents_vec == 0) { return 0; }
+    var parents: *Vec<*ParentDesc> = struct_def.parents_vec;
+    var pn: u64 = parents.len();
+    for (var i: u64 = 0; i < pn; i++) {
+        var parent_desc: *ParentDesc = parents.get(i);
+        var direct_parent: *AstStructDef = resolve_parent_def(parent_desc, "Compiler error");
+        var found: *AstStructDef = _compiler_find_parent_def_identity(direct_parent, parent_def, depth + 1);
+        if (found != 0) { return found; }
+    }
+    return 0;
+}
+
 func struct_is_same_or_descendant(child: []u8, ancestor: []u8) -> u64 {
     if (str_eq(slice(child.ptr, child.len), slice(ancestor.ptr, ancestor.len)) != 0) { return true; }
-    var child_def: *AstStructDef = get_struct_def(slice(child.ptr, child.len));
+    var child_def: *AstStructDef = sym_get_struct_def_by_identity(slice(child.ptr, child.len));
     if (child_def == 0) { return false; }
+    var ancestor_def: *AstStructDef = sym_get_struct_def_by_identity(slice(ancestor.ptr, ancestor.len));
+    if (ancestor_def != 0) {
+        var found_by_identity: *AstStructDef = _compiler_find_parent_def_identity(child_def, ancestor_def, 0);
+        if (found_by_identity != 0) { return true; }
+        return false;
+    }
     var found: *AstStructDef = _compiler_find_parent_def(child_def, slice(ancestor.ptr, ancestor.len), 0);
     if (found != 0) { return true; }
     return false;
@@ -1054,23 +1277,24 @@ func _find_method_decl_in_hierarchy(struct_def: *AstStructDef, method: []u8, dep
         return lookup;
     }
 
-    var method_name: *NameInfo = build_method_name(struct_def.name, slice(method.ptr, method.len));
+    var struct_identity: *NameInfo = sym_get_struct_canonical_name(struct_def);
+    var method_name: *NameInfo = build_method_name(slice(struct_identity.ptr, struct_identity.len), slice(method.ptr, method.len));
     if (sym_is_impl_method(slice(method_name.ptr, method_name.len)) != 0) {
         lookup.found = 1;
-        lookup.owner = struct_def.name;
+        lookup.owner = slice(struct_identity.ptr, struct_identity.len);
         lookup.access = sym_get_impl_method_access(slice(method_name.ptr, method_name.len));
         lookup.sig = sym_get_func(slice(method_name.ptr, method_name.len));
         return lookup;
     }
 
-    var overload_lookup: CompilerDeclLookup = find_unique_impl_method_decl_in_struct(struct_def.name, slice(method.ptr, method.len));
+    var overload_lookup: CompilerDeclLookup = find_unique_impl_method_decl_in_struct(slice(struct_identity.ptr, struct_identity.len), slice(method.ptr, method.len));
     if (overload_lookup.found != 0) { return overload_lookup; }
 
-    if (sym_is_abst_method(struct_def.name, slice(method.ptr, method.len)) != 0) {
+    if (sym_is_abst_method_for_struct(struct_def, slice(method.ptr, method.len)) != 0) {
         lookup.found = 1;
-        lookup.owner = struct_def.name;
-        lookup.access = sym_get_abst_method_access(struct_def.name, slice(method.ptr, method.len));
-        lookup.sig = sym_get_abst_method_sig(struct_def.name, slice(method.ptr, method.len));
+        lookup.owner = slice(struct_identity.ptr, struct_identity.len);
+        lookup.access = sym_get_abst_method_access_for_struct(struct_def, slice(method.ptr, method.len));
+        lookup.sig = sym_get_abst_method_sig_for_struct(struct_def, slice(method.ptr, method.len));
         return lookup;
     }
 
@@ -1236,7 +1460,9 @@ func generic_find_struct_field_type(struct_name: []u8, parent: []u8, member: []u
     var field_desc: *FieldDesc = find_struct_field_desc_scoped(sd, slice(parent.ptr, parent.len), slice(member.ptr, member.len));
     if (field_desc != 0) {
         var f: *FieldDesc = field_desc;
-        return generic_make_typeinfo_from_fields(f.type_kind, f.ptr_depth, f.is_tagged, f.struct_name, f.tag_layout, f.elem_type_kind, f.elem_ptr_depth, f.array_len, 0, slice(0, 0));
+        var ti: *TypeInfo = generic_make_typeinfo_from_fields(f.type_kind, f.ptr_depth, f.is_tagged, f.struct_name, f.tag_layout, f.elem_type_kind, f.elem_ptr_depth, f.array_len, 0, slice(0, 0));
+        ti.elem_typeinfo = f.elem_typeinfo;
+        return ti;
     }
 
     if (GENERIC_DEBUG != 0) {
@@ -1249,13 +1475,204 @@ func generic_find_struct_field_type(struct_name: []u8, parent: []u8, member: []u
     return 0;
 }
 
+func ast_walker_declared_type_error(walker: *CompilerAstWalker, type_name: []u8) -> u64 {
+    diag_emit_error_tag("validation", "unknown-type", "unknown declared type");
+    if (type_name.ptr != 0 && type_name.len != 0) {
+        diag_emit_labelled_name("type: ", slice(type_name.ptr, type_name.len));
+    } else {
+        diag_emit_note("type: <missing nominal name>");
+    }
+    if (walker != 0 && walker.owner.ptr != 0 && walker.owner.len != 0) {
+        diag_emit_labelled_name("declaration: ", walker.owner);
+        walker.found = 1;
+    }
+    diag_note_error();
+    return 0;
+}
+
+func ast_walker_declared_name_is_generic_param(walker: *CompilerAstWalker, type_name: []u8) -> u64 {
+    if (walker == 0 || type_name.ptr == 0 || type_name.len == 0) { return 0; }
+    if (walker.allow_self_type != 0 && str_eq(type_name, slice("Self", 4)) != 0) { return 1; }
+    if (walker.generic_params_vec == 0) { return 0; }
+    var n: u64 = walker.generic_params_vec.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var param: *GenericParam = walker.generic_params_vec.get(i);
+        if (param != 0 && param.kind == GENERIC_KIND_TYPE && str_eq(param.name, type_name) != 0) { return 1; }
+    }
+    return 0;
+}
+
+func ast_walker_declared_nominal_exists(walker: *CompilerAstWalker, type_kind: u64, type_name: []u8) -> u64 {
+    if (type_name.ptr == 0 || type_name.len == 0) { return 0; }
+    if (ast_walker_declared_name_is_generic_param(walker, type_name) != 0) { return 1; }
+    if (type_kind == TYPE_STRUCT) {
+        var resolved_struct: CompilerResolvedStructName = lower_try_resolve_struct_name(type_name);
+        return resolved_struct.found;
+    }
+    if (type_kind == TYPE_TRAIT) {
+        if (sym_get_trait_def(type_name) != 0) { return 1; }
+        var resolved_name: *NameInfo = resolve_name(type_name);
+        if (resolved_name != 0 && sym_get_trait_def(slice(resolved_name.ptr, resolved_name.len)) != 0) { return 1; }
+        return 0;
+    }
+    return 1;
+}
+
+func ast_walker_validate_declared_typeinfo_depth(walker: *CompilerAstWalker, ti: *TypeInfo, depth: u64) -> u64 {
+    if (ti == 0) { return 1; }
+    if (depth > 64) {
+        diag_emit_error_tag("validation", "type-descriptor-cycle", "type descriptor nesting limit exceeded");
+        if (walker != 0) { walker.found = 1; }
+        diag_note_error();
+        return 0;
+    }
+
+    var ok: u64 = 1;
+    if ((ti.type_kind == TYPE_STRUCT || ti.type_kind == TYPE_TRAIT) &&
+        ti.struct_def == 0 &&
+        ast_walker_declared_nominal_exists(walker, ti.type_kind, ti.struct_name) == 0) {
+        ast_walker_declared_type_error(walker, ti.struct_name);
+        ok = 0;
+    }
+
+    if (ti.type_kind == TYPE_ARRAY || ti.type_kind == TYPE_SLICE) {
+        if (ti.elem_typeinfo != 0) {
+            if (ast_walker_validate_declared_typeinfo_depth(walker, ti.elem_typeinfo, depth + 1) == 0) { ok = 0; }
+        } else if ((ti.elem_type_kind == TYPE_STRUCT || ti.elem_type_kind == TYPE_TRAIT) &&
+                   ast_walker_declared_nominal_exists(walker, ti.elem_type_kind, ti.struct_name) == 0) {
+            ast_walker_declared_type_error(walker, ti.struct_name);
+            ok = 0;
+        }
+    }
+
+    if (ti.type_kind == TYPE_FUNC) {
+        var sig: *TypeInfo = ti;
+        if (ti.fn_params_vec == 0 && ti.fn_ret_typeinfo == 0 &&
+            ti.elem_typeinfo != 0 && ti.elem_typeinfo != ti && ti.elem_typeinfo.type_kind == TYPE_FUNC) {
+            sig = ti.elem_typeinfo;
+        }
+        if (sig.fn_params_vec != 0) {
+            var pn: u64 = sig.fn_params_vec.len();
+            for (var pi: u64 = 0; pi < pn; pi++) {
+                if (ast_walker_validate_declared_typeinfo_depth(walker, sig.fn_params_vec.get(pi), depth + 1) == 0) { ok = 0; }
+            }
+        }
+        if (sig.fn_ret_typeinfo != 0 &&
+            ast_walker_validate_declared_typeinfo_depth(walker, sig.fn_ret_typeinfo, depth + 1) == 0) {
+            ok = 0;
+        }
+    }
+    return ok;
+}
+
+func ast_walker_validate_declared_typeinfo(walker: *CompilerAstWalker, ti: *TypeInfo) -> u64 {
+    return ast_walker_validate_declared_typeinfo_depth(walker, ti, 0);
+}
+
+func ast_walker_validate_declared_type_fields(walker: *CompilerAstWalker, type_kind: u64, struct_name: []u8,
+                                               elem_type_kind: u64, elem_typeinfo: *TypeInfo) -> u64 {
+    var ok: u64 = 1;
+    if ((type_kind == TYPE_STRUCT || type_kind == TYPE_TRAIT) &&
+        ast_walker_declared_nominal_exists(walker, type_kind, struct_name) == 0) {
+        ast_walker_declared_type_error(walker, struct_name);
+        ok = 0;
+    }
+    if (type_kind == TYPE_ARRAY || type_kind == TYPE_SLICE) {
+        if (elem_typeinfo != 0) {
+            if (ast_walker_validate_declared_typeinfo(walker, elem_typeinfo) == 0) { ok = 0; }
+        } else if ((elem_type_kind == TYPE_STRUCT || elem_type_kind == TYPE_TRAIT) &&
+                   ast_walker_declared_nominal_exists(walker, elem_type_kind, struct_name) == 0) {
+            ast_walker_declared_type_error(walker, struct_name);
+            ok = 0;
+        }
+    } else if (type_kind == TYPE_FUNC && elem_typeinfo != 0) {
+        if (ast_walker_validate_declared_typeinfo(walker, elem_typeinfo) == 0) { ok = 0; }
+    }
+    return ok;
+}
+
+func ast_walker_validate_declared_generic_args(walker: *CompilerAstWalker, args: *Vec<*GenericArg>) -> u64 {
+    if (args == 0) { return 1; }
+    var ok: u64 = 1;
+    var n: u64 = args.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var arg: *GenericArg = args.get(i);
+        if (arg != 0 && arg.kind == GENERIC_KIND_TYPE &&
+            ast_walker_validate_declared_typeinfo(walker, arg.type_ptr) == 0) {
+            ok = 0;
+        }
+    }
+    return ok;
+}
+
+func ast_walker_validate_declared_expr(walker: *CompilerAstWalker, expr: *AstNode) -> u64 {
+    if (expr == 0) { return 1; }
+    match (ast_kind(expr)) {
+        case AST_CAST:
+            var cast_expr: *AstCast = (*AstCast)expr;
+            return ast_walker_validate_declared_typeinfo_depth(walker, ast_cast_target_type(cast_expr), 0);
+        case AST_SIZEOF:
+            var sizeof_type: *AstSizeof = (*AstSizeof)expr;
+            return ast_walker_validate_declared_type_fields(walker, sizeof_type.type_kind, sizeof_type.struct_name,
+                sizeof_type.elem_type_kind, sizeof_type.elem_typeinfo);
+        case AST_NEW:
+            var new_expr: *AstNew = (*AstNew)expr;
+            return ast_walker_validate_declared_type_fields(walker, new_expr.type_kind, new_expr.struct_name,
+                new_expr.elem_type_kind, new_expr.elem_typeinfo);
+        case AST_STACK_CTOR:
+            var stack_ctor: *AstStackCtor = (*AstStackCtor)expr;
+            return ast_walker_validate_declared_type_fields(walker, stack_ctor.type_kind, stack_ctor.struct_name,
+                stack_ctor.elem_type_kind, stack_ctor.elem_typeinfo);
+        case AST_GENERIC_CALL:
+            return ast_walker_validate_declared_generic_args(walker, ((*AstGenericCall)expr).generic_args_vec);
+        case AST_GENERIC_STRUCT_LITERAL:
+            return ast_walker_validate_declared_generic_args(walker, ((*AstGenericStructLiteral)expr).generic_args_vec);
+        case AST_STATIC_GENERIC_CALL:
+            return ast_walker_validate_declared_generic_args(walker, ((*AstStaticGenericCall)expr).generic_args_vec);
+    }
+    return 1;
+}
+
+func ast_walker_validate_declared_stmt(walker: *CompilerAstWalker, stmt: *AstNode) -> u64 {
+    if (stmt == 0) { return 1; }
+    match (ast_kind(stmt)) {
+        case AST_VAR_DECL:
+            var decl: *AstVarDecl = (*AstVarDecl)stmt;
+            return ast_walker_validate_declared_type_fields(walker, decl.type_kind, decl.struct_name,
+                decl.elem_type_kind, decl.elem_typeinfo);
+        case AST_TRY_STMT:
+            return ast_walker_validate_declared_typeinfo(walker, ((*AstTryStmt)stmt).catch_value_type);
+    }
+    return 1;
+}
+
 func ast_walker_new(mode: u64, owner: []u8) -> CompilerAstWalker {
     var walker: CompilerAstWalker;
     walker.mode = mode;
     walker.owner = owner;
     walker.super_allowed = 1;
     walker.found = 0;
+    walker.generic_params_vec = 0;
+    walker.allow_self_type = 0;
     return walker;
+}
+
+func compiler_type_has_gc_slots(ti: *TypeInfo) -> u64 {
+    return typeinfo_has_gc_slots(ti);
+}
+
+func compiler_function_needs_gc_frame(name: []u8) -> u64 {
+    var fn: *AstFunc = sym_get_func(name);
+    if (fn == 0) { return 1; }
+    if (compiler_type_has_gc_slots(ast_func_return_type(fn)) != 0) { return 1; }
+    if (fn.params_vec != 0) {
+        for (var i: u64 = 0; i < fn.params_vec.len(); i++) {
+            if (compiler_type_has_gc_slots(typeinfo_from_call_param(fn.params_vec.get(i))) != 0) { return 1; }
+        }
+    }
+    var walker: CompilerAstWalker = ast_walker_new(COMPILER_AST_WALK_FIND_GC_SLOTS, slice(0, 0));
+    ast_walker_walk_stmt(&walker, fn.body);
+    return walker.found;
 }
 
 func ast_walker_walk_args(walker: *CompilerAstWalker, args: *Vec<*AstNode>) -> u64 {
@@ -1268,9 +1685,29 @@ func ast_walker_walk_args(walker: *CompilerAstWalker, args: *Vec<*AstNode>) -> u
     return 0;
 }
 
-func ast_walker_walk_expr(walker: *CompilerAstWalker, expr: *AstNode) -> *AstNode {
+func ast_walker_walk_expr_impl(walker: *CompilerAstWalker, expr: *AstNode) -> *AstNode {
     if (expr == 0) { return 0; }
+    if (walker.mode == COMPILER_AST_WALK_FIND_GC_SLOTS) {
+        if (walker.found != 0) { return expr; }
+        if (ast_kind(expr) == AST_NEW) { walker.found = 1; return expr; }
+        if (ast_kind(expr) == AST_CAST && compiler_type_has_gc_slots(typeinfo_from_cast_expr((*AstCast)expr)) != 0) {
+            walker.found = 1;
+            return expr;
+        }
+        if (ast_kind(expr) == AST_CALL) {
+            var gc_call: *AstCall = (*AstCall)expr;
+            var gc_target: *AstFunc = lower_find_func_signature_for_call(gc_call.name);
+            if (gc_target != 0 && compiler_type_has_gc_slots(ast_func_return_type(gc_target)) != 0) { walker.found = 1; return expr; }
+        }
+    }
+    if (walker.mode == COMPILER_AST_WALK_SAFE_CAPTURE && ast_kind(expr) == AST_IDENT) {
+        var capture: *AstNode = safe_lower_capture(walker, ((*AstIdent)expr).name);
+        if (capture != 0) { return capture; }
+    }
     if (walker.mode == COMPILER_AST_WALK_FIND_SUPER_CTOR && walker.found != 0) { return expr; }
+    if (walker.mode == COMPILER_AST_WALK_VALIDATE_DECLARED_TYPES) {
+        ast_walker_validate_declared_expr(walker, expr);
+    }
 
     var kind: u64 = ast_kind(expr);
     match (kind) {
@@ -1287,6 +1724,10 @@ func ast_walker_walk_expr(walker: *CompilerAstWalker, expr: *AstNode) -> *AstNod
                 validate_direct_impl_call_name(call.name, call.origin, walker.owner);
             }
             ast_walker_walk_args(walker, call.args_vec);
+            if (walker.mode == COMPILER_AST_WALK_SAFE_CAPTURE) {
+                var captured_call: *AstNode = safe_lower_capture(walker, call.name);
+                if (captured_call != 0) { return (*AstNode)ast_call_ptr(captured_call, call.args_vec); }
+            }
             if (walker.mode == COMPILER_AST_WALK_LOWER_PARSE_SUGAR) {
                 var lowered_ctor: *AstNode = lower_parse_sugar_ctor_call(call);
                 if (lowered_ctor != 0 && ast_kind(lowered_ctor) == AST_STACK_CTOR) {
@@ -1402,6 +1843,9 @@ func ast_walker_walk_expr(walker: *CompilerAstWalker, expr: *AstNode) -> *AstNod
             return expr;
         case AST_METHOD_CALL:
             var mc: *AstMethodCall = (*AstMethodCall)expr;
+            if (walker.mode == COMPILER_AST_WALK_COUNT_SUPER_CTOR && is_super_expr(mc.receiver) != 0 && sym_is_constructor_name(mc.method) != 0) {
+                walker.found = walker.found + 1;
+            }
             if (walker.mode == COMPILER_AST_WALK_FIND_SUPER_CTOR) {
                 if (is_super_expr(mc.receiver) != 0 &&
                     sym_is_constructor_name(mc.method) != 0) {
@@ -1468,6 +1912,10 @@ func ast_walker_walk_expr(walker: *CompilerAstWalker, expr: *AstNode) -> *AstNod
             sl.ptr_expr = ast_walker_walk_expr(walker, sl.ptr_expr);
             sl.len_expr = ast_walker_walk_expr(walker, sl.len_expr);
             return expr;
+        case AST_VARIADIC_PACK:
+            var pack: *AstVariadicPack = (*AstVariadicPack)expr;
+            ast_walker_walk_args(walker, pack.values_vec);
+            return expr;
         case AST_TERNARY:
             var ternary: *AstTernary = (*AstTernary)expr;
             ternary.cond = ast_walker_walk_expr(walker, ternary.cond);
@@ -1503,9 +1951,24 @@ func ast_walker_walk_expr(walker: *CompilerAstWalker, expr: *AstNode) -> *AstNod
     }
 }
 
+func ast_walker_walk_expr(walker: *CompilerAstWalker, expr: *AstNode) -> *AstNode {
+    var result: *AstNode = ast_walker_walk_expr_impl(walker, expr);
+    if (walker != 0 && walker.mode == COMPILER_AST_WALK_LOWER_PARSE_SUGAR && result != expr) {
+        generic_infer_cache_invalidate(1);
+    }
+    return result;
+}
+
 func ast_walker_walk_stmt(walker: *CompilerAstWalker, stmt: *AstNode) -> u64 {
     if (stmt == 0) { return 0; }
+    // Statement lowering mutates nodes in place. Start a fresh logical cache
+    // epoch so only the post-order-stable subtree within this statement is reused.
+    if (walker.mode == COMPILER_AST_WALK_LOWER_PARSE_SUGAR) { generic_infer_cache_invalidate(2); }
+    if (walker.mode == COMPILER_AST_WALK_FIND_GC_SLOTS && walker.found != 0) { return 0; }
     if (walker.mode == COMPILER_AST_WALK_FIND_SUPER_CTOR && walker.found != 0) { return 0; }
+    if (walker.mode == COMPILER_AST_WALK_VALIDATE_DECLARED_TYPES) {
+        ast_walker_validate_declared_stmt(walker, stmt);
+    }
 
     var kind: u64 = ast_kind(stmt);
     match (kind) {
@@ -1520,16 +1983,20 @@ func ast_walker_walk_stmt(walker: *CompilerAstWalker, stmt: *AstNode) -> u64 {
             break;
         case AST_VAR_DECL:
             var vd: *AstVarDecl = (*AstVarDecl)stmt;
+            if (walker.mode == COMPILER_AST_WALK_FIND_GC_SLOTS) {
+                if (compiler_type_has_gc_slots(typeinfo_from_var_decl(vd)) != 0) { walker.found = 1; }
+                ast_walker_walk_expr(walker, vd.init_expr);
+                break;
+            }
+            if (walker.mode == COMPILER_AST_WALK_LOWER_PARSE_SUGAR && vd.init_expr != 0 && lower_var_decl_needs_inference(vd) == 0) {
+                vd.init_expr = lower_contextualize_implicit_generic_call(vd.init_expr, lower_make_typeinfo_from_vardecl(vd));
+            }
             vd.init_expr = ast_walker_walk_expr(walker, vd.init_expr);
             if (walker.mode == COMPILER_AST_WALK_LOWER_PARSE_SUGAR && vd.init_expr != 0) {
                 if (lower_var_decl_infer_from_init(vd) == 0) { break; }
                 var vd_ti: *TypeInfo = lower_make_typeinfo_from_vardecl(vd);
                 var lowered_init: *AstNode = lower_parse_sugar_expr_for_type(vd.init_expr, vd_ti);
                 if (lowered_init != vd.init_expr) { vd.init_expr = lowered_init; }
-                if (lower_var_decl_needs_inference(vd) != 0) {
-                    if (lower_var_decl_infer_from_init(vd) == 0) { break; }
-                    vd_ti = lower_make_typeinfo_from_vardecl(vd);
-                }
                 if (lower_is_number_struct_type(vd_ti) != 0 &&
                     lower_is_integer_literal_expr(vd.init_expr) != 0) {
                     var wrapped_num: *AstNode = lower_wrap_integer_literal_to_number(vd.init_expr);
@@ -1736,43 +2203,43 @@ func build_method_name_base(struct_name_base: []u8, method: []u8, suffix_len: u6
     return module_util_build_joined_name_with_suffix(slice(struct_name_base.ptr, struct_name_base.len), slice(method.ptr, method.len), slice(struct_name_base.ptr + struct_name_base.len, suffix_len));
 }
 
-func compiler_operator_binary_name(op: u64) -> *NameInfo {
+func compiler_operator_binary_name(op: u64) -> NameInfo {
     match (op) {
-        case TOKEN_PLUS: return new NameInfo{"__op_add", 8};
-        case TOKEN_MINUS: return new NameInfo{"__op_sub", 8};
-        case TOKEN_STAR: return new NameInfo{"__op_mul", 8};
-        case TOKEN_SLASH: return new NameInfo{"__op_div", 8};
-        case TOKEN_PERCENT: return new NameInfo{"__op_mod", 8};
-        case TOKEN_LSHIFT: return new NameInfo{"__op_shl", 8};
-        case TOKEN_RSHIFT: return new NameInfo{"__op_shr", 8};
-        case TOKEN_AMPERSAND: return new NameInfo{"__op_bitand", 11};
-        case TOKEN_PIPE: return new NameInfo{"__op_bitor", 10};
-        case TOKEN_CARET: return new NameInfo{"__op_bitxor", 11};
-        case TOKEN_EQEQ: return new NameInfo{"__op_eq", 7};
-        case TOKEN_BANGEQ: return new NameInfo{"__op_ne", 7};
-        case TOKEN_LT: return new NameInfo{"__op_lt", 7};
-        case TOKEN_GT: return new NameInfo{"__op_gt", 7};
-        case TOKEN_LTEQ: return new NameInfo{"__op_lteq", 9};
-        case TOKEN_GTEQ: return new NameInfo{"__op_gteq", 9};
-        default: return 0;
+        case TOKEN_PLUS: return NameInfo{"__op_add", 8};
+        case TOKEN_MINUS: return NameInfo{"__op_sub", 8};
+        case TOKEN_STAR: return NameInfo{"__op_mul", 8};
+        case TOKEN_SLASH: return NameInfo{"__op_div", 8};
+        case TOKEN_PERCENT: return NameInfo{"__op_mod", 8};
+        case TOKEN_LSHIFT: return NameInfo{"__op_shl", 8};
+        case TOKEN_RSHIFT: return NameInfo{"__op_shr", 8};
+        case TOKEN_AMPERSAND: return NameInfo{"__op_bitand", 11};
+        case TOKEN_PIPE: return NameInfo{"__op_bitor", 10};
+        case TOKEN_CARET: return NameInfo{"__op_bitxor", 11};
+        case TOKEN_EQEQ: return NameInfo{"__op_eq", 7};
+        case TOKEN_BANGEQ: return NameInfo{"__op_ne", 7};
+        case TOKEN_LT: return NameInfo{"__op_lt", 7};
+        case TOKEN_GT: return NameInfo{"__op_gt", 7};
+        case TOKEN_LTEQ: return NameInfo{"__op_lteq", 9};
+        case TOKEN_GTEQ: return NameInfo{"__op_gteq", 9};
+        default: return NameInfo{0, 0};
     }
 }
 
-func compiler_operator_unary_name(op: u64) -> *NameInfo {
+func compiler_operator_unary_name(op: u64) -> NameInfo {
     match (op) {
-        case TOKEN_MINUS: return new NameInfo{"__op_neg", 8};
-        case TOKEN_BANG: return new NameInfo{"__op_not", 8};
-        case TOKEN_TILDE: return new NameInfo{"__op_bitnot", 11};
-        default: return 0;
+        case TOKEN_MINUS: return NameInfo{"__op_neg", 8};
+        case TOKEN_BANG: return NameInfo{"__op_not", 8};
+        case TOKEN_TILDE: return NameInfo{"__op_bitnot", 11};
+        default: return NameInfo{0, 0};
     }
 }
 
-func compiler_operator_index_get_name() -> *NameInfo {
-    return new NameInfo{"__op_index", 10};
+func compiler_operator_index_get_name() -> NameInfo {
+    return NameInfo{"__op_index", 10};
 }
 
-func compiler_operator_index_set_name() -> *NameInfo {
-    return new NameInfo{"__op_index_set", 14};
+func compiler_operator_index_set_name() -> NameInfo {
+    return NameInfo{"__op_index_set", 14};
 }
 
 // ============================================

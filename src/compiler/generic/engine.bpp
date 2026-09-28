@@ -5,15 +5,92 @@ import compiler.trait_runtime;
 import compiler.try_runtime;
 import compiler.core_utils;
 import compiler.symbol_runtime;
+import compiler.timings;
 import compiler.generic.core;
 import compiler.call_utils;
 import compiler.ast_lowering;
+import compiler.safe_lowering;
+import emitter.typeinfo;
 import std.io;
+import std.mem;
 import std.str;
 import std.vec;
 import std.hashmap;
 import ast;
 import types;
+
+const GENERIC_INFER_CACHE_CAPACITY = 8192;
+
+struct GenericInferCacheEntry {
+    public expr: u64;
+    public symtab: u64;
+    public epoch: u64;
+    public result: *TypeInfo;
+}
+
+func generic_infer_cache_begin(symtab: *HashMap<u64, *TypeInfo>) -> u64 {
+    var ctx: *CompilerCtx = compiler_ctx_current();
+    if (ctx.generic_infer_cache_entries == 0) {
+        ctx.generic_infer_cache_entries = heap_alloc(GENERIC_INFER_CACHE_CAPACITY * sizeof(GenericInferCacheEntry));
+        if (ctx.generic_infer_cache_entries != 0) {
+            memset(ctx.generic_infer_cache_entries, 0, GENERIC_INFER_CACHE_CAPACITY * sizeof(GenericInferCacheEntry));
+        }
+    }
+    ctx.generic_infer_cache_epoch = ctx.generic_infer_cache_epoch + 1;
+    if (ctx.generic_infer_cache_epoch == 0) { ctx.generic_infer_cache_epoch = 1; }
+    ctx.generic_infer_cache_symtab = (u64)symtab;
+    ctx.generic_infer_cache_generation = ctx.generation;
+    ctx.generic_infer_cache_enabled = ctx.generic_infer_cache_entries != 0;
+    return ctx.generic_infer_cache_enabled;
+}
+
+func generic_infer_cache_end() -> u64 {
+    var ctx: *CompilerCtx = compiler_ctx_current();
+    ctx.generic_infer_cache_enabled = 0;
+    ctx.generic_infer_cache_symtab = 0;
+    ctx.generic_infer_cache_generation = 0;
+    return 0;
+}
+
+func generic_infer_cache_invalidate(reason: u64) -> u64 {
+    var ctx: *CompilerCtx = compiler_ctx_current();
+    if (ctx.generic_infer_cache_enabled == 0) { return 0; }
+    ctx.generic_infer_cache_epoch = ctx.generic_infer_cache_epoch + 1;
+    if (ctx.generic_infer_cache_epoch == 0) { ctx.generic_infer_cache_epoch = 1; }
+    timings_note_infer_invalidation(reason);
+    return 0;
+}
+
+func generic_infer_cache_entry(expr: *AstNode, symtab: *HashMap<u64, *TypeInfo>) -> *GenericInferCacheEntry {
+    var mixed: u64 = ((u64)expr >> 3) ^ ((u64)symtab >> 4);
+    var index: u64 = mixed & (GENERIC_INFER_CACHE_CAPACITY - 1);
+    return (*GenericInferCacheEntry)(compiler_ctx_current().generic_infer_cache_entries + index * sizeof(GenericInferCacheEntry));
+}
+
+func generic_infer_cache_get(expr: *AstNode, symtab: *HashMap<u64, *TypeInfo>, found: *u64) -> *TypeInfo {
+    *found = 0;
+    var ctx: *CompilerCtx = compiler_ctx_current();
+    if (expr == 0 || ctx.generic_infer_cache_enabled == 0 ||
+        ctx.generic_infer_cache_entries == 0 || ctx.generic_infer_cache_symtab != (u64)symtab ||
+        ctx.generic_infer_cache_generation != ctx.generation) { return 0; }
+    var entry: *GenericInferCacheEntry = generic_infer_cache_entry(expr, symtab);
+    if (entry.expr != (u64)expr || entry.symtab != (u64)symtab || entry.epoch != ctx.generic_infer_cache_epoch) { return 0; }
+    *found = 1;
+    return entry.result;
+}
+
+func generic_infer_cache_put(expr: *AstNode, symtab: *HashMap<u64, *TypeInfo>, result: *TypeInfo) -> u64 {
+    var ctx: *CompilerCtx = compiler_ctx_current();
+    if (expr == 0 || result == 0 || ctx.generic_infer_cache_enabled == 0 ||
+        ctx.generic_infer_cache_entries == 0 || ctx.generic_infer_cache_symtab != (u64)symtab ||
+        ctx.generic_infer_cache_generation != ctx.generation) { return 0; }
+    var entry: *GenericInferCacheEntry = generic_infer_cache_entry(expr, symtab);
+    entry.expr = (u64)expr;
+    entry.symtab = (u64)symtab;
+    entry.epoch = ctx.generic_infer_cache_epoch;
+    entry.result = result;
+    return 1;
+}
 
 func generic_diag_error_name(code: u64, msg: u64, label: u64, name: []u8) -> u64 {
     diag_emit_error_tag("generic", code, msg);
@@ -104,18 +181,15 @@ func generic_type_is_integer_scalar(ti: *TypeInfo) -> u64 {
 
 func generic_type_clone_local(ti: *TypeInfo) -> *TypeInfo {
     if (ti == 0) { return generic_type_u64(); }
-    return generic_make_typeinfo_from_fields(
-        ti.type_kind,
-        ti.ptr_depth,
-        ti.is_tagged,
-        ti.struct_name,
-        ti.tag_layout,
-        ti.elem_type_kind,
-        ti.elem_ptr_depth,
-        ti.array_len,
-        ti.array_len_is_param,
-        ti.array_len_param
-    );
+    var out: *TypeInfo = typeinfo_new(ti.type_kind, ti.ptr_depth);
+    out.copy_from(ti);
+    return out;
+}
+
+func generic_infer_callable_result(ti: *TypeInfo) -> *TypeInfo {
+    var sig: *TypeInfo = typeinfo_func_signature(ti);
+    if (sig != 0 && sig.fn_ret_typeinfo != 0) { return generic_type_clone_local(sig.fn_ret_typeinfo); }
+    return generic_type_u64();
 }
 
 func generic_infer_binary_expr_type(bin: *AstBinary, symtab: *HashMap<u64, *TypeInfo>) -> *TypeInfo {
@@ -194,7 +268,29 @@ func generic_infer_try_type(tr: *AstTry, symtab: *HashMap<u64, *TypeInfo>) -> *T
     return generic_type_u64();
 }
 
-func generic_infer_call_return_type(call: *AstCall) -> *TypeInfo {
+func generic_infer_template_return(call: *AstCall, symtab: *HashMap<u64, *TypeInfo>) -> *TypeInfo {
+    var tpl: *GenericFuncTemplate = generic_resolve_template(call.name);
+    if (tpl == 0) { return 0; }
+    var fn: *AstFunc = tpl.func_def;
+    if (fn == 0) { fn = tpl.func_sig; }
+    if (fn == 0 || fn.params_vec == 0 || call.args_vec == 0) { return 0; }
+    if (fn.params_vec.len() != call.args_vec.len()) { return 0; }
+    // Type-directed lowering runs before monomorphization. Infer the result
+    // without creating an instance or diagnosing an incomplete call here.
+    var bindings: *Vec<*GenericBinding> = new Vec<*GenericBinding>{0, 0, 0};
+    for (var i: u64 = 0; i < fn.params_vec.len(); i++) {
+        var p: *Param = fn.params_vec.get(i);
+        if (p.is_variadic != 0) { return 0; }
+        var actual: *TypeInfo = generic_infer_expr_type(call.args_vec.get(i), symtab);
+        if (generic_infer_from_typeinfo(generic_make_typeinfo_from_param(p), actual, bindings) != 0) { return 0; }
+    }
+    var rt: *TypeInfo = ast_func_return_type(fn);
+    return generic_subst_typeinfo(rt.type_kind, rt.ptr_depth, rt.is_tagged, rt.struct_name, rt.tag_layout, rt.elem_type_kind, rt.elem_ptr_depth, rt.array_len, rt.array_len_is_param, rt.array_len_param, rt.elem_typeinfo, bindings);
+}
+
+func generic_infer_call_return_type(call: *AstCall, symtab: *HashMap<u64, *TypeInfo>) -> *TypeInfo {
+    var inferred: *TypeInfo = generic_infer_template_return(call, symtab);
+    if (inferred != 0) { return inferred; }
     var resolved_ptr: u64 = u8_slice_ptr(call.name);
     var resolved_len: u64 = u8_slice_len(call.name);
     var resolved: *NameInfo = resolve_name(call.name);
@@ -233,18 +329,7 @@ func generic_collect_call_arg_types(
 
 func generic_make_typeinfo_from_func_return(fn: *AstFunc) -> *TypeInfo {
     if (fn == 0) { return generic_type_u64(); }
-    return generic_make_typeinfo_from_fields(
-        fn.ret_type,
-        fn.ret_ptr_depth,
-        fn.ret_is_tagged,
-        fn.ret_struct_name,
-        fn.ret_tag_layout,
-        0,
-        0,
-        0,
-        0,
-        slice(0, 0)
-    );
+    return ast_func_return_type(fn);
 }
 
 func generic_find_func_signature_by_name(name: []u8) -> *AstFunc {
@@ -265,6 +350,15 @@ func generic_infer_method_call_type(
 ) -> *TypeInfo {
     if (mc == 0) { return generic_type_u64(); }
     var recv_ti: *TypeInfo = generic_infer_expr_type(mc.receiver, symtab);
+    if (recv_ti != 0 && recv_ti.type_kind == TYPE_TRAIT) {
+        var trait_def: *TraitDef = sym_get_trait_def(recv_ti.struct_name);
+        if (trait_def != 0 && trait_def.methods_vec != 0) {
+            for (var ti: u64 = 0; ti < trait_def.methods_vec.len(); ti++) {
+                var method: *TraitMethod = trait_def.methods_vec.get(ti);
+                if (str_eq(method.name, mc.method) != 0) { return generic_make_typeinfo_from_func_return(method.sig); }
+            }
+        }
+    }
     if (recv_ti == 0 || recv_ti.type_kind != TYPE_STRUCT) {
         return generic_type_u64();
     }
@@ -294,11 +388,18 @@ func generic_infer_method_call_type(
             return generic_make_typeinfo_from_func_return(fn_sig);
         }
     }
+    var field_ti: *TypeInfo = generic_find_struct_field_type(recv_ti.struct_name, slice(0, 0), mc.method);
+    if (field_ti != 0 && field_ti.type_kind == TYPE_FUNC) {
+        return generic_infer_callable_result(field_ti);
+    }
     return generic_type_u64();
 }
 
-func generic_infer_expr_type(expr: *AstNode, symtab: *HashMap<u64, *TypeInfo>) -> *TypeInfo {
+func generic_infer_expr_type_uncached(expr: *AstNode, symtab: *HashMap<u64, *TypeInfo>) -> *TypeInfo {
     var kind: u64 = ast_kind(expr);
+    if (kind == AST_VARIADIC_PACK) {
+        return ast_variadic_pack_type((*AstVariadicPack)expr);
+    }
     match (kind) {
         case AST_LITERAL:
             return generic_type_number();
@@ -332,7 +433,7 @@ func generic_infer_expr_type(expr: *AstNode, symtab: *HashMap<u64, *TypeInfo>) -
                 return generic_type_u64();
             }
             if (sym_func_exists(id.name) != 0) {
-                return generic_make_typeinfo_from_fields(TYPE_FUNC, 0, 0, slice(0, 0), slice(0, 0), 0, 0, 0, 0, slice(0, 0));
+                return typeinfo_from_func_decl(sym_get_func(id.name));
             }
             return generic_type_unknown();
         case AST_SUPER:
@@ -340,32 +441,51 @@ func generic_infer_expr_type(expr: *AstNode, symtab: *HashMap<u64, *TypeInfo>) -
         case AST_ADDR_OF:
             var a: *AstAddrOf = (*AstAddrOf)expr;
             var base_t: *TypeInfo = generic_infer_expr_type(a.operand, symtab);
-            return generic_make_typeinfo_from_fields(base_t.type_kind, base_t.ptr_depth + 1, base_t.is_tagged, base_t.struct_name, base_t.tag_layout, base_t.elem_type_kind, base_t.elem_ptr_depth, base_t.array_len, base_t.array_len_is_param, base_t.array_len_param);
+            var addr_t: *TypeInfo = generic_type_clone_local(base_t);
+            addr_t.ptr_depth = addr_t.ptr_depth + 1;
+            return addr_t;
         case AST_DEREF:
             var d: *AstDeref = (*AstDeref)expr;
             var dt: *TypeInfo = generic_infer_expr_type(d.operand, symtab);
             if (dt.ptr_depth == 0) { return generic_type_u64(); }
-            return generic_make_typeinfo_from_fields(dt.type_kind, dt.ptr_depth - 1, dt.is_tagged, dt.struct_name, dt.tag_layout, dt.elem_type_kind, dt.elem_ptr_depth, dt.array_len, dt.array_len_is_param, dt.array_len_param);
+            var deref_t: *TypeInfo = generic_type_clone_local(dt);
+            deref_t.ptr_depth = deref_t.ptr_depth - 1;
+            return deref_t;
         case AST_CAST:
             var c: *AstCast = (*AstCast)expr;
-            return generic_make_typeinfo_from_fields(c.target_type, c.target_ptr_depth, c.target_is_tagged, c.struct_name, c.tag_layout, 0, 0, 0, 0, slice(0, 0));
-        case AST_INDEX:
+            return ast_cast_target_type(c);
+        case AST_SLICE:
+            var slice_expr: *AstSlice = (*AstSlice)expr;
+            var slice_ptr_ti: *TypeInfo = generic_infer_expr_type(slice_expr.ptr_expr, symtab);
+            if (slice_ptr_ti == 0 || slice_ptr_ti.ptr_depth == 0) { return generic_type_unknown(); }
+            var slice_elem: *TypeInfo = generic_type_clone_local(slice_ptr_ti);
+            slice_elem.ptr_depth = slice_elem.ptr_depth - 1;
+            var slice_ti: *TypeInfo = typeinfo_new(TYPE_SLICE, 0);
+            slice_ti.elem_type_kind = slice_elem.type_kind;
+            slice_ti.elem_ptr_depth = slice_elem.ptr_depth;
+            slice_ti.elem_typeinfo = slice_elem;
+            slice_ti.struct_name = slice_elem.struct_name;
+            return slice_ti;
         case AST_SAFE_INDEX:
+        case AST_SAFE_MEMBER_ACCESS:
+        case AST_SAFE_METHOD_CALL:
+            return safe_lower_infer_type(expr, symtab);
+        case AST_INDEX:
             var ix: *AstIndex = (*AstIndex)expr;
             var bt: *TypeInfo = generic_infer_expr_type(ix.base, symtab);
-            if (bt.type_kind == TYPE_ARRAY || bt.type_kind == TYPE_SLICE) {
-                return generic_make_typeinfo_from_fields(bt.elem_type_kind, bt.elem_ptr_depth, 0, bt.struct_name, slice(0, 0), 0, 0, 0, 0, slice(0, 0));
-            }
             if (bt.ptr_depth > 0) {
-                return generic_make_typeinfo_from_fields(bt.type_kind, bt.ptr_depth - 1, bt.is_tagged, bt.struct_name, bt.tag_layout, bt.elem_type_kind, bt.elem_ptr_depth, bt.array_len, bt.array_len_is_param, bt.array_len_param);
+                var index_t: *TypeInfo = generic_type_clone_local(bt);
+                index_t.ptr_depth = index_t.ptr_depth - 1;
+                return index_t;
+            }
+            if (bt.type_kind == TYPE_ARRAY || bt.type_kind == TYPE_SLICE) {
+                if (bt.elem_typeinfo != 0) { return generic_type_clone_local(bt.elem_typeinfo); }
+                return generic_make_typeinfo_from_fields(bt.elem_type_kind, bt.elem_ptr_depth, 0, bt.struct_name, slice(0, 0), 0, 0, 0, 0, slice(0, 0));
             }
             return generic_type_u64();
         case AST_MEMBER_ACCESS:
             var ma: *AstMemberAccess = (*AstMemberAccess)expr;
             return generic_infer_member_access_type(ma, symtab);
-        case AST_SAFE_MEMBER_ACCESS:
-            var sma: *AstMemberAccess = (*AstMemberAccess)expr;
-            return generic_infer_member_access_type(sma, symtab);
         case AST_TRY:
             var tr: *AstTry = (*AstTry)expr;
             return generic_infer_try_type(tr, symtab);
@@ -399,7 +519,7 @@ func generic_infer_expr_type(expr: *AstNode, symtab: *HashMap<u64, *TypeInfo>) -
                 if (local_call_ti != 0) {
                     // Local symbol call (fn ptr / closure handle / shadowing value):
                     // do not resolve via free-function tables by suffix.
-                    return generic_type_u64();
+                    return generic_infer_callable_result(local_call_ti);
                 }
             }
             var call_resolved_ptr: u64 = u8_slice_ptr(call_expr.name);
@@ -414,17 +534,33 @@ func generic_infer_expr_type(expr: *AstNode, symtab: *HashMap<u64, *TypeInfo>) -
                 call_ginfo = sym_find_global_info(call_expr.name);
             }
             if (call_ginfo != 0) {
-                if (call_ginfo.typeinfo_ptr != 0) { return call_ginfo.typeinfo_ptr; }
-                return generic_type_u64();
+                return generic_infer_callable_result(call_ginfo.typeinfo_ptr);
             }
-            return generic_infer_call_return_type(call_expr);
+            return generic_infer_call_return_type(call_expr, symtab);
+        case AST_CALL_PTR:
+            return generic_infer_callable_result(generic_infer_expr_type(((*AstCallPtr)expr).callee, symtab));
         case AST_METHOD_CALL:
-        case AST_SAFE_METHOD_CALL:
             var mc_expr: *AstMethodCall = (*AstMethodCall)expr;
             return generic_infer_method_call_type(mc_expr, symtab);
         default:
             return generic_type_u64();
     }
+}
+
+func generic_infer_expr_type(expr: *AstNode, symtab: *HashMap<u64, *TypeInfo>) -> *TypeInfo {
+    var found: u64 = 0;
+    var cached: *TypeInfo = generic_infer_cache_get(expr, symtab, &found);
+    if (found != 0) {
+        timings_note_infer_call(1);
+        return cached;
+    }
+    var result: *TypeInfo = generic_infer_expr_type_uncached(expr, symtab);
+    var ctx: *CompilerCtx = compiler_ctx_current();
+    if (ctx.generic_infer_cache_enabled != 0 && ctx.generic_infer_cache_symtab == (u64)symtab) {
+        timings_note_infer_call(0);
+        generic_infer_cache_put(expr, symtab, result);
+    }
+    return result;
 }
 
 func generic_collect_var_decls(stmt: *AstNode, symtab: *HashMap<u64, *TypeInfo>) -> u64 {
@@ -670,27 +806,22 @@ func generic_clone_expr(node: *AstNode, bindings: *Vec<*GenericBinding>) -> *Ast
         case AST_DEREF8:
             return ast_deref8(generic_clone_expr(nref.deref8.operand, bindings));
         case AST_CAST:
-            var sub: *TypeInfo = generic_subst_typeinfo(nref.cast_expr.target_type, nref.cast_expr.target_ptr_depth, nref.cast_expr.target_is_tagged, nref.cast_expr.struct_name, nref.cast_expr.tag_layout, 0, 0, 0, 0, slice(0, 0), 0, bindings);
+            var cast_type: *TypeInfo = ast_cast_target_type(nref.cast_expr);
+            var sub: *TypeInfo = generic_subst_typeinfo(cast_type.type_kind, cast_type.ptr_depth, cast_type.is_tagged, cast_type.struct_name, cast_type.tag_layout, cast_type.elem_type_kind, cast_type.elem_ptr_depth, cast_type.array_len, cast_type.array_len_is_param, cast_type.array_len_param, cast_type.elem_typeinfo, bindings);
             var ti: *TypeInfo = sub;
-            return ast_cast_ex(generic_clone_expr(nref.cast_expr.expr, bindings), ti.type_kind, ti.ptr_depth, ti.is_tagged, ti.struct_name, ti.tag_layout);
+            return ast_cast_typed(generic_clone_expr(nref.cast_expr.expr, bindings), ti);
         case AST_MEMBER_ACCESS:
-            if (u8_slice_ptr(nref.member_access.parent) != 0) {
-                return ast_member_access_scoped(
-                    generic_clone_expr(nref.member_access.object, bindings),
-                    nref.member_access.parent,
-                    nref.member_access.member
-                );
-            }
-            return ast_member_access(generic_clone_expr(nref.member_access.object, bindings), nref.member_access.member);
+            var member_copy: *AstMemberAccess = ast_member_access_scoped(
+                generic_clone_expr(nref.member_access.object, bindings),
+                nref.member_access.parent, nref.member_access.member);
+            member_copy.is_raw = nref.member_access.is_raw;
+            return member_copy;
         case AST_SAFE_MEMBER_ACCESS:
-            if (u8_slice_ptr(nref.member_access.parent) != 0) {
-                return ast_safe_member_access_scoped(
-                    generic_clone_expr(nref.member_access.object, bindings),
-                    nref.member_access.parent,
-                    nref.member_access.member
-                );
-            }
-            return ast_safe_member_access(generic_clone_expr(nref.member_access.object, bindings), nref.member_access.member);
+            var safe_member_copy: *AstMemberAccess = ast_safe_member_access_scoped(
+                generic_clone_expr(nref.member_access.object, bindings),
+                nref.member_access.parent, nref.member_access.member);
+            safe_member_copy.is_raw = nref.member_access.is_raw;
+            return safe_member_copy;
         case AST_METHOD_CALL:
             var args2: *Vec<*AstNode> = generic_clone_args_vec(nref.method_call.args_vec, bindings);
             var arg_names2: *Vec<*NameInfo> = generic_clone_arg_names(nref.method_call.arg_names_vec);
@@ -703,7 +834,13 @@ func generic_clone_expr(node: *AstNode, bindings: *Vec<*GenericBinding>) -> *Ast
             return ast_try(generic_clone_expr(nref.try_expr.operand, bindings));
         case AST_STRUCT_LITERAL:
             var vals: *Vec<*AstNode> = generic_clone_args_vec(nref.struct_lit.values_vec, bindings);
-            return ast_struct_literal(nref.struct_lit.struct_def, vals);
+            var literal_def: *AstStructDef = nref.struct_lit.struct_def;
+            if (literal_def != 0 && bindings != 0) {
+                var literal_type: *TypeInfo = generic_subst_typeinfo(TYPE_STRUCT, 0, 0, literal_def.name, slice(0, 0), 0, 0, 0, 0, slice(0, 0), 0, bindings);
+                var concrete_def: *AstStructDef = get_struct_def(literal_type.struct_name);
+                if (concrete_def != 0) { literal_def = concrete_def; }
+            }
+            return ast_struct_literal(literal_def, vals);
         case AST_SIZEOF:
             var sub2: *TypeInfo = generic_subst_typeinfo(nref.sizeof_type.type_kind, nref.sizeof_type.ptr_depth, 0, nref.sizeof_type.struct_name, slice(0, 0), nref.sizeof_type.elem_type_kind, nref.sizeof_type.elem_ptr_depth, nref.sizeof_type.array_len, nref.sizeof_type.array_len_is_param, nref.sizeof_type.array_len_param, nref.sizeof_type.elem_typeinfo, bindings);
             var ti2: *TypeInfo = sub2;
@@ -719,6 +856,11 @@ func generic_clone_expr(node: *AstNode, bindings: *Vec<*GenericBinding>) -> *Ast
             return (*AstNode)ast_safe_index(generic_clone_expr(nref.index_expr.base, bindings), generic_clone_expr(nref.index_expr.index, bindings));
         case AST_SLICE:
             return ast_slice(generic_clone_expr(nref.slice_expr.ptr_expr, bindings), generic_clone_expr(nref.slice_expr.len_expr, bindings));
+        case AST_VARIADIC_PACK:
+            var pack: *AstVariadicPack = (*AstVariadicPack)node;
+            var elem: *TypeInfo = pack.elem_typeinfo;
+            var sub_elem: *TypeInfo = generic_subst_typeinfo(elem.type_kind, elem.ptr_depth, elem.is_tagged, elem.struct_name, elem.tag_layout, elem.elem_type_kind, elem.elem_ptr_depth, elem.array_len, elem.array_len_is_param, elem.array_len_param, elem.elem_typeinfo, bindings);
+            return ast_variadic_pack(generic_clone_args_vec(pack.values_vec, bindings), sub_elem);
         case AST_CALL_PTR:
             var args3: *Vec<*AstNode> = generic_clone_args_vec(nref.call_ptr.args_vec, bindings);
             return ast_call_ptr(generic_clone_expr(nref.call_ptr.callee, bindings), args3);
@@ -826,15 +968,20 @@ func generic_clone_func(template_ptr: *AstFunc, bindings: *Vec<*GenericBinding>,
         var np: *Param = new Param{};
         np.name = p.name;
         np.fill_from_typeinfo(ti);
+        np.is_variadic = p.is_variadic;
+        np.has_default = p.has_default;
+        np.default_expr = (u64)generic_clone_expr((*AstNode)p.default_expr, bindings);
         if (np.elem_typeinfo == 0) {
             np.elem_typeinfo = p.elem_typeinfo;
         }
         params_out.push(np);
     }
 
-    var rt: *TypeInfo = generic_subst_typeinfo(fn.ret_type, fn.ret_ptr_depth, fn.ret_is_tagged, fn.ret_struct_name, fn.ret_tag_layout, 0, 0, 0, 0, slice(0, 0), 0, bindings);
+    var original_ret: *TypeInfo = ast_func_return_type(fn);
+    var rt: *TypeInfo = generic_subst_typeinfo(original_ret.type_kind, original_ret.ptr_depth, original_ret.is_tagged, original_ret.struct_name, original_ret.tag_layout, original_ret.elem_type_kind, original_ret.elem_ptr_depth, original_ret.array_len, original_ret.array_len_is_param, original_ret.array_len_param, original_ret.elem_typeinfo, bindings);
     var body_out: *AstNode = generic_clone_stmt(fn.body, bindings);
     var fn_out: *AstFunc = ast_func_ex(slice(new_name.ptr, new_name.len), params_out, rt.type_kind, rt.ptr_depth, rt.is_tagged, rt.struct_name, rt.tag_layout, body_out);
+    fn_out.ret_typeinfo = rt;
     fn_out.annotations_vec = fn.annotations_vec;
     return fn_out;
 }
@@ -849,14 +996,19 @@ func generic_clone_func_sig(template_ptr: *AstFunc, bindings: *Vec<*GenericBindi
         var np: *Param = new Param{};
         np.name = p.name;
         np.fill_from_typeinfo(ti);
+        np.is_variadic = p.is_variadic;
+        np.has_default = p.has_default;
+        np.default_expr = (u64)generic_clone_expr((*AstNode)p.default_expr, bindings);
         if (np.elem_typeinfo == 0) {
             np.elem_typeinfo = p.elem_typeinfo;
         }
         params_out.push(np);
     }
 
-    var rt: *TypeInfo = generic_subst_typeinfo(fn.ret_type, fn.ret_ptr_depth, fn.ret_is_tagged, fn.ret_struct_name, fn.ret_tag_layout, 0, 0, 0, 0, slice(0, 0), 0, bindings);
+    var original_ret: *TypeInfo = ast_func_return_type(fn);
+    var rt: *TypeInfo = generic_subst_typeinfo(original_ret.type_kind, original_ret.ptr_depth, original_ret.is_tagged, original_ret.struct_name, original_ret.tag_layout, original_ret.elem_type_kind, original_ret.elem_ptr_depth, original_ret.array_len, original_ret.array_len_is_param, original_ret.array_len_param, original_ret.elem_typeinfo, bindings);
     var fn_out: *AstFunc = ast_func_ex(slice(new_name.ptr, new_name.len), params_out, rt.type_kind, rt.ptr_depth, rt.is_tagged, rt.struct_name, rt.tag_layout, 0);
+    fn_out.ret_typeinfo = rt;
     fn_out.annotations_vec = fn.annotations_vec;
     return fn_out;
 }
@@ -1225,13 +1377,16 @@ func generic_clone_struct(template_def: *AstStructDef, bindings: *Vec<*GenericBi
 
 func generic_struct_get_or_create_instance(tpl_ptr: *GenericStructTemplate, bindings: *Vec<*GenericBinding>) -> *NameInfo {
     var tpl: *GenericStructTemplate = tpl_ptr;
-    var name_info: *NameInfo = generic_mangle_name(tpl.name, tpl.params_vec, bindings);
+    var template_name: []u8 = tpl.mangled_name;
+    if (template_name.ptr == 0 || template_name.len == 0) { template_name = tpl.name; }
+    var name_info: *NameInfo = generic_mangle_name(template_name, tpl.params_vec, bindings);
     var inst_ptr: u64 = name_info.ptr;
     var inst_len: u64 = name_info.len;
 
     if (g_compiler_ctx.generic_struct_instantiations != 0) {
         var exists: *AstStructDef = g_compiler_ctx.generic_struct_instantiations.get(slice(inst_ptr, inst_len));
         if (exists != 0) {
+            sym_register_struct_visible_in_module(exists, g_compiler_ctx.current_module);
             sym_register_generic_struct_bindings(slice(inst_ptr, inst_len), bindings);
             return name_info;
         }
@@ -1245,6 +1400,9 @@ func generic_struct_get_or_create_instance(tpl_ptr: *GenericStructTemplate, bind
 
     var struct_new: *AstStructDef = generic_clone_struct(def_src, bindings, slice(inst_ptr, inst_len));
     register_struct_type(struct_new);
+    if (tpl.module.ptr != 0 && tpl.module.len != 0) {
+        sym_register_struct_module(struct_new, tpl.module);
+    }
 
     if (g_compiler_ctx.generic_struct_instantiations == 0) {
         g_compiler_ctx.generic_struct_instantiations = new HashMap<u64, *AstStructDef>{0, 0, 0};
@@ -1280,8 +1438,17 @@ func generic_build_bindings_by_infer(tpl_ptr: *GenericFuncTemplate, call_args: *
     for (var i: u64 = 0; i < pn; i++) {
         var p: *Param = params.get(i);
         var arg_expr: *AstNode = call_args.get(i);
+        if (p.is_variadic != 0 && ast_kind(arg_expr) == AST_VARIADIC_PACK) {
+            var pack: *AstVariadicPack = (*AstVariadicPack)arg_expr;
+            var elem: *TypeInfo = p.elem_typeinfo;
+            for (var vi: u64 = 0; vi < pack.values_vec.len(); vi++) {
+                var value_ti: *TypeInfo = generic_infer_expr_type(pack.values_vec.get(vi), symtab);
+                if (generic_infer_from_typeinfo(elem, value_ti, bindings) != 0) { return 0; }
+            }
+            continue;
+        }
         var arg_ti: *TypeInfo = generic_infer_expr_type(arg_expr, symtab);
-        if (generic_infer_from_typeinfo(p.type_kind, p.ptr_depth, p.struct_name, p.elem_type_kind, p.elem_ptr_depth, p.array_len, p.array_len_is_param, p.array_len_param, arg_ti, bindings) != 0) {
+        if (generic_infer_from_typeinfo(generic_make_typeinfo_from_param(p), arg_ti, bindings) != 0) {
             return 0;
         }
     }
@@ -1407,10 +1574,25 @@ const COMPILER_AST_WALK_LOWER_PARSE_SUGAR = 1;
 const COMPILER_AST_WALK_VALIDATE_DIRECT_IMPL = 2;
 const COMPILER_AST_WALK_LOWER_SUPER = 3;
 const COMPILER_AST_WALK_FIND_SUPER_CTOR = 4;
+const COMPILER_AST_WALK_VALIDATE_DECLARED_TYPES = 5;
+const COMPILER_AST_WALK_SAFE_CAPTURE = 6;
+const COMPILER_AST_WALK_COUNT_SUPER_CTOR = 7;
+const COMPILER_AST_WALK_FIND_GC_SLOTS = 8;
+
+struct CompilerSafeCaptureCtx {
+    public source_types: *HashMap<u64, *TypeInfo>;
+    public helper_types: *HashMap<u64, *TypeInfo>;
+    public names: *HashMap<u64, *NameInfo>;
+    public params: *Vec<*Param>;
+    public args: *Vec<*AstNode>;
+}
 
 struct CompilerAstWalker {
     public mode: u64;
     public owner: []u8;
     public super_allowed: u64;
     public found: u64;
+    public generic_params_vec: *Vec<*GenericParam>;
+    public allow_self_type: u64;
+    public safe_capture: *CompilerSafeCaptureCtx;
 }

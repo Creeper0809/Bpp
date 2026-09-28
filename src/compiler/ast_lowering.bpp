@@ -132,6 +132,15 @@ func lower_should_consume_legacy_string_len_arg(arg_expr: *AstNode, arg_names: *
     return 0;
 }
 
+func lower_normalize_call_args_with_symtab(call_name: []u8, params: *Vec<*Param>, params_start: u64, args: *Vec<*AstNode>, arg_names: *Vec<*NameInfo>, symtab: *Symtab) -> *Vec<*AstNode> {
+    var previous: *HashMap<u64, *TypeInfo> = g_lower_parse_sugar_symtab;
+    g_lower_parse_sugar_symtab = 0;
+    if (symtab != 0) { g_lower_parse_sugar_symtab = symtab.name_to_type_map; }
+    var result: *Vec<*AstNode> = lower_normalize_call_args_for_params(call_name, params, params_start, args, arg_names);
+    g_lower_parse_sugar_symtab = previous;
+    return result;
+}
+
 func lower_normalize_call_args_for_params(call_name: []u8, params: *Vec<*Param>, params_start: u64, args: *Vec<*AstNode>, arg_names: *Vec<*NameInfo>) -> *Vec<*AstNode> {
     var input_args: *Vec<*AstNode> = args;
     if (input_args == 0) { input_args = new Vec<*AstNode>{heap_alloc((0) * sizeof(*AstNode)), 0, (0)}; }
@@ -258,7 +267,14 @@ func lower_normalize_call_args_for_params(call_name: []u8, params: *Vec<*Param>,
     if (has_variadic == 0) {
         return out_fixed;
     }
-    return call_pack_variadic_args(out_fixed, variadic_args);
+    var rest_param: *Param = params.get(param_count - 1);
+    var elem: *TypeInfo = rest_param.elem_typeinfo;
+    var packed_args: *Vec<*AstNode> = call_pack_variadic_args(out_fixed, variadic_args, elem);
+    var pack: *AstVariadicPack = (*AstVariadicPack)packed_args.get(fixed_count);
+    for (var vi: u64 = 0; vi < pack.values_vec.len(); vi++) {
+        pack.values_vec.set(vi, lower_parse_sugar_expr_for_type(pack.values_vec.get(vi), elem));
+    }
+    return packed_args;
 }
 
 func lower_method_func_name_matches(fn: *AstFunc, method: []u8) -> u64 {
@@ -430,6 +446,34 @@ func lower_find_generic_template_for_call(name: []u8) -> *GenericFuncTemplate {
     return found;
 }
 
+func lower_contextualize_implicit_generic_call(expr: *AstNode, expected_type: *TypeInfo) -> *AstNode {
+    if (expr == 0 || expected_type == 0 || generic_type_is_integer_scalar(expected_type) == 0) { return expr; }
+    if (ast_kind(expr) != AST_CALL) { return expr; }
+    var call: *AstCall = (*AstCall)expr;
+    if (call.args_vec == 0 || call.arg_names_vec != 0) { return expr; }
+
+    var tpl: *GenericFuncTemplate = lower_find_generic_template_for_call(call.name);
+    if (tpl == 0) { return expr; }
+    var fn: *AstFunc = tpl.func_def;
+    if (fn == 0) { fn = tpl.func_sig; }
+    if (fn == 0 || fn.params_vec == 0) { return expr; }
+
+    var return_pattern: *TypeInfo = ast_func_return_type(fn);
+    if (return_pattern == 0 || return_pattern.type_kind != TYPE_GENERIC || return_pattern.ptr_depth != 0) { return expr; }
+    var param_count: u64 = fn.params_vec.len();
+    if (param_count != call.args_vec.len()) { return expr; }
+
+    for (var i: u64 = 0; i < param_count; i++) {
+        var param: *Param = fn.params_vec.get(i);
+        var arg: *AstNode = call.args_vec.get(i);
+        if (param == 0 || param.type_kind != TYPE_GENERIC || param.ptr_depth != 0) { continue; }
+        if (str_eq(param.struct_name, return_pattern.struct_name) == 0) { continue; }
+        if (lower_is_integer_literal_expr(arg) == 0) { continue; }
+        call.args_vec.set(i, lower_make_scalar_cast(arg, expected_type.type_kind));
+    }
+    return expr;
+}
+
 func lower_normalize_direct_call_args(call: *AstCall) -> u64 {
     if (call == 0) { return 0; }
     var fn: *AstFunc = lower_find_func_signature_for_call(call.name);
@@ -448,27 +492,9 @@ func lower_normalize_direct_call_args(call: *AstCall) -> u64 {
 }
 
 func lower_normalize_generic_call_args(gcall: *AstGenericCall) -> u64 {
-    if (gcall == 0) { return 0; }
-    var tpl: *GenericFuncTemplate = lower_find_generic_template_for_call(gcall.name);
-    if (tpl == 0) {
-        if (call_has_named_args(gcall.arg_names_vec) != 0) {
-            diag_emit_error_tag("lowering", "L1005", "named arguments require a known generic function signature");
-            diag_emit_labelled_name("call: ", gcall.name);
-            diag_error("Compiler error");
-            return 0;
-        }
-        return 0;
-    }
-    var fn: *AstFunc = tpl.func_def;
-    if (fn == 0) { fn = tpl.func_sig; }
-    if (fn == 0) {
-        diag_emit_error_tag("lowering", "L1006", "missing generic function signature for call");
-        diag_emit_labelled_name("call: ", gcall.name);
-        diag_error("Compiler error");
-        return 0;
-    }
-    gcall.args_vec = lower_normalize_call_args_for_params(gcall.name, fn.params_vec, 0, gcall.args_vec, gcall.arg_names_vec);
-    gcall.arg_names_vec = 0;
+    // Explicit type arguments determine the concrete parameter/default types.
+    // Keep names and expressions intact until generic instantiation, then use
+    // the same normalizer as an ordinary call to the instantiated signature.
     return 0;
 }
 
@@ -1586,26 +1612,26 @@ func lower_expr_returns_number_value(expr: *AstNode, actual_ti: *TypeInfo) -> u6
     return 0;
 }
 
-func lower_number_to_integer_method_name(kind: u64) -> *NameInfo {
+func lower_number_to_integer_method_name(kind: u64) -> NameInfo {
     match (kind) {
-        case TYPE_I8: return new NameInfo{(u64)"to_i8_checked_value", str_len("to_i8_checked_value")};
-        case TYPE_I16: return new NameInfo{(u64)"to_i16_checked_value", str_len("to_i16_checked_value")};
-        case TYPE_I32: return new NameInfo{(u64)"to_i32_checked_value", str_len("to_i32_checked_value")};
-        case TYPE_I64: return new NameInfo{(u64)"to_i64_checked_value", str_len("to_i64_checked_value")};
-        case TYPE_U8: return new NameInfo{(u64)"to_u8_checked_value", str_len("to_u8_checked_value")};
-        case TYPE_U16: return new NameInfo{(u64)"to_u16_checked_value", str_len("to_u16_checked_value")};
-        case TYPE_U32: return new NameInfo{(u64)"to_u32_checked_value", str_len("to_u32_checked_value")};
-        case TYPE_U64: return new NameInfo{(u64)"to_u64_checked_value", str_len("to_u64_checked_value")};
+        case TYPE_I8: return NameInfo{(u64)"to_i8_checked_value", str_len("to_i8_checked_value")};
+        case TYPE_I16: return NameInfo{(u64)"to_i16_checked_value", str_len("to_i16_checked_value")};
+        case TYPE_I32: return NameInfo{(u64)"to_i32_checked_value", str_len("to_i32_checked_value")};
+        case TYPE_I64: return NameInfo{(u64)"to_i64_checked_value", str_len("to_i64_checked_value")};
+        case TYPE_U8: return NameInfo{(u64)"to_u8_checked_value", str_len("to_u8_checked_value")};
+        case TYPE_U16: return NameInfo{(u64)"to_u16_checked_value", str_len("to_u16_checked_value")};
+        case TYPE_U32: return NameInfo{(u64)"to_u32_checked_value", str_len("to_u32_checked_value")};
+        case TYPE_U64: return NameInfo{(u64)"to_u64_checked_value", str_len("to_u64_checked_value")};
     }
-    return 0;
+    return NameInfo{0, 0};
 }
 
 func lower_wrap_number_expr_to_integer(expr: *AstNode, target_kind: u64, actual_ti: *TypeInfo) -> *AstNode {
     if (expr == 0) { return 0; }
     if (lower_type_kind_is_integer(target_kind) == 0) { return 0; }
     if (lower_expr_returns_number_value(expr, actual_ti) == 0) { return 0; }
-    var method: *NameInfo = lower_number_to_integer_method_name(target_kind);
-    if (method == 0) { return 0; }
+    var method: NameInfo = lower_number_to_integer_method_name(target_kind);
+    if (method.ptr == 0) { return 0; }
     return (*AstNode)ast_method_call(
         expr,
         slice(method.ptr, method.len),
@@ -1815,6 +1841,11 @@ func lower_number_storage_stmt_contains_inline_asm(stmt: u64) -> u64 {
         case AST_DEFER:
             var df: *AstDefer = nref.defer_stmt;
             return lower_number_storage_stmt_contains_inline_asm(df.stmt);
+        case AST_TRY_STMT:
+            var ts: *AstTryStmt = (*AstTryStmt)stmt;
+            if (lower_number_storage_stmt_contains_inline_asm(ts.try_block) != 0) { return 1; }
+            if (lower_number_storage_stmt_contains_inline_asm(ts.catch_block) != 0) { return 1; }
+            return lower_number_storage_stmt_contains_inline_asm(ts.finally_block);
         case AST_IF:
             var ifs: *AstIf = nref.if_stmt;
             if (lower_number_storage_stmt_contains_inline_asm(ifs.then_block) != 0) { return 1; }
@@ -1974,6 +2005,8 @@ func lower_number_storage_scan_expr(candidates: *HashMap<u64, u64>, blocked: *Ha
         case AST_SLICE:
             var sl: *AstSlice = nref.slice_expr;
             return lower_number_storage_scan_pair(candidates, blocked, sl.ptr_expr, sl.len_expr);
+        case AST_VARIADIC_PACK:
+            return lower_number_storage_scan_expr_vec(candidates, blocked, ((*AstVariadicPack)expr).values_vec);
         case AST_SIZEOF_EXPR:
             var se: *AstSizeofExpr = nref.sizeof_expr;
             return lower_number_storage_scan_expr(candidates, blocked, se.expr);
@@ -2240,15 +2273,13 @@ func lower_var_decl_register_typeinfo(vd: *AstVarDecl, ti: *TypeInfo) -> u64 {
     if (vd == 0 || ti == 0) { return 0; }
     if (g_lower_parse_sugar_symtab == 0) { return 0; }
     g_lower_parse_sugar_symtab.put(vd.name, ti);
+    generic_infer_cache_invalidate(3);
     return 0;
 }
 
 func lower_var_decl_infer_from_init(vd: *AstVarDecl) -> u64 {
     if (vd == 0 || vd.init_expr == 0) { return 0; }
-    if (lower_var_decl_needs_inference(vd) == 0) {
-        lower_var_decl_register_typeinfo(vd, lower_make_typeinfo_from_vardecl(vd));
-        return 1;
-    }
+    if (lower_var_decl_needs_inference(vd) == 0) { return 1; }
 
     var inferred_ti: *TypeInfo = lower_infer_known_call_type(vd.init_expr);
     if (inferred_ti == 0) {
@@ -2275,7 +2306,6 @@ func lower_var_decl_infer_from_init(vd: *AstVarDecl) -> u64 {
         inferred_ti.struct_def != 0) {
         vd.struct_name = inferred_ti.struct_def.name;
     }
-    lower_var_decl_register_typeinfo(vd, lower_make_typeinfo_from_vardecl(vd));
     return 1;
 }
 
@@ -2288,7 +2318,7 @@ func lower_make_typeinfo_from_param(param: *Param) -> *TypeInfo {
 
 func lower_make_typeinfo_from_func_return(fn: *AstFunc) -> *TypeInfo {
     if (fn == 0) { return 0; }
-    return generic_make_typeinfo_from_fields(fn.ret_type, fn.ret_ptr_depth, fn.ret_is_tagged, fn.ret_struct_name, fn.ret_tag_layout, 0, 0, 0, 0, slice(0, 0));
+    return ast_func_return_type(fn);
 }
 
 func lower_is_direct_input_call(expr: *AstNode) -> *AstCall {
@@ -2545,8 +2575,8 @@ func lower_parse_sugar_expr_for_type(expr: *AstNode, expected_ti: *TypeInfo) -> 
 
 func lower_parse_sugar_binary_operator(bin: *AstBinary) -> *AstNode {
     if (bin == 0) { return 0; }
-    var literal_method_name: *NameInfo = compiler_operator_binary_name(bin.op);
-    if (literal_method_name != 0 && lower_is_integer_literal_expr(bin.right) != 0) {
+    var literal_method_name: NameInfo = compiler_operator_binary_name(bin.op);
+    if (literal_method_name.ptr != 0 && lower_is_integer_literal_expr(bin.right) != 0) {
         var literal_recv_ti: *TypeInfo = lower_operator_receiver_type(bin.left);
         if (literal_recv_ti != 0 && lower_is_number_struct_type(literal_recv_ti) == 0) {
             var literal_target_type: u64 = TYPE_U64;
@@ -2567,8 +2597,8 @@ func lower_parse_sugar_binary_operator(bin: *AstBinary) -> *AstNode {
     var right_is_number: u64 = lower_is_number_struct_type(right_ti);
     if (left_is_number != 0 || right_is_number != 0) { return (*AstNode)bin; }
 
-    var method_name: *NameInfo = compiler_operator_binary_name(bin.op);
-    if (method_name == 0) { return (*AstNode)bin; }
+    var method_name: NameInfo = compiler_operator_binary_name(bin.op);
+    if (method_name.ptr == 0) { return (*AstNode)bin; }
 
     var arg_types: *Vec<*TypeInfo> = lower_operator_arg_type_vec1(bin.right);
     if (lower_operator_can_dispatch(bin.left, slice(method_name.ptr, method_name.len), arg_types, 1) == 0) {
@@ -2585,8 +2615,8 @@ func lower_parse_sugar_unary_operator(un: *AstUnary) -> *AstNode {
     var operand_ti: *TypeInfo = lower_operator_receiver_type(un.operand);
     if (lower_is_number_struct_type(operand_ti) != 0) { return (*AstNode)un; }
 
-    var method_name: *NameInfo = compiler_operator_unary_name(un.op);
-    if (method_name == 0) { return (*AstNode)un; }
+    var method_name: NameInfo = compiler_operator_unary_name(un.op);
+    if (method_name.ptr == 0) { return (*AstNode)un; }
 
     if (lower_operator_can_dispatch(un.operand, slice(method_name.ptr, method_name.len), 0, 0) == 0) {
         return (*AstNode)un;
@@ -2598,7 +2628,7 @@ func lower_parse_sugar_unary_operator(un: *AstUnary) -> *AstNode {
 
 func lower_parse_sugar_index_operator(ix: *AstIndex) -> *AstNode {
     if (ix == 0) { return 0; }
-    var method_name: *NameInfo = compiler_operator_index_get_name();
+    var method_name: NameInfo = compiler_operator_index_get_name();
     var arg_types: *Vec<*TypeInfo> = lower_operator_arg_type_vec1(ix.index);
     if (lower_operator_can_dispatch(ix.base, slice(method_name.ptr, method_name.len), arg_types, 1) == 0) {
         var base_ti: *TypeInfo = generic_infer_expr_type(ix.base, g_lower_parse_sugar_symtab);

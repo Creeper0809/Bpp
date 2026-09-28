@@ -4,11 +4,18 @@ import compiler;
 import compiler.core_utils;
 import compiler.generic.engine;
 import compiler.symbol_runtime;
+import compiler.super_lowering;
 import compiler.ast_lowering;
+import compiler.annotations;
+import compiler.runtime_api;
 import std.str;
 import std.vec;
+import std.hashmap;
+import module_utils;
 import ast;
 import types;
+import codegen;
+import opt;
 
 func lower_exceptions() -> u64 {
     if (g_compiler_ctx.all_funcs != 0) {
@@ -22,19 +29,81 @@ func lower_exceptions() -> u64 {
     return 0;
 }
 
+func lower_parse_sugar_func(fn: *AstFunc) -> u64 {
+    if (fn == 0 || fn.body == 0) { return 0; }
+    set_current_module_for_func(fn.name);
+    var fn_symtab: *HashMap<u64, *TypeInfo> = generic_build_symtab_for_func(fn);
+    lower_parse_sugar_set_symtab(fn_symtab);
+    generic_infer_cache_begin(fn_symtab);
+    lower_parse_sugar_set_return_typeinfo(lower_make_typeinfo_from_func_return(fn));
+    lower_parse_sugar_stmt(fn.body);
+    lower_parse_sugar_set_return_typeinfo(0);
+    generic_infer_cache_end();
+    return 0;
+}
+
+func lower_func_is_bundled_std(fn: *AstFunc) -> u64 {
+    if (fn == 0) { return 0; }
+    var module: *NameInfo = sym_get_func_module(fn.name);
+    if (module == 0 || module.ptr == 0 || module.len < 4) { return 0; }
+    return str_eq(slice(module.ptr, 4), slice("std/", 4)) != 0;
+}
+
+func lower_program_has_global_initializers() -> u64 {
+    if (g_compiler_ctx.all_globals == 0) { return 0; }
+    var n: u64 = g_compiler_ctx.all_globals.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var ginfo: *GlobalInfo = g_compiler_ctx.all_globals.get(i);
+        if (ginfo != 0 && ginfo.init_expr != 0) { return 1; }
+    }
+    return 0;
+}
+
 func lower_parse_sugar() -> u64 {
     lower_parse_sugar_set_final_phase(0);
     if (g_compiler_ctx.all_funcs != 0) {
-        var fn_count: u64 = g_compiler_ctx.all_funcs.len();
-        for (var i: u64 = 0; i < fn_count; i++) {
-            var fn: *AstFunc = g_compiler_ctx.all_funcs.get(i);
-            if (fn == 0 || fn.body == 0) { continue; }
-            set_current_module_for_func(fn.name);
-            lower_parse_sugar_set_symtab(generic_build_symtab_for_func(fn));
-            lower_parse_sugar_set_return_typeinfo(lower_make_typeinfo_from_func_return(fn));
-            lower_parse_sugar_stmt(fn.body);
-            lower_parse_sugar_set_return_typeinfo(0);
+        var lowered: *HashMap<u64, u64> = new HashMap<u64, u64>{0, 0, 0};
+        lowered.ensure_capacity(256);
+        var prune_bundled_std: u64 = lower_program_has_global_initializers() == 0;
+        // Native emission follows the reachable-function closure. IR, contract
+        // and analysis outputs inspect every function, including unused stdlib
+        // bodies, so they require those bodies to be lowered as well.
+        var output_mode: u64 = opt_get_output_mode();
+        if (output_mode != OUT_EXEC && output_mode != OUT_ASM && output_mode != OUT_SOURCE_MAP) {
+            prune_bundled_std = 0;
         }
+        if (annotation_symbolic_report_enabled() != 0) { prune_bundled_std = 0; }
+        var keep_lowering: u64 = 1;
+        while (keep_lowering != 0) {
+            keep_lowering = 0;
+            var used: *Vec<*NameInfo> = 0;
+            if (prune_bundled_std != 0) {
+                // If the early closure is already broad, discovery costs more
+                // than simply lowering the trusted stdlib once. Fall back
+                // before a generic/operator-heavy graph can regress latency.
+                used = collect_used_names_bounded(build_merged_program(), 0, 96);
+                if (used == 0) { prune_bundled_std = 0; }
+            }
+
+            var fn_count: u64 = g_compiler_ctx.all_funcs.len();
+            for (var i: u64 = 0; i < fn_count; i++) {
+                var fn: *AstFunc = g_compiler_ctx.all_funcs.get(i);
+                if (fn == 0 || fn.body == 0 || lowered.has(fn.name) != 0) { continue; }
+                if (prune_bundled_std != 0 && lower_func_is_bundled_std(fn) != 0 && used_has_resolved_name(used, fn.name) == 0) {
+                    continue;
+                }
+                lower_parse_sugar_func(fn);
+                lowered.put(fn.name, 1);
+                keep_lowering = 1;
+            }
+
+            // Lowering can expose direct helper/operator calls that were not
+            // present in the parsed source. Recompute the closure until no new
+            // bundled-stdlib body becomes reachable.
+            if (prune_bundled_std == 0) { break; }
+        }
+        lowered.release_buffer();
+        free((u64)lowered);
     }
 
     lower_parse_sugar_set_symtab(0);
@@ -45,9 +114,11 @@ func lower_parse_sugar() -> u64 {
             var ginfo: *GlobalInfo = g_compiler_ctx.all_globals.get(gi);
             if (ginfo == 0 || ginfo.init_expr == 0) { continue; }
             set_current_module_for_global(ginfo.name);
+            generic_infer_cache_begin(0);
             var lowered_global: *AstNode = lower_parse_sugar_expr((*AstNode)ginfo.init_expr);
             lowered_global = lower_parse_sugar_expr_for_type(lowered_global, ginfo.typeinfo_ptr);
             ginfo.init_expr = (u64)lowered_global;
+            generic_infer_cache_end();
         }
     }
     g_compiler_ctx.current_module = slice(0, 0);
@@ -150,8 +221,11 @@ func lower_finalize_global_init_kinds() -> u64 {
     if (g_compiler_ctx.all_globals == 0) { return 0; }
     var n: u64 = g_compiler_ctx.all_globals.len();
     for (var i: u64 = 0; i < n; i++) {
-        finalize_single_global_init_kind(g_compiler_ctx.all_globals.get(i));
+        var ginfo: *GlobalInfo = g_compiler_ctx.all_globals.get(i);
+        set_current_module_for_global(ginfo.name);
+        finalize_single_global_init_kind(ginfo);
     }
+    g_compiler_ctx.current_module = slice(0, 0);
     return 0;
 }
 
@@ -182,8 +256,8 @@ func insert_default_constructor(struct_name: []u8) -> u64 {
 }
 
 func lower_insert_default_constructors() -> u64 {
-    // Constructors are explicit. Zero-initialization remains available through
-    // brace initialization and plain local declarations, but `Type()` / `new Type()`
+    // Constructors are explicit. Zero-initialization is available through
+    // brace initialization; plain local declarations remain uninitialized. `Type()` / `new Type()`
     // should only succeed when a matching constructor is declared.
     return 0;
 }
@@ -214,7 +288,33 @@ func insert_auto_super_constructor_chain_for_fn(fn: *AstFunc) -> u64 {
 
     var owner_def: *AstStructDef = get_struct_def(fn.impl_owner);
     if (owner_def == 0 || owner_def.parents_vec == 0 || owner_def.parents_vec.len() == 0) { return 0; }
-    if (has_super_constructor_call_stmt(fn.body) != 0) { return 0; }
+    var counter: CompilerAstWalker = ast_walker_new(COMPILER_AST_WALK_COUNT_SUPER_CTOR, fn.impl_owner);
+    ast_walker_walk_stmt(&counter, fn.body);
+    if (counter.found > 0) {
+        var first_is_super: u64 = 0;
+        if (fn.body != 0 && ast_kind(fn.body) == AST_BLOCK) {
+            var body: *AstBlock = (*AstBlock)fn.body;
+            if (body.stmts_vec != 0 && body.stmts_vec.len() > 0) {
+                var first: *AstNode = body.stmts_vec.get(0);
+                if (ast_kind(first) == AST_EXPR_STMT) {
+                    var first_expr: *AstNode = ((*AstExprStmt)first).expr;
+                    if (ast_kind(first_expr) == AST_METHOD_CALL) {
+                        var first_call: *AstMethodCall = (*AstMethodCall)first_expr;
+                        first_is_super = is_super_expr(first_call.receiver) != 0 && sym_is_constructor_name(first_call.method) != 0;
+                    }
+                }
+            }
+        }
+        if (first_is_super == 0) {
+            diag_emit_error_tag("lowering", "constructor-order", "super.constructor() must be the first statement of a derived constructor");
+            diag_note_error();
+        }
+        if (counter.found != 1) {
+            diag_emit_error_tag("lowering", "constructor-count", "parent constructor must be called exactly once");
+            diag_note_error();
+        }
+        return 0;
+    }
 
     var parent_ctor_count: u64 = 0;
     var pn: u64 = owner_def.parents_vec.len();
@@ -222,7 +322,7 @@ func insert_auto_super_constructor_chain_for_fn(fn: *AstFunc) -> u64 {
         var parent_desc: *ParentDesc = owner_def.parents_vec.get(pi);
         var parent_def: *AstStructDef = resolve_parent_def(parent_desc, "Compiler error");
         if (parent_def == 0) { continue; }
-        var parent_ctor: CompilerMethodResolveResult = sym_resolve_method_overload(parent_def.name, slice("constructor", 11), 0, 0);
+        var parent_ctor: CompilerDeclLookup = find_method_decl_in_hierarchy(parent_def.name, slice("constructor", 11));
         if (parent_ctor.found != 0) {
             parent_ctor_count = parent_ctor_count + 1;
         }
@@ -268,8 +368,21 @@ func lower_insert_global_init_func() -> u64 {
         }
         var target: *AstNode = (*AstNode)ast_ident(ginfo.name);
         var assign: *AstAssign = ast_assign(target, init_expr);
-        stmts.push((*AstNode)assign);
+        // Each expression keeps its lexical module, including function values
+        // and calls nested inside initializers. The dispatcher retains order.
+        var helper_name: *NameInfo = module_util_build_joined_name(slice("__global_init", 13), ginfo.name);
+        var helper_stmts: *Vec<*AstNode> = new Vec<*AstNode>{heap_alloc(sizeof(*AstNode)), 0, 1};
+        helper_stmts.push((*AstNode)assign);
+        var helper_params: *Vec<*Param> = new Vec<*Param>{0, 0, 0};
+        var helper: *AstFunc = ast_func(slice(helper_name.ptr, helper_name.len), helper_params, TYPE_VOID, (*AstNode)ast_block(helper_stmts));
+        set_current_module_for_global(ginfo.name);
+        sym_assign_func_module(helper.name, g_compiler_ctx.current_module);
+        g_compiler_ctx.all_funcs.push(helper);
+        g_compiler_ctx.all_func_sigs.push(helper);
+        var args: *Vec<*AstNode> = new Vec<*AstNode>{0, 0, 0};
+        stmts.push((*AstNode)ast_expr_stmt((*AstNode)ast_call(helper.name, args)));
     }
+    g_compiler_ctx.current_module = slice(0, 0);
 
     if (stmts.len() == 0) { return 0; }
 
