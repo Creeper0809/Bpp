@@ -44,16 +44,7 @@ status=$?
 set -e
 printf 'build_and_test_exit=%s\nelapsed_seconds=%s\n' "$status" "$((SECONDS - started))"
 if [[ $status == 0 ]]; then
-    cmp build/v15_stage1.asm build/v15_stage2.asm
-    if [[ $(wc -l < build/v15_stage2.asm) -ge 120000 ]]; then
-        bash tools/nasm_split_assemble.sh build/v15_stage2.asm build/v15_stage2.o -felf64 -O1
-    else
-        nasm -felf64 -O1 build/v15_stage2.asm -o build/v15_stage2.o
-    fi
-    ld build/v15_stage2.o -o bin/v15_stage2
-    cmp bin/v15_stage1 bin/v15_stage2
-    sha256sum bin/v15_stage1 bin/v15_stage2 build/v15_stage1.asm build/v15_stage2.asm
-    printf 'NATIVE_EXECUTABLE_EQUALITY=PASS\n'
+    bash .linux-verification/run_linux_native_equality.sh
 fi
 du -sb build bin
 date -u
