@@ -33,6 +33,7 @@ printf 'address_space_limit_kib=%s\n' "$(ulimit -v)"
 nasm -v
 clang --version
 sha256sum linux-bootstrap.asm
+mkdir -p build bin
 nasm -felf64 -O1 linux-bootstrap.asm -o build/linux-bootstrap.o
 ld build/linux-bootstrap.o -o bin/v15_cross_seed
 chmod +x tools/*.sh
