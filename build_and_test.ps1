@@ -184,6 +184,189 @@ function Resolve-Tool {
     throw "$Description not found."
 }
 
+function Get-ConfiguredNasmVersion {
+    param([string]$Root)
+
+    $cmakeLists = Join-Path $Root "CMakeLists.txt"
+    if (-not (Test-Path -LiteralPath $cmakeLists)) { return "" }
+    $match = Select-String -LiteralPath $cmakeLists `
+        -Pattern '^\s*set\(BPP_NASM_VERSION\s+"([^"]+)"' | Select-Object -First 1
+    if (-not $match -or $match.Matches.Count -eq 0) { return "" }
+    return $match.Matches[0].Groups[1].Value
+}
+
+function Find-RepositoryNasm {
+    param([string]$Root)
+
+    $toolsRoot = Join-Path $Root "build-win\_tools"
+    if (-not (Test-Path -LiteralPath $toolsRoot)) { return "" }
+    $candidate = Get-ChildItem -LiteralPath $toolsRoot -Filter "nasm.exe" -File -Recurse -ErrorAction SilentlyContinue |
+        Sort-Object FullName -Descending |
+        Select-Object -First 1
+    if ($candidate) { return $candidate.FullName }
+    return ""
+}
+
+function Install-RepositoryNasm {
+    param([string]$Root)
+
+    $version = Get-ConfiguredNasmVersion -Root $Root
+    if (-not $version) {
+        throw "Cannot determine BPP_NASM_VERSION from CMakeLists.txt."
+    }
+
+    $toolsRoot = Join-Path $Root "build-win\_tools"
+    $archive = Join-Path $toolsRoot "nasm-${version}-win64.zip"
+    $downloadUrl = "https://www.nasm.us/pub/nasm/releasebuilds/${version}/win64/nasm-${version}-win64.zip"
+    New-Item -ItemType Directory -Force -Path $toolsRoot | Out-Null
+
+    Write-Host "[INFO] Downloading repository-local NASM ${version}: $downloadUrl"
+    try {
+        Invoke-WebRequest -Uri $downloadUrl -OutFile $archive -UseBasicParsing
+        Expand-Archive -LiteralPath $archive -DestinationPath $toolsRoot -Force
+        Remove-Item -LiteralPath $archive -Force
+    } catch {
+        if (Test-Path -LiteralPath $archive) {
+            Remove-Item -LiteralPath $archive -Force -ErrorAction SilentlyContinue
+        }
+        throw "Failed to bootstrap repository-local NASM ${version}: $($_.Exception.Message)"
+    }
+
+    $resolved = Find-RepositoryNasm -Root $Root
+    if (-not $resolved) {
+        throw "NASM archive was extracted but nasm.exe was not found under $toolsRoot"
+    }
+    return $resolved
+}
+
+function Resolve-NasmTool {
+    param(
+        [string]$ExplicitPath,
+        [string]$Root
+    )
+
+    if ($ExplicitPath) {
+        return Resolve-Tool -ExplicitPath $ExplicitPath -Candidates @() -Description "NASM"
+    }
+
+    try {
+        return Resolve-Tool -ExplicitPath "" -Candidates @("nasm.exe", "nasm") -Description "NASM"
+    } catch {
+        $repositoryNasm = Find-RepositoryNasm -Root $Root
+        if ($repositoryNasm) { return $repositoryNasm }
+        return Install-RepositoryNasm -Root $Root
+    }
+}
+
+function Find-VisualStudioLinker {
+    $vswhereCandidates = New-Object System.Collections.Generic.List[string]
+    $vswhereCommand = Get-Command "vswhere.exe" -ErrorAction SilentlyContinue
+    if ($vswhereCommand) { $vswhereCandidates.Add($vswhereCommand.Source) }
+    if (${env:ProgramFiles(x86)}) {
+        $vswhereCandidates.Add((Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"))
+    }
+
+    foreach ($vswhere in @($vswhereCandidates | Select-Object -Unique)) {
+        if (-not (Test-Path -LiteralPath $vswhere)) { continue }
+        $installations = @(& $vswhere -products "*" `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath)
+        foreach ($installation in $installations) {
+            if (-not $installation) { continue }
+            $msvcRoot = Join-Path $installation.Trim() "VC\Tools\MSVC"
+            if (-not (Test-Path -LiteralPath $msvcRoot)) { continue }
+            $linker = Get-ChildItem -LiteralPath $msvcRoot -Filter "link.exe" -File -Recurse -ErrorAction SilentlyContinue |
+                Where-Object { $_.FullName -match '\\bin\\Hostx64\\x64\\link\.exe$' } |
+                Sort-Object FullName -Descending |
+                Select-Object -First 1
+            if ($linker) { return $linker.FullName }
+        }
+    }
+
+    if ($env:ProgramFiles) {
+        $llvmLinker = Join-Path $env:ProgramFiles "LLVM\bin\lld-link.exe"
+        if (Test-Path -LiteralPath $llvmLinker) { return $llvmLinker }
+    }
+    return ""
+}
+
+function Resolve-LinkerTool {
+    param([string]$ExplicitPath)
+
+    if ($ExplicitPath) {
+        return Resolve-Tool -ExplicitPath $ExplicitPath -Candidates @() -Description "Windows linker"
+    }
+    try {
+        return Resolve-Tool -ExplicitPath "" `
+            -Candidates @("link.exe", "lld-link.exe", "lld-link") `
+            -Description "Windows linker"
+    } catch {
+        $visualStudioLinker = Find-VisualStudioLinker
+        if ($visualStudioLinker) { return $visualStudioLinker }
+        throw
+    }
+}
+
+function Find-WindowsSdkLibraryPaths {
+    $sdkRoots = New-Object System.Collections.Generic.List[string]
+    try {
+        $installedRoots = Get-ItemProperty `
+            -LiteralPath "HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots" `
+            -ErrorAction Stop
+        if ($installedRoots.KitsRoot10) { $sdkRoots.Add($installedRoots.KitsRoot10) }
+    } catch {}
+    if (${env:ProgramFiles(x86)}) {
+        $sdkRoots.Add((Join-Path ${env:ProgramFiles(x86)} "Windows Kits\10"))
+    }
+
+    foreach ($sdkRoot in @($sdkRoots | Select-Object -Unique)) {
+        $libRoot = Join-Path $sdkRoot "Lib"
+        if (-not (Test-Path -LiteralPath $libRoot)) { continue }
+        $versions = Get-ChildItem -LiteralPath $libRoot -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '^\d+(\.\d+){3}$' } |
+            Sort-Object { [version]$_.Name } -Descending
+        foreach ($version in $versions) {
+            $um = Join-Path $version.FullName "um\x64"
+            $ucrt = Join-Path $version.FullName "ucrt\x64"
+            if (Test-Path -LiteralPath (Join-Path $um "kernel32.lib")) {
+                $paths = @($um)
+                if (Test-Path -LiteralPath $ucrt) { $paths += $ucrt }
+                return $paths
+            }
+        }
+    }
+    return @()
+}
+
+function Initialize-LinkerEnvironment {
+    param([string]$Linker)
+
+    $libraryPaths = New-Object System.Collections.Generic.List[string]
+    $linkerItem = Get-Item -LiteralPath $Linker -ErrorAction Stop
+    if ($linkerItem.Name -ieq "link.exe") {
+        $versionRoot = $linkerItem.Directory.Parent.Parent.Parent
+        if ($versionRoot) {
+            $msvcLib = Join-Path $versionRoot.FullName "lib\x64"
+            if (Test-Path -LiteralPath $msvcLib) { $libraryPaths.Add($msvcLib) }
+        }
+    }
+    foreach ($sdkPath in @(Find-WindowsSdkLibraryPaths)) {
+        if ($sdkPath) { $libraryPaths.Add($sdkPath) }
+    }
+    if ($env:LIB) {
+        foreach ($existing in @($env:LIB -split ';')) {
+            if ($existing) { $libraryPaths.Add($existing) }
+        }
+    }
+
+    $resolved = @($libraryPaths | Select-Object -Unique)
+    if (-not ($resolved | Where-Object { Test-Path -LiteralPath (Join-Path $_ "kernel32.lib") })) {
+        throw "Windows SDK x64 library directory containing kernel32.lib was not found."
+    }
+    $env:LIB = $resolved -join ';'
+    return $resolved
+}
+
 function Invoke-Link {
     param(
         [string]$Linker,
@@ -287,16 +470,16 @@ if (-not $LinkerPath -and $env:BPP_LINKER_EXECUTABLE) {
 }
 
 try {
-    $ResolvedNasm = Resolve-Tool -ExplicitPath $NasmPath -Candidates @("nasm.exe", "nasm") -Description "NASM"
+    $ResolvedNasm = Resolve-NasmTool -ExplicitPath $NasmPath -Root $RootDir
 } catch {
-    throw "NASM not found. Re-run CMake with -DBPP_BOOTSTRAP_NASM=ON or install from https://www.nasm.us/pub/nasm/releasebuilds/"
+    throw "NASM could not be resolved or bootstrapped: $($_.Exception.Message)"
 }
 
-$linkCandidates = @("link.exe", "lld-link.exe", "lld-link")
 try {
-    $ResolvedLinker = Resolve-Tool -ExplicitPath $LinkerPath -Candidates $linkCandidates -Description "Windows linker"
+    $ResolvedLinker = Resolve-LinkerTool -ExplicitPath $LinkerPath
+    $ResolvedLinkerLibraryPaths = @(Initialize-LinkerEnvironment -Linker $ResolvedLinker)
 } catch {
-    throw "No Windows linker found. Install Visual Studio Build Tools (https://aka.ms/vs/17/release/vs_BuildTools.exe) or LLVM lld-link (https://releases.llvm.org/)"
+    throw "Windows linker/toolchain could not be resolved: $($_.Exception.Message)"
 }
 
 if (-not $CompilerPath) {
@@ -438,4 +621,11 @@ $testRunnerArgs = @{
 if ($PSBoundParameters.ContainsKey("TestJobs")) { $testRunnerArgs.Jobs = $TestJobs }
 if ($TimingJsonPath) { $testRunnerArgs.TimingJsonPath = $TimingJsonPath }
 & $TestRunner @testRunnerArgs
-exit $LASTEXITCODE
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+# Exercise persistent cache reuse/invalidation with the verified self-hosted
+# compiler; these are multi-invocation filesystem tests, not single fixtures.
+& (Join-Path $ScriptDir 'test/run_cache_tests.ps1') -CompilerPath $Stage1Compiler `
+    -NasmPath $ResolvedNasm -LinkerPath $ResolvedLinker `
+    -CompilerTimeoutMs $CompilerTimeoutMs -MemoryLimitBytes $MemoryLimitBytes
+exit 0

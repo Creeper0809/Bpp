@@ -1,0 +1,508 @@
+// Opt-in native assembly cache. Module resolution/parsing is always fresh;
+// reuse requires exact compiler, options, manifest and dependency source bytes.
+import compiler;
+import compiler.manifest;
+import compiler.module_path;
+import compiler.runtime_api;
+import compiler.annotations;
+import compiler.timings;
+import std.io;
+import std.mem;
+import std.os;
+import std.str;
+import opt;
+import types;
+
+const ARTIFACT_CACHE_FORMAT = 1;
+const ARTIFACT_CACHE_MAGIC = 0x3148434143505042;
+const ARTIFACT_CACHE_END = 0x31444e4543505042;
+const ARTIFACT_CACHE_MAX_KEY = 67108864;
+const ARTIFACT_CACHE_MAX_RECORD = 335544320;
+const ARTIFACT_CACHE_INDEX_FORMAT = 1;
+const ARTIFACT_CACHE_INDEX_MAGIC = 0x3149584143505042;
+const ARTIFACT_CACHE_INDEX_END = 0x31444e4943505042;
+const ARTIFACT_CACHE_MAX_INDEX = 134217728;
+
+struct ArtifactCacheBytes {
+    public data: u64;
+    public length: u64;
+    public capacity: u64;
+}
+
+var g_artifact_cache_directory: []u8;
+var g_artifact_cache_identity: ArtifactCacheBytes;
+var g_artifact_cache_enabled: u64;
+var g_artifact_cache_report: u64;
+var g_artifact_cache_path: u64;
+var g_artifact_cache_temp: u64;
+var g_artifact_cache_fd: u64;
+var g_artifact_cache_record: u64;
+var g_artifact_cache_payload: u64;
+var g_artifact_cache_payload_len: u64;
+var g_artifact_cache_base_identity_len: u64;
+var g_artifact_cache_index_path: u64;
+var g_artifact_cache_index_temp: u64;
+
+func artifact_cache_note(message: u64) -> u64 {
+    if (g_artifact_cache_report != 0) { emit_stderr("[cache] "); emit_stderr(message); emit_stderr("\n"); }
+    return 0;
+}
+
+func artifact_cache_hex(value: u64) -> u64 {
+    var result: u64 = heap_alloc(17);
+    var bytes: *u8 = (*u8)result;
+    var digits: *u8 = (*u8)"0123456789abcdef";
+    for (var i: u64 = 0; i < 16; i++) { bytes[15 - i] = digits[value & 15]; value = value >> 4; }
+    bytes[16] = 0;
+    return result;
+}
+
+func artifact_cache_path_for_key(key: u64, key_len: u64, suffix: u64, suffix_len: u64) -> u64 {
+    var hash: u64 = io_content_hash_extend(14695981039346656037, key, key_len);
+    var hex: u64 = artifact_cache_hex(hash);
+    var basename: u64 = str_concat(hex, 16, suffix, suffix_len);
+    var path: u64 = str_concat3(g_artifact_cache_directory.ptr, g_artifact_cache_directory.len, "/", 1, basename, 16 + suffix_len);
+    heap_free(hex);
+    heap_free(basename);
+    return path;
+}
+
+func artifact_cache_key_part(data: u64, length: u64) -> u64 {
+    if (g_artifact_cache_enabled == 0) { return 0; }
+    if (length > ARTIFACT_CACHE_MAX_KEY - 8 || g_artifact_cache_identity.length > ARTIFACT_CACHE_MAX_KEY - 8 - length) {
+        g_artifact_cache_enabled = 0;
+        return 0;
+    }
+    var required: u64 = g_artifact_cache_identity.length + 8 + length;
+    if (required > g_artifact_cache_identity.capacity) {
+        var capacity: u64 = g_artifact_cache_identity.capacity * 2;
+        if (capacity < 4096) { capacity = 4096; }
+        if (capacity < required) { capacity = required; }
+        var next: u64 = heap_alloc(capacity);
+        if (next == 0) { g_artifact_cache_enabled = 0; return 0; }
+        if (g_artifact_cache_identity.length != 0) { memcopy(next, g_artifact_cache_identity.data, g_artifact_cache_identity.length); }
+        if (g_artifact_cache_identity.data != 0) { heap_free(g_artifact_cache_identity.data); }
+        g_artifact_cache_identity.data = next;
+        g_artifact_cache_identity.capacity = capacity;
+    }
+    var cursor: u64 = g_artifact_cache_identity.data + g_artifact_cache_identity.length;
+    *((*u64)cursor) = length;
+    if (length != 0) { memcopy(cursor + 8, data, length); }
+    g_artifact_cache_identity.length = required;
+    return 1;
+}
+
+// Size is checked before allocation. Short reads, oversized and unreadable
+// files are misses, not trusted partially initialized records.
+func artifact_cache_read(path: u64, limit: u64, out_len: *u64) -> u64 {
+    var fd: i64 = (i64)sys_open(path, 0, 0);
+    if (fd < 0) { return 0; }
+    var stat_bytes: [144]u8;
+    if ((i64)sys_fstat((u64)fd, (u64)&stat_bytes) < 0) { sys_close((u64)fd); return 0; }
+    var size: u64 = ((*Stat)&stat_bytes).size;
+    if (size > limit) { sys_close((u64)fd); return 0; }
+    var data: u64 = heap_alloc(size + 1);
+    if (data == 0) { sys_close((u64)fd); return 0; }
+    var done: u64 = 0;
+    while (done < size) {
+        var count: i64 = (i64)sys_read((u64)fd, data + done, size - done);
+        if (count <= 0 || (u64)count > size - done) { heap_free(data); sys_close((u64)fd); return 0; }
+        done = done + (u64)count;
+    }
+    sys_close((u64)fd);
+    ((*u8)data)[size] = 0;
+    *out_len = size;
+    return data;
+}
+
+func artifact_cache_configure(directory: []u8, report: u64, argc: u64, argv: *u64) -> u64 {
+    g_artifact_cache_report = report;
+    if (directory.ptr == 0 || directory.len == 0) { return 0; }
+    if ((opt_get_output_mode() != OUT_ASM && opt_get_output_mode() != OUT_EXEC) ||
+        opt_get_backend_report() != 0 || annotation_symbolic_report_enabled() != 0) {
+        artifact_cache_note("disabled for diagnostic/report output");
+        return 0;
+    }
+    g_artifact_cache_directory = directory;
+    g_artifact_cache_enabled = 1;
+    var executable_len: u64 = 0;
+    var executable_path: [4096]u8;
+    var executable_path_len: u64 = os_executable_path((u64)&executable_path, 4096);
+    var executable: u64 = 0;
+    if (executable_path_len != 0) { executable = artifact_cache_read((u64)&executable_path, ARTIFACT_CACHE_MAX_KEY / 2, &executable_len); }
+    if (executable == 0) {
+        g_artifact_cache_enabled = 0;
+        artifact_cache_note("unavailable: cannot identify compiler executable");
+        return 0;
+    }
+    artifact_cache_key_part(executable, executable_len);
+    heap_free(executable);
+    for (var i: u64 = 1; i < argc; i++) {
+        var arg: u64 = argv[i];
+        var length: u64 = str_len(arg);
+        if (str_eq(slice(arg, length), slice("--cache-dir", 11)) || str_eq(slice(arg, length), slice("--timings-json", 14))) { i = i + 1; continue; }
+        if (str_eq(slice(arg, length), slice("--cache-report", 14)) || str_eq(slice(arg, length), slice("--no-cache", 10))) { continue; }
+        if (length >= 12 && str_eq(slice(arg, 12), slice("--cache-dir=", 12))) { continue; }
+        if (length >= 15 && str_eq(slice(arg, 15), slice("--timings-json=", 15))) { continue; }
+        artifact_cache_key_part(arg, length);
+    }
+    var target: u64 = compiler_target();
+    artifact_cache_key_part((u64)&target, sizeof(u64));
+    var ctx: *CompilerCtx = compiler_ctx_current();
+    artifact_cache_key_part(ctx.base_dir, ctx.base_dir_len);
+    artifact_cache_key_part(ctx.project_dir, ctx.project_dir_len);
+    artifact_cache_key_part(ctx.lib_dir, ctx.lib_dir_len);
+    var manifest_path: u64 = find_manifest_path_impl(ctx.base_dir, ctx.base_dir_len);
+    if (manifest_path != 0) {
+        var manifest_len: u64 = 0;
+        var manifest: u64 = artifact_cache_read(manifest_path, ARTIFACT_CACHE_MAX_KEY / 2, &manifest_len);
+        if (manifest == 0) { g_artifact_cache_enabled = 0; return 0; }
+        artifact_cache_key_part(manifest_path, str_len(manifest_path));
+        artifact_cache_key_part(manifest, manifest_len);
+        heap_free(manifest);
+    } else { artifact_cache_key_part(0, 0); artifact_cache_key_part(0, 0); }
+    if (g_artifact_cache_enabled != 0) {
+        g_artifact_cache_base_identity_len = g_artifact_cache_identity.length;
+        g_artifact_cache_index_path = artifact_cache_path_for_key(
+            g_artifact_cache_identity.data,
+            g_artifact_cache_identity.length,
+            (u64)".bppidx",
+            7
+        );
+    }
+    return g_artifact_cache_enabled;
+}
+
+func artifact_cache_take_part(cursor: *u64, end: u64, out_data: *u64, out_len: *u64) -> u64 {
+    if (*cursor > end || end - *cursor < 8) { return 0; }
+    var length: u64 = *((*u64)*cursor);
+    *cursor = *cursor + 8;
+    if (length > end - *cursor) { return 0; }
+    *out_data = *cursor;
+    *out_len = length;
+    *cursor = *cursor + length;
+    return 1;
+}
+
+func artifact_cache_validate_dependencies(key: u64, key_len: u64, base_len: u64) -> u64 {
+    if (base_len > key_len) { return 0; }
+    var cursor: u64 = key + base_len;
+    var end: u64 = key + key_len;
+    var count_data: u64 = 0;
+    var count_len: u64 = 0;
+    if (artifact_cache_take_part(&cursor, end, &count_data, &count_len) == 0 || count_len != 8) { return 0; }
+    var count: u64 = *((*u64)count_data);
+    if (count > (end - cursor) / 16) { return 0; }
+    for (var i: u64 = 0; i < count; i++) {
+        var path: u64 = 0;
+        var path_len: u64 = 0;
+        var expected: u64 = 0;
+        var expected_len: u64 = 0;
+        if (artifact_cache_take_part(&cursor, end, &path, &path_len) == 0 || path_len == 0) { return 0; }
+        if (artifact_cache_take_part(&cursor, end, &expected, &expected_len) == 0) { return 0; }
+        var path_cstr: u64 = heap_alloc(path_len + 1);
+        if (path_cstr == 0) { return 0; }
+        memcopy(path_cstr, path, path_len);
+        ((*u8)path_cstr)[path_len] = 0;
+        var actual_len: u64 = 0;
+        var actual: u64 = artifact_cache_read(path_cstr, ARTIFACT_CACHE_MAX_KEY, &actual_len);
+        heap_free(path_cstr);
+        if (actual == 0) { return 0; }
+        var same: u64 = str_eq(slice(actual, actual_len), slice(expected, expected_len));
+        heap_free(actual);
+        if (same == 0) { return 0; }
+    }
+    return cursor == end;
+}
+
+// The index never authorizes reuse by itself. It is only a pre-parse witness:
+// exact source bytes, every logical import resolution and then the original
+// full artifact record must all match before cached assembly is exposed.
+func artifact_cache_index_validate(data: u64, length: u64, full_key: *u64, full_key_len: *u64) -> u64 {
+    if (data == 0 || length < 56 || length > ARTIFACT_CACHE_MAX_INDEX) { return 0; }
+    var header: *u64 = (*u64)data;
+    var base_len: u64 = header[2];
+    var key_len: u64 = header[3];
+    var witness_count: u64 = header[4];
+    if (header[0] != ARTIFACT_CACHE_INDEX_MAGIC || header[1] != ARTIFACT_CACHE_INDEX_FORMAT) { return 0; }
+    if (base_len != g_artifact_cache_base_identity_len || key_len < base_len || key_len > ARTIFACT_CACHE_MAX_KEY) { return 0; }
+    if (key_len > length - 56) { return 0; }
+    var footer: *u64 = (*u64)(data + length - 16);
+    var payload_len: u64 = length - 56;
+    if (footer[1] != ARTIFACT_CACHE_INDEX_END) { return 0; }
+    if (io_content_hash_extend(14695981039346656037, data + 40, payload_len) != footer[0]) { return 0; }
+    var key: u64 = data + 40;
+    if (str_eq(slice(key, base_len), slice(g_artifact_cache_identity.data, base_len)) == 0) { return 0; }
+    if (artifact_cache_validate_dependencies(key, key_len, base_len) == 0) { return 0; }
+    var cursor: u64 = key + key_len;
+    var end: u64 = data + length - 16;
+    if (witness_count > (end - cursor) / 16) { return 0; }
+    for (var i: u64 = 0; i < witness_count; i++) {
+        var query: u64 = 0;
+        var query_len: u64 = 0;
+        var expected_path: u64 = 0;
+        var expected_path_len: u64 = 0;
+        if (artifact_cache_take_part(&cursor, end, &query, &query_len) == 0 || query_len == 0) { return 0; }
+        if (artifact_cache_take_part(&cursor, end, &expected_path, &expected_path_len) == 0 || expected_path_len == 0) { return 0; }
+        var resolved: u64 = resolve_path_quiet(query, query_len);
+        if (resolved == 0 || str_eq(slice(resolved, str_len(resolved)), slice(expected_path, expected_path_len)) == 0) { return 0; }
+    }
+    if (cursor != end) { return 0; }
+    *full_key = key;
+    *full_key_len = key_len;
+    return 1;
+}
+
+func artifact_cache_identity_replace(data: u64, length: u64) -> u64 {
+    var replacement: u64 = heap_alloc(length);
+    if (replacement == 0) { return 0; }
+    if (length != 0) { memcopy(replacement, data, length); }
+    if (g_artifact_cache_identity.data != 0) { heap_free(g_artifact_cache_identity.data); }
+    g_artifact_cache_identity.data = replacement;
+    g_artifact_cache_identity.length = length;
+    g_artifact_cache_identity.capacity = length;
+    return 1;
+}
+
+func artifact_cache_record_matches(data: u64, length: u64, key: u64, key_len: u64, payload: *u64, payload_len: *u64) -> u64 {
+    if (data == 0 || length < 48 || length > ARTIFACT_CACHE_MAX_RECORD || key_len > ARTIFACT_CACHE_MAX_KEY) { return 0; }
+    var header: *u64 = (*u64)data;
+    if (header[0] != ARTIFACT_CACHE_MAGIC || header[1] != ARTIFACT_CACHE_FORMAT || header[2] != key_len) { return 0; }
+    if (key_len > length - 48) { return 0; }
+    var footer: *u64 = (*u64)(data + length - 24);
+    var output_len: u64 = length - 48 - key_len;
+    if (footer[0] != output_len || footer[2] != ARTIFACT_CACHE_END || output_len == 0) { return 0; }
+    // The filename hash is only an index. Exact comparison makes key-hash
+    // collisions misses. Output FNV is an accidental-corruption checksum;
+    // this private cache is not an authenticated distribution format.
+    if (str_eq(slice(data + 24, key_len), slice(key, key_len)) == 0) { return 0; }
+    var output: u64 = data + 24 + key_len;
+    if (io_content_hash_extend(14695981039346656037, output, output_len) != footer[1]) { return 0; }
+    *payload = output;
+    *payload_len = output_len;
+    return 1;
+}
+
+func artifact_cache_publish_index(ctx: *CompilerCtx) -> u64 {
+    if (g_artifact_cache_enabled == 0 || g_artifact_cache_index_path == 0 ||
+        g_artifact_cache_identity.length < g_artifact_cache_base_identity_len ||
+        ctx == 0 || ctx.module_resolution_witnesses == 0) { return 0; }
+    var witness_entries: u64 = ctx.module_resolution_witnesses.len();
+    if ((witness_entries & 1) != 0) { return 0; }
+    var total: u64 = 56 + g_artifact_cache_identity.length;
+    for (var i: u64 = 0; i < witness_entries; i++) {
+        var info: *NameInfo = ctx.module_resolution_witnesses.get(i);
+        if (info == 0 || info.ptr == 0 || info.len == 0 || info.len > ARTIFACT_CACHE_MAX_INDEX - 8) { return 0; }
+        if (total > ARTIFACT_CACHE_MAX_INDEX - 8 - info.len) { return 0; }
+        total = total + 8 + info.len;
+    }
+    var data: u64 = heap_alloc(total);
+    if (data == 0) { return 0; }
+    var header: *u64 = (*u64)data;
+    header[0] = ARTIFACT_CACHE_INDEX_MAGIC;
+    header[1] = ARTIFACT_CACHE_INDEX_FORMAT;
+    header[2] = g_artifact_cache_base_identity_len;
+    header[3] = g_artifact_cache_identity.length;
+    header[4] = witness_entries / 2;
+    var cursor: u64 = data + 40;
+    memcopy(cursor, g_artifact_cache_identity.data, g_artifact_cache_identity.length);
+    cursor = cursor + g_artifact_cache_identity.length;
+    for (var wi: u64 = 0; wi < witness_entries; wi++) {
+        var witness: *NameInfo = ctx.module_resolution_witnesses.get(wi);
+        *((*u64)cursor) = witness.len;
+        cursor = cursor + 8;
+        memcopy(cursor, witness.ptr, witness.len);
+        cursor = cursor + witness.len;
+    }
+    var footer: *u64 = (*u64)cursor;
+    footer[0] = io_content_hash_extend(14695981039346656037, data + 40, cursor - data - 40);
+    footer[1] = ARTIFACT_CACHE_INDEX_END;
+    cursor = cursor + 16;
+    if (cursor != data + total) { heap_free(data); return 0; }
+
+    os_make_directory(g_artifact_cache_directory.ptr);
+    var pid: u64 = artifact_cache_hex(os_process_id());
+    var stamp: u64 = artifact_cache_hex(os_monotonic_ms());
+    var suffix: u64 = str_concat3(pid, 16, ".", 1, stamp, 16);
+    g_artifact_cache_index_temp = str_concat3(
+        g_artifact_cache_index_path,
+        str_len(g_artifact_cache_index_path),
+        ".tmp.",
+        5,
+        suffix,
+        33
+    );
+    heap_free(pid); heap_free(stamp); heap_free(suffix);
+    var fd: i64 = (i64)sys_open(g_artifact_cache_index_temp, OS_O_WRONLY + OS_O_CREAT + OS_O_TRUNC, 384);
+    var written: u64 = 0;
+    if (fd >= 0) {
+        written = io_write_all((u64)fd, data, total);
+        sys_close((u64)fd);
+    }
+    heap_free(data);
+    if (written != 0 && os_rename_replace(g_artifact_cache_index_temp, g_artifact_cache_index_path) != 0) {
+        return 1;
+    }
+    os_remove_file(g_artifact_cache_index_temp);
+    return 0;
+}
+
+func artifact_cache_preparse_probe() -> u64 {
+    if (g_artifact_cache_enabled == 0 || g_artifact_cache_index_path == 0) { return 0; }
+    var started: u64 = timings_profile_start();
+    var index_len: u64 = 0;
+    var index_data: u64 = artifact_cache_read(g_artifact_cache_index_path, ARTIFACT_CACHE_MAX_INDEX, &index_len);
+    if (index_data == 0) { return 0; }
+    var full_key: u64 = 0;
+    var full_key_len: u64 = 0;
+    if (artifact_cache_index_validate(index_data, index_len, &full_key, &full_key_len) == 0) {
+        heap_free(index_data);
+        artifact_cache_note("preparse index miss");
+        return 0;
+    }
+    var record_path: u64 = artifact_cache_path_for_key(full_key, full_key_len, (u64)".bppasm", 7);
+    var record_len: u64 = 0;
+    var record: u64 = artifact_cache_read(record_path, ARTIFACT_CACHE_MAX_RECORD, &record_len);
+    var payload: u64 = 0;
+    var payload_len: u64 = 0;
+    if (record == 0 || artifact_cache_record_matches(record, record_len, full_key, full_key_len, &payload, &payload_len) == 0) {
+        if (record != 0) { heap_free(record); }
+        heap_free(record_path);
+        heap_free(index_data);
+        return 0;
+    }
+    if (artifact_cache_identity_replace(full_key, full_key_len) == 0) {
+        heap_free(record);
+        heap_free(record_path);
+        heap_free(index_data);
+        return 0;
+    }
+    g_artifact_cache_path = record_path;
+    g_artifact_cache_record = record;
+    g_artifact_cache_payload = payload;
+    g_artifact_cache_payload_len = payload_len;
+    g_timings_cache_status = 2;
+    g_timings_cache_preparse_hit = 1;
+    g_timings_cache_lookup_ms = timings_elapsed_ms(started);
+    heap_free(index_data);
+    artifact_cache_note("preparse hit");
+    return 1;
+}
+
+func artifact_cache_probe(ctx: *CompilerCtx) -> u64 {
+    if (g_artifact_cache_enabled == 0) { return 0; }
+    var started: u64 = timings_profile_start();
+    var count: u64 = ctx.loaded_modules_vec.len();
+    artifact_cache_key_part((u64)&count, sizeof(u64));
+    for (var i: u64 = 0; i < count; i++) {
+        var path: *NameInfo = ctx.loaded_modules_vec.get(i);
+        var source: *NameInfo = ctx.module_source_cache.get(slice(path.ptr, path.len));
+        if (source == 0) { g_artifact_cache_enabled = 0; return 0; }
+        artifact_cache_key_part(path.ptr, path.len);
+        artifact_cache_key_part(source.ptr, source.len);
+    }
+    if (g_artifact_cache_enabled == 0) { return 0; }
+    g_artifact_cache_path = artifact_cache_path_for_key(
+        g_artifact_cache_identity.data,
+        g_artifact_cache_identity.length,
+        (u64)".bppasm",
+        7
+    );
+    var length: u64 = 0;
+    var record: u64 = artifact_cache_read(g_artifact_cache_path, ARTIFACT_CACHE_MAX_RECORD, &length);
+    g_timings_cache_status = 1;
+    if (record != 0) {
+        if (artifact_cache_record_matches(record, length, g_artifact_cache_identity.data, g_artifact_cache_identity.length, &g_artifact_cache_payload, &g_artifact_cache_payload_len) != 0) {
+            g_artifact_cache_record = record;
+            g_timings_cache_status = 2;
+            g_timings_cache_lookup_ms = timings_elapsed_ms(started);
+            artifact_cache_publish_index(ctx);
+            artifact_cache_note("hit");
+            return 1;
+        }
+        heap_free(record);
+        g_timings_cache_status = 3;
+        artifact_cache_note("invalid record; rebuilding");
+    } else { artifact_cache_note("miss"); }
+    g_timings_cache_lookup_ms = timings_elapsed_ms(started);
+    return 0;
+}
+
+func artifact_cache_hit() -> u64 { return g_artifact_cache_payload != 0; }
+
+func artifact_cache_incremental_enabled() -> u64 {
+    return g_artifact_cache_enabled != 0 && g_artifact_cache_base_identity_len != 0 && g_artifact_cache_directory.ptr != 0;
+}
+
+func artifact_cache_base_identity_data() -> u64 { return g_artifact_cache_identity.data; }
+func artifact_cache_base_identity_length() -> u64 { return g_artifact_cache_base_identity_len; }
+func artifact_cache_report_enabled() -> u64 { return g_artifact_cache_report; }
+
+func artifact_cache_emit_hit() -> u64 {
+    if (artifact_cache_hit() == 0) { return 0; }
+    return io_write_all(io_get_output_fd(), g_artifact_cache_payload, g_artifact_cache_payload_len);
+}
+
+func artifact_cache_begin_output() -> u64 {
+    if (g_artifact_cache_enabled == 0 || g_artifact_cache_path == 0 || artifact_cache_hit() != 0) { return 0; }
+    os_make_directory(g_artifact_cache_directory.ptr);
+    var pid: u64 = artifact_cache_hex(os_process_id());
+    var stamp: u64 = artifact_cache_hex(os_monotonic_ms());
+    var suffix: u64 = str_concat3(pid, 16, ".", 1, stamp, 16);
+    g_artifact_cache_temp = str_concat3(g_artifact_cache_path, str_len(g_artifact_cache_path), ".tmp.", 5, suffix, 33);
+    heap_free(pid); heap_free(stamp); heap_free(suffix);
+    var fd: i64 = (i64)sys_open(g_artifact_cache_temp, OS_O_WRONLY + OS_O_CREAT + OS_O_TRUNC, 384);
+    if (fd < 0) { artifact_cache_note("unavailable: output directory is not writable"); return 0; }
+    g_artifact_cache_fd = (u64)fd;
+    var header: [3]u64;
+    header[0] = ARTIFACT_CACHE_MAGIC;
+    header[1] = ARTIFACT_CACHE_FORMAT;
+    header[2] = g_artifact_cache_identity.length;
+    if (io_write_all((u64)fd, (u64)&header, 24) == 0 || io_write_all((u64)fd, g_artifact_cache_identity.data, g_artifact_cache_identity.length) == 0) {
+        sys_close((u64)fd); g_artifact_cache_fd = 0; os_remove_file(g_artifact_cache_temp); return 0;
+    }
+    io_output_tee_start((u64)fd);
+    return 1;
+}
+
+func artifact_cache_end_output(success: u64) -> u64 {
+    if (g_artifact_cache_fd == 0) { return 0; }
+    var intact: u64 = io_output_tee_stop();
+    var footer: [3]u64;
+    footer[0] = g_io_output_tee_bytes;
+    footer[1] = g_io_output_tee_hash;
+    footer[2] = ARTIFACT_CACHE_END;
+    if (success != 0 && intact != 0) { intact = io_write_all(g_artifact_cache_fd, (u64)&footer, 24); }
+    sys_close(g_artifact_cache_fd);
+    g_artifact_cache_fd = 0;
+    if (success != 0 && intact != 0 && footer[0] != 0 && os_rename_replace(g_artifact_cache_temp, g_artifact_cache_path) != 0) {
+        artifact_cache_publish_index(compiler_ctx_current());
+        artifact_cache_note("stored");
+        return 1;
+    }
+    os_remove_file(g_artifact_cache_temp);
+    return 0;
+}
+
+func artifact_cache_release() -> u64 {
+    artifact_cache_end_output(0);
+    if (g_artifact_cache_identity.data != 0) { heap_free(g_artifact_cache_identity.data); }
+    if (g_artifact_cache_record != 0) { heap_free(g_artifact_cache_record); }
+    if (g_artifact_cache_path != 0) { heap_free(g_artifact_cache_path); }
+    if (g_artifact_cache_temp != 0) { heap_free(g_artifact_cache_temp); }
+    if (g_artifact_cache_index_path != 0) { heap_free(g_artifact_cache_index_path); }
+    if (g_artifact_cache_index_temp != 0) { heap_free(g_artifact_cache_index_temp); }
+    g_artifact_cache_identity.data = 0;
+    g_artifact_cache_identity.length = 0;
+    g_artifact_cache_identity.capacity = 0;
+    g_artifact_cache_record = 0;
+    g_artifact_cache_payload = 0;
+    g_artifact_cache_payload_len = 0;
+    g_artifact_cache_path = 0;
+    g_artifact_cache_temp = 0;
+    g_artifact_cache_base_identity_len = 0;
+    g_artifact_cache_index_path = 0;
+    g_artifact_cache_index_temp = 0;
+    g_artifact_cache_enabled = 0;
+    return 0;
+}

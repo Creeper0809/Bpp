@@ -18,6 +18,13 @@ import compiler.module_path;
 import compiler.source_cache;
 import compiler.timings;
 
+// A boolean visited bit cannot distinguish an import cycle from a completed or
+// failed load. Keep the state explicit so cycles terminate without turning a
+// previous failure into a later success.
+const MODULE_LOAD_LOADING = 1;
+const MODULE_LOAD_READY = 2;
+const MODULE_LOAD_FAILED = 3;
+
 func load_module_by_name(module_path: u64, module_len: u64) -> u64 {
     return load_module_by_name_with_ctx(compiler_ctx_current(), module_path, module_len);
 }
@@ -27,6 +34,13 @@ func load_module_by_name_with_ctx(ctx: *CompilerCtx, module_path: u64, module_le
         emit_stderr("[ERROR] load_module_by_name_with_ctx currently requires active compiler context\n");
         return false;
     }
+    var previous_owned_scope: *HeapOwnedAllocList = compiler_ctx_owned_scope_enter(ctx);
+    var result: u64 = load_module_by_name_with_ctx_core(ctx, module_path, module_len);
+    compiler_ctx_owned_scope_leave(previous_owned_scope);
+    return result;
+}
+
+func load_module_by_name_with_ctx_core(ctx: *CompilerCtx, module_path: u64, module_len: u64) -> u64 {
     var resolved: u64 = resolve_path(module_path, module_len);
     if (resolved == 0) {
         diag_error("Compilation failed");
@@ -237,12 +251,67 @@ func pass1_load_imports_recursive_with_ctx(ctx: *CompilerCtx, imports_copy: *Vec
     return true;
 }
 
-func pass1_register_func_sigs(prog_sig: *AstProgram) -> u64 {
+// Import aliases must exist while the importing module is parsed so nominal
+// types resolve in that module's namespace instead of through a process-global
+// short-name table. Dependencies have completed their full load before this is
+// called, so their export maps are ready.
+func loader_register_parse_import_aliases(importer: []u8, imports: *Vec<*AstImport>) -> u64 {
+    if (imports == 0 || importer.ptr == 0 || importer.len == 0) { return 1; }
+    var ok: u64 = 1;
+    var n: u64 = imports.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var imp: *AstImport = imports.get(i);
+        if (imp == 0) { continue; }
+        var module_id: *NameInfo = module_util_module_id_from_import(imp.path.ptr, imp.path.len);
+        if (module_id == 0 || module_id.ptr == 0 || module_id.len == 0) { ok = 0; continue; }
+        // A dependency cycle can reach this module before the dependency has
+        // published its full export table. Calls and other late-bound names are
+        // completed by finalize_import_aliases(); only consume aliases eagerly
+        // when the table is already available.
+        if (module_exports_get(slice(module_id.ptr, module_id.len)) == 0) { continue; }
+        if (imp.symbol.ptr != 0 && imp.symbol.len != 0) {
+            if (import_symbol_from_module(importer, slice(module_id.ptr, module_id.len), imp.symbol, imp.alias_name) == 0) { ok = 0; }
+        } else if (imp.alias_name.ptr == 0 || imp.alias_name.len == 0) {
+            if (import_all_from_module(importer, slice(module_id.ptr, module_id.len)) == 0) { ok = 0; }
+        }
+    }
+    return ok;
+}
+
+// Signature parsing runs after imported modules have completed their own
+// signature pass, but before their full export tables are necessarily ready.
+// Make only the exports already published by that pass visible here. Missing
+// selective imports remain deferred to the full-parse registration above so a
+// partially initialized dependency cycle does not become a false error.
+func loader_register_available_pass1_import_aliases(importer: []u8, imports: *Vec<*AstImport>) -> u64 {
+    if (imports == 0 || importer.ptr == 0 || importer.len == 0) { return 0; }
+    var n: u64 = imports.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var imp: *AstImport = imports.get(i);
+        if (imp == 0) { continue; }
+        var module_id: *NameInfo = module_util_module_id_from_import(imp.path.ptr, imp.path.len);
+        if (module_id == 0 || module_id.ptr == 0 || module_id.len == 0) { continue; }
+        var export_map: *HashMap<u64, *NameInfo> = module_export_map_get(slice(module_id.ptr, module_id.len));
+        if (export_map == 0) { continue; }
+        if (imp.symbol.ptr != 0 && imp.symbol.len != 0) {
+            var mapped: *NameInfo = export_map.get(imp.symbol);
+            if (mapped != 0) {
+                add_import_alias(importer, imp.alias_name, slice(mapped.ptr, mapped.len));
+            }
+        } else if (imp.alias_name.ptr == 0 || imp.alias_name.len == 0) {
+            import_all_from_module(importer, slice(module_id.ptr, module_id.len));
+        }
+    }
+    return 0;
+}
+
+func pass1_register_func_sigs(prog_sig: *AstProgram, module: []u8) -> u64 {
     if (prog_sig == 0) { return 0; }
     var sig_funcs: *Vec<*AstFunc> = prog_sig.funcs_vec;
     var num_sig_funcs: u64 = sig_funcs.len();
     for (var i: u64 = 0; i < num_sig_funcs; i++) {
         var sig_fn: *AstFunc = sig_funcs.get(i);
+        sym_register_func_sig_module(sig_fn, module);
         g_compiler_ctx.all_func_sigs.push(sig_fn);
     }
     return 0;
@@ -259,18 +328,26 @@ func load_module_pass1_with_ctx(ctx: *CompilerCtx, file_path: u64, file_path_len
         emit_stderr("[ERROR] load_module_pass1_with_ctx currently requires active compiler context\n");
         return false;
     }
+    var previous_owned_scope: *HeapOwnedAllocList = compiler_ctx_owned_scope_enter(ctx);
+    var result: u64 = load_module_pass1_with_ctx_core(ctx, file_path, file_path_len);
+    compiler_ctx_owned_scope_leave(previous_owned_scope);
+    return result;
+}
+
+func load_module_pass1_with_ctx_core(ctx: *CompilerCtx, file_path: u64, file_path_len: u64) -> u64 {
     if (file_path == 0 || file_path_len == 0) {
         diag_error("Compilation failed");
         return false;
     }
-    if (g_compiler_ctx.loaded_modules_pass1.has(slice(file_path, file_path_len))) {
-        return true;
-    }
-    g_compiler_ctx.loaded_modules_pass1.put(slice(file_path, file_path_len), 1);
+    var pass1_state: u64 = g_compiler_ctx.loaded_modules_pass1.get(slice(file_path, file_path_len));
+    if (pass1_state == MODULE_LOAD_LOADING || pass1_state == MODULE_LOAD_READY) { return true; }
+    if (pass1_state == MODULE_LOAD_FAILED) { return false; }
+    g_compiler_ctx.loaded_modules_pass1.put(slice(file_path, file_path_len), MODULE_LOAD_LOADING);
 
     var tokens: *Vec<*Token> = get_cached_module_tokens(file_path, file_path_len);
     if (tokens == 0) {
         report_module_open_error(file_path, file_path_len);
+        g_compiler_ctx.loaded_modules_pass1.put(slice(file_path, file_path_len), MODULE_LOAD_FAILED);
         return false;
     }
 
@@ -278,25 +355,38 @@ func load_module_pass1_with_ctx(ctx: *CompilerCtx, file_path: u64, file_path_len
     var imports_copy: *Vec<*AstImport> = scan_imports_from_tokens(tokens);
     g_compiler_ctx.module_imports_pass1.put(slice(file_path, file_path_len), imports_copy);
 
-    pass1_load_imports_recursive_with_ctx(ctx, imports_copy);
+    if (pass1_load_imports_recursive_with_ctx(ctx, imports_copy) == 0) {
+        g_compiler_ctx.loaded_modules_pass1.put(slice(file_path, file_path_len), MODULE_LOAD_FAILED);
+        return false;
+    }
+
+    var pass1_identity: CompilerModuleIdentity = module_identity(file_path, file_path_len);
+    loader_register_available_pass1_import_aliases(pass1_identity.module, imports_copy);
 
     if (set_current_source(file_path, file_path_len) == 0) {
         report_module_open_error(file_path, file_path_len);
+        g_compiler_ctx.loaded_modules_pass1.put(slice(file_path, file_path_len), MODULE_LOAD_FAILED);
         return false;
     }
     ast_source_span_set_current_file_and_source(file_path, file_path_len, g_compiler_ctx.file_ptr, g_compiler_ctx.file_len);
+    var pass1_prev_module_ptr: u64 = g_compiler_ctx.current_module.ptr;
+    var pass1_prev_module_len: u64 = g_compiler_ctx.current_module.len;
+    g_compiler_ctx.current_module = pass1_identity.module;
     var p1: *Parser = new_parser(tokens);
     var signature_started: u64 = 0;
     if (timings_is_enabled() != 0) { signature_started = timings_now_ms(); }
     var prog_sig: *AstProgram = decl_parse_program_pass1(p1);
+    g_compiler_ctx.current_module = slice(pass1_prev_module_ptr, pass1_prev_module_len);
     if (timings_is_enabled() != 0) { timings_add_signature_parse(timings_elapsed_ms(signature_started)); }
     if (prog_sig == 0 || has_errors(p1) != 0) {
         if (has_errors(p1) == 0) {
             diag_note_error();
         }
+        g_compiler_ctx.loaded_modules_pass1.put(slice(file_path, file_path_len), MODULE_LOAD_FAILED);
         return false;
     }
-    pass1_register_func_sigs(prog_sig);
+    pass1_register_func_sigs(prog_sig, pass1_identity.module);
+    g_compiler_ctx.loaded_modules_pass1.put(slice(file_path, file_path_len), MODULE_LOAD_READY);
     return true;
 }
 
@@ -333,9 +423,42 @@ func load_std_prelude_with_ctx(ctx: *CompilerCtx) -> u64 {
 }
 
 func mark_module_loaded(file_path: u64, file_path_len: u64) -> u64 {
-    g_compiler_ctx.loaded_modules.put(slice(file_path, file_path_len), 1);
+    g_compiler_ctx.loaded_modules.put(slice(file_path, file_path_len), MODULE_LOAD_READY);
     var path_info: *NameInfo = module_util_clone_name_info(slice(file_path, file_path_len));
     g_compiler_ctx.loaded_modules_vec.push(path_info);
+    return 0;
+}
+
+// A cycle edge may temporarily treat a LOADING dependency as available. If
+// that dependency later fails, no module that traversed the edge may remain
+// READY: READY promises that the complete import closure succeeded.
+func loader_propagate_failed_dependencies() -> u64 {
+    if (g_compiler_ctx.loaded_modules_vec == 0 || g_compiler_ctx.module_imports_pass1 == 0) { return 0; }
+    var changed: u64 = 1;
+    while (changed != 0) {
+        changed = 0;
+        var module_count: u64 = g_compiler_ctx.loaded_modules_vec.len();
+        for (var mi: u64 = 0; mi < module_count; mi++) {
+            var path_info: *NameInfo = g_compiler_ctx.loaded_modules_vec.get(mi);
+            if (path_info == 0 || path_info.ptr == 0 || path_info.len == 0) { continue; }
+            if (g_compiler_ctx.loaded_modules.get(slice(path_info.ptr, path_info.len)) != MODULE_LOAD_READY) { continue; }
+            var imports: *Vec<*AstImport> = g_compiler_ctx.module_imports_pass1.get(slice(path_info.ptr, path_info.len));
+            if (imports == 0) { continue; }
+            var import_count: u64 = imports.len();
+            for (var ii: u64 = 0; ii < import_count; ii++) {
+                var imp: *AstImport = imports.get(ii);
+                if (imp == 0) { continue; }
+                var resolved: u64 = resolve_path(imp.path.ptr, imp.path.len);
+                if (resolved == 0) { continue; }
+                var resolved_len: u64 = str_len(resolved);
+                if (g_compiler_ctx.loaded_modules.get(slice(resolved, resolved_len)) == MODULE_LOAD_FAILED) {
+                    g_compiler_ctx.loaded_modules.put(slice(path_info.ptr, path_info.len), MODULE_LOAD_FAILED);
+                    changed = 1;
+                    break;
+                }
+            }
+        }
+    }
     return 0;
 }
 
@@ -438,15 +561,22 @@ func load_module_with_ctx(ctx: *CompilerCtx, file_path: u64, file_path_len: u64)
         emit_stderr("[ERROR] load_module_with_ctx currently requires active compiler context\n");
         return false;
     }
+    var previous_owned_scope: *HeapOwnedAllocList = compiler_ctx_owned_scope_enter(ctx);
+    var result: u64 = load_module_with_ctx_core(ctx, file_path, file_path_len);
+    compiler_ctx_owned_scope_leave(previous_owned_scope);
+    return result;
+}
+
+func load_module_with_ctx_core(ctx: *CompilerCtx, file_path: u64, file_path_len: u64) -> u64 {
     if (file_path == 0 || file_path_len == 0) {
         diag_error("Compilation failed");
         return false;
     }
-    if (g_compiler_ctx.loaded_modules.has(slice(file_path, file_path_len))) {
-        return true;
-    }
+    var load_state: u64 = g_compiler_ctx.loaded_modules.get(slice(file_path, file_path_len));
+    if (load_state == MODULE_LOAD_LOADING || load_state == MODULE_LOAD_READY) { return true; }
+    if (load_state == MODULE_LOAD_FAILED) { return false; }
 
-    mark_module_loaded(file_path, file_path_len);
+    g_compiler_ctx.loaded_modules.put(slice(file_path, file_path_len), MODULE_LOAD_LOADING);
     var ok: u64 = 1;
 
     if (!load_module_pass1_with_ctx(ctx, file_path, file_path_len)) {
@@ -465,8 +595,14 @@ func load_module_with_ctx(ctx: *CompilerCtx, file_path: u64, file_path_len: u64)
         ok = 0;
     } else {
         ast_source_span_set_current_file_and_source(file_path, file_path_len, g_compiler_ctx.file_ptr, g_compiler_ctx.file_len);
-        // Module identity for mangling
+        // Module identity scopes both parser lookup and later mangling.
         var mod_id: CompilerModuleIdentity = module_identity(file_path, file_path_len);
+        if (loader_register_parse_import_aliases(mod_id.module, g_compiler_ctx.module_imports_pass1.get(slice(file_path, file_path_len))) == 0) {
+            ok = 0;
+        }
+        var prev_module_ptr: u64 = g_compiler_ctx.current_module.ptr;
+        var prev_module_len: u64 = g_compiler_ctx.current_module.len;
+        g_compiler_ctx.current_module = mod_id.module;
 
         // Pass 2: full parse with bodies
         var p: *Parser = new_parser(tokens);
@@ -485,7 +621,14 @@ func load_module_with_ctx(ctx: *CompilerCtx, file_path: u64, file_path_len: u64)
             merge_module_program(file_path, file_path_len, prog, mod_id.module, mod_id.prefix);
             if (timings_is_enabled() != 0) { timings_add_module_merge(timings_elapsed_ms(merge_started)); }
         }
+        g_compiler_ctx.current_module = slice(prev_module_ptr, prev_module_len);
     }
     source_release_cached_module_tokens(g_compiler_ctx.module_tokens_cache, file_path, file_path_len, tokens);
+    if (ok != 0) {
+        mark_module_loaded(file_path, file_path_len);
+    } else {
+        g_compiler_ctx.loaded_modules.put(slice(file_path, file_path_len), MODULE_LOAD_FAILED);
+        loader_propagate_failed_dependencies();
+    }
     return ok;
 }

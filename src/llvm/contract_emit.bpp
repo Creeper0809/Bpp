@@ -646,6 +646,7 @@ func llvm_contract_global_type_supported_impl(ginfo: *GlobalInfo) -> u64 {
         case TYPE_U64: return 1;
         case TYPE_I64: return 1;
         case TYPE_F64: return 1;
+        case TYPE_FUNC: return 1;
     }
     return 0;
 }
@@ -723,6 +724,16 @@ func llvm_contract_emit_global_init_impl(program: *AstProgram, ginfo: *GlobalInf
     if (ti.ptr_depth != 0) {
         emit("null");
         return 1;
+    }
+    if (ti.type_kind == TYPE_FUNC && ginfo.init_expr != 0) {
+        var fn_ptr: u64 = 0;
+        var fn_len: u64 = 0;
+        if (llvm_contract_global_symbol_from_expr_impl((*AstNode)ginfo.init_expr, &fn_ptr, &fn_len) == 1) {
+            emit("ptrtoint (ptr ");
+            llvm_contract_emit_quoted_symbol_impl(slice(fn_ptr, fn_len));
+            emit(" to i64)");
+            return 1;
+        }
     }
     if (ti.type_kind == TYPE_ARRAY || ti.type_kind == TYPE_SLICE) {
         emit("zeroinitializer");
@@ -1341,7 +1352,9 @@ func llvm_contract_fn_abi_part_info_impl(fn: *AstFunc, target_idx: u64) -> LLVMA
 }
 
 func llvm_contract_fn_abi_part_info_from_program_impl(program: *AstProgram, fn: *AstFunc, target_idx: u64) -> LLVMABIParamPartInfo {
-    var out: LLVMABIParamPartInfo;
+    // A bare local declaration is uninitialized; every not-found path must
+    // return a deterministic empty record, including indirect callees.
+    var out: LLVMABIParamPartInfo = LLVMABIParamPartInfo{};
     if (fn == 0) { return out; }
     var abi_idx: u64 = 0;
     if (llvm_contract_fn_has_sret_param_from_program_impl(program, fn) != 0) {
@@ -1715,7 +1728,6 @@ func llvm_contract_fn_has_supported_param_types_from_program_impl(program: *AstP
     for (var i: u64 = 0; i < n; i = i + 1) {
         var param: *Param = fn.params_vec.get(i);
         if (param == 0) { return 0; }
-        if (param.is_variadic != 0 && param.ptr_depth == 0) { return 0; }
         if ((param.type_kind == TYPE_STRUCT || param.type_kind == TYPE_ARRAY || param.type_kind == TYPE_SLICE) && param.ptr_depth == 0) {
             if (llvm_contract_param_storage_size_from_program_impl(program, param) == 0 && param.type_kind != TYPE_SLICE) { return 0; }
             continue;
@@ -1732,7 +1744,6 @@ func llvm_contract_emit_fn_params_impl(fn: *AstFunc) -> u64 {
 func llvm_contract_emit_fn_params_from_program_impl(program: *AstProgram, fn: *AstFunc) -> u64 {
     if (fn == 0) { return 0; }
     var n: u64 = llvm_contract_fn_abi_param_count_from_program_impl(program, fn);
-    var has_variadic: u64 = llvm_contract_fn_has_variadic_param_impl(fn);
     for (var i: u64 = 0; i < n; i = i + 1) {
         var part: LLVMABIParamPartInfo = llvm_contract_fn_abi_part_info_from_program_impl(program, fn, i);
         if (part.found == 0) { continue; }
@@ -1740,11 +1751,6 @@ func llvm_contract_emit_fn_params_from_program_impl(program: *AstProgram, fn: *A
         if (llvm_contract_emit_abi_part_type_impl(part) == 0) { emit("i64"); }
         emit(" %p");
         print_u64(i);
-    }
-    if (has_variadic != 0) {
-        if (n != 0) { emit(", "); }
-        emit("...");
-        return 1;
     }
     return (n != 0);
 }
@@ -2233,6 +2239,10 @@ func llvm_contract_ll_reg_value_type_origin_depth_impl(fn: *AstFunc, sketch: *LL
                 if (param_ti != 0) {
                     if (param_ti.ptr_depth != 0) { return TYPE_U64; }
                     if (param_ti.type_kind == TYPE_ARRAY || param_ti.type_kind == TYPE_STRUCT || param_ti.type_kind == TYPE_SLICE) { return TYPE_U64; }
+                    // PARAM emission widens integer/bool ABI inputs into i64
+                    // registers. Consumers need that representation, not the
+                    // source-language type (notably when returning a bool).
+                    if (param_ti.type_kind != TYPE_F64) { return TYPE_U64; }
                     return param_ti.type_kind;
                 }
             }
@@ -5277,16 +5287,25 @@ func llvm_contract_ll_emit_ssa_body_impl(program: *AstProgram, fn: *AstFunc, ske
                     emit(", ");
                     print_u64(inst.dest);
                     emit("\n");
-                    emit("  %retsliceheap");
+                    emit("  %retslicealloc");
                     print_u64(block.id);
                     emit("_");
                     print_u64(i);
-                    emit(" = call ptr @\"malloc\"(i64 %retslicesize");
+                    emit(" = call i64 @\"std_io__heap_alloc\"(i64 %retslicesize");
                     print_u64(block.id);
                     emit("_");
                     print_u64(i);
                     emit(")\n");
                     var ret_heap_enc: u64 = llvm_contract_ll_find_reg_local_base_impl(sketch, inst.src1_value, bi, i);
+                    emit("  %retsliceheap");
+                    print_u64(block.id);
+                    emit("_");
+                    print_u64(i);
+                    emit(" = inttoptr i64 %retslicealloc");
+                    print_u64(block.id);
+                    emit("_");
+                    print_u64(i);
+                    emit(" to ptr\n");
                     if (ret_heap_enc != 0) {
                         emit("  call void @\"llvm.memcpy.p0.p0.i64\"(ptr %retsliceheap");
                         print_u64(block.id);
@@ -8058,23 +8077,11 @@ func llvm_contract_ll_emit_tag_heap_block_state_body_impl() -> u64 {
     emitln(" {");
     emitln("entry:");
     emitln("  ; bpp.tag.heap_state = heap-header-state");
-    emitln("  %raw = and i64 %p0, 281474976710655");
-    emitln("  %is_null = icmp eq i64 %raw, 0");
-    emitln("  br i1 %is_null, label %fail, label %size_check");
-    emitln("size_check:");
-    emitln("  %too_small = icmp ult i64 %raw, 32");
-    emitln("  br i1 %too_small, label %fail, label %check_magic");
-    emitln("check_magic:");
-    emitln("  %block = sub i64 %raw, 32");
-    emitln("  %magic_ptr = inttoptr i64 %block to ptr");
-    emitln("  %magic = load i64, ptr %magic_ptr");
-    emitln("  %magic_ok = icmp eq i64 %magic, 4774451407313060417");
-    emitln("  br i1 %magic_ok, label %state, label %fail");
+    emitln("  %block = call i64 @\"std_mem__bpp_tag_heap_block_raw\"(i64 %p0)");
+    emitln("  %is_null = icmp eq i64 %block, 0");
+    emitln("  br i1 %is_null, label %fail, label %state");
     emitln("state:");
-    emitln("  %state_addr = add i64 %block, 24");
-    emitln("  %state_ptr = inttoptr i64 %state_addr to ptr");
-    emitln("  %meta = load i64, ptr %state_ptr");
-    emitln("  %state_value = and i64 %meta, 255");
+    emitln("  %state_value = call i64 @\"std_io__heap_block_get_state\"(i64 %block)");
     emitln("  ret i64 %state_value");
     emitln("fail:");
     emitln("  ret i64 0");
@@ -8086,23 +8093,11 @@ func llvm_contract_ll_emit_tag_heap_generation_body_impl() -> u64 {
     emitln(" {");
     emitln("entry:");
     emitln("  ; bpp.tag.heap_generation = heap-header-generation");
-    emitln("  %raw = and i64 %p0, 281474976710655");
-    emitln("  %is_null = icmp eq i64 %raw, 0");
-    emitln("  br i1 %is_null, label %fail, label %size_check");
-    emitln("size_check:");
-    emitln("  %too_small = icmp ult i64 %raw, 32");
-    emitln("  br i1 %too_small, label %fail, label %check_magic");
-    emitln("check_magic:");
-    emitln("  %block = sub i64 %raw, 32");
-    emitln("  %magic_ptr = inttoptr i64 %block to ptr");
-    emitln("  %magic = load i64, ptr %magic_ptr");
-    emitln("  %magic_ok = icmp eq i64 %magic, 4774451407313060417");
-    emitln("  br i1 %magic_ok, label %generation, label %fail");
+    emitln("  %block = call i64 @\"std_mem__bpp_tag_heap_block_raw\"(i64 %p0)");
+    emitln("  %is_null = icmp eq i64 %block, 0");
+    emitln("  br i1 %is_null, label %fail, label %generation");
     emitln("generation:");
-    emitln("  %meta_addr = add i64 %block, 24");
-    emitln("  %meta_ptr = inttoptr i64 %meta_addr to ptr");
-    emitln("  %meta = load i64, ptr %meta_ptr");
-    emitln("  %gen = lshr i64 %meta, 8");
+    emitln("  %gen = call i64 @\"std_io__heap_block_get_generation\"(i64 %block)");
     emitln("  ret i64 %gen");
     emitln("fail:");
     emitln("  ret i64 0");
@@ -8219,14 +8214,7 @@ func llvm_contract_ll_emit_tagged_delete_begin_body_impl() -> u64 {
     emitln("  %can_delete_bool = icmp ne i64 %can_delete, 0");
     emitln("  br i1 %can_delete_bool, label %mark_lookup, label %fail");
     emitln("mark_lookup:");
-    emitln("  %raw = and i64 %p0, 281474976710655");
-    emitln("  %block = sub i64 %raw, 32");
-    emitln("  %state_addr = add i64 %block, 24");
-    emitln("  %state_ptr = inttoptr i64 %state_addr to ptr");
-    emitln("  %meta = load i64, ptr %state_ptr");
-    emitln("  %gen_bits = and i64 %meta, -256");
-    emitln("  %new_meta = or i64 %gen_bits, 2");
-    emitln("  store i64 %new_meta, ptr %state_ptr");
+    emitln("  %raw = call i64 @\"std_io__heap_delete_begin\"(i64 %p0)");
     emitln("  ret i64 %raw");
     emitln("fail:");
     emitln("  ret i64 0");
@@ -8525,6 +8513,14 @@ func llvm_contract_ll_emit_decl_or_def_impl(program: *AstProgram, owner: []u8, s
         can_define = 1;
         supported_sig = 1;
     }
+    // Keep allocator headers, ownership, quarantine and counters in the shared
+    // Bpp runtime. Only its OS boundary requires a host-specific LLVM bridge.
+    var memory_syscall: u64 = 0;
+    var memory_syscall_args: u64 = 0;
+    if (str_eq(owner, slice("std_os__os_sys_brk", str_len("std_os__os_sys_brk"))) != 0) { memory_syscall = 12; memory_syscall_args = 1; }
+    if (str_eq(owner, slice("std_os__os_sys_mmap", str_len("std_os__os_sys_mmap"))) != 0) { memory_syscall = 9; memory_syscall_args = 6; }
+    if (str_eq(owner, slice("std_os__os_sys_munmap", str_len("std_os__os_sys_munmap"))) != 0) { memory_syscall = 11; memory_syscall_args = 2; }
+    if (memory_syscall != 0) { can_define = 1; supported_sig = 1; }
     if (can_define != 0) { emit("define "); }
     else { emit("declare "); }
     if (sketch != 0 && sketch.supported_ret_type != 0) {
@@ -8547,95 +8543,17 @@ func llvm_contract_ll_emit_decl_or_def_impl(program: *AstProgram, owner: []u8, s
         emit("\n");
         return 1;
     }
-    if (owner.len == 18 && str_eq(slice(owner.ptr, owner.len), slice("std_io__heap_alloc", str_len("std_io__heap_alloc"))) != 0) {
+    if (memory_syscall != 0) {
         emitln(" {");
         emitln("entry:");
-        emitln("  %aligned.add = add i64 %p0, 7");
-        emitln("  %aligned = and i64 %aligned.add, -8");
-        emitln("  %le4096 = icmp ule i64 %aligned, 4096");
-        emitln("  %payload4096 = select i1 %le4096, i64 4096, i64 %aligned");
-        emitln("  %le2048 = icmp ule i64 %aligned, 2048");
-        emitln("  %payload2048 = select i1 %le2048, i64 2048, i64 %payload4096");
-        emitln("  %le1024 = icmp ule i64 %aligned, 1024");
-        emitln("  %payload1024 = select i1 %le1024, i64 1024, i64 %payload2048");
-        emitln("  %le512 = icmp ule i64 %aligned, 512");
-        emitln("  %payload512 = select i1 %le512, i64 512, i64 %payload1024");
-        emitln("  %le256 = icmp ule i64 %aligned, 256");
-        emitln("  %payload256 = select i1 %le256, i64 256, i64 %payload512");
-        emitln("  %le128 = icmp ule i64 %aligned, 128");
-        emitln("  %payload128 = select i1 %le128, i64 128, i64 %payload256");
-        emitln("  %le64 = icmp ule i64 %aligned, 64");
-        emitln("  %payload64 = select i1 %le64, i64 64, i64 %payload128");
-        emitln("  %le32 = icmp ule i64 %aligned, 32");
-        emitln("  %payload32 = select i1 %le32, i64 32, i64 %payload64");
-        emitln("  %le16 = icmp ule i64 %aligned, 16");
-        emitln("  %payload16 = select i1 %le16, i64 16, i64 %payload32");
-        emitln("  %le8 = icmp ule i64 %aligned, 8");
-        emitln("  %payload = select i1 %le8, i64 8, i64 %payload16");
-        emitln("  %total = add i64 %payload, 40");
-        emitln("  %heap_ptr = call ptr @\"malloc\"(i64 %total)");
-        emitln("  %block = ptrtoint ptr %heap_ptr to i64");
-        emitln("  store i64 1, ptr @\"_gvar_std_io__heap_inited\"");
-        emitln("  store i64 0, ptr @\"_gvar_std_io__heap_base\"");
-        emitln("  store i64 -1, ptr @\"_gvar_std_io__heap_brk\"");
-        emitln("  store i64 -1, ptr @\"_gvar_std_io__heap_reserved_end\"");
-        emitln("  %magic_ptr = inttoptr i64 %block to ptr");
-        emitln("  store i64 4774451407313060417, ptr %magic_ptr");
-        emitln("  %size_addr = add i64 %block, 8");
-        emitln("  %size_ptr = inttoptr i64 %size_addr to ptr");
-        emitln("  store i64 %payload, ptr %size_ptr");
-        emitln("  %next_addr = add i64 %block, 16");
-        emitln("  %next_ptr = inttoptr i64 %next_addr to ptr");
-        emitln("  store i64 0, ptr %next_ptr");
-        emitln("  %state_addr = add i64 %block, 24");
-        emitln("  %state_ptr = inttoptr i64 %state_addr to ptr");
-        emitln("  store i64 257, ptr %state_ptr");
-        emitln("  %footer_addr = add i64 %block, 32");
-        emitln("  %footer_payload_addr = add i64 %footer_addr, %payload");
-        emitln("  %footer_ptr = inttoptr i64 %footer_payload_addr to ptr");
-        emitln("  store i64 1311768467463790320, ptr %footer_ptr");
-        emitln("  %alloc_calls = load i64, ptr @\"_gvar_std_io__heap_profile_alloc_calls\"");
-        emitln("  %alloc_calls_next = add i64 %alloc_calls, 1");
-        emitln("  store i64 %alloc_calls_next, ptr @\"_gvar_std_io__heap_profile_alloc_calls\"");
-        emitln("  %requested_old = load i64, ptr @\"_gvar_std_io__heap_profile_requested_bytes\"");
-        emitln("  %requested_next = add i64 %requested_old, %p0");
-        emitln("  store i64 %requested_next, ptr @\"_gvar_std_io__heap_profile_requested_bytes\"");
-        emitln("  %payload_old = load i64, ptr @\"_gvar_std_io__heap_profile_payload_bytes\"");
-        emitln("  %payload_next = add i64 %payload_old, %payload");
-        emitln("  store i64 %payload_next, ptr @\"_gvar_std_io__heap_profile_payload_bytes\"");
-        emitln("  %live_old = load i64, ptr @\"_gvar_std_io__heap_profile_live_payload_bytes\"");
-        emitln("  %live_next = add i64 %live_old, %payload");
-        emitln("  store i64 %live_next, ptr @\"_gvar_std_io__heap_profile_live_payload_bytes\"");
-        emitln("  %is_class = icmp ule i64 %payload, 4096");
-        emitln("  br i1 %is_class, label %small_alloc, label %large_alloc");
-        emitln("small_alloc:");
-        emitln("  %slab_old = load i64, ptr @\"_gvar_std_io__heap_profile_slab_refills\"");
-        emitln("  %slab_next = add i64 %slab_old, 1");
-        emitln("  store i64 %slab_next, ptr @\"_gvar_std_io__heap_profile_slab_refills\"");
-        emitln("  %qcount = load i64, ptr @\"_gvar_std_io__heap_quarantine_count\"");
-        emitln("  %has_quarantine = icmp ugt i64 %qcount, 0");
-        emitln("  br i1 %has_quarantine, label %reuse_note, label %alloc_done");
-        emitln("reuse_note:");
-        emitln("  %qnext = sub i64 %qcount, 1");
-        emitln("  store i64 %qnext, ptr @\"_gvar_std_io__heap_quarantine_count\"");
-        emitln("  %release_old = load i64, ptr @\"_gvar_std_io__heap_profile_quarantine_releases\"");
-        emitln("  %release_next = add i64 %release_old, 1");
-        emitln("  store i64 %release_next, ptr @\"_gvar_std_io__heap_profile_quarantine_releases\"");
-        emitln("  %tcache_old = load i64, ptr @\"_gvar_std_io__heap_profile_tcache_hits\"");
-        emitln("  %tcache_next = add i64 %tcache_old, 1");
-        emitln("  store i64 %tcache_next, ptr @\"_gvar_std_io__heap_profile_tcache_hits\"");
-        emitln("  br label %alloc_done");
-        emitln("large_alloc:");
-        emitln("  %is_huge = icmp uge i64 %payload, 1048576");
-        emitln("  br i1 %is_huge, label %huge_note, label %alloc_done");
-        emitln("huge_note:");
-        emitln("  %mmap_old = load i64, ptr @\"_gvar_std_io__heap_profile_mmap_allocs\"");
-        emitln("  %mmap_next = add i64 %mmap_old, 1");
-        emitln("  store i64 %mmap_next, ptr @\"_gvar_std_io__heap_profile_mmap_allocs\"");
-        emitln("  br label %alloc_done");
-        emitln("alloc_done:");
-        emitln("  %user_ptr = add i64 %block, 32");
-        emitln("  ret i64 %user_ptr");
+        emit("  %sys_ret = call i64 (i64, ...) @\"syscall\"(i64 ");
+        print_u64(memory_syscall);
+        for (var sys_arg: u64 = 0; sys_arg < memory_syscall_args; sys_arg = sys_arg + 1) {
+            emit(", i64 %p");
+            print_u64(sys_arg);
+        }
+        emitln(")");
+        emitln("  ret i64 %sys_ret");
         emitln("}");
         return 1;
     }
@@ -8665,136 +8583,6 @@ func llvm_contract_ll_emit_decl_or_def_impl(program: *AstProgram, owner: []u8, s
         emitln("  %sys_code = trunc i64 %p0 to i32");
         emitln("  call void @\"exit\"(i32 %sys_code)");
         emitln("  unreachable");
-        emitln("}");
-        return 1;
-    }
-    if (owner.len == 17 && str_eq(slice(owner.ptr, owner.len), slice("std_io__heap_free", str_len("std_io__heap_free"))) != 0) {
-        emitln(" {");
-        emitln("entry:");
-        emitln("  %raw = and i64 %p0, 281474976710655");
-        emitln("  %is_null = icmp eq i64 %raw, 0");
-        emitln("  br i1 %is_null, label %done, label %size_check");
-        emitln("size_check:");
-        emitln("  %too_small = icmp ult i64 %raw, 32");
-        emitln("  br i1 %too_small, label %done, label %check_magic");
-        emitln("check_magic:");
-        emitln("  %block = sub i64 %raw, 32");
-        emitln("  %magic_ptr = inttoptr i64 %block to ptr");
-        emitln("  %magic = load i64, ptr %magic_ptr");
-        emitln("  %magic_ok = icmp eq i64 %magic, 4774451407313060417");
-        emitln("  br i1 %magic_ok, label %check_state, label %done");
-        emitln("check_state:");
-        emitln("  %state_addr = add i64 %block, 24");
-        emitln("  %state_ptr = inttoptr i64 %state_addr to ptr");
-        emitln("  %meta = load i64, ptr %state_ptr");
-        emitln("  %state = and i64 %meta, 255");
-        emitln("  %is_live = icmp eq i64 %state, 1");
-        emitln("  %is_dropping = icmp eq i64 %state, 2");
-        emitln("  %can_free = or i1 %is_live, %is_dropping");
-        emitln("  br i1 %can_free, label %mark_free, label %done");
-        emitln("mark_free:");
-        emitln("  %size_addr = add i64 %block, 8");
-        emitln("  %size_ptr = inttoptr i64 %size_addr to ptr");
-        emitln("  %size = load i64, ptr %size_ptr");
-        emitln("  %free_old = load i64, ptr @\"_gvar_std_io__heap_profile_free_calls\"");
-        emitln("  %free_next = add i64 %free_old, 1");
-        emitln("  store i64 %free_next, ptr @\"_gvar_std_io__heap_profile_free_calls\"");
-        emitln("  %live_old = load i64, ptr @\"_gvar_std_io__heap_profile_live_payload_bytes\"");
-        emitln("  %live_has = icmp uge i64 %live_old, %size");
-        emitln("  %live_sub = sub i64 %live_old, %size");
-        emitln("  %live_next = select i1 %live_has, i64 %live_sub, i64 0");
-        emitln("  store i64 %live_next, ptr @\"_gvar_std_io__heap_profile_live_payload_bytes\"");
-        emitln("  %poison_old = load i64, ptr @\"_gvar_std_io__heap_profile_poison_writes\"");
-        emitln("  %poison_next = add i64 %poison_old, 1");
-        emitln("  store i64 %poison_next, ptr @\"_gvar_std_io__heap_profile_poison_writes\"");
-        emitln("  %qold = load i64, ptr @\"_gvar_std_io__heap_quarantine_count\"");
-        emitln("  %qnext = add i64 %qold, 1");
-        emitln("  store i64 %qnext, ptr @\"_gvar_std_io__heap_quarantine_count\"");
-        emitln("  %push_old = load i64, ptr @\"_gvar_std_io__heap_profile_quarantine_pushes\"");
-        emitln("  %push_next = add i64 %push_old, 1");
-        emitln("  store i64 %push_next, ptr @\"_gvar_std_io__heap_profile_quarantine_pushes\"");
-        emitln("  %is_huge = icmp uge i64 %size, 1048576");
-        emitln("  br i1 %is_huge, label %huge_free_note, label %finish_free");
-        emitln("huge_free_note:");
-        emitln("  %mfree_old = load i64, ptr @\"_gvar_std_io__heap_profile_mmap_frees\"");
-        emitln("  %mfree_next = add i64 %mfree_old, 1");
-        emitln("  store i64 %mfree_next, ptr @\"_gvar_std_io__heap_profile_mmap_frees\"");
-        emitln("  br label %finish_free");
-        emitln("finish_free:");
-        emitln("  %gen = lshr i64 %meta, 8");
-        emitln("  %gen_next = add i64 %gen, 1");
-        emitln("  %gen_bits = shl i64 %gen_next, 8");
-        emitln("  %new_meta = or i64 %gen_bits, 3");
-        emitln("  store i64 %new_meta, ptr %state_ptr");
-        emitln("  br label %done");
-        emitln("done:");
-        emitln("  ret i64 0");
-        emitln("}");
-        return 1;
-    }
-    if (owner.len == 25 && str_eq(slice(owner.ptr, owner.len), slice("std_io__heap_delete_begin", str_len("std_io__heap_delete_begin"))) != 0) {
-        emitln(" {");
-        emitln("entry:");
-        emitln("  %raw = and i64 %p0, 281474976710655");
-        emitln("  %is_null = icmp eq i64 %raw, 0");
-        emitln("  br i1 %is_null, label %fail, label %size_check");
-        emitln("size_check:");
-        emitln("  %too_small = icmp ult i64 %raw, 32");
-        emitln("  br i1 %too_small, label %fail, label %check_magic");
-        emitln("check_magic:");
-        emitln("  %block = sub i64 %raw, 32");
-        emitln("  %magic_ptr = inttoptr i64 %block to ptr");
-        emitln("  %magic = load i64, ptr %magic_ptr");
-        emitln("  %magic_ok = icmp eq i64 %magic, 4774451407313060417");
-        emitln("  br i1 %magic_ok, label %check_state, label %fail");
-        emitln("check_state:");
-        emitln("  %state_addr = add i64 %block, 24");
-        emitln("  %state_ptr = inttoptr i64 %state_addr to ptr");
-        emitln("  %meta = load i64, ptr %state_ptr");
-        emitln("  %state = and i64 %meta, 255");
-        emitln("  %is_live = icmp eq i64 %state, 1");
-        emitln("  br i1 %is_live, label %mark_dropping, label %fail");
-        emitln("mark_dropping:");
-        emitln("  %gen_bits = and i64 %meta, -256");
-        emitln("  %new_meta = or i64 %gen_bits, 2");
-        emitln("  store i64 %new_meta, ptr %state_ptr");
-        emitln("  ret i64 %raw");
-        emitln("fail:");
-        emitln("  ret i64 0");
-        emitln("}");
-        return 1;
-    }
-    if (owner.len == 23 && str_eq(slice(owner.ptr, owner.len), slice("std_io__heap_delete_end", str_len("std_io__heap_delete_end"))) != 0) {
-        emitln(" {");
-        emitln("entry:");
-        emitln("  %raw = and i64 %p0, 281474976710655");
-        emitln("  %is_null = icmp eq i64 %raw, 0");
-        emitln("  br i1 %is_null, label %done, label %size_check");
-        emitln("size_check:");
-        emitln("  %too_small = icmp ult i64 %raw, 32");
-        emitln("  br i1 %too_small, label %done, label %check_magic");
-        emitln("check_magic:");
-        emitln("  %block = sub i64 %raw, 32");
-        emitln("  %magic_ptr = inttoptr i64 %block to ptr");
-        emitln("  %magic = load i64, ptr %magic_ptr");
-        emitln("  %magic_ok = icmp eq i64 %magic, 4774451407313060417");
-        emitln("  br i1 %magic_ok, label %check_state, label %done");
-        emitln("check_state:");
-        emitln("  %state_addr = add i64 %block, 24");
-        emitln("  %state_ptr = inttoptr i64 %state_addr to ptr");
-        emitln("  %meta = load i64, ptr %state_ptr");
-        emitln("  %state = and i64 %meta, 255");
-        emitln("  %is_dropping = icmp eq i64 %state, 2");
-        emitln("  br i1 %is_dropping, label %mark_free, label %done");
-        emitln("mark_free:");
-        emitln("  %gen = lshr i64 %meta, 8");
-        emitln("  %gen_next = add i64 %gen, 1");
-        emitln("  %gen_bits = shl i64 %gen_next, 8");
-        emitln("  %new_meta = or i64 %gen_bits, 3");
-        emitln("  store i64 %new_meta, ptr %state_ptr");
-        emitln("  br label %done");
-        emitln("done:");
-        emitln("  ret i64 0");
         emitln("}");
         return 1;
     }
@@ -10550,7 +10338,7 @@ func llvm_contract_dump_ll_skeleton_from_module_fd_impl(module: *LLVMSSAModuleSk
     llvm_contract_ll_emit_global_defs_impl(module.source_program);
     llvm_contract_ll_emit_string_globals_impl(module);
     emit("\n");
-    emitln("declare ptr @\"malloc\"(i64)");
+    emitln("declare i64 @\"syscall\"(i64, ...)");
     emitln("declare i64 @\"read\"(i32, ptr, i64)");
     emitln("declare i64 @\"write\"(i32, ptr, i64)");
     emitln("declare void @\"exit\"(i32)");

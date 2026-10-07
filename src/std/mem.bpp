@@ -5,9 +5,19 @@ import std.str;
 
 func memset(dst: u64, value: u64, len: u64) -> u64 {
     var v: u64 = value & 255;
-    var dst_u8: *u8 = (*u8)dst;
-    for (var i: u64 = 0; i < len; i++) {
-        dst_u8[i] = v;
+    var word: u64 = v * 72340172838076673;
+    var words: u64 = len / 8;
+    var dst_u64: *u64 = (*u64)dst;
+    for (var i: u64 = 0; i < words; i++) {
+        dst_u64[i] = word;
+    }
+    var rem: u64 = len % 8;
+    if (rem != 0) {
+        var base: u64 = words * 8;
+        var dst_u8: *u8 = (*u8)(dst + base);
+        for (var j: u64 = 0; j < rem; j++) {
+            dst_u8[j] = v;
+        }
     }
     return dst;
 }
@@ -62,6 +72,21 @@ func memcopy(dst: u64, src: u64, size: u64) -> u64 {
     return 0;
 }
 
+// Compiler-owned escape copy for a slice backed by a function-local array.
+// The returned length is in elements, even though this ABI helper uses u8.
+func bpp_return_slice_copy(src: u64, len: u64, elem_size: u64) -> []u8 {
+    if (len == 0) { return slice(0, 0); }
+    var max_bytes: u64 = 18446744073709551615;
+    if (elem_size == 0 || len > max_bytes / elem_size) {
+        panic("slice return size overflow");
+    }
+    var bytes: u64 = len * elem_size;
+    var dst: u64 = heap_alloc(bytes);
+    if (dst == 0) { panic("slice return allocation failed"); }
+    memcopy(dst, src, bytes);
+    return slice(dst, len);
+}
+
 func malloc(size: u64) -> u64 {
     return heap_alloc(size);
 }
@@ -81,7 +106,9 @@ func __bpp_delete_end(ptr: u64) -> u64 {
 }
 
 const BPP_TAG_PTR_MASK = 281474976710655;
-const BPP_TAG_HEAP_HEADER_SIZE = 32;
+// Tagged-pointer lifetime checks must decode the allocator's actual block
+// layout. Keep this as an alias instead of duplicating a byte offset.
+const BPP_TAG_HEAP_HEADER_SIZE = HEAP_ALLOC_HEADER_SIZE;
 const BPP_TAG_HEAP_STATE_LIVE = 1;
 const BPP_TAG_HEAP_STATE_DROPPING = 2;
 const BPP_TAG_HEAP_STATE_FREED = 3;
@@ -368,6 +395,7 @@ struct BppGcBlock {
     public forwarding: u64;
     public edges: *BppGcEdge;
     public edge_slots: *BppGcEdgeSlot;
+    public previous: *BppGcBlock;
     public next: *BppGcBlock;
     public index_next: *BppGcBlock;
 }
@@ -380,6 +408,123 @@ struct BppGcRoot {
 struct BppGcRootSlot {
     public slot: *u64;
     public next: *BppGcRootSlot;
+    public frame: u64;
+}
+
+struct BppGcTemporaryRoot {
+    public value: u64;
+    public frame: u64;
+    public sequence: u64;
+    public next: *BppGcTemporaryRoot;
+    public previous: *BppGcTemporaryRoot;
+    public frame_next: *BppGcTemporaryRoot;
+}
+
+var g_bpp_gc_temporary_roots: *BppGcTemporaryRoot;
+var g_bpp_gc_temporary_sequence: u64;
+var g_bpp_gc_temporary_count: u64;
+const BPP_GC_TEMPORARY_BUCKETS = 256;
+const BPP_GC_TEMPORARY_POOL_LIMIT = 128;
+var g_bpp_gc_temporary_frames: [256]*BppGcTemporaryRoot;
+var g_bpp_gc_temporary_pool: *BppGcTemporaryRoot;
+var g_bpp_gc_temporary_pool_count: u64;
+var g_bpp_gc_temporary_record_allocs: u64;
+
+func bpp_gc_temporary_mark() -> u64 { return g_bpp_gc_temporary_sequence; }
+func bpp_gc_temporary_root_count() -> u64 { return g_bpp_gc_temporary_count; }
+func bpp_gc_temporary_record_alloc_count() -> u64 { return g_bpp_gc_temporary_record_allocs; }
+
+func bpp_gc_temporary_frame_bucket(frame: u64) -> u64 {
+    return ((frame >> 4) ^ (frame >> 12)) % BPP_GC_TEMPORARY_BUCKETS;
+}
+
+func bpp_gc_temporary_record_acquire() -> *BppGcTemporaryRoot {
+    var root: *BppGcTemporaryRoot = g_bpp_gc_temporary_pool;
+    if (root != 0) {
+        g_bpp_gc_temporary_pool = root.next;
+        g_bpp_gc_temporary_pool_count = g_bpp_gc_temporary_pool_count - 1;
+        return root;
+    }
+    root = (*BppGcTemporaryRoot)bpp_runtime_heap_alloc(sizeof(BppGcTemporaryRoot));
+    if (root != 0) { g_bpp_gc_temporary_record_allocs = g_bpp_gc_temporary_record_allocs + 1; }
+    return root;
+}
+
+func bpp_gc_temporary_record_recycle(root: *BppGcTemporaryRoot) -> u64 {
+    if (g_bpp_gc_temporary_pool_count >= BPP_GC_TEMPORARY_POOL_LIMIT) {
+        heap_free((u64)root);
+        return 0;
+    }
+    // Free records are absent from both active indexes and retain no values.
+    root.value = 0;
+    root.frame = 0;
+    root.sequence = 0;
+    root.previous = 0;
+    root.frame_next = 0;
+    root.next = g_bpp_gc_temporary_pool;
+    g_bpp_gc_temporary_pool = root;
+    g_bpp_gc_temporary_pool_count = g_bpp_gc_temporary_pool_count + 1;
+    return 0;
+}
+
+// Values staged in ABI registers cannot be rewritten by compaction. Retain
+// and pin them only until their enclosing expression finishes evaluation.
+func bpp_gc_temporary_push(value: u64, frame: u64) -> u64 {
+    if (frame == 0 || bpp_gc_find_block(value) == 0) { return 0; }
+    var bucket: u64 = bpp_gc_temporary_frame_bucket(frame);
+    var current: *BppGcTemporaryRoot = g_bpp_gc_temporary_frames[bucket];
+    while (current != 0) {
+        if (current.frame == frame && current.value == value) { return 0; }
+        current = current.frame_next;
+    }
+    var root: *BppGcTemporaryRoot = bpp_gc_temporary_record_acquire();
+    if (root == 0) { return 0; }
+    g_bpp_gc_temporary_sequence = g_bpp_gc_temporary_sequence + 1;
+    root.value = value;
+    root.frame = frame;
+    root.sequence = g_bpp_gc_temporary_sequence;
+    root.next = g_bpp_gc_temporary_roots;
+    root.previous = 0;
+    if (root.next != 0) { root.next.previous = root; }
+    root.frame_next = g_bpp_gc_temporary_frames[bucket];
+    g_bpp_gc_temporary_frames[bucket] = root;
+    g_bpp_gc_temporary_roots = root;
+    g_bpp_gc_temporary_count = g_bpp_gc_temporary_count + 1;
+    return 1;
+}
+
+func bpp_gc_temporary_release(frame: u64, mark: u64) -> u64 {
+    var bucket: u64 = bpp_gc_temporary_frame_bucket(frame);
+    var previous: *BppGcTemporaryRoot = 0;
+    var current: *BppGcTemporaryRoot = g_bpp_gc_temporary_frames[bucket];
+    var removed: u64 = 0;
+    while (current != 0) {
+        // A bucket is newest-first even when other frames hash to it.
+        if (current.sequence <= mark) { break; }
+        var next: *BppGcTemporaryRoot = current.frame_next;
+        if (current.frame == frame && current.sequence > mark) {
+            if (previous == 0) { g_bpp_gc_temporary_frames[bucket] = next; }
+            else { previous.frame_next = next; }
+            if (current.previous == 0) { g_bpp_gc_temporary_roots = current.next; }
+            else { current.previous.next = current.next; }
+            if (current.next != 0) { current.next.previous = current.previous; }
+            bpp_gc_temporary_record_recycle(current);
+            if (g_bpp_gc_temporary_count > 0) { g_bpp_gc_temporary_count = g_bpp_gc_temporary_count - 1; }
+            removed = removed + 1;
+        } else { previous = current; }
+        current = next;
+    }
+    return removed;
+}
+
+func bpp_gc_temporary_points_to(block: *BppGcBlock) -> u64 {
+    var raw: u64 = bpp_gc_block_raw(block);
+    var root: *BppGcTemporaryRoot = g_bpp_gc_temporary_roots;
+    while (root != 0) {
+        if (bpp_tag_strip(root.value) == raw) { return 1; }
+        root = root.next;
+    }
+    return 0;
 }
 
 var g_bpp_tag_allocs: u64;
@@ -412,6 +557,7 @@ var g_bpp_tag_gc_barrier_dirty: u64;
 var g_bpp_gc_blocks: *BppGcBlock;
 var g_bpp_gc_block_index: *u64;
 var g_bpp_gc_block_index_buckets: u64;
+var g_bpp_gc_block_index_incomplete: u64;
 var g_bpp_gc_roots: *BppGcRoot;
 var g_bpp_gc_root_slots: *BppGcRootSlot;
 var g_bpp_gc_allocs: u64;
@@ -443,6 +589,16 @@ var g_bpp_gc_root_slot_tracking_state: u64;
 
 func bpp_tag_strip(ptr: u64) -> u64 {
     return ptr & BPP_TAG_PTR_MASK;
+}
+
+// The tagged-runtime arena and GC own these allocations independently of any
+// active compiler session. Keep them out of the allocator's session capture;
+// their explicit reset/collection paths remain the sole lifetime authority.
+func bpp_runtime_heap_alloc(size: u64) -> u64 {
+    var previous_recording: u64 = heap_owned_alloc_recording_suspend();
+    var ptr: u64 = heap_alloc(size);
+    heap_owned_alloc_recording_restore(previous_recording);
+    return ptr;
 }
 
 func bpp_tag_layout_has_memory_state(layout: []u8) -> u64 {
@@ -680,7 +836,7 @@ func bpp_tag_arena_alloc_raw(size: u64) -> u64 {
     if (g_bpp_tag_arena_cur == 0 || g_bpp_tag_arena_cur + aligned > g_bpp_tag_arena_end) {
         var payload_size: u64 = BPP_TAG_ARENA_CHUNK_BYTES;
         if (aligned > payload_size) { payload_size = aligned; }
-        var chunk: u64 = heap_alloc(payload_size + BPP_TAG_ARENA_CHUNK_HEADER_SIZE);
+        var chunk: u64 = bpp_runtime_heap_alloc(payload_size + BPP_TAG_ARENA_CHUNK_HEADER_SIZE);
         if (chunk == 0) { return 0; }
         var meta: *u64 = (*u64)chunk;
         meta[0] = g_bpp_tag_arena_head;
@@ -924,7 +1080,7 @@ func bpp_gc_block_index_hash(raw: u64) -> u64 {
 func bpp_gc_block_index_ensure() -> u64 {
     if (g_bpp_gc_block_index != 0 && g_bpp_gc_block_index_buckets != 0) { return 1; }
     var bytes: u64 = BPP_GC_BLOCK_INDEX_BUCKETS * sizeof(u64);
-    var table: *u64 = (*u64)heap_alloc(bytes);
+    var table: *u64 = (*u64)bpp_runtime_heap_alloc(bytes);
     if (table == 0) { return 0; }
     memset((u64)table, 0, bytes);
     g_bpp_gc_block_index = table;
@@ -934,14 +1090,47 @@ func bpp_gc_block_index_ensure() -> u64 {
 
 func bpp_gc_block_index_bucket(raw: u64) -> u64 {
     if (g_bpp_gc_block_index_buckets == 0) { return 0; }
-    return bpp_gc_block_index_hash(raw) % g_bpp_gc_block_index_buckets;
+    return bpp_gc_block_index_hash(raw) & (g_bpp_gc_block_index_buckets - 1);
+}
+
+// Keep lookups bounded as compiler sessions and application heaps grow. Only
+// rehash indexed records: the allocation being registered is already in the
+// global list, but must not be inserted twice. A failed growth leaves the old
+// index intact, including its existing incomplete-index fallback contract.
+func bpp_gc_block_index_grow() -> u64 {
+    var old_count: u64 = g_bpp_gc_block_index_buckets;
+    if (old_count == 0 || old_count > 1152921504606846975) { return 0; }
+    var count: u64 = old_count * 2;
+    var bytes: u64 = count * sizeof(u64);
+    var table: *u64 = (*u64)bpp_runtime_heap_alloc(bytes);
+    if (table == 0) { return 0; }
+    memset((u64)table, 0, bytes);
+    var old_table: *u64 = g_bpp_gc_block_index;
+    for (var i: u64 = 0; i < old_count; i++) {
+        var block: *BppGcBlock = (*BppGcBlock)old_table[i];
+        while (block != 0) {
+            var next: *BppGcBlock = block.index_next;
+            var bucket: u64 = bpp_gc_block_index_hash(bpp_gc_block_raw(block)) & (count - 1);
+            block.index_next = (*BppGcBlock)table[bucket];
+            table[bucket] = (u64)block;
+            block = next;
+        }
+    }
+    g_bpp_gc_block_index = table;
+    g_bpp_gc_block_index_buckets = count;
+    heap_free((u64)old_table);
+    return 1;
 }
 
 func bpp_gc_block_index_insert(block: *BppGcBlock) -> u64 {
     if (block == 0) { return 0; }
     var raw: u64 = bpp_gc_block_raw(block);
     if (raw == 0) { return 0; }
-    if (bpp_gc_block_index_ensure() == 0) { return 0; }
+    if (bpp_gc_block_index_ensure() == 0) {
+        g_bpp_gc_block_index_incomplete = 1;
+        return 0;
+    }
+    if (g_bpp_gc_live >= g_bpp_gc_block_index_buckets) { bpp_gc_block_index_grow(); }
     var bucket: u64 = bpp_gc_block_index_bucket(raw);
     block.index_next = (*BppGcBlock)g_bpp_gc_block_index[bucket];
     g_bpp_gc_block_index[bucket] = (u64)block;
@@ -953,7 +1142,9 @@ func bpp_gc_block_index_find(raw: u64) -> *BppGcBlock {
     var bucket: u64 = bpp_gc_block_index_bucket(raw);
     var cur: *BppGcBlock = (*BppGcBlock)g_bpp_gc_block_index[bucket];
     while (cur != 0) {
-        if (bpp_gc_block_is_live(cur) != 0 && bpp_gc_block_raw(cur) == raw) { return cur; }
+        // Compare the address first: collisions need neither a liveness call
+        // nor its additional stack frame on the legacy backend.
+        if ((cur.ptr & BPP_TAG_PTR_MASK) == raw && (cur.meta & BPP_GC_META_LIVE) != 0) { return cur; }
         cur = cur.index_next;
     }
     return (*BppGcBlock)0;
@@ -988,6 +1179,10 @@ func bpp_gc_find_block(ptr: u64) -> *BppGcBlock {
     if (raw == 0) { return (*BppGcBlock)0; }
     var indexed: *BppGcBlock = bpp_gc_block_index_find(raw);
     if (indexed != 0) { return indexed; }
+    // Stack/static/non-GC addresses are common in generated root checks. An
+    // authoritative negative lookup must not walk every managed allocation.
+    // Retain the slow path if index allocation ever failed in this GC epoch.
+    if (g_bpp_gc_block_index != 0 && g_bpp_gc_block_index_buckets != 0 && g_bpp_gc_block_index_incomplete == 0) { return (*BppGcBlock)0; }
     var cur: *BppGcBlock = g_bpp_gc_blocks;
     while (cur != 0) {
         if (bpp_gc_block_is_live(cur) != 0 && bpp_gc_block_raw(cur) == raw) { return cur; }
@@ -1036,16 +1231,68 @@ func bpp_gc_root_remove(ptr: u64) -> u64 {
     return 0;
 }
 
+func bpp_gc_block_record_release(block: *BppGcBlock) -> u64 {
+    if (block == 0) { return 0; }
+    if (block.previous == 0) {
+        if (g_bpp_gc_blocks != block) { return 0; }
+        g_bpp_gc_blocks = block.next;
+    } else {
+        if (block.previous.next != block) { return 0; }
+        block.previous.next = block.next;
+    }
+    if (block.next != 0) { block.next.previous = block.previous; }
+
+    var edge: *BppGcEdge = block.edges;
+    while (edge != 0) {
+        var next_edge: *BppGcEdge = edge.next;
+        heap_free((u64)edge);
+        if (g_bpp_gc_edges > 0) { g_bpp_gc_edges = g_bpp_gc_edges - 1; }
+        edge = next_edge;
+    }
+
+    var edge_slot: *BppGcEdgeSlot = block.edge_slots;
+    while (edge_slot != 0) {
+        var next_edge_slot: *BppGcEdgeSlot = edge_slot.next;
+        heap_free((u64)edge_slot);
+        if (g_bpp_gc_edge_slots > 0) { g_bpp_gc_edge_slots = g_bpp_gc_edge_slots - 1; }
+        edge_slot = next_edge_slot;
+    }
+
+    heap_free((u64)block);
+    return 1;
+}
+
 func bpp_gc_forget_live(ptr: u64) -> u64 {
     var block: *BppGcBlock = bpp_gc_find_block(ptr);
     if (block == 0) { return 0; }
     bpp_gc_root_remove(ptr);
     bpp_gc_forget_live_generation(bpp_tag_lifecycle_raw(block.ptr), bpp_gc_block_generation(block));
     bpp_gc_block_index_remove(block);
-    bpp_gc_block_set_live(block, 0);
-    bpp_gc_block_set_mark(block, 0);
     if (g_bpp_gc_live > 0) { g_bpp_gc_live = g_bpp_gc_live - 1; }
+    bpp_gc_block_record_release(block);
     return 1;
+}
+
+// Compiler sessions can own ordinary GC payloads while the collector's index
+// and graph records remain process-global. Detach every record whose payload
+// belongs to a session before that session bulk-releases its heap blocks.
+func bpp_gc_forget_owned_allocations(owner: *HeapOwnedAllocList) -> u64 {
+    if (owner == 0) { return 0; }
+    var released: u64 = 0;
+    var cur: *BppGcBlock = g_bpp_gc_blocks;
+    while (cur != 0) {
+        var next_block: *BppGcBlock = cur.next;
+        var raw: u64 = bpp_gc_block_raw(cur);
+        if (raw >= HEAP_ALLOC_HEADER_SIZE) {
+            var heap_block: u64 = raw - HEAP_ALLOC_HEADER_SIZE;
+            if (heap_block_is_valid(heap_block) != 0 &&
+                (u64)heap_block_get_owner(heap_block) == (u64)owner) {
+                if (bpp_gc_forget_live(cur.ptr) != 0) { released = released + 1; }
+            }
+        }
+        cur = next_block;
+    }
+    return released;
 }
 
 func bpp_gc_register_block(ptr: u64, size: u64, shape: u64) -> u64 {
@@ -1054,7 +1301,7 @@ func bpp_gc_register_block(ptr: u64, size: u64, shape: u64) -> u64 {
 
 func bpp_gc_register_block_policy(ptr: u64, size: u64, shape: u64, lifecycle: u64) -> u64 {
     if (ptr == 0) { return 0; }
-    var node: *BppGcBlock = (*BppGcBlock)heap_alloc(sizeof(BppGcBlock));
+    var node: *BppGcBlock = (*BppGcBlock)bpp_runtime_heap_alloc(sizeof(BppGcBlock));
     if (node == 0) { return 0; }
     node.ptr = ptr;
     node.meta = bpp_gc_block_make_meta_policy(shape, lifecycle);
@@ -1062,8 +1309,10 @@ func bpp_gc_register_block_policy(ptr: u64, size: u64, shape: u64, lifecycle: u6
     node.forwarding = 0;
     node.edges = (*BppGcEdge)0;
     node.edge_slots = (*BppGcEdgeSlot)0;
+    node.previous = (*BppGcBlock)0;
     node.next = g_bpp_gc_blocks;
     node.index_next = (*BppGcBlock)0;
+    if (g_bpp_gc_blocks != 0) { g_bpp_gc_blocks.previous = node; }
     g_bpp_gc_blocks = node;
     bpp_gc_block_index_insert(node);
     g_bpp_gc_allocs = g_bpp_gc_allocs + 1;
@@ -1086,6 +1335,8 @@ func bpp_gc_auto_collect_before_alloc(size: u64) -> u64 {
 func bpp_gc_alloc_tagged_policy(size: u64, lifecycle: u64, ownership: u64, barrier: u64, shape: u64) -> u64 {
     if (size == 0) { return 0; }
     bpp_gc_auto_collect_before_alloc(size);
+    // Payloads participate in the active heap ownership scope. Collector
+    // bookkeeping uses bpp_runtime_heap_alloc separately and stays global.
     var raw: u64 = heap_alloc(size);
     if (raw == 0) { return 0; }
     var tagged_ptr: u64 = bpp_tag_pack(raw, lifecycle, ownership, BPP_TAG_STORAGE_HEAP, barrier, shape, 0);
@@ -1144,7 +1395,7 @@ func bpp_gc_root_push(ptr: u64) -> u64 {
         }
         return 1;
     }
-    var root: *BppGcRoot = (*BppGcRoot)heap_alloc(sizeof(BppGcRoot));
+    var root: *BppGcRoot = (*BppGcRoot)bpp_runtime_heap_alloc(sizeof(BppGcRoot));
     if (root == 0) { return 0; }
     root.ptr = ptr;
     root.next = g_bpp_gc_roots;
@@ -1176,6 +1427,12 @@ func bpp_gc_root_pop() -> u64 {
 func bpp_gc_root_count() -> u64 { return g_bpp_gc_roots_count; }
 
 func bpp_gc_root_slot_push(slot: *u64) -> u64 {
+    return bpp_gc_root_slot_push_owned(slot, 0);
+}
+
+// Compiler-generated slots belong to one activation, including slots emitted
+// textually after a return but reached in an earlier loop iteration.
+func bpp_gc_root_slot_push_owned(slot: *u64, frame: u64) -> u64 {
     if (bpp_gc_root_slot_tracking_enabled() == 0) { return 0; }
     if (slot == 0) { return 0; }
     if (slot[0] == 0) { return 0; }
@@ -1185,13 +1442,34 @@ func bpp_gc_root_slot_push(slot: *u64) -> u64 {
         if (cur.slot == slot) { return 0; }
         cur = cur.next;
     }
-    var root: *BppGcRootSlot = (*BppGcRootSlot)heap_alloc(sizeof(BppGcRootSlot));
+    var root: *BppGcRootSlot = (*BppGcRootSlot)bpp_runtime_heap_alloc(sizeof(BppGcRootSlot));
     if (root == 0) { return 0; }
     root.slot = slot;
+    root.frame = frame;
     root.next = g_bpp_gc_root_slots;
     g_bpp_gc_root_slots = root;
     g_bpp_gc_root_slots_count = g_bpp_gc_root_slots_count + 1;
     return 1;
+}
+
+func bpp_gc_root_slots_remove_frame(frame: u64) -> u64 {
+    if (frame == 0) { return 0; }
+    bpp_gc_temporary_release(frame, 0);
+    var removed: u64 = 0;
+    var previous: *BppGcRootSlot = 0;
+    var current: *BppGcRootSlot = g_bpp_gc_root_slots;
+    while (current != 0) {
+        var next: *BppGcRootSlot = current.next;
+        if (current.frame == frame) {
+            if (previous == 0) { g_bpp_gc_root_slots = next; }
+            else { previous.next = next; }
+            heap_free((u64)current);
+            if (g_bpp_gc_root_slots_count > 0) { g_bpp_gc_root_slots_count = g_bpp_gc_root_slots_count - 1; }
+            removed = removed + 1;
+        } else { previous = current; }
+        current = next;
+    }
+    return removed;
 }
 
 func bpp_gc_root_slot_pop() -> u64 {
@@ -1238,7 +1516,7 @@ func bpp_gc_record_edge(parent: u64, child: u64) -> u64 {
         if (bpp_tag_strip(edge.child) == child_raw) { return 0; }
         edge = edge.next;
     }
-    var new_edge: *BppGcEdge = (*BppGcEdge)heap_alloc(sizeof(BppGcEdge));
+    var new_edge: *BppGcEdge = (*BppGcEdge)bpp_runtime_heap_alloc(sizeof(BppGcEdge));
     if (new_edge == 0) { return 0; }
     new_edge.child = child_block.ptr;
     new_edge.next = parent_block.edges;
@@ -1259,7 +1537,7 @@ func bpp_gc_record_edge_slot(parent: u64, child_slot: *u64) -> u64 {
         if (cur.slot == child_slot) { return 0; }
         cur = cur.next;
     }
-    var new_edge: *BppGcEdgeSlot = (*BppGcEdgeSlot)heap_alloc(sizeof(BppGcEdgeSlot));
+    var new_edge: *BppGcEdgeSlot = (*BppGcEdgeSlot)bpp_runtime_heap_alloc(sizeof(BppGcEdgeSlot));
     if (new_edge == 0) { return 0; }
     new_edge.slot = child_slot;
     new_edge.next = parent_block.edge_slots;
@@ -1330,6 +1608,12 @@ func bpp_gc_collect() -> u64 {
         root_slot = root_slot.next;
     }
 
+    var temporary: *BppGcTemporaryRoot = g_bpp_gc_temporary_roots;
+    while (temporary != 0) {
+        bpp_gc_mark(temporary.value);
+        temporary = temporary.next;
+    }
+
     cur = g_bpp_gc_blocks;
     while (cur != 0) {
         if (bpp_gc_block_is_live(cur) != 0 && bpp_gc_block_is_rooted(cur) != 0) {
@@ -1340,6 +1624,7 @@ func bpp_gc_collect() -> u64 {
 
     cur = g_bpp_gc_blocks;
     while (cur != 0) {
+        var next_block: *BppGcBlock = cur.next;
         if (bpp_gc_block_is_live(cur) != 0) {
             if (bpp_gc_block_is_marked(cur) != 0) {
                 bpp_gc_promote_survivor(cur);
@@ -1352,15 +1637,15 @@ func bpp_gc_collect() -> u64 {
                     }
                     bpp_gc_forget_live_generation(lifecycle, bpp_gc_block_generation(cur));
                     bpp_gc_block_index_remove(cur);
-                    bpp_gc_block_set_live(cur, 0);
                     if (g_bpp_gc_live > 0) { g_bpp_gc_live = g_bpp_gc_live - 1; }
                     g_bpp_gc_frees = g_bpp_gc_frees + 1;
                     g_bpp_gc_last_swept = g_bpp_gc_last_swept + 1;
                     bpp_tag_allocator_record_free(cur.ptr, 1);
+                    bpp_gc_block_record_release(cur);
                 }
             }
         }
-        cur = cur.next;
+        cur = next_block;
     }
 
     g_bpp_gc_bytes_since_collect = 0;
@@ -1493,6 +1778,7 @@ func bpp_gc_block_move_blocked_untracked(block: *BppGcBlock) -> u64 {
     if (lifecycle == BPP_TAG_LIFE_PINNED || lifecycle == BPP_TAG_LIFE_IMMORTAL) { return 0; }
     if (bpp_gc_block_is_rooted(block) != 0) { return 1; }
     if (bpp_gc_value_root_points_to(block) != 0) { return 1; }
+    if (bpp_gc_temporary_points_to(block) != 0) { return 1; }
     if (bpp_gc_legacy_edge_points_to(block) != 0) { return 1; }
     if (bpp_gc_block_has_update_slot(block) == 0) { return 1; }
     return 0;
@@ -1583,9 +1869,10 @@ func bpp_gc_move_block(block: *BppGcBlock) -> u64 {
     if (bpp_gc_can_move_block(block) == 0) { return 0; }
     var old_raw: u64 = bpp_gc_block_raw(block);
     if (old_raw == 0) { return 0; }
-    var new_raw: u64 = heap_alloc(block.size);
+    var new_raw: u64 = bpp_runtime_heap_alloc(block.size);
     if (new_raw == 0) { return 0; }
     memcopy(new_raw, old_raw, block.size);
+    heap_owned_alloc_transfer(old_raw, new_raw);
 
     var new_block_ptr: u64 = bpp_tag_pack(new_raw,
         bpp_tag_lifecycle_raw(block.ptr),
@@ -1636,6 +1923,26 @@ func bpp_gc_compact() -> u64 {
 }
 
 func bpp_gc_reset() -> u64 {
+    var temporary: *BppGcTemporaryRoot = g_bpp_gc_temporary_roots;
+    while (temporary != 0) {
+        var next_temporary: *BppGcTemporaryRoot = temporary.next;
+        heap_free((u64)temporary);
+        temporary = next_temporary;
+    }
+    g_bpp_gc_temporary_roots = 0;
+    g_bpp_gc_temporary_count = 0;
+    var pooled: *BppGcTemporaryRoot = g_bpp_gc_temporary_pool;
+    while (pooled != 0) {
+        var next_pooled: *BppGcTemporaryRoot = pooled.next;
+        heap_free((u64)pooled);
+        pooled = next_pooled;
+    }
+    g_bpp_gc_temporary_pool = 0;
+    g_bpp_gc_temporary_pool_count = 0;
+    g_bpp_gc_temporary_record_allocs = 0;
+    for (var bucket: u64 = 0; bucket < BPP_GC_TEMPORARY_BUCKETS; bucket++) { g_bpp_gc_temporary_frames[bucket] = 0; }
+    // Preserve the sequence across reset: an enclosing expression may still
+    // hold a mark and must be able to release allocations made after reset.
     var cur: *BppGcBlock = g_bpp_gc_blocks;
     while (cur != 0) {
         var next_block: *BppGcBlock = cur.next;
@@ -1680,6 +1987,7 @@ func bpp_gc_reset() -> u64 {
     g_bpp_gc_blocks = (*BppGcBlock)0;
     g_bpp_gc_block_index = (*u64)0;
     g_bpp_gc_block_index_buckets = 0;
+    g_bpp_gc_block_index_incomplete = 0;
     g_bpp_gc_roots = (*BppGcRoot)0;
     g_bpp_gc_root_slots = (*BppGcRootSlot)0;
     g_bpp_gc_allocs = 0;

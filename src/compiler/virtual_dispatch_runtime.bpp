@@ -17,7 +17,7 @@ func vdispatch_collect_parent_abst_methods(parent_def: *AstStructDef, out: *Vec<
     if (parent_def == 0 || out == 0) { return 0; }
     vdispatch_collect_abst_methods_recursive(parent_def, out);
 
-    var list: *Vec<*NameInfo> = sym_get_abst_methods(parent_def.name);
+    var list: *Vec<*NameInfo> = sym_get_abst_methods_for_struct(parent_def);
     if (list == 0) { return 0; }
 
     var n: u64 = list.len();
@@ -36,7 +36,8 @@ func vdispatch_collect_abst_methods_recursive(struct_def: *AstStructDef, out: *V
     scheduled.ensure_capacity(64);
     struct_stack.push(struct_def);
     parent_index_stack.push(0);
-    scheduled.put(struct_def.name, 1);
+    var root_identity: *NameInfo = sym_get_struct_canonical_name(struct_def);
+    scheduled.put(slice(root_identity.ptr, root_identity.len), 1);
 
     while (struct_stack.len() > 0) {
         var top_index: u64 = struct_stack.len() - 1;
@@ -50,10 +51,13 @@ func vdispatch_collect_abst_methods_recursive(struct_def: *AstStructDef, out: *V
             parent_index_stack.set(top_index, next_parent + 1);
             var parent_def: *AstStructDef = parent_desc.struct_def;
             if (parent_def == 0) { parent_def = get_struct_def(parent_desc.name); }
-            if (parent_def != 0 && scheduled.has(parent_def.name) == 0) {
-                scheduled.put(parent_def.name, 1);
-                struct_stack.push(parent_def);
-                parent_index_stack.push(0);
+            if (parent_def != 0) {
+                var parent_identity: *NameInfo = sym_get_struct_canonical_name(parent_def);
+                if (scheduled.has(slice(parent_identity.ptr, parent_identity.len)) == 0) {
+                    scheduled.put(slice(parent_identity.ptr, parent_identity.len), 1);
+                    struct_stack.push(parent_def);
+                    parent_index_stack.push(0);
+                }
             }
             continue;
         }
@@ -61,7 +65,7 @@ func vdispatch_collect_abst_methods_recursive(struct_def: *AstStructDef, out: *V
         struct_stack.pop();
         parent_index_stack.pop();
         if ((u64)current != (u64)struct_def) {
-            var list: *Vec<*NameInfo> = sym_get_abst_methods(current.name);
+            var list: *Vec<*NameInfo> = sym_get_abst_methods_for_struct(current);
             if (list != 0) {
                 var n: u64 = list.len();
                 for (var i: u64 = 0; i < n; i++) {
@@ -76,7 +80,7 @@ func vdispatch_collect_abst_methods_recursive(struct_def: *AstStructDef, out: *V
 func vdispatch_collect_self_and_parent_abst_methods(struct_def: *AstStructDef, out: *Vec<*NameInfo>) -> u64 {
     if (struct_def == 0 || out == 0) { return 0; }
     vdispatch_collect_abst_methods_recursive(struct_def, out);
-    var own: *Vec<*NameInfo> = sym_get_abst_methods(struct_def.name);
+    var own: *Vec<*NameInfo> = sym_get_abst_methods_for_struct(struct_def);
     if (own == 0) { return 0; }
     var n: u64 = own.len();
     for (var i: u64 = 0; i < n; i++) {
@@ -95,11 +99,12 @@ func _compiler_find_abst_decl_in_hierarchy(struct_def: *AstStructDef, method: []
         return lookup;
     }
 
-    if (sym_is_abst_method(struct_def.name, slice(method.ptr, method.len)) != 0) {
+    if (sym_is_abst_method_for_struct(struct_def, slice(method.ptr, method.len)) != 0) {
         lookup.found = 1;
-        lookup.owner = struct_def.name;
-        lookup.access = sym_get_abst_method_access(struct_def.name, slice(method.ptr, method.len));
-        lookup.sig = sym_get_abst_method_sig(struct_def.name, slice(method.ptr, method.len));
+        var owner_identity: *NameInfo = sym_get_struct_canonical_name(struct_def);
+        lookup.owner = slice(owner_identity.ptr, owner_identity.len);
+        lookup.access = sym_get_abst_method_access_for_struct(struct_def, slice(method.ptr, method.len));
+        lookup.sig = sym_get_abst_method_sig_for_struct(struct_def, slice(method.ptr, method.len));
         return lookup;
     }
 
@@ -135,6 +140,24 @@ func vdispatch_build_virtual_trait_name(base: []u8) -> *NameInfo {
     return module_util_name_concat2(slice("__Virt_", 7), slice(base.ptr, base.len));
 }
 
+func vdispatch_struct_def_is_same_or_descendant_depth(child: *AstStructDef, ancestor: *AstStructDef, depth: u64) -> u64 {
+    if (child == 0 || ancestor == 0) { return 0; }
+    if (child == ancestor) { return 1; }
+    if (depth > 64 || child.parents_vec == 0) { return 0; }
+    var pn: u64 = child.parents_vec.len();
+    for (var i: u64 = 0; i < pn; i++) {
+        var parent_desc: *ParentDesc = child.parents_vec.get(i);
+        var parent_def: *AstStructDef = parent_desc.struct_def;
+        if (parent_def == 0) { parent_def = resolve_parent_def(parent_desc, "Compiler error"); }
+        if (vdispatch_struct_def_is_same_or_descendant_depth(parent_def, ancestor, depth + 1) != 0) { return 1; }
+    }
+    return 0;
+}
+
+func vdispatch_struct_def_is_same_or_descendant(child: *AstStructDef, ancestor: *AstStructDef) -> u64 {
+    return vdispatch_struct_def_is_same_or_descendant_depth(child, ancestor, 0);
+}
+
 func vdispatch_build_virtual_trait_method_sig(abst_sig: *AstFunc, method: []u8) -> *AstFunc {
     if (abst_sig == 0 || abst_sig.params_vec == 0 || abst_sig.params_vec.len() == 0) {
         diag_emit_error_tag("validation", "virtual-dispatch", "abstract method requires self parameter for virtual dispatch");
@@ -158,12 +181,14 @@ func vdispatch_build_virtual_trait_method_sig(abst_sig: *AstFunc, method: []u8) 
         params_out.push(dst);
     }
 
-    return ast_func_ex(slice(method.ptr, method.len), params_out, abst_sig.ret_type, abst_sig.ret_ptr_depth, abst_sig.ret_is_tagged, abst_sig.ret_struct_name, abst_sig.ret_tag_layout, 0);
+    var abstract_fn: *AstFunc = ast_func_ex(slice(method.ptr, method.len), params_out, abst_sig.ret_type, abst_sig.ret_ptr_depth, abst_sig.ret_is_tagged, abst_sig.ret_struct_name, abst_sig.ret_tag_layout, 0);
+    abstract_fn.ret_typeinfo = ast_func_return_type(abst_sig);
+    return abstract_fn;
 }
 
 func vdispatch_setup_single_trait(base_def: *AstStructDef) -> u64 {
     if (base_def == 0) { return 0; }
-    var own_abst: *Vec<*NameInfo> = sym_get_abst_methods(base_def.name);
+    var own_abst: *Vec<*NameInfo> = sym_get_abst_methods_for_struct(base_def);
     if (own_abst == 0 || own_abst.len() == 0) { return 0; }
 
     var required: *Vec<*NameInfo> = new Vec<*NameInfo>{heap_alloc((8) * sizeof(*NameInfo)), 0, (8)};
@@ -171,7 +196,11 @@ func vdispatch_setup_single_trait(base_def: *AstStructDef) -> u64 {
     if (required.len() == 0) { return 0; }
 
     var trait_name: *NameInfo = vdispatch_build_virtual_trait_name(base_def.name);
-    var trait_def: *TraitDef = sym_get_trait_def(slice(trait_name.ptr, trait_name.len));
+    var base_module: *NameInfo = sym_get_struct_module(base_def);
+    var trait_def: *TraitDef = 0;
+    if (base_module != 0) {
+        trait_def = sym_get_trait_def_in_module(slice(trait_name.ptr, trait_name.len), slice(base_module.ptr, base_module.len));
+    }
     if (trait_def == 0) {
         var methods: *Vec<*TraitMethod> = new Vec<*TraitMethod>{heap_alloc((required.len()) * sizeof(*TraitMethod)), 0, (required.len())};
         var rn: u64 = required.len();
@@ -200,7 +229,9 @@ func vdispatch_setup_single_trait(base_def: *AstStructDef) -> u64 {
         sym_register_trait_def(trait_def);
     }
 
-    var vtable_info2: CompilerVtableStructInfo = trait_get_or_create_vtable_struct(trait_def, slice(trait_name.ptr, trait_name.len));
+    var canonical_trait: []u8 = trait_def.mangled_name;
+    if (canonical_trait.ptr == 0 || canonical_trait.len == 0) { canonical_trait = trait_def.name; }
+    var vtable_info2: CompilerVtableStructInfo = trait_get_or_create_vtable_struct(trait_def, canonical_trait);
     var vtable_name: []u8 = vtable_info2.vtable_name;
     var vtable_struct_def: *AstStructDef = vtable_info2.vtable_struct_def;
     if (vtable_struct_def == 0) {
@@ -214,14 +245,17 @@ func vdispatch_setup_single_trait(base_def: *AstStructDef) -> u64 {
     for (var si: u64 = 0; si < sn; si++) {
         var sd: *AstStructDef = g_compiler_ctx.all_structs_vec.get(si);
         if (sd == 0) { continue; }
-        if (struct_is_same_or_descendant(sd.name, base_def.name) == 0) { continue; }
+        if (vdispatch_struct_def_is_same_or_descendant(sd, base_def) == 0) { continue; }
 
-        struct_insert_vptr_field(sd, slice(trait_name.ptr, trait_name.len), vtable_name);
+        set_current_module_for_struct(sd);
+
+        struct_insert_vptr_field(sd, canonical_trait, vtable_name);
 
         var rn2: u64 = required.len();
         for (var rj: u64 = 0; rj < rn2; rj++) {
             var mref: *NameInfo = required.get(rj);
-            vdispatch_register_trait(sd.name, slice(mref.ptr, mref.len), slice(trait_name.ptr, trait_name.len));
+            var sd_identity: *NameInfo = sym_get_struct_canonical_name(sd);
+            vdispatch_register_trait(slice(sd_identity.ptr, sd_identity.len), slice(mref.ptr, mref.len), canonical_trait);
         }
 
         if (trait_find_trait_impl(slice(trait_name.ptr, trait_name.len), sd.name) != 0) { continue; }
@@ -249,6 +283,11 @@ func vdispatch_setup_single_trait(base_def: *AstStructDef) -> u64 {
         impl_info.assoc_bindings_vec = 0;
         impl_info.vtable_struct_def = 0;
         impl_info.vtable_global = slice(0, 0);
+        impl_info.canonical_trait_name = canonical_trait;
+        var impl_struct_identity: *NameInfo = sym_get_struct_canonical_name(sd);
+        impl_info.canonical_struct_name = slice(impl_struct_identity.ptr, impl_struct_identity.len);
+        impl_info.resolved_trait_def = trait_def;
+        impl_info.resolved_struct_def = sd;
         sym_register_trait_impl(impl_info);
     }
     return 0;
@@ -256,12 +295,16 @@ func vdispatch_setup_single_trait(base_def: *AstStructDef) -> u64 {
 
 func vdispatch_setup_traits() -> u64 {
     if (g_compiler_ctx.all_structs_vec == 0) { return 0; }
+    var prev_module_ptr: u64 = g_compiler_ctx.current_module.ptr;
+    var prev_module_len: u64 = g_compiler_ctx.current_module.len;
     var sn: u64 = g_compiler_ctx.all_structs_vec.len();
     for (var si: u64 = 0; si < sn; si++) {
         var sd: *AstStructDef = g_compiler_ctx.all_structs_vec.get(si);
         if (sd == 0) { continue; }
+        set_current_module_for_struct(sd);
         vdispatch_setup_single_trait(sd);
     }
+    g_compiler_ctx.current_module = slice(prev_module_ptr, prev_module_len);
     return 0;
 }
 
@@ -275,7 +318,8 @@ func vdispatch_find_parent_method_decl_for_override(struct_def: *AstStructDef, m
     for (var i: u64 = 0; i < pn; i++) {
         var parent_desc: *ParentDesc = parents.get(i);
         var parent_def: *AstStructDef = resolve_parent_def(parent_desc, "Compiler error");
-        var child_lookup: CompilerDeclLookup = find_method_decl_in_hierarchy_overload(parent_def.name, slice(method.ptr, method.len), arg_types, arg_count_hint);
+        var parent_identity: *NameInfo = sym_get_struct_canonical_name(parent_def);
+        var child_lookup: CompilerDeclLookup = find_method_decl_in_hierarchy_overload(slice(parent_identity.ptr, parent_identity.len), slice(method.ptr, method.len), arg_types, arg_count_hint);
         if (child_lookup.found != 0) {
             found = found + 1;
             if (found == 1) { first_hit = child_lookup; }

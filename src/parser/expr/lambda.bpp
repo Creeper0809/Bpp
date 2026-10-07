@@ -573,23 +573,20 @@ func lambda_build_param_typeinfo(src: *Param) -> *TypeInfo {
     return ti;
 }
 
-func lambda_build_func_sig_typeinfo(fn: *AstFunc) -> *TypeInfo {
+func lambda_build_func_sig_typeinfo(fn: *AstFunc, first_param: u64 = 0) -> *TypeInfo {
     if (fn == 0) { return 0; }
     var sig: *TypeInfo = typeinfo_new(TYPE_FUNC, 0);
     var params_sig: *Vec<*TypeInfo> = new Vec<*TypeInfo>{heap_alloc((4) * sizeof(*TypeInfo)), 0, (4)};
     var variadic: u64 = 0;
     if (fn.params_vec != 0) {
         var n: u64 = fn.params_vec.len();
-        for (var i: u64 = 0; i < n; i++) {
+        for (var i: u64 = first_param; i < n; i++) {
             var p: *Param = fn.params_vec.get(i);
             params_sig.push(lambda_build_param_typeinfo(p));
             if (p != 0 && p.is_variadic != 0) { variadic = 1; }
         }
     }
-    var ret_ti: *TypeInfo = typeinfo_new(fn.ret_type, fn.ret_ptr_depth);
-    ret_ti.is_tagged = fn.ret_is_tagged;
-    ret_ti.struct_name = fn.ret_struct_name;
-    ret_ti.tag_layout = fn.ret_tag_layout;
+    var ret_ti: *TypeInfo = ast_func_return_type(fn);
     sig.fn_params_vec = params_sig;
     sig.fn_ret_typeinfo = ret_ti;
     sig.fn_is_variadic = variadic;
@@ -925,13 +922,14 @@ func lambda_rewrite_stmt_captures_env(p: *Parser, node: *AstNode, captures: *Vec
     }
 }
 
-func lambda_block_convert_tail_to_return(p: *Parser, body_block: *AstNode) -> *AstNode {
+func lambda_block_convert_tail_to_return(p: *Parser, body_block: *AstNode, is_void: u64) -> *AstNode {
     if (body_block == 0 || ast_kind(body_block) != AST_BLOCK) {
         lambda_fail_tok(p, prev_tok(p), "P1658", "lambda body block parse failed");
         return body_block;
     }
     var blk: *AstBlock = (*AstBlock)body_block;
     if (blk.stmts_vec == 0 || blk.stmts_vec.len() == 0) {
+        if (is_void != 0) { return body_block; }
         lambda_fail_tok(p, prev_tok(p), "P1659", "lambda body expression is required");
         return body_block;
     }
@@ -939,12 +937,17 @@ func lambda_block_convert_tail_to_return(p: *Parser, body_block: *AstNode) -> *A
     var last_idx: u64 = blk.stmts_vec.len() - 1;
     var last_stmt: *AstNode = blk.stmts_vec.get(last_idx);
     var last_kind: u64 = ast_kind(last_stmt);
-    if (last_kind == AST_RETURN) { return body_block; }
-    if (last_kind == AST_EXPR_STMT) {
-        var expr_stmt: *AstExprStmt = (*AstExprStmt)last_stmt;
-        blk.stmts_vec.set(last_idx, (*AstNode)ast_return(expr_stmt.expr));
+    if (last_kind == AST_RETURN) {
+        if (is_void == 0 && ((*AstReturn)last_stmt).expr == 0) {
+            lambda_fail_tok(p, prev_tok(p), "P1663", "value-returning lambda requires a return value");
+        }
         return body_block;
     }
+    if (last_kind == AST_BLOCK) {
+        lambda_block_convert_tail_to_return(p, last_stmt, is_void);
+        return body_block;
+    }
+    if (is_void != 0) { return body_block; }
 
     lambda_fail_tok(p, prev_tok(p), "P1660", "lambda block must end with expression or return statement");
     return body_block;
@@ -986,7 +989,8 @@ func lambda_body_block(p: *Parser) -> *AstNode {
             continue;
         }
         if (peek_kind(p) == TOKEN_RBRACE) {
-            stmts.push((*AstNode)ast_expr_stmt(expr_stmt_expr));
+            // Only an unterminated final expression contributes a value.
+            stmts.push((*AstNode)ast_return(expr_stmt_expr));
             break;
         }
         lambda_fail_tok(p, peek_tok(p), "P1662", "Expected ';' or '}' in lambda body");
@@ -1215,8 +1219,10 @@ func lambda_parse_primary_expr(p: *Parser) -> *AstNode {
     var ret_is_tagged: u64 = 0;
     var ret_struct_name: []u8 = slice(0, 0);
     var ret_tag_layout: []u8 = slice(0, 0);
+    var ret_typeinfo: *TypeInfo = 0;
     if (match_tok(p, TOKEN_ARROW)) {
         var ret_ti: *TypeInfo = type_parse_ex(p);
+        ret_typeinfo = ast_normalize_return_type(ret_ti);
         ret_type = ret_ti.type_kind;
         ret_ptr_depth = ret_ti.ptr_depth;
         ret_is_tagged = ret_ti.is_tagged;
@@ -1271,9 +1277,10 @@ func lambda_parse_primary_expr(p: *Parser) -> *AstNode {
         }
     }
 
-    var body: *AstNode = lambda_block_convert_tail_to_return(p, body_block);
+    var body: *AstNode = lambda_block_convert_tail_to_return(p, body_block, ret_type == TYPE_VOID && ret_ptr_depth == 0);
 
     var lambda_fn: *AstFunc = ast_func_ex(slice(lambda_body_name.ptr, lambda_body_name.len), lambda_params, ret_type, ret_ptr_depth, ret_is_tagged, ret_struct_name, ret_tag_layout, body);
+    lambda_fn.ret_typeinfo = ret_typeinfo;
     generated_funcs_push(p, (u64)lambda_fn);
 
     if (has_captures == 0) {
@@ -1299,7 +1306,7 @@ func lambda_parse_primary_expr(p: *Parser) -> *AstNode {
         bind_params.push(lambda_make_capture_param(p, cap, slice(bind_param_name.ptr, bind_param_name.len)));
 
         var cap_slot: []u8 = cap.slot_name;
-        var env_target: *AstNode = (*AstNode)ast_member_access((*AstNode)ast_deref((*AstNode)ast_ident(slice("__env_obj", 9))), cap_slot);
+        var env_target: *AstNode = (*AstNode)ast_member_access((*AstNode)ast_ident(slice("__env_obj", 9)), cap_slot);
         bind_body_stmts.push((*AstNode)ast_assign(
             env_target,
             (*AstNode)ast_ident(slice(bind_param_name.ptr, bind_param_name.len))
@@ -1317,20 +1324,25 @@ func lambda_parse_primary_expr(p: *Parser) -> *AstNode {
     bind_body_stmts.push((*AstNode)closure_decl);
 
     bind_body_stmts.push((*AstNode)ast_assign(
-        (*AstNode)ast_member_access((*AstNode)ast_deref((*AstNode)ast_ident(slice("__clo_obj", 9))), slice("fn", 2)),
+        (*AstNode)ast_member_access((*AstNode)ast_ident(slice("__clo_obj", 9)), slice("fn", 2)),
         (*AstNode)ast_addr_of((*AstNode)ast_ident(slice(lambda_body_name.ptr, lambda_body_name.len)))
     ));
 
     bind_body_stmts.push((*AstNode)ast_assign(
-        (*AstNode)ast_member_access((*AstNode)ast_deref((*AstNode)ast_ident(slice("__clo_obj", 9))), slice("env", 3)),
+        (*AstNode)ast_member_access((*AstNode)ast_ident(slice("__clo_obj", 9)), slice("env", 3)),
         (*AstNode)ast_ident(slice("__env_obj", 9))
     ));
     var clo_as_u64: *AstNode = (*AstNode)ast_cast_ex((*AstNode)ast_ident(slice("__clo_obj", 9)), TYPE_U64, 0, 0, slice(0, 0), slice(0, 0));
     var clo_tagged: *AstNode = (*AstNode)ast_binary(TOKEN_PIPE, clo_as_u64, (*AstNode)ast_literal(LAMBDA_CLOSURE_HANDLE_TAG));
-    bind_body_stmts.push((*AstNode)ast_return(clo_tagged));
+    var public_sig: *TypeInfo = lambda_build_func_sig_typeinfo(lambda_fn, 1);
+    var public_type: *TypeInfo = typeinfo_new(TYPE_FUNC, 0);
+    public_type.copy_from(public_sig);
+    public_type.elem_typeinfo = public_sig;
+    bind_body_stmts.push((*AstNode)ast_return((*AstNode)ast_cast_typed(clo_tagged, public_type)));
 
     var bind_body: *AstNode = (*AstNode)ast_block(bind_body_stmts);
-    var bind_fn: *AstFunc = ast_func_ex(slice(bind_name.ptr, bind_name.len), bind_params, TYPE_U64, 0, 0, slice(0, 0), slice(0, 0), bind_body);
+    var bind_fn: *AstFunc = ast_func_ex(slice(bind_name.ptr, bind_name.len), bind_params, TYPE_FUNC, 0, 0, slice(0, 0), slice(0, 0), bind_body);
+    bind_fn.ret_typeinfo = public_type;
     generated_funcs_push(p, (u64)bind_fn);
 
     return (*AstNode)ast_call_with_origin_named(slice(bind_name.ptr, bind_name.len), bind_call_args, 0, AST_CALL_ORIGIN_DIRECT);

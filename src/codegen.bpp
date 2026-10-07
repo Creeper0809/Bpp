@@ -22,6 +22,7 @@ import compiler.annotations;
 import compiler.runtime_api;
 import compiler.ast_lowering;
 import compiler.timings;
+import compiler.incremental_cache;
 import llvm.contract_adapter;
 import ssa.datastruct;
 import ssa;
@@ -49,12 +50,11 @@ const CG_USED_HAS_CALL_PTR = 1;
 const CG_USED_HAS_METHOD_CALL = 2;
 const CG_USED_HAS_FUNC_ADDR = 4;
 const CG_USED_HAS_BINARY = 8;
-var g_cg_trace_runtime_needed: u64 = 0;
-var g_collect_used_symtab: *HashMap<u64, *TypeInfo>;
-var g_used_name_membership: *HashMap<u64, u64> = 0;
-var g_used_func_index: *HashMap<u64, *AstFunc> = 0;
-var g_used_closure_cursor: u64 = 0;
-
+var g_codegen_trace_runtime_touches: u64;
+var g_codegen_used_name_budget: u64;
+var g_codegen_used_name_budget_exceeded: u64;
+var g_codegen_gc_runtime_needed: u64;
+var g_codegen_gc_runtime_reason: u64;
 func used_mark_flag(flags_ptr: u64, mask: u64) -> u64 {
     *(flags_ptr) = *(flags_ptr) | mask;
     return 0;
@@ -62,8 +62,8 @@ func used_mark_flag(flags_ptr: u64, mask: u64) -> u64 {
 
 func used_has_name(used: *Vec<*NameInfo>, name: []u8) -> u64 {
     if (used == 0) { return false; }
-    if (g_used_name_membership != 0) {
-        return g_used_name_membership.get(slice(name.ptr, name.len)) != 0;
+    if (g_compiler_ctx.codegen_used_name_membership != 0) {
+        return g_compiler_ctx.codegen_used_name_membership.get(slice(name.ptr, name.len)) != 0;
     }
     var n: u64 = used.len();
     for (var i: u64 = 0; i < n; i++) {
@@ -107,10 +107,14 @@ func codegen_name_contains(name: []u8, needle: []u8) -> u64 {
 
 func used_add_name(used: *Vec<*NameInfo>, name: []u8) -> u64 {
     if (used_has_name(used, name) != 0) { return false; }
+    if (g_codegen_used_name_budget != 0 && used.len() >= g_codegen_used_name_budget) {
+        g_codegen_used_name_budget_exceeded = 1;
+        return false;
+    }
     var info: *NameInfo = new NameInfo{name.ptr, name.len};
     used.push(info);
-    if (g_used_name_membership != 0) {
-        g_used_name_membership.put(slice(name.ptr, name.len), 1);
+    if (g_compiler_ctx.codegen_used_name_membership != 0) {
+        g_compiler_ctx.codegen_used_name_membership.put(slice(name.ptr, name.len), 1);
     }
     return true;
 }
@@ -155,12 +159,12 @@ func collect_calls_in_method_call(mc: *AstMethodCall, used: *Vec<*NameInfo>, fla
     collect_calls_in_expr(mc.receiver, used, flags_ptr);
     collect_calls_in_args_vec(mc.args_vec, used, flags_ptr);
     var resolved: u64 = 0;
-    if (g_collect_used_symtab != 0) {
-        var recv_ti: *TypeInfo = generic_infer_expr_type(mc.receiver, g_collect_used_symtab);
+    if (g_compiler_ctx.codegen_collect_used_symtab != 0) {
+        var recv_ti: *TypeInfo = generic_infer_expr_type(mc.receiver, g_compiler_ctx.codegen_collect_used_symtab);
         if (recv_ti != 0 && recv_ti.type_kind == TYPE_STRUCT && u8_slice_ptr(recv_ti.struct_name) != 0 && u8_slice_len(recv_ti.struct_name) != 0) {
             var arg_count_hint: u64 = 0;
             if (mc.args_vec != 0) { arg_count_hint = mc.args_vec.len(); }
-            var arg_types: *Vec<*TypeInfo> = generic_collect_call_arg_types(mc.args_vec, g_collect_used_symtab);
+            var arg_types: *Vec<*TypeInfo> = generic_collect_call_arg_types(mc.args_vec, g_compiler_ctx.codegen_collect_used_symtab);
             var method_target: *AstFunc = lower_resolve_method_call_edge(recv_ti, mc.method, arg_types, arg_count_hint);
             if (method_target != 0) {
                 used_add_resolved_name(used, method_target.name);
@@ -185,20 +189,98 @@ func collect_calls_in_method_call(mc: *AstMethodCall, used: *Vec<*NameInfo>, fla
     return 0;
 }
 
+func codegen_binary_preserves_struct_value(op: u64) -> u64 {
+    if (op == TOKEN_PLUS) { return 1; }
+    if (op == TOKEN_MINUS) { return 1; }
+    if (op == TOKEN_STAR) { return 1; }
+    if (op == TOKEN_SLASH) { return 1; }
+    if (op == TOKEN_PERCENT) { return 1; }
+    if (op == TOKEN_LSHIFT) { return 1; }
+    if (op == TOKEN_RSHIFT) { return 1; }
+    if (op == TOKEN_AMPERSAND) { return 1; }
+    if (op == TOKEN_PIPE) { return 1; }
+    if (op == TOKEN_CARET) { return 1; }
+    return 0;
+}
+
+// SSA may synthesize an overloaded method call from a binary expression after
+// reachability has run. Recover the receiver type for nested value operations
+// using the same rule as the backend so those implicit callees are retained.
+func codegen_infer_overloaded_receiver_type(expr: *AstNode, symtab: *HashMap<u64, *TypeInfo>) -> *TypeInfo {
+    if (expr == 0 || symtab == 0) { return 0; }
+    // Raw integer constants are scalar at this backend boundary. Generic
+    // inference treats them as contextual Number values before lowering.
+    if (generic_expr_is_integer_literal(expr) != 0) { return 0; }
+    var ti: *TypeInfo = generic_infer_expr_type(expr, symtab);
+    if (ti != 0 && ti.ptr_depth == 0 && ti.type_kind == TYPE_STRUCT) { return ti; }
+    if (ast_kind(expr) != AST_BINARY) { return 0; }
+    var bin: *AstBinary = (*AstBinary)expr;
+    if (codegen_binary_preserves_struct_value(bin.op) == 0) { return 0; }
+    return codegen_infer_overloaded_receiver_type(bin.left, symtab);
+}
+
 func collect_calls_in_binary(bin: *AstBinary, used: *Vec<*NameInfo>, flags_ptr: u64) -> u64 {
-    // Primitive binary operations lower directly. Struct-valued operands may
-    // invoke generated overloads, which are not represented as calls in this
-    // AST and therefore need an implicit reachability root.
-    if (g_collect_used_symtab != 0) {
-        var left_ti: *TypeInfo = generic_infer_expr_type(bin.left, g_collect_used_symtab);
-        var right_ti: *TypeInfo = generic_infer_expr_type(bin.right, g_collect_used_symtab);
-        if ((left_ti != 0 && left_ti.type_kind == TYPE_STRUCT) ||
-            (right_ti != 0 && right_ti.type_kind == TYPE_STRUCT)) {
-            used_mark_flag(flags_ptr, CG_USED_HAS_BINARY);
-        }
-    }
     collect_calls_in_expr(bin.left, used, flags_ptr);
     collect_calls_in_expr(bin.right, used, flags_ptr);
+    var symtab: *HashMap<u64, *TypeInfo> = g_compiler_ctx.codegen_collect_used_symtab;
+    if (symtab == 0) { return 0; }
+    // Comparisons and logical operations do not preserve the receiver value;
+    // Number lowers them through dedicated runtime paths, while user-defined
+    // overloads have already become method-call nodes during parse lowering.
+    if (codegen_binary_preserves_struct_value(bin.op) == 0) { return 0; }
+    var method_name: NameInfo = compiler_operator_binary_name(bin.op);
+    if (method_name.ptr == 0) { return 0; }
+    var recv_ti: *TypeInfo = codegen_infer_overloaded_receiver_type(bin.left, symtab);
+    if (recv_ti == 0) { return 0; }
+
+    var arg_types: *Vec<*TypeInfo> = new Vec<*TypeInfo>{heap_alloc(sizeof(*TypeInfo)), 0, 1};
+    // Match the SSA caller's overload type exactly. Integer literals are i64
+    // at this late backend boundary; generic inference may contextualize them
+    // as Number and retain a different overload.
+    var arg_ti: *TypeInfo = 0;
+    if (generic_expr_is_integer_literal(bin.right) != 0) {
+        arg_ti = typeinfo_make(TYPE_I64, 0);
+    } else {
+        arg_ti = generic_infer_expr_type(bin.right, symtab);
+    }
+    if (arg_ti == 0) { arg_ti = codegen_infer_overloaded_receiver_type(bin.right, symtab); }
+    arg_types.push(arg_ti);
+    var target: *AstFunc = lower_resolve_method_call_edge(recv_ti, slice(method_name.ptr, method_name.len), arg_types, 1);
+    arg_types.release_buffer();
+    free((u64)arg_types);
+    if (target != 0) {
+        used_add_resolved_name(used, target.name);
+    } else {
+        // Preserve the conservative fallback for an overload that cannot be
+        // resolved precisely, rather than silently dropping a generated edge.
+        used_mark_flag(flags_ptr, CG_USED_HAS_BINARY);
+    }
+    return 0;
+}
+
+func collect_calls_in_unary(un: *AstUnary, used: *Vec<*NameInfo>, flags_ptr: u64) -> u64 {
+    collect_calls_in_expr(un.operand, used, flags_ptr);
+    var symtab: *HashMap<u64, *TypeInfo> = g_compiler_ctx.codegen_collect_used_symtab;
+    if (symtab == 0) { return 0; }
+    var recv_ti: *TypeInfo = codegen_infer_overloaded_receiver_type(un.operand, symtab);
+    if (recv_ti == 0) { return 0; }
+
+    // Operator declarations use the subtraction family for both binary and
+    // unary '-', distinguished by overload arity. Other unary operators have
+    // dedicated method families.
+    var method_name: NameInfo;
+    if (un.op == TOKEN_MINUS) {
+        method_name = compiler_operator_binary_name(un.op);
+    } else {
+        method_name = compiler_operator_unary_name(un.op);
+    }
+    if (method_name.ptr == 0) { return 0; }
+    var target: *AstFunc = lower_resolve_method_call_edge(recv_ti, slice(method_name.ptr, method_name.len), 0, 0);
+    if (target != 0) {
+        used_add_resolved_name(used, target.name);
+    } else {
+        used_mark_flag(flags_ptr, CG_USED_HAS_BINARY);
+    }
     return 0;
 }
 
@@ -252,8 +334,8 @@ func collect_calls_in_stack_ctor(sc: *AstStackCtor, used: *Vec<*NameInfo>, flags
 }
 
 func collect_calls_in_property_member(member: *AstMemberAccess, used: *Vec<*NameInfo>, is_write: u64) -> u64 {
-    if (member == 0 || g_collect_used_symtab == 0) { return 0; }
-    var recv_ti: *TypeInfo = generic_infer_expr_type(member.object, g_collect_used_symtab);
+    if (member == 0 || g_compiler_ctx.codegen_collect_used_symtab == 0) { return 0; }
+    var recv_ti: *TypeInfo = generic_infer_expr_type(member.object, g_compiler_ctx.codegen_collect_used_symtab);
     if (recv_ti == 0 || recv_ti.type_kind != TYPE_STRUCT || u8_slice_ptr(recv_ti.struct_name) == 0) { return 0; }
     var struct_def: *AstStructDef = get_struct_def(recv_ti.struct_name);
     if (struct_def == 0) { return 0; }
@@ -309,7 +391,7 @@ func collect_calls_in_expr(node: *AstNode, used: *Vec<*NameInfo>, flags_ptr: u64
         case AST_METHOD_CALL: return collect_calls_in_method_call(nref.method_call, used, flags_ptr);
         case AST_SAFE_METHOD_CALL: return collect_calls_in_method_call(nref.method_call, used, flags_ptr);
         case AST_BINARY: return collect_calls_in_binary(nref.binary, used, flags_ptr);
-        case AST_UNARY: return collect_calls_in_expr(nref.unary.operand, used, flags_ptr);
+        case AST_UNARY: return collect_calls_in_unary(nref.unary, used, flags_ptr);
         case AST_ADDR_OF: return collect_calls_in_addr_of(nref.addr_of, used, flags_ptr);
         case AST_DEREF: return collect_calls_in_expr(nref.deref.operand, used, flags_ptr);
         case AST_DEREF8: return collect_calls_in_expr(nref.deref8.operand, used, flags_ptr);
@@ -327,8 +409,11 @@ func collect_calls_in_expr(node: *AstNode, used: *Vec<*NameInfo>, flags_ptr: u64
         case AST_NEW: return collect_calls_in_new(nref.new_expr, used, flags_ptr);
         case AST_STACK_CTOR: return collect_calls_in_stack_ctor(nref.stack_ctor, used, flags_ptr);
         case AST_SLICE:
+            used_add_resolved_name(used, slice("std_mem__bpp_return_slice_copy", str_len("std_mem__bpp_return_slice_copy")));
             collect_calls_in_expr(nref.slice_expr.ptr_expr, used, flags_ptr);
             return collect_calls_in_expr(nref.slice_expr.len_expr, used, flags_ptr);
+        case AST_VARIADIC_PACK:
+            return collect_calls_in_args_vec(((*AstVariadicPack)node).values_vec, used, flags_ptr);
         case AST_TERNARY:
             collect_calls_in_expr(nref.ternary_expr.cond, used, flags_ptr);
             collect_calls_in_expr(nref.ternary_expr.then_expr, used, flags_ptr);
@@ -336,6 +421,7 @@ func collect_calls_in_expr(node: *AstNode, used: *Vec<*NameInfo>, flags_ptr: u64
         case AST_TRY:
             return collect_calls_in_expr(nref.try_expr.operand, used, flags_ptr);
         case AST_STRUCT_LITERAL:
+            used_add_resolved_name(used, slice("memset", 6));
             return collect_calls_in_args_vec(nref.struct_lit.values_vec, used, flags_ptr);
         case AST_GENERIC_STRUCT_LITERAL:
             return collect_calls_in_args_vec(nref.generic_struct_lit.values_vec, used, flags_ptr);
@@ -454,9 +540,9 @@ func collect_calls_in_stmt(node: *AstNode, used: *Vec<*NameInfo>, flags_ptr: u64
 
 func collect_calls_in_func(fn: *AstFunc, used: *Vec<*NameInfo>, flags_ptr: u64) -> u64 {
     if (fn == 0) { return 0; }
-    g_collect_used_symtab = generic_build_symtab_for_func(fn);
+    g_compiler_ctx.codegen_collect_used_symtab = generic_build_symtab_for_func(fn);
     collect_calls_in_stmt(fn.body, used, flags_ptr);
-    g_collect_used_symtab = 0;
+    g_compiler_ctx.codegen_collect_used_symtab = 0;
     return 0;
 }
 
@@ -517,6 +603,11 @@ func collect_add_number_runtime_helper_names(used: *Vec<*NameInfo>) -> u64 {
 func collect_add_gc_runtime_helper_names(used: *Vec<*NameInfo>) -> u64 {
     if (used == 0) { return 0; }
     used_add_resolved_name(used, slice("std_mem__bpp_gc_root_slot_push", str_len("std_mem__bpp_gc_root_slot_push")));
+    used_add_resolved_name(used, slice("std_mem__bpp_gc_root_slot_push_owned", str_len("std_mem__bpp_gc_root_slot_push_owned")));
+    used_add_resolved_name(used, slice("std_mem__bpp_gc_root_slots_remove_frame", str_len("std_mem__bpp_gc_root_slots_remove_frame")));
+    used_add_resolved_name(used, slice("std_mem__bpp_gc_temporary_mark", str_len("std_mem__bpp_gc_temporary_mark")));
+    used_add_resolved_name(used, slice("std_mem__bpp_gc_temporary_push", str_len("std_mem__bpp_gc_temporary_push")));
+    used_add_resolved_name(used, slice("std_mem__bpp_gc_temporary_release", str_len("std_mem__bpp_gc_temporary_release")));
     used_add_resolved_name(used, slice("std_mem__bpp_gc_root_slot_remove", str_len("std_mem__bpp_gc_root_slot_remove")));
     used_add_resolved_name(used, slice("std_mem__bpp_gc_alloc_raw", str_len("std_mem__bpp_gc_alloc_raw")));
     used_add_resolved_name(used, slice("std_mem__bpp_gc_alloc_raw_rooted", str_len("std_mem__bpp_gc_alloc_raw_rooted")));
@@ -544,8 +635,23 @@ func codegen_expr_has_gc_runtime_need(node: *AstNode) -> u64 {
     var nref: AstNodeTagRef;
     nref.node = node;
     match (kind) {
-        case AST_NEW: return 1;
+        case AST_VARIADIC_PACK:
+            // Even pointer-only packs register temporary roots without a local
+            // pointer declaration or an allocation at this call site.
+            g_codegen_gc_runtime_reason = g_codegen_gc_runtime_reason | 1;
+            return 1;
+        case AST_NEW:
+            g_codegen_gc_runtime_reason = g_codegen_gc_runtime_reason | 2;
+            return 1;
         case AST_CALL:
+            if (nref.call.name.len == 10 && str_eq(nref.call.name, slice("heap_alloc", 10)) != 0) {
+                g_codegen_gc_runtime_reason = g_codegen_gc_runtime_reason | 4;
+                return 1;
+            }
+            if (nref.call.name.len >= 12 && codegen_name_has_prefix(nref.call.name, slice("bpp_gc_alloc", 12)) != 0) {
+                g_codegen_gc_runtime_reason = g_codegen_gc_runtime_reason | 4;
+                return 1;
+            }
             return codegen_expr_vec_has_gc_runtime_need(nref.call.args_vec);
         case AST_CALL_PTR:
             if (codegen_expr_has_gc_runtime_need(nref.call_ptr.callee) != 0) { return 1; }
@@ -573,7 +679,10 @@ func codegen_expr_has_gc_runtime_need(node: *AstNode) -> u64 {
             if (codegen_expr_has_gc_runtime_need(nref.assign_stmt.target) != 0) { return 1; }
             return codegen_expr_has_gc_runtime_need(nref.assign_stmt.value);
         case AST_STACK_CTOR:
-            if (nref.stack_ctor.is_tagged != 0) { return 1; }
+            if (nref.stack_ctor.is_tagged != 0) {
+                g_codegen_gc_runtime_reason = g_codegen_gc_runtime_reason | 16;
+                return 1;
+            }
             return codegen_expr_vec_has_gc_runtime_need(nref.stack_ctor.ctor_args_vec);
         case AST_STRUCT_LITERAL:
             return codegen_expr_vec_has_gc_runtime_need(nref.struct_lit.values_vec);
@@ -590,8 +699,6 @@ func codegen_stmt_has_gc_runtime_need(node: *AstNode) -> u64 {
         case AST_RETURN:
             return codegen_expr_has_gc_runtime_need(nref.ret_stmt.expr);
         case AST_VAR_DECL:
-            if (nref.var_decl.ptr_depth > 0) { return 1; }
-            if (nref.var_decl.is_tagged != 0) { return 1; }
             return codegen_expr_has_gc_runtime_need(nref.var_decl.init_expr);
         case AST_CONST_DECL:
             return codegen_expr_has_gc_runtime_need(nref.const_decl.value);
@@ -599,6 +706,7 @@ func codegen_stmt_has_gc_runtime_need(node: *AstNode) -> u64 {
             if (codegen_expr_has_gc_runtime_need(nref.assign_stmt.target) != 0) { return 1; }
             return codegen_expr_has_gc_runtime_need(nref.assign_stmt.value);
         case AST_DELETE:
+            g_codegen_gc_runtime_reason = g_codegen_gc_runtime_reason | 8;
             return 1;
         case AST_EXPR_STMT:
             return codegen_expr_has_gc_runtime_need(nref.expr_stmt.expr);
@@ -670,7 +778,7 @@ func codegen_func_params_have_gc_runtime_need(fn: *AstFunc) -> u64 {
     var n: u64 = params.len();
     for (var i: u64 = 0; i < n; i++) {
         var param: *Param = params.get(i);
-        if (param != 0 && param.ptr_depth > 0) { return 1; }
+        if (param != 0 && (param.ptr_depth > 0 || param.type_kind == TYPE_FUNC)) { return 1; }
     }
     return 0;
 }
@@ -684,7 +792,6 @@ func codegen_program_has_gc_runtime_need(program: *AstProgram, used: *Vec<*NameI
         if (fn == 0 || fn.body == 0) { continue; }
         if (used != 0 && used_has_resolved_name(used, fn.name) == 0) { continue; }
         if (codegen_gc_codegen_disabled_for_name(fn.name) != 0) { continue; }
-        if (codegen_func_params_have_gc_runtime_need(fn) != 0) { return 1; }
         if (codegen_stmt_has_gc_runtime_need(fn.body) != 0) { return 1; }
     }
     return 0;
@@ -710,14 +817,14 @@ func collect_trait_vtable_impl_func_names(used: *Vec<*NameInfo>) -> u64 {
 }
 
 func collect_used_func_closure(funcs: *Vec<*AstFunc>, used: *Vec<*NameInfo>, flags_ptr: u64) -> u64 {
-    if (funcs == 0 || used == 0 || g_used_func_index == 0) { return 0; }
+    if (funcs == 0 || used == 0 || g_compiler_ctx.codegen_used_func_index == 0) { return 0; }
     // used is insertion ordered. Processing it with a cursor turns the old
     // whole-program fixed-point scan into a deterministic work queue.
-    while (g_used_closure_cursor < used.len()) {
-        var info: *NameInfo = used.get(g_used_closure_cursor);
-        g_used_closure_cursor = g_used_closure_cursor + 1;
+    while (g_compiler_ctx.codegen_used_closure_cursor < used.len()) {
+        var info: *NameInfo = used.get(g_compiler_ctx.codegen_used_closure_cursor);
+        g_compiler_ctx.codegen_used_closure_cursor = g_compiler_ctx.codegen_used_closure_cursor + 1;
         if (info == 0) { continue; }
-        var fn: *AstFunc = g_used_func_index.get(slice(info.ptr, info.len));
+        var fn: *AstFunc = g_compiler_ctx.codegen_used_func_index.get(slice(info.ptr, info.len));
         if (fn == 0) { continue; }
         set_current_module_for_func(fn.name);
         collect_calls_in_func(fn, used, flags_ptr);
@@ -726,19 +833,37 @@ func collect_used_func_closure(funcs: *Vec<*AstFunc>, used: *Vec<*NameInfo>, fla
 }
 
 func collect_build_func_index(funcs: *Vec<*AstFunc>) -> u64 {
-    g_used_func_index = new HashMap<u64, *AstFunc>{0, 0, 0};
-    g_used_func_index.ensure_capacity(256);
-    g_used_closure_cursor = 0;
+    if (g_compiler_ctx.codegen_used_func_index == 0) {
+        g_compiler_ctx.codegen_used_func_index = new HashMap<u64, *AstFunc>{0, 0, 0};
+        g_compiler_ctx.codegen_used_func_index.ensure_capacity(256);
+    } else {
+        g_compiler_ctx.codegen_used_func_index.clear();
+    }
+    g_compiler_ctx.codegen_used_closure_cursor = 0;
     if (funcs == 0) { return 0; }
     var n: u64 = funcs.len();
     for (var i: u64 = 0; i < n; i++) {
         var fn: *AstFunc = funcs.get(i);
         if (fn == 0) { continue; }
-        g_used_func_index.put(slice(fn.name.ptr, fn.name.len), fn);
+        g_compiler_ctx.codegen_used_func_index.put(slice(fn.name.ptr, fn.name.len), fn);
         var resolved: *NameInfo = resolve_name(slice(fn.name.ptr, fn.name.len));
         if (resolved != 0) {
-            g_used_func_index.put(slice(resolved.ptr, resolved.len), fn);
+            g_compiler_ctx.codegen_used_func_index.put(slice(resolved.ptr, resolved.len), fn);
         }
+    }
+    return 0;
+}
+
+func collect_used_functions_need_gc_frame(used: *Vec<*NameInfo>) -> u64 {
+    if (used == 0 || g_compiler_ctx.codegen_used_func_index == 0) { return 0; }
+    var n: u64 = used.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var info: *NameInfo = used.get(i);
+        if (info == 0) { continue; }
+        var fn: *AstFunc = g_compiler_ctx.codegen_used_func_index.get(slice(info.ptr, info.len));
+        if (fn == 0) { continue; }
+        if (codegen_gc_codegen_disabled_for_name(fn.name) != 0) { continue; }
+        if (compiler_function_needs_gc_frame(fn.name) != 0) { return 1; }
     }
     return 0;
 }
@@ -780,20 +905,12 @@ func collect_used_func_names(program: *AstProgram, used: *Vec<*NameInfo>, flags_
     for (var si: u64 = 0; si < seed_n; si++) {
         var seed_fn: *AstFunc = funcs.get(si);
         if (seed_fn == 0) { continue; }
-        // Operator calls are created by the lowering pass. Seed their bodies
-        // before closure so calls made by an operator remain reachable too.
-        if (seed_implicit_codegen != 0 && codegen_name_contains(seed_fn.name, slice("__op_", str_len("__op_"))) != 0) {
-            used_add_resolved_name(used, seed_fn.name);
-        }
         if (seed_implicit_codegen != 0 && codegen_name_has_suffix(seed_fn.name, slice("_destructor", str_len("_destructor"))) != 0) {
             used_add_name(used, seed_fn.name);
         }
-        if (seed_implicit_codegen != 0 && codegen_name_has_prefix(seed_fn.name, slice("__thunk_", str_len("__thunk_"))) != 0) {
-            used_add_name(used, seed_fn.name);
-        }
-        // Virtual-dispatch tables reference these thunks from emitted data,
+        // Trait and virtual-dispatch tables reference thunks from emitted data,
         // not from an AST call node. They are roots in every backend mode.
-        if (codegen_name_has_prefix(seed_fn.name, slice("__thunk___Virt_", str_len("__thunk___Virt_"))) != 0) {
+        if (codegen_name_has_prefix(seed_fn.name, slice("__thunk_", str_len("__thunk_"))) != 0) {
             used_add_resolved_name(used, seed_fn.name);
         }
         if (seed_fn.annotations_vec == 0) { continue; }
@@ -812,6 +929,18 @@ func collect_used_func_names(program: *AstProgram, used: *Vec<*NameInfo>, flags_
 
     collect_used_func_closure(funcs, used, flags_ptr);
     var collected_flags: u64 = *(flags_ptr);
+    if (seed_implicit_codegen != 0 && (collected_flags & CG_USED_HAS_BINARY) != 0) {
+        // Direct operator calls created by lowering are already part of the
+        // closure. Only unresolved struct-valued binary nodes need the legacy
+        // fallback that retains every overload target.
+        for (var oi: u64 = 0; oi < seed_n; oi++) {
+            var operator_target: *AstFunc = funcs.get(oi);
+            if (operator_target != 0 && codegen_name_contains(operator_target.name, slice("__op_", str_len("__op_"))) != 0) {
+                used_add_resolved_name(used, operator_target.name);
+            }
+        }
+        collect_used_func_closure(funcs, used, flags_ptr);
+    }
     if (seed_implicit_codegen == 0 && (collected_flags & (CG_USED_HAS_METHOD_CALL | CG_USED_HAS_BINARY)) != 0) {
         // An unresolved method edge may dispatch through a trait vtable or an
         // implicit destructor. Add exactly those generated targets, then
@@ -833,9 +962,32 @@ func collect_used_func_names(program: *AstProgram, used: *Vec<*NameInfo>, flags_
         }
         collect_used_func_closure(funcs, used, flags_ptr);
     }
-    if (codegen_program_has_gc_runtime_need(program, used) != 0 ||
-        used_has_name_prefix(used, slice("std_mem__bpp_gc_", str_len("std_mem__bpp_gc_"))) != 0 ||
-        used_has_name_prefix(used, slice("std_number__", str_len("std_number__"))) != 0) {
+    // Code generation emits the frame cleanup edge only for functions whose
+    // signature or body can contain GC root slots. Keep reachability aligned
+    // with that exact predicate instead of pulling the entire GC/heap runtime
+    // into programs whose reachable functions cannot register a root slot.
+    g_codegen_gc_runtime_reason = 0;
+    var gc_runtime_needed: u64 = codegen_program_has_gc_runtime_need(program, used);
+    var used_functions_need_gc_frame: u64 = collect_used_functions_need_gc_frame(used);
+    if (used_functions_need_gc_frame != 0) {
+        g_codegen_gc_runtime_reason = g_codegen_gc_runtime_reason | 128;
+        gc_runtime_needed = 1;
+    }
+    if (used_has_name_prefix(used, slice("std_mem__bpp_gc_", str_len("std_mem__bpp_gc_"))) != 0) {
+        g_codegen_gc_runtime_reason = g_codegen_gc_runtime_reason | 32;
+        gc_runtime_needed = 1;
+    }
+    if (used_has_name_prefix(used, slice("std_number__", str_len("std_number__"))) != 0) {
+        g_codegen_gc_runtime_reason = g_codegen_gc_runtime_reason | 64;
+        gc_runtime_needed = 1;
+    }
+    timings_set_codegen_gc_runtime_reason(g_codegen_gc_runtime_reason);
+    g_codegen_gc_runtime_needed = gc_runtime_needed;
+    if (gc_runtime_needed != 0 && used_functions_need_gc_frame != 0) {
+        used_add_resolved_name(used, slice("std_mem__bpp_gc_root_slots_remove_frame", str_len("std_mem__bpp_gc_root_slots_remove_frame")));
+        collect_used_func_closure(funcs, used, flags_ptr);
+    }
+    if (gc_runtime_needed != 0) {
         var before_gc: u64 = used.len();
         collect_add_gc_runtime_helper_names(used);
         if (used.len() != before_gc) {
@@ -1084,7 +1236,14 @@ func config_read_trace_overrides(cfg_ann: *CompilerAnnotationParsed, out_enabled
 func func_stack_reserve(fn: *AstFunc) -> u64 {
     var reserve: u64 = CG_STACK_RESERVE_DEFAULT;
     var cfg_ann: *CompilerAnnotationParsed = fn_find_annotation(fn, slice("config", 6));
-    config_read_stack_override(cfg_ann, &reserve);
+    var explicit_reserve: u64 = config_read_stack_override(cfg_ann, &reserve);
+    // The final frame equate already accounts for every local, parameter and
+    // compiler temporary. Do not impose an unrelated 2KiB floor on each call.
+    // Raw inline assembly may rely on the historic scratch area; keep its
+    // default and preserve the existing explicit config clamping rules.
+    if (explicit_reserve == 0 && fn != 0 && lower_number_storage_stmt_contains_inline_asm(fn.body) == 0) {
+        return 0;
+    }
     if (reserve < CG_STACK_RESERVE_MIN) { reserve = CG_STACK_RESERVE_MIN; }
     if (reserve > CG_STACK_RESERVE_MAX) { reserve = CG_STACK_RESERVE_MAX; }
     return align_up_16(reserve);
@@ -1166,7 +1325,8 @@ func emit_func_section(section_kind: u64) -> u64 {
 }
 
 func emit_func_trace_enter(level: u64) -> u64 {
-    g_cg_trace_runtime_needed = 1;
+    g_codegen_trace_runtime_touches = g_codegen_trace_runtime_touches + 1;
+    g_compiler_ctx.codegen_trace_runtime_needed = 1;
     emit("    mov edi, ");
     emit_u64(level);
     emit_nl();
@@ -1196,28 +1356,21 @@ func param_size(p: *Param) -> u64 {
 }
 
 func resolve_struct_def_for_param(ti: *TypeInfo, p: *Param, g_structs_vec: *Vec<*AstStructDef>) -> u64 {
-    if (g_structs_vec == 0) { return 0; }
     if (u8_slice_ptr(p.struct_name) == 0) { return 0; }
 
     if (p.type_kind == TYPE_STRUCT) {
-        var num_structs: u64 = g_structs_vec.len();
-        for (var si: u64 = 0; si < num_structs; si++) {
-            var sd: *AstStructDef = g_structs_vec.get(si);
-            if (u8_slice_len(sd.name) == u8_slice_len(p.struct_name) && str_eq(sd.name, p.struct_name) != 0) {
-                ti.struct_def = sd;
-                break;
-            }
-        }
+        ti.struct_def = get_struct_def(p.struct_name);
     }
 
     if (p.elem_type_kind == TYPE_STRUCT) {
-        var num_structs2: u64 = g_structs_vec.len();
-        for (var sj: u64 = 0; sj < num_structs2; sj++) {
-            var sd2: *AstStructDef = g_structs_vec.get(sj);
-            if (u8_slice_len(sd2.name) == u8_slice_len(p.struct_name) && str_eq(sd2.name, p.struct_name) != 0) {
-                ti.struct_def = sd2;
-                break;
-            }
+        var elem_name: []u8 = p.struct_name;
+        if (p.elem_typeinfo != 0 && u8_slice_ptr(p.elem_typeinfo.struct_name) != 0) {
+            elem_name = p.elem_typeinfo.struct_name;
+        }
+        var elem_def: *AstStructDef = get_struct_def(elem_name);
+        ti.struct_def = elem_def;
+        if (ti.elem_typeinfo != 0) {
+            ti.elem_typeinfo.struct_def = elem_def;
         }
     }
     return 0;
@@ -1351,7 +1504,12 @@ func emit_func_prologue(fn: *AstFunc, g_symtab: *Symtab, section_kind: u64, stac
 
     emitln("    push rbp");
     emitln("    mov rbp, rsp");
-    emitln("    sub rsp, strict qword (.Lbpp_frame_size + 32)");
+    if (compiler_target() == COMPILER_TARGET_WINDOWS_X86_64) {
+        emitln("    mov rax, strict qword (.Lbpp_frame_size + 32)");
+        emit_windows_stack_probe_rax();
+    } else {
+        emitln("    sub rsp, strict qword (.Lbpp_frame_size + 32)");
+    }
     emit_legacy_nonvolatile_save(stack_reserve);
 
     if (fn.ret_type == TYPE_STRUCT && fn.ret_ptr_depth == 0) {
@@ -1421,11 +1579,10 @@ func store_target_arg_word(arg_idx: u64, dst_offset: u64) -> u64 {
     return 0;
 }
 
-func emit_func(fn: *AstFunc) -> u64 {
+func emit_func_prepared(fn: *AstFunc) -> u64 {
     if (fn == 0) { return 0; }
-
-    lower_number_storage_prepare_function(fn);
-
+    typeinfo_expr_cache_next_function();
+    var legacy_started: u64 = timings_profile_start();
     var g_symtab: *Symtab = symtab_current();
     var section_kind: u64 = func_section_kind(fn);
     var stack_reserve: u64 = func_stack_reserve(fn);
@@ -1450,17 +1607,71 @@ func emit_func(fn: *AstFunc) -> u64 {
         arg_word_index = store_param_words(p, offset, arg_word_index);
     }
 
+    // Register parameter roots only after every incoming ABI word is saved.
+    for (var ri: u64 = 0; ri < nparams; ri++) {
+        var root_param: *Param = fn.params_vec.get(ri);
+        emit_gc_typed_root_slots(symtab_get_type(g_symtab, root_param.name), symtab_find(g_symtab, root_param.name));
+    }
+
     var trace_enabled: u64 = 0;
     var trace_level: u64 = 0;
     func_trace_info(fn, &trace_enabled, &trace_level);
     if (trace_enabled != 0) {
         emit_func_trace_enter(trace_level);
     }
-    
-    emit_block(fn.body);
+    timings_add_codegen_legacy_span(2, legacy_started);
 
+    legacy_started = timings_profile_start();
+    emit_block(fn.body);
+    timings_add_codegen_legacy_span(3, legacy_started);
+
+    legacy_started = timings_profile_start();
     emit_func_epilogue();
     emit_func_frame_size_equ(g_symtab, stack_reserve);
+    timings_add_codegen_legacy_span(4, legacy_started);
+}
+
+func emit_func(fn: *AstFunc) -> u64 {
+    if (fn == 0) { return 0; }
+    var legacy_started: u64 = timings_profile_start();
+    lower_number_storage_prepare_function(fn);
+    timings_add_codegen_legacy_span(1, legacy_started);
+
+    var key_len: u64 = 0;
+    var key: u64 = incremental_cache_make_function_key(fn, &key_len);
+    if (key == 0) { emit_func_prepared(fn); return 0; }
+    var cached: u64 = 0;
+    var cached_len: u64 = 0;
+    var cached_label_delta: u64 = 0;
+    if (incremental_cache_lookup(key, key_len, emitter_label_counter(), &cached, &cached_len, &cached_label_delta) != 0) {
+        emit_len(cached, cached_len);
+        emitter_advance_label_counter(cached_label_delta);
+        heap_free(key);
+        return 0;
+    }
+
+    var label_before: u64 = emitter_label_counter();
+    var strings_before: u64 = emitter_string_label_lookup_count();
+    var floats_before: u64 = emitter_float_label_lookup_count();
+    var globals_before: u64 = emitter_backend_global_touch_count();
+    var trace_before: u64 = g_codegen_trace_runtime_touches;
+    io_raw_capture_start();
+    emit_func_prepared(fn);
+    var fragment: u64 = 0;
+    var fragment_len: u64 = 0;
+    var capture_ok: u64 = io_raw_capture_stop(&fragment, &fragment_len);
+    var state_neutral: u64 =
+        emitter_string_label_lookup_count() == strings_before
+        && emitter_float_label_lookup_count() == floats_before
+        && emitter_backend_global_touch_count() == globals_before
+        && g_codegen_trace_runtime_touches == trace_before;
+    if (capture_ok != 0 && state_neutral != 0 && diag_should_stop_pass() == 0 && fragment_len != 0) {
+        if (incremental_cache_store(key, key_len, fragment, fragment_len, label_before, emitter_label_counter() - label_before) != 0) { return 0; }
+    }
+    timings_note_incremental_ineligible();
+    heap_free(key);
+    if (fragment != 0) { heap_free(fragment); }
+    return 0;
 }
 
 // ============================================
@@ -1479,13 +1690,17 @@ func program_has_runtime_global_init(program: *AstProgram) -> u64 {
 }
 
 func collect_used_names(program: *AstProgram, has_runtime_init: u64) -> *Vec<*NameInfo> {
-    // Strict SSA validates and emits the reachable closure even at O0. Building
-    // every unused prelude function would make the backend contract depend on
-    // unrelated library implementation details and multiply allocation time.
-    if (opt_get_level() < 1 && codegen_ssa_requested() == 0) { return 0; }
+    // Reachability controls which already-validated functions are emitted; it
+    // is not an optimization-level semantic. Keep the conservative legacy
+    // implicit roots below, but do not make O0 generate every unused prelude
+    // and compiler function merely because instruction optimization is off.
     var used_names: *Vec<*NameInfo> = new Vec<*NameInfo>{heap_alloc((64) * sizeof(*NameInfo)), 0, (64)};
-    g_used_name_membership = new HashMap<u64, u64>{0, 0, 0};
-    g_used_name_membership.ensure_capacity(256);
+    if (g_compiler_ctx.codegen_used_name_membership == 0) {
+        g_compiler_ctx.codegen_used_name_membership = new HashMap<u64, u64>{0, 0, 0};
+        g_compiler_ctx.codegen_used_name_membership.ensure_capacity(256);
+    } else {
+        g_compiler_ctx.codegen_used_name_membership.clear();
+    }
     var used_flags: u64 = 0;
     collect_used_func_names(program, used_names, &used_flags);
     // Address-taken functions are added to the closure at the address
@@ -1500,6 +1715,38 @@ func collect_used_names(program: *AstProgram, has_runtime_init: u64) -> *Vec<*Na
         }
     }
     return used_names;
+}
+
+func collect_used_names_bounded(program: *AstProgram, has_runtime_init: u64, max_names: u64) -> *Vec<*NameInfo> {
+    g_codegen_used_name_budget = max_names;
+    g_codegen_used_name_budget_exceeded = 0;
+    var used_names: *Vec<*NameInfo> = collect_used_names(program, has_runtime_init);
+    var exceeded: u64 = g_codegen_used_name_budget_exceeded;
+    g_codegen_used_name_budget = 0;
+    g_codegen_used_name_budget_exceeded = 0;
+    if (exceeded != 0) { return 0; }
+    return used_names;
+}
+
+func collect_auto_ssa_used_names(used_names: *Vec<*NameInfo>) -> *Vec<*NameInfo> {
+    if (used_names == 0 || opt_get_backend_mode() != BACKEND_AUTO) { return used_names; }
+    var n: u64 = used_names.len();
+    var ssa_names: *Vec<*NameInfo> = new Vec<*NameInfo>{heap_alloc((n) * sizeof(*NameInfo)), 0, n};
+    for (var i: u64 = 0; i < n; i++) {
+        var info: *NameInfo = used_names.get(i);
+        if (info == 0) { continue; }
+        var fn: *AstFunc = 0;
+        if (g_compiler_ctx.codegen_used_func_index != 0) {
+            fn = g_compiler_ctx.codegen_used_func_index.get(slice(info.ptr, info.len));
+        }
+        // Auto SSA is intentionally a mixed backend. Compiler/prelude runtime
+        // functions are already validated and have a mature legacy emitter;
+        // rebuilding their large implementation graphs in SSA for every user
+        // program dominates compile time without increasing user-code coverage.
+        if (fn != 0 && codegen_gc_codegen_disabled_for_name(fn.name) != 0) { continue; }
+        ssa_names.push(info);
+    }
+    return ssa_names;
 }
 
 const CG_EXPR_FEATURE_SAFE_NAV = 1;
@@ -1559,6 +1806,8 @@ func expr_has_feature(node: *AstNode, feature: u64) -> u64 {
         case AST_SLICE:
             if (expr_has_feature(nref.slice_expr.ptr_expr, feature) != 0) { return true; }
             return expr_has_feature(nref.slice_expr.len_expr, feature);
+        case AST_VARIADIC_PACK:
+            return expr_vec_has_feature(((*AstVariadicPack)node).values_vec, feature);
         case AST_CALL_PTR:
             if (feature == CG_EXPR_FEATURE_FLOAT) { return false; }
             if (expr_has_feature(nref.call_ptr.callee, feature) != 0) { return true; }
@@ -1787,14 +2036,8 @@ func find_ssa_func_by_name(ssa_ctx: *SSAContext, name: []u8) -> *SSAFunction {
 }
 
 func init_globals(program: *AstProgram) -> u64 {
-    if (program.globals_vec == 0) {
-        var globals_vec: *Vec<*GlobalInfo> = new Vec<*GlobalInfo>{heap_alloc((32) * sizeof(*GlobalInfo)), 0, (32)};
-        globals_set(globals_vec);
-        sym_set_all_globals(globals_vec);
-    } else {
-        globals_set(program.globals_vec);
-        sym_set_all_globals(program.globals_vec);
-    }
+    globals_set_from_prog(program.globals_vec);
+    sym_set_all_globals(globals_current());
     return 0;
 }
 
@@ -1881,7 +2124,7 @@ func emit_entry(program: *AstProgram, has_runtime_init: u64) -> u64 {
 }
 
 func emit_trace_runtime() -> u64 {
-    if (g_cg_trace_runtime_needed == 0) { return 0; }
+    if (g_compiler_ctx.codegen_trace_runtime_needed == 0) { return 0; }
     if (compiler_target() == COMPILER_TARGET_WINDOWS_X86_64) {
         emitln("\nsection .text");
         emitln("align 16");
@@ -1913,6 +2156,26 @@ func emit_backend_fallback_report(fn: *AstFunc, reason: u64) -> u64 {
     return 0;
 }
 
+// Reject an explicit strict-SSA/legacy-only conflict before constructing the
+// whole-program SSA graph. The old check in emit_functions remains as a
+// defensive invariant, but waiting until emission made a known-invalid request
+// pay the full prelude SSA and register-allocation cost first.
+func strict_ssa_preflight_legacy_only(program: *AstProgram, used_names: *Vec<*NameInfo>) -> u64 {
+    if (opt_get_backend_mode() != BACKEND_SSA || program == 0 || program.funcs_vec == 0) { return 1; }
+    for (var i: u64 = 0; i < program.funcs_vec.len(); i++) {
+        var fn: *AstFunc = program.funcs_vec.get(i);
+        if (generic_template_fn(fn) != 0) { continue; }
+        if (used_names != 0 && used_has_resolved_name(used_names, fn.name) == 0) { continue; }
+        if (func_has_codegen_annotation(fn) != 0) {
+            diag_emit_error_tag("backend", "ssa", "strict SSA backend rejected a legacy-only annotated function");
+            diag_emit_labelled_name("function: ", fn.name);
+            diag_force_stop_pass();
+            return 0;
+        }
+    }
+    return 1;
+}
+
 func emit_functions(program: *AstProgram, used_names: *Vec<*NameInfo>, use_ssa: u64, ssa_ctx: *SSAContext) -> u64 {
     var strict_ssa: u64 = opt_get_backend_mode() == BACKEND_SSA;
     for (var i: u64 = 0; i < program.funcs_vec.len(); i++) {
@@ -1924,7 +2187,10 @@ func emit_functions(program: *AstProgram, used_names: *Vec<*NameInfo>, use_ssa: 
         if (used_names != 0 && used_has_resolved_name(used_names, fn.name) == 0) {
             continue;
         }
-        var force_non_ssa_codegen: u64 = func_has_codegen_annotation(fn);
+        var annotation_forces_legacy: u64 = func_has_codegen_annotation(fn);
+        var auto_runtime_legacy: u64 = strict_ssa == 0 && use_ssa != 0 &&
+            codegen_gc_codegen_disabled_for_name(fn.name) != 0;
+        var force_non_ssa_codegen: u64 = annotation_forces_legacy != 0 || auto_runtime_legacy != 0;
         if (strict_ssa != 0 && force_non_ssa_codegen != 0) {
             diag_emit_error_tag("backend", "ssa", "strict SSA backend rejected a legacy-only annotated function");
             diag_emit_labelled_name("function: ", fn.name);
@@ -1966,7 +2232,7 @@ func emit_functions(program: *AstProgram, used_names: *Vec<*NameInfo>, use_ssa: 
                 }
             }
         } else {
-            if (use_ssa != 0 && force_non_ssa_codegen != 0) {
+            if (use_ssa != 0 && annotation_forces_legacy != 0) {
                 emit_backend_fallback_report(fn, "legacy-only annotation");
             }
             emit_func(fn);
@@ -1981,7 +2247,8 @@ func program_with_sigs(prog: *AstProgram, sigs: *Vec<*AstFunc>) -> u64 {
     defer pop_trace();
 
     var program: *AstProgram = prog;
-    g_cg_trace_runtime_needed = 0;
+    g_compiler_ctx.codegen_trace_runtime_needed = 0;
+    g_codegen_trace_runtime_touches = 0;
 
     var has_runtime_init: u64 = program_has_runtime_global_init(program);
     var used_names: *Vec<*NameInfo> = collect_used_names(program, has_runtime_init);
@@ -2001,38 +2268,83 @@ func program_with_sigs(prog: *AstProgram, sigs: *Vec<*AstFunc>) -> u64 {
         use_ssa = 1;
     }
 
-    var ssa_ctx: *SSAContext = build_ssa_pipeline(program, use_ssa, used_names);
+    if (strict_ssa_preflight_legacy_only(program, used_names) == 0) { return 1; }
+
+    var ssa_used_names: *Vec<*NameInfo> = collect_auto_ssa_used_names(used_names);
+    var ssa_ctx: *SSAContext = build_ssa_pipeline(program, use_ssa, ssa_used_names);
+    if (ssa_used_names != used_names && ssa_used_names != 0) {
+        ssa_used_names.release_buffer();
+        free((u64)ssa_used_names);
+    }
     defer ssa_context_release_aux(ssa_ctx);
-    if (diag_has_errors() != 0) { return 0; }
+    if (diag_has_errors() != 0) { return 1; }
     if (ssa_ctx == 0) {
         if (backend_mode == BACKEND_SSA) {
             diag_emit_error_tag("backend", "ssa", "strict SSA backend pipeline failed");
             diag_force_stop_pass();
-            return 0;
+            return 2;
         }
         use_ssa = 0;
     }
 
     var codegen_started: u64 = timings_now_ms();
+    var codegen_expr_queries_before: u64 = typeinfo_expr_query_count();
+    var codegen_expr_cache_hits_before: u64 = typeinfo_expr_cache_hits();
+    var codegen_allocs_before: u64 = heap_profile_alloc_count();
+    var codegen_alloc_bytes_before: u64 = heap_profile_requested_byte_count();
+    var codegen_output_fragments_before: u64 = io_buffered_write_call_count();
+    var codegen_output_bytes_before: u64 = io_buffered_write_byte_count();
+    var codegen_output_flushes_before: u64 = io_buffer_flush_count();
+    var codegen_detail_started: u64 = timings_profile_start();
     init_state();
+    emit_gc_program_enabled_set(g_codegen_gc_runtime_needed);
+    timings_add_codegen_span(1, codegen_detail_started);
 
     // Set structs and functions for typeinfo module
     typeinfo_set_structs(program.structs_vec);
     typeinfo_set_funcs(program.funcs_vec);
+    typeinfo_layout_cache_begin();
+    defer typeinfo_layout_cache_end();
+    typeinfo_expr_cache_begin();
+    defer typeinfo_expr_cache_end();
     
 
+    codegen_detail_started = timings_profile_start();
     init_globals(program);
+    timings_add_codegen_span(2, codegen_detail_started);
+    codegen_detail_started = timings_profile_start();
     load_consts(program.consts_vec);
     emit_windows_runtime_externs();
+    timings_add_codegen_span(3, codegen_detail_started);
+    incremental_cache_begin(program, use_ssa);
+    codegen_detail_started = timings_profile_start();
     emit_functions(program, used_names, use_ssa, ssa_ctx);
-    if (diag_has_errors() != 0) { return 0; }
+    timings_add_codegen_span(4, codegen_detail_started);
+    if (diag_has_errors() != 0) { incremental_cache_end(0); return 2; }
+    codegen_detail_started = timings_profile_start();
     emit_entry(program, has_runtime_init);
     emit_trace_runtime();
-    
+    timings_add_codegen_span(5, codegen_detail_started);
+
+    codegen_detail_started = timings_profile_start();
     globals_emit_data();
+    timings_add_codegen_span(6, codegen_detail_started);
+    codegen_detail_started = timings_profile_start();
     string_emit_data();
     float_emit_data();
+    timings_add_codegen_span(7, codegen_detail_started);
+    codegen_detail_started = timings_profile_start();
     globals_emit_bss();
+    timings_add_codegen_span(8, codegen_detail_started);
+    incremental_cache_end(diag_has_errors() == 0);
+    timings_set_codegen_metrics(
+        typeinfo_expr_query_count() - codegen_expr_queries_before,
+        typeinfo_expr_cache_hits() - codegen_expr_cache_hits_before,
+        heap_profile_alloc_count() - codegen_allocs_before,
+        heap_profile_requested_byte_count() - codegen_alloc_bytes_before,
+        io_buffered_write_call_count() - codegen_output_fragments_before,
+        io_buffered_write_byte_count() - codegen_output_bytes_before,
+        io_buffer_flush_count() - codegen_output_flushes_before);
     timings_add_codegen(timings_elapsed_ms(codegen_started));
     return 0;
 }

@@ -8,6 +8,7 @@ import compiler.generic.engine;
 import compiler.symbol_runtime;
 import compiler.annotations;
 import compiler.ast_lowering;
+import emitter.typeinfo;
 import module_utils;
 import std.io;
 import std.hashmap;
@@ -117,7 +118,10 @@ func validate_program_duplicate_traits() -> u64 {
     var ok: u64 = 1;
     for (var i: u64 = 0; i < n; i++) {
         var td: *TraitDef = g_compiler_ctx.all_traits_vec.get(i);
-        if (td != 0 && validate_program_duplicate_name(seen, td.name, "duplicate-trait", "duplicate trait definition", "trait: ") == 0) { ok = 0; }
+        if (td == 0) { continue; }
+        var identity: []u8 = td.mangled_name;
+        if (identity.ptr == 0 || identity.len == 0) { identity = td.name; }
+        if (validate_program_duplicate_name(seen, identity, "duplicate-trait", "duplicate trait definition", "trait: ") == 0) { ok = 0; }
     }
     return ok;
 }
@@ -157,6 +161,9 @@ func validate_program_inheritance_cycles() -> u64 {
             var sd: *AstStructDef = g_compiler_ctx.all_structs_vec.get(i);
             if (sd == 0) { continue; }
             if (resolved.get(i) != 0) { continue; }
+            var prev_module_ptr: u64 = g_compiler_ctx.current_module.ptr;
+            var prev_module_len: u64 = g_compiler_ctx.current_module.len;
+            set_current_module_for_struct(sd);
 
             var ready: u64 = 1;
             if (sd.parents_vec != 0) {
@@ -171,6 +178,7 @@ func validate_program_inheritance_cycles() -> u64 {
                     }
                 }
             }
+            g_compiler_ctx.current_module = slice(prev_module_ptr, prev_module_len);
             if (ready != 0) {
                 resolved.set(i, 1);
                 remaining = remaining - 1;
@@ -194,6 +202,285 @@ func validate_program_inheritance_cycles() -> u64 {
     return 1;
 }
 
+func validate_program_value_layout_typeinfo_struct(ti: *TypeInfo, depth: u64) -> *AstStructDef {
+    if (ti == 0 || ti.ptr_depth > 0 || depth > 64) { return 0; }
+    if (ti.type_kind == TYPE_STRUCT) {
+        if (ti.struct_def != 0) { return ti.struct_def; }
+        var resolved_struct: CompilerResolvedStructName = lower_try_resolve_struct_name(ti.struct_name);
+        return resolved_struct.struct_def;
+    }
+    if (ti.type_kind == TYPE_ARRAY) {
+        if (ti.array_len == 0) { return 0; }
+        if (ti.elem_typeinfo != 0) {
+            return validate_program_value_layout_typeinfo_struct(ti.elem_typeinfo, depth + 1);
+        }
+        if (ti.elem_ptr_depth == 0 && ti.elem_type_kind == TYPE_STRUCT) {
+            var resolved_elem: CompilerResolvedStructName = lower_try_resolve_struct_name(ti.struct_name);
+            return resolved_elem.struct_def;
+        }
+    }
+    return 0;
+}
+
+func validate_program_value_layout_field_struct(field: *FieldDesc) -> *AstStructDef {
+    if (field == 0 || field.ptr_depth > 0) { return 0; }
+    if (field.type_kind == TYPE_STRUCT) {
+        var resolved_field: CompilerResolvedStructName = lower_try_resolve_struct_name(field.struct_name);
+        return resolved_field.struct_def;
+    }
+    if (field.type_kind == TYPE_ARRAY) {
+        if (field.array_len == 0) { return 0; }
+        if (field.elem_typeinfo != 0) {
+            return validate_program_value_layout_typeinfo_struct(field.elem_typeinfo, 0);
+        }
+        if (field.elem_ptr_depth == 0 && field.elem_type_kind == TYPE_STRUCT) {
+            var resolved_elem: CompilerResolvedStructName = lower_try_resolve_struct_name(field.struct_name);
+            return resolved_elem.struct_def;
+        }
+    }
+    return 0;
+}
+
+func validate_program_value_layout_visit(sd: *AstStructDef, states: *Vec<u64>) -> u64 {
+    if (sd == 0) { return 1; }
+    var idx: u64 = validate_program_struct_index(sd);
+    if (idx >= states.len()) { return 1; }
+    var state: u64 = states.get(idx);
+    if (state == 2) { return 1; }
+    if (state == 1) {
+        diag_emit_error_tag("validation", "recursive-value-layout", "recursive value layout");
+        diag_emit_labelled_name("struct: ", sd.name);
+        diag_emit_help("break the value cycle with a pointer or slice edge");
+        diag_note_error();
+        return 0;
+    }
+
+    var prev_module_ptr: u64 = g_compiler_ctx.current_module.ptr;
+    var prev_module_len: u64 = g_compiler_ctx.current_module.len;
+    var struct_stack: *Vec<*AstStructDef> = new Vec<*AstStructDef>{heap_alloc(16 * sizeof(*AstStructDef)), 0, 16};
+    var edge_index_stack: *Vec<u64> = new Vec<u64>{heap_alloc(16 * sizeof(u64)), 0, 16};
+    states.set(idx, 1);
+    struct_stack.push(sd);
+    edge_index_stack.push(0);
+
+    while (struct_stack.len() > 0) {
+        var top: u64 = struct_stack.len() - 1;
+        var current: *AstStructDef = struct_stack.get(top);
+        var next_edge: u64 = edge_index_stack.get(top);
+        var parent_count: u64 = 0;
+        var field_count: u64 = 0;
+        if (current.parents_vec != 0) { parent_count = current.parents_vec.len(); }
+        if (current.fields_vec != 0) { field_count = current.fields_vec.len(); }
+
+        if (next_edge < parent_count + field_count) {
+            edge_index_stack.set(top, next_edge + 1);
+            set_current_module_for_struct(current);
+            var contained: *AstStructDef = 0;
+            if (next_edge < parent_count) {
+                contained = validate_program_parent_def(current.parents_vec.get(next_edge));
+            } else {
+                contained = validate_program_value_layout_field_struct(current.fields_vec.get(next_edge - parent_count));
+            }
+            if (contained == 0) { continue; }
+            var contained_idx: u64 = validate_program_struct_index(contained);
+            if (contained_idx >= states.len()) { continue; }
+            var contained_state: u64 = states.get(contained_idx);
+            if (contained_state == 2) { continue; }
+            if (contained_state == 1) {
+                diag_emit_error_tag("validation", "recursive-value-layout", "recursive value layout");
+                diag_emit_labelled_name("struct: ", contained.name);
+                diag_emit_help("break the value cycle with a pointer or slice edge");
+                diag_note_error();
+                g_compiler_ctx.current_module = slice(prev_module_ptr, prev_module_len);
+                return 0;
+            }
+            states.set(contained_idx, 1);
+            struct_stack.push(contained);
+            edge_index_stack.push(0);
+            continue;
+        }
+
+        states.set(validate_program_struct_index(current), 2);
+        struct_stack.pop();
+        edge_index_stack.pop();
+    }
+    g_compiler_ctx.current_module = slice(prev_module_ptr, prev_module_len);
+    return 1;
+}
+
+func validate_program_value_layout_cycles() -> u64 {
+    if (g_compiler_ctx.all_structs_vec == 0) { return 1; }
+    var n: u64 = g_compiler_ctx.all_structs_vec.len();
+    var states: *Vec<u64> = new Vec<u64>{heap_alloc((n + 1) * sizeof(u64)), 0, n + 1};
+    for (var i: u64 = 0; i < n; i++) { states.push(0); }
+    for (var si: u64 = 0; si < n; si++) {
+        if (validate_program_value_layout_visit(g_compiler_ctx.all_structs_vec.get(si), states) == 0) { return 0; }
+    }
+    return 1;
+}
+
+func validate_function_declared_types_in_module(fn: *AstFunc, allow_self_type: u64, owner_module: []u8) -> u64 {
+    if (fn == 0) { return 1; }
+    var prev_module_ptr: u64 = u8_slice_ptr(g_compiler_ctx.current_module);
+    var prev_module_len: u64 = u8_slice_len(g_compiler_ctx.current_module);
+    if (owner_module.ptr != 0 && owner_module.len != 0) {
+        g_compiler_ctx.current_module = slice(owner_module.ptr, owner_module.len);
+    } else {
+        set_current_module_for_func(fn.name);
+    }
+
+    var walker: CompilerAstWalker = ast_walker_new(COMPILER_AST_WALK_VALIDATE_DECLARED_TYPES, fn.name);
+    walker.allow_self_type = allow_self_type;
+    var func_template: *GenericFuncTemplate = sym_find_generic_template_by_func_ptr(fn);
+    if (func_template != 0) {
+        walker.generic_params_vec = func_template.params_vec;
+    } else if (fn.impl_owner.ptr != 0 && fn.impl_owner.len != 0) {
+        var owner_def: *AstStructDef = get_struct_def(fn.impl_owner);
+        if (owner_def != 0 && g_compiler_ctx.generic_struct_ptrs != 0) {
+            var owner_template_count: u64 = g_compiler_ctx.generic_struct_ptrs.len();
+            for (var oti: u64 = 0; oti < owner_template_count; oti++) {
+                var owner_template: *GenericStructTemplate = g_compiler_ctx.generic_struct_ptrs.get(oti);
+                if (owner_template != 0 && owner_template.struct_def == owner_def) {
+                    walker.generic_params_vec = owner_template.params_vec;
+                    break;
+                }
+            }
+        }
+    }
+    ast_walker_validate_declared_typeinfo_depth(&walker, ast_func_return_type(fn), 0);
+    if (fn.params_vec != 0) {
+        var pn: u64 = fn.params_vec.len();
+        for (var pi: u64 = 0; pi < pn; pi++) {
+            var param: *Param = fn.params_vec.get(pi);
+            if (param == 0) { continue; }
+            ast_walker_validate_declared_type_fields(&walker, param.type_kind, param.struct_name,
+                param.elem_type_kind, param.elem_typeinfo);
+            if (param.default_expr != 0) {
+                ast_walker_walk_expr(&walker, (*AstNode)param.default_expr);
+            }
+        }
+    }
+    ast_walker_walk_stmt(&walker, fn.body);
+    g_compiler_ctx.current_module = slice(prev_module_ptr, prev_module_len);
+    if (walker.found != 0) { return 0; }
+    return 1;
+}
+
+func validate_function_declared_types_ex(fn: *AstFunc, allow_self_type: u64) -> u64 {
+    return validate_function_declared_types_in_module(fn, allow_self_type, slice(0, 0));
+}
+
+func validate_function_declared_types(fn: *AstFunc) -> u64 {
+    return validate_function_declared_types_ex(fn, 0);
+}
+
+func validate_struct_field_declared_types(sd: *AstStructDef) -> u64 {
+    if (sd == 0 || sd.fields_vec == 0) { return 1; }
+    var prev_module_ptr: u64 = g_compiler_ctx.current_module.ptr;
+    var prev_module_len: u64 = g_compiler_ctx.current_module.len;
+    set_current_module_for_struct(sd);
+    var walker: CompilerAstWalker = ast_walker_new(COMPILER_AST_WALK_VALIDATE_DECLARED_TYPES, sd.name);
+    if (g_compiler_ctx.generic_struct_ptrs != 0) {
+        var template_count: u64 = g_compiler_ctx.generic_struct_ptrs.len();
+        for (var ti: u64 = 0; ti < template_count; ti++) {
+            var struct_template: *GenericStructTemplate = g_compiler_ctx.generic_struct_ptrs.get(ti);
+            if (struct_template != 0 && struct_template.struct_def == sd) {
+                walker.generic_params_vec = struct_template.params_vec;
+                break;
+            }
+        }
+    }
+    var n: u64 = sd.fields_vec.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var field: *FieldDesc = sd.fields_vec.get(i);
+        if (field == 0) { continue; }
+        ast_walker_validate_declared_type_fields(&walker, field.type_kind, field.struct_name,
+            field.elem_type_kind, field.elem_typeinfo);
+    }
+    g_compiler_ctx.current_module = slice(prev_module_ptr, prev_module_len);
+    if (walker.found != 0) { return 0; }
+    return 1;
+}
+
+func validate_global_declared_types(ginfo: *GlobalInfo) -> u64 {
+    if (ginfo == 0) { return 1; }
+    var prev_module_ptr: u64 = u8_slice_ptr(g_compiler_ctx.current_module);
+    var prev_module_len: u64 = u8_slice_len(g_compiler_ctx.current_module);
+    set_current_module_for_global(ginfo.name);
+    var walker: CompilerAstWalker = ast_walker_new(COMPILER_AST_WALK_VALIDATE_DECLARED_TYPES, ginfo.name);
+    ast_walker_validate_declared_typeinfo(&walker, ginfo.typeinfo_ptr);
+    if (ginfo.init_expr != 0) {
+        ast_walker_walk_expr(&walker, (*AstNode)ginfo.init_expr);
+    }
+    g_compiler_ctx.current_module = slice(prev_module_ptr, prev_module_len);
+    if (walker.found != 0) { return 0; }
+    return 1;
+}
+
+func validate_trait_declared_types(td: *TraitDef) -> u64 {
+    if (td == 0 || td.methods_vec == 0) { return 1; }
+    var ok: u64 = 1;
+    var n: u64 = td.methods_vec.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var method: *TraitMethod = td.methods_vec.get(i);
+        if (method != 0 && validate_function_declared_types_in_module(method.sig, 1, td.module) == 0) { ok = 0; }
+    }
+    return ok;
+}
+
+func validate_trait_impl_declared_types(impl_info: *TraitImpl) -> u64 {
+    if (impl_info == 0 || impl_info.assoc_bindings_vec == 0) { return 1; }
+    var prev_module_ptr: u64 = g_compiler_ctx.current_module.ptr;
+    var prev_module_len: u64 = g_compiler_ctx.current_module.len;
+    if (impl_info.module.ptr != 0 && impl_info.module.len != 0) {
+        g_compiler_ctx.current_module = slice(impl_info.module.ptr, impl_info.module.len);
+    }
+    var walker: CompilerAstWalker = ast_walker_new(COMPILER_AST_WALK_VALIDATE_DECLARED_TYPES, impl_info.impl_struct_name);
+    var n: u64 = impl_info.assoc_bindings_vec.len();
+    for (var i: u64 = 0; i < n; i++) {
+        var binding: *TraitAssocBinding = impl_info.assoc_bindings_vec.get(i);
+        if (binding != 0) { ast_walker_validate_declared_typeinfo(&walker, binding.type_ptr); }
+    }
+    g_compiler_ctx.current_module = slice(prev_module_ptr, prev_module_len);
+    if (walker.found != 0) { return 0; }
+    return 1;
+}
+
+func validate_program_declared_types() -> u64 {
+    var ok: u64 = 1;
+    if (g_compiler_ctx.all_funcs != 0) {
+        var fn_count: u64 = g_compiler_ctx.all_funcs.len();
+        for (var fi: u64 = 0; fi < fn_count; fi++) {
+            if (validate_function_declared_types(g_compiler_ctx.all_funcs.get(fi)) == 0) { ok = 0; }
+        }
+    }
+    if (g_compiler_ctx.all_globals != 0) {
+        var global_count: u64 = g_compiler_ctx.all_globals.len();
+        for (var gi: u64 = 0; gi < global_count; gi++) {
+            if (validate_global_declared_types(g_compiler_ctx.all_globals.get(gi)) == 0) { ok = 0; }
+        }
+    }
+    if (g_compiler_ctx.all_structs_vec != 0) {
+        var struct_count: u64 = g_compiler_ctx.all_structs_vec.len();
+        for (var si: u64 = 0; si < struct_count; si++) {
+            if (validate_struct_field_declared_types(g_compiler_ctx.all_structs_vec.get(si)) == 0) { ok = 0; }
+        }
+    }
+    if (g_compiler_ctx.all_traits_vec != 0) {
+        var trait_count: u64 = g_compiler_ctx.all_traits_vec.len();
+        for (var ti: u64 = 0; ti < trait_count; ti++) {
+            if (validate_trait_declared_types(g_compiler_ctx.all_traits_vec.get(ti)) == 0) { ok = 0; }
+        }
+    }
+    if (g_compiler_ctx.all_trait_impls_vec != 0) {
+        var impl_count: u64 = g_compiler_ctx.all_trait_impls_vec.len();
+        for (var ii: u64 = 0; ii < impl_count; ii++) {
+            if (validate_trait_impl_declared_types(g_compiler_ctx.all_trait_impls_vec.get(ii)) == 0) { ok = 0; }
+        }
+    }
+    return ok;
+}
+
 func validate_program_structure_with_ctx(ctx: *CompilerCtx) -> u64 {
     if (ctx == 0) { return 1; }
     var ok: u64 = validate_program_duplicate_functions();
@@ -202,7 +489,11 @@ func validate_program_structure_with_ctx(ctx: *CompilerCtx) -> u64 {
     if (validate_all_struct_duplicate_fields() == 0) { ok = 0; }
     if (validate_program_duplicate_traits() == 0) { ok = 0; }
     if (ok == 0) { return 1; }
+    if (validate_program_declared_types() == 0) { ok = 0; }
+    if (ok == 0) { return 1; }
     if (validate_program_inheritance_cycles() == 0) { ok = 0; }
+    if (ok == 0) { return 1; }
+    if (validate_program_value_layout_cycles() == 0) { ok = 0; }
     if (ok == 0) { return 1; }
     return 0;
 }
@@ -240,6 +531,9 @@ func property_hook_field_matches_param(field: *FieldDesc, param: *Param) -> u64 
     if (param.is_variadic != 0 || param.has_default != 0) { return 0; }
     if (field.type_kind != param.type_kind) { return 0; }
     if (field.ptr_depth != param.ptr_depth) { return 0; }
+    if (field.type_kind == TYPE_ARRAY || field.type_kind == TYPE_SLICE || field.type_kind == TYPE_FUNC) {
+        return typeinfo_equal(typeinfo_from_field_desc(field, 0), typeinfo_from_param(param));
+    }
     if (field.type_kind == TYPE_STRUCT || field.type_kind == TYPE_GENERIC || field.type_kind == TYPE_TRAIT) {
         if (str_eq(field.struct_name, param.struct_name) == 0 &&
             property_hook_name_matches(param.struct_name, field.struct_name) == 0 &&
@@ -254,6 +548,9 @@ func property_hook_field_matches_return(field: *FieldDesc, fn: *AstFunc) -> u64 
     if (field == 0 || fn == 0) { return 0; }
     if (field.type_kind != fn.ret_type) { return 0; }
     if (field.ptr_depth != fn.ret_ptr_depth) { return 0; }
+    if (field.type_kind == TYPE_ARRAY || field.type_kind == TYPE_SLICE || field.type_kind == TYPE_FUNC) {
+        return typeinfo_equal(typeinfo_from_field_desc(field, 0), ast_func_return_type(fn));
+    }
     if (field.type_kind == TYPE_STRUCT || field.type_kind == TYPE_GENERIC || field.type_kind == TYPE_TRAIT) {
         if (str_eq(field.struct_name, fn.ret_struct_name) == 0 &&
             property_hook_name_matches(fn.ret_struct_name, field.struct_name) == 0 &&
@@ -500,6 +797,7 @@ func property_hook_create_auto_getter(field: *FieldDesc) -> u64 {
     var body: *AstNode = (*AstNode)ast_block(stmts);
 
     var fn: *AstFunc = ast_func_ex(slice(name.ptr, name.len), params, ret_type, ret_ptr_depth, ret_is_tagged, slice(ret_struct_ptr, ret_struct_len), slice(ret_tag_ptr, ret_tag_len), body);
+    fn.ret_typeinfo = ast_normalize_return_type(typeinfo_from_field_desc(field, 0));
     if (g_compiler_ctx.all_funcs == 0) { g_compiler_ctx.all_funcs = new Vec<*AstFunc>{heap_alloc((8) * sizeof(*AstFunc)), 0, (8)}; }
     if (g_compiler_ctx.all_func_sigs == 0) { g_compiler_ctx.all_func_sigs = new Vec<*AstFunc>{heap_alloc((8) * sizeof(*AstFunc)), 0, (8)}; }
     g_compiler_ctx.all_funcs.push(fn);
@@ -563,7 +861,7 @@ func validate_global_function_name_collisions_core() -> u64 {
 }
 
 func validate_child_implements_abst_method(sd: *AstStructDef, mi: *NameInfo) -> u64 {
-    if (sym_is_abst_method(sd.name, slice(mi.ptr, mi.len)) != 0) {
+    if (sym_is_abst_method_for_struct(sd, slice(mi.ptr, mi.len)) != 0) {
         return 0;
     }
     var found_impl: *AstFunc = find_method_func_in_hierarchy(sd, slice(mi.ptr, mi.len));
@@ -626,6 +924,7 @@ func validate_impl_overrides_core() -> u64 {
     for (var i: u64 = 0; i < n; i++) {
         if (diag_should_stop_pass() != 0) { break; }
         var fn_sig: *AstFunc = g_compiler_ctx.all_func_sigs.get(i);
+        if (fn_sig != 0) { set_current_module_for_func_def(fn_sig); }
         vdispatch_validate_single_impl_override(fn_sig);
         if (diag_should_stop_pass() != 0) { break; }
         vdispatch_validate_single_magic_method_contract(fn_sig);
@@ -822,11 +1121,14 @@ func apply_annotations() -> u64 {
 
 func finalize_abst_methods() -> u64 {
     if (g_compiler_ctx.all_structs_vec == 0) { return 0; }
+    var prev_module_ptr: u64 = g_compiler_ctx.current_module.ptr;
+    var prev_module_len: u64 = g_compiler_ctx.current_module.len;
     var sn: u64 = g_compiler_ctx.all_structs_vec.len();
     for (var si: u64 = 0; si < sn; si++) {
         if (diag_should_stop_pass() != 0) { break; }
         var sd: *AstStructDef = g_compiler_ctx.all_structs_vec.get(si);
         if (sd == 0 || sd.parents_vec == 0) { continue; }
+        set_current_module_for_struct(sd);
         var required: *Vec<*NameInfo> = new Vec<*NameInfo>{heap_alloc((8) * sizeof(*NameInfo)), 0, (8)};
         vdispatch_collect_abst_methods_recursive(sd, required);
         var rn: u64 = required.len();
@@ -837,6 +1139,7 @@ func finalize_abst_methods() -> u64 {
         }
     }
     vdispatch_setup_traits();
+    g_compiler_ctx.current_module = slice(prev_module_ptr, prev_module_len);
     return 0;
 }
 
@@ -921,9 +1224,10 @@ func contract_preservation_emit_generated_func_error(fn: *AstFunc, msg: u64, hel
 
 func contract_preservation_direct_func_symbol_ok(name: []u8) -> u64 {
     if (name.ptr == 0 || name.len == 0) { return 0; }
-    if (resolve_name(slice(name.ptr, name.len)) != 0) { return 1; }
-    if (contract_preservation_is_generated_decorator_name(slice(name.ptr, name.len)) != 0) { return 1; }
-    return 0;
+    // Check the same concrete function table used by codegen. Lowered generic
+    // instances already have exact names and need not be source-level exports.
+    // A generated-name prefix alone is not evidence of a callable definition.
+    return sym_get_func(name) != 0;
 }
 
 func contract_preservation_validate_expr(node: *AstNode, owner: *AstFunc) -> u64 {
@@ -965,6 +1269,12 @@ func contract_preservation_validate_expr(node: *AstNode, owner: *AstFunc) -> u64
         case AST_SLICE:
             if (contract_preservation_validate_expr(nref.slice_expr.ptr_expr, owner) == 0) { return 0; }
             return contract_preservation_validate_expr(nref.slice_expr.len_expr, owner);
+        case AST_VARIADIC_PACK:
+            var pack: *AstVariadicPack = (*AstVariadicPack)node;
+            for (var vi: u64 = 0; vi < pack.values_vec.len(); vi++) {
+                if (contract_preservation_validate_expr(pack.values_vec.get(vi), owner) == 0) { return 0; }
+            }
+            return 1;
         case AST_TRY:
             return contract_preservation_validate_expr(nref.try_expr.operand, owner);
         case AST_STRUCT_LITERAL:

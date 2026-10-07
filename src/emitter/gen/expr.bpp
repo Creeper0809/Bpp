@@ -28,14 +28,7 @@ import emitter.typeinfo;
 // ============================================
 
 func _cg_find_global_info(name: []u8) -> *GlobalInfo {
-    var globals: *Vec<*GlobalInfo> = globals_current();
-    var n: u64 = 0;
-    if (globals != 0) { n = globals.len(); }
-    for (var i: u64 = 0; i < n; i++) {
-        var ginfo: *GlobalInfo = globals.get(i);
-        if (str_eq(ginfo.name, slice(name.ptr, name.len))) { return ginfo; }
-    }
-    return 0;
+    return find_global_info(name);
 }
 var g_tmp_struct_arg_id: u64;
 const LAMBDA_CLOSURE_HANDLE_MASK = 9223372036854775807;
@@ -114,7 +107,7 @@ func emit_try_match_struct_def_by_tail(name: []u8) -> *AstStructDef {
         if (sd == 0) { continue; }
         var ok: u64 = 0;
         if (str_eq(sd.name, slice(name.ptr, name.len)) != 0) {
-            return sd;
+            ok = 1;
         }
 
         if (u8_slice_len(sd.name) > name.len + 2) {
@@ -309,27 +302,30 @@ func emit_resolve_constructor_call(struct_slice: []u8, args: *Vec<*AstNode>, sym
 }
 
 func emit_stack_ctor_emit_constructor_call(sc: *AstStackCtor, symtab: *Symtab, fn_ctor: *AstFunc, call: []u8) -> u64 {
+    var result: u64 = emit_stack_ctor_emit_constructor_call_impl(sc, symtab, fn_ctor, call);
+    emit_variadic_call_cleanup(sc.ctor_args_vec);
+    return result;
+}
+
+func emit_stack_ctor_emit_constructor_call_impl(sc: *AstStackCtor, symtab: *Symtab, fn_ctor: *AstFunc, call: []u8) -> u64 {
+    sc.ctor_args_vec = lower_normalize_call_args_with_symtab(fn_ctor.name, fn_ctor.params_vec, 1, sc.ctor_args_vec, 0, symtab);
+    if (typeinfo_validate_call_arguments(sc.ctor_args_vec, fn_ctor, symtab, "typecheck") == 0) { return 0; }
     var args: *Vec<*AstNode> = sc.ctor_args_vec;
     var nargs: u64 = 0;
     if (args != 0) { nargs = args.len(); }
-    var total_arg_words: u64 = 0;
-    if (nargs != 0) {
-        var ai: u64 = nargs;
-        while (ai > 0) {
-            ai = ai - 1;
-            var arg: *AstNode = args.get(ai);
-            var param: *Param = emit_call_param_at(fn_ctor, ai + 1);
-            total_arg_words = total_arg_words + emit_call_push_arg_with_param(arg, param, symtab);
-        }
-    }
+    emit("    push r12\n");
+    var total_arg_words: u64 = emit_method_push_user_args(args, nargs, fn_ctor, 1, symtab);
+    emit("    mov r12, [rsp+");
+    emit_u64(total_arg_words * 8);
+    emit("]\n");
     emit("    push r12\n");
     total_arg_words = total_arg_words + 1;
     var stack_words: u64 = _cg_target_pop_arg_regs(total_arg_words);
-    var reserve_words: u64 = _cg_target_call_prepare(stack_words, 0);
+    var reserve_words: u64 = _cg_target_call_prepare(stack_words + 1, 0);
     emit("    call ");
     emit_len(call.ptr, call.len);
     emit_nl();
-    _cg_target_call_cleanup(stack_words, reserve_words);
+    _cg_target_call_cleanup(stack_words + 1, reserve_words);
     return 0;
 }
 
@@ -374,8 +370,8 @@ func emit_emit_trait_vptr_init_at_r12(struct_name: []u8) -> u64 {
     var n: u64 = impls.len();
     for (var i: u64 = 0; i < n; i++) {
         var impl_info: *TraitImpl = impls.get(i);
-        if (!str_eq(impl_info.impl_struct_name, slice(struct_name.ptr, struct_name.len))) { continue; }
-        var vptr_name: *NameInfo = trait_build_vptr_field_name(impl_info.trait_name);
+        if (trait_impl_matches_struct_def(impl_info, struct_def) == 0) { continue; }
+        var vptr_name: *NameInfo = trait_build_vptr_field_name(trait_impl_vptr_trait_name(impl_info));
         var field_offset: u64 = 0;
         var field_desc: *FieldDesc = 0;
         var found: u64 = struct_find_field_desc_scoped(struct_def, slice(0, 0), slice(vptr_name.ptr, vptr_name.len), &field_offset, &field_desc);
@@ -402,8 +398,8 @@ func emit_call_resolved_expr(name: []u8) -> u64 {
         resolved_ptr = resolved.ptr;
         resolved_len = resolved.len;
     }
-    var canonical_number_call: *NameInfo = emit_number_canonical_lower_call_name(slice(resolved_ptr, resolved_len));
-    if (canonical_number_call != 0) {
+    var canonical_number_call: NameInfo = emit_number_canonical_lower_call_name(slice(resolved_ptr, resolved_len));
+    if (canonical_number_call.ptr != 0) {
         resolved_ptr = canonical_number_call.ptr;
         resolved_len = canonical_number_call.len;
     }
@@ -428,27 +424,34 @@ func emit_alloc_tmp_struct(symtab: *Symtab, struct_size: u64) -> u64 {
     for (var j: u64 = 0; j < 8; j++) {
         name_u8[base_len + j] = (id >> (j * 8)) & 255;
     }
-    return symtab_add(symtab, name, TYPE_STRUCT, 0, struct_size);
+    return symtab_add_owned_name(symtab, name, TYPE_STRUCT, 0, struct_size);
 }
 
-func emit_call_sret_to_offset(call_ptr: u64, dest_offset: u64, symtab: *Symtab) -> u64 {
+func emit_call_sret_to_offset(call_ptr: u64, dest_offset: u64, symtab: *Symtab, dest_is_saved_ptr: u64 = 0) -> u64 {
+    var result: u64 = emit_call_sret_to_offset_impl(call_ptr, dest_offset, symtab, dest_is_saved_ptr);
+    emit_variadic_call_cleanup(((*AstCall)call_ptr).args_vec);
+    return result;
+}
+
+func emit_call_sret_to_offset_impl(call_ptr: u64, dest_offset: u64, symtab: *Symtab, dest_is_saved_ptr: u64 = 0) -> u64 {
     var call: *AstCall = (*AstCall)call_ptr;
+    var callee: *AstNode = (*AstNode)ast_ident(call.name);
+    var value_ti: *TypeInfo = symtab_get_type(symtab, call.name);
+    if (value_ti == 0 && is_global_var(call.name) != 0) {
+        value_ti = get_expr_type_with_symtab(callee, symtab);
+    }
     var fn_call: *AstFunc = typeinfo_find_func(call.name);
+    if (typeinfo_func_signature(value_ti) != 0 || typeinfo_try_lambda_closure_sig(value_ti) != 0 || closure_handle_is(call.name) != 0 || (value_ti != 0 && fn_call == 0)) {
+        var cp: *AstCallPtr = ast_call_ptr(callee, call.args_vec);
+        return emit_expr_call_ptr((u64)cp, symtab, dest_offset, dest_is_saved_ptr);
+    }
+    if (fn_call == 0) { fn_call = lower_find_func_signature_for_call(call.name); }
     var args: *Vec<*AstNode> = call.args_vec;
+    if (typeinfo_validate_call_arguments(args, fn_call, symtab, "typecheck") == 0) { return 0; }
     var nargs: u64 = 0;
     if (args != 0) { nargs = args.len(); }
-    var total_arg_words: u64 = 0;
-    if (nargs > 0) {
-        var i: u64 = nargs;
-        while (i > 0) {
-            i = i - 1;
-            var arg: *AstNode = args.get(i);
-            var param: *Param = emit_call_param_at(fn_call, i);
-            total_arg_words = total_arg_words + emit_call_push_arg_with_param(arg, param, symtab);
-        }
-    }
-
-    _cg_emit_sret_ptr_from_rbp(dest_offset);
+    var total_arg_words: u64 = emit_method_push_user_args(args, nargs, fn_call, 0, symtab);
+    _cg_emit_sret_ptr_from_rbp(dest_offset, dest_is_saved_ptr);
     var stack_words: u64 = _cg_target_pop_arg_regs_sret(total_arg_words);
     var reserve_words: u64 = _cg_target_call_prepare(stack_words, 0);
     emit_call_resolved_expr(call.name);
@@ -484,6 +487,12 @@ func emit_method_call_ret_struct_size(mc: *AstMethodCall, symtab: *Symtab) -> u6
 }
 
 func emit_method_call_sret_to_offset(mc: *AstMethodCall, dest_offset: u64, symtab: *Symtab, dest_is_saved_ptr: u64 = 0) -> u64 {
+    var result: u64 = emit_method_call_sret_to_offset_impl(mc, dest_offset, symtab, dest_is_saved_ptr);
+    emit_variadic_call_cleanup(mc.args_vec);
+    return result;
+}
+
+func emit_method_call_sret_to_offset_impl(mc: *AstMethodCall, dest_offset: u64, symtab: *Symtab, dest_is_saved_ptr: u64 = 0) -> u64 {
     var receiver: u64 = mc.receiver;
     var type_info: *TypeInfo = get_expr_type_with_symtab((*AstNode)receiver, symtab);
     var struct_name: []u8 = slice(0, 0);
@@ -517,17 +526,7 @@ func emit_method_call_sret_to_offset(mc: *AstMethodCall, dest_offset: u64, symta
             fn_call = typeinfo_find_func(slice(name_info.ptr, name_info.len));
         }
     }
-    var total_arg_words: u64 = 0;
-
-    if (nargs != 0) {
-        var i: u64 = nargs;
-        while (i > 0) {
-            i = i - 1;
-            var arg: *AstNode = args.get(i);
-            var param: *Param = emit_call_param_at(fn_call, i + 1);
-            total_arg_words = total_arg_words + emit_call_push_arg_with_param(arg, param, symtab);
-        }
-    }
+    var total_arg_words: u64 = emit_method_push_user_args(args, nargs, fn_call, 1, symtab);
 
     var recv_is_ptr: u64 = 0;
     if (type_info != 0 && type_info.ptr_depth > 0) {
@@ -690,8 +689,9 @@ func _cg_target_call_cleanup(stack_words: u64, reserve_words: u64) -> u64 {
     return 0;
 }
 
-func _cg_emit_sret_ptr_from_rbp(dest_offset: u64) -> u64 {
-    emit("    lea ");
+func _cg_emit_sret_ptr_from_rbp(dest_offset: u64, dest_is_saved_ptr: u64 = 0) -> u64 {
+    if (dest_is_saved_ptr != 0) { emit("    mov "); }
+    else { emit("    lea "); }
     var reg_name: u64 = compiler_target_raw_arg_reg_name(0);
     var reg_len: u64 = compiler_target_raw_arg_reg_name_len(0);
     if (reg_name != 0 && reg_len != 0) {
@@ -783,8 +783,8 @@ func _cg_emit_direct_call_resolved(name: []u8, stack_words: u64, extra_words: u6
         resolved_ptr = resolved.ptr;
         resolved_len = resolved.len;
     }
-    var canonical_number_call: *NameInfo = emit_number_canonical_lower_call_name(slice(resolved_ptr, resolved_len));
-    if (canonical_number_call != 0) {
+    var canonical_number_call: NameInfo = emit_number_canonical_lower_call_name(slice(resolved_ptr, resolved_len));
+    if (canonical_number_call.ptr != 0) {
         resolved_ptr = canonical_number_call.ptr;
         resolved_len = canonical_number_call.len;
     }
@@ -818,14 +818,297 @@ func emit_push_struct_words_from_tmp(tmp_offset: u64, struct_size: u64) -> u64 {
     return 1;
 }
 
+// Store exactly the requested bytes: packed aggregate strides need not be words.
+func emit_store_rax_bytes_at_offset(offset: u64, size: u64) -> u64 {
+    if (size == 8 || size == 4 || size == 2 || size == 1) {
+        emit("    mov [rbp");
+        emit_signed_disp(offset);
+        if (size == 8) { emit("], rax\n"); }
+        else if (size == 4) { emit("], eax\n"); }
+        else if (size == 2) { emit("], ax\n"); }
+        else { emit("], al\n"); }
+        return 0;
+    }
+    for (var byte_index: u64 = 0; byte_index < size; byte_index++) {
+        emit("    mov [rbp");
+        emit_signed_disp(offset + byte_index);
+        emit("], al\n    shr rax, 8\n");
+    }
+    return 0;
+}
+
+func emit_typed_value_to_offset(value: *AstNode, elem: *TypeInfo, offset: u64, symtab: *Symtab) -> u64 {
+    var result: u64 = emit_typed_value_to_offset_core(value, elem, offset, symtab);
+    emit_gc_temporary_typed_offset(elem, offset);
+    return result;
+}
+
+func emit_typed_value_to_offset_core(value: *AstNode, elem: *TypeInfo, offset: u64, symtab: *Symtab) -> u64 {
+    var elem_size: u64 = sizeof_type_ex(elem);
+    var kind: u64 = ast_kind(value);
+    if (elem.ptr_depth == 0 && elem.type_kind == TYPE_STRUCT && kind == AST_STRUCT_LITERAL) {
+        var lit: *AstStructLiteral = (*AstStructLiteral)value;
+        emit("    push rdi\n    push rcx\n    xor eax, eax\n    lea rdi, [rbp");
+        emit_signed_disp(offset);
+        emit("]\n    mov rcx, ");
+        emit_u64(elem_size);
+        emit("\n    rep stosb\n    pop rcx\n    pop rdi\n");
+        var fields: *Vec<*FieldDesc> = lit.struct_def.fields_vec;
+        var vi: u64 = 0;
+        for (var fi: u64 = 0; fi < fields.len() && vi < lit.values_vec.len(); fi++) {
+            var field: *FieldDesc = fields.get(fi);
+            if (trait_is_vptr_field_name(field.name) != 0) { continue; }
+            var field_offset: u64 = 0;
+            var found_field: *FieldDesc = 0;
+            struct_find_field_desc_scoped(lit.struct_def, slice(0, 0), field.name, &field_offset, &found_field);
+            emit_typed_value_to_offset(lit.values_vec.get(vi), typeinfo_from_field_desc(field, 0), offset + field_offset, symtab);
+            vi = vi + 1;
+        }
+        emit("    push r12\n    lea r12, [rbp");
+        emit_signed_disp(offset);
+        emit("]\n");
+        emit_emit_trait_vptr_init_at_r12(elem.struct_name);
+        emit("    pop r12\n");
+        return 0;
+    }
+    if (elem.ptr_depth == 0 && (elem.type_kind == TYPE_ARRAY || (elem.type_kind == TYPE_STRUCT && emit_binary_is_addressable(value) != 0))) {
+        emit_lvalue(value);
+        emit("    mov rbx, rax\n    lea r8, [rbp");
+        emit_signed_disp(offset);
+        emit("]\n");
+        return emit_copy_bytes_with_regs(slice("rbx", 3), slice("r8", 2), elem_size);
+    }
+    if (elem.ptr_depth != 0 || (elem.type_kind != TYPE_STRUCT && elem.type_kind != TYPE_SLICE)) {
+        value = (*AstNode)ast_cast_ex(value, elem.type_kind, elem.ptr_depth, elem.is_tagged, elem.struct_name, elem.tag_layout);
+    }
+    var words: u64 = _cg_target_push_call_arg(value, symtab);
+    if (elem.ptr_depth == 0 && elem.type_kind == TYPE_STRUCT && elem_size > 16) {
+        emit("    pop rbx\n    lea r8, [rbp");
+        emit_signed_disp(offset);
+        emit("]\n");
+        return emit_copy_bytes_with_regs(slice("rbx", 3), slice("r8", 2), elem_size);
+    }
+    for (var wi: u64 = 0; wi < words; wi++) {
+        emit("    pop rax\n");
+        if (wi * 8 < elem_size) {
+            var remaining: u64 = elem_size - wi * 8;
+            if (remaining > 8) { remaining = 8; }
+            emit_store_rax_bytes_at_offset(offset + wi * 8, remaining);
+        }
+    }
+    return 0;
+}
+
+func emit_gc_name_has_prefix(name: []u8, prefix: u64, prefix_len: u64) -> u64 {
+    if (name.ptr == 0 || name.len < prefix_len || prefix == 0 || prefix_len == 0) { return 0; }
+    if (str_eq(slice(name.ptr, prefix_len), slice(prefix, prefix_len)) != 0) { return 1; }
+    return 0;
+}
+
+var g_emit_gc_disabled_cached_name_ptr: u64;
+var g_emit_gc_disabled_cached_name_len: u64;
+var g_emit_gc_disabled_cached_value: u64;
+var g_emit_gc_program_enabled: u64;
+
+func emit_gc_program_enabled_set(enabled: u64) -> u64 {
+    g_emit_gc_program_enabled = enabled;
+    g_emit_gc_disabled_cached_name_ptr = 0;
+    g_emit_gc_disabled_cached_name_len = 0;
+    g_emit_gc_disabled_cached_value = 0;
+    return 0;
+}
+
+func emit_gc_auto_slots_disabled_uncached(name: []u8) -> u64 {
+    if (emit_gc_name_has_prefix(name, (u64)"std_", str_len("std_")) != 0) { return 1; }
+    if (emit_gc_name_has_prefix(name, (u64)"std.", str_len("std.")) != 0) { return 1; }
+    if (emit_gc_name_has_prefix(name, (u64)"std_mem__", str_len("std_mem__")) != 0) { return 1; }
+    if (emit_gc_name_has_prefix(name, (u64)"std_mem.", str_len("std_mem.")) != 0) { return 1; }
+    if (emit_gc_name_has_prefix(name, (u64)"bpp_gc_", str_len("bpp_gc_")) != 0) { return 1; }
+    if (emit_gc_name_has_prefix(name, (u64)"bpp_tag_", str_len("bpp_tag_")) != 0) { return 1; }
+    if (emit_gc_name_has_prefix(name, (u64)"__bpp_", str_len("__bpp_")) != 0) { return 1; }
+    if (emit_gc_name_has_prefix(name, (u64)"emitter_", str_len("emitter_")) != 0) { return 1; }
+    if (emit_gc_name_has_prefix(name, (u64)"emitter.", str_len("emitter.")) != 0) { return 1; }
+    if (emit_gc_name_has_prefix(name, (u64)"ssa_", str_len("ssa_")) != 0) { return 1; }
+    if (emit_gc_name_has_prefix(name, (u64)"ssa.", str_len("ssa.")) != 0) { return 1; }
+    if (emit_gc_name_has_prefix(name, (u64)"compiler_", str_len("compiler_")) != 0) { return 1; }
+    if (emit_gc_name_has_prefix(name, (u64)"compiler.", str_len("compiler.")) != 0) { return 1; }
+    if (emit_gc_name_has_prefix(name, (u64)"llvm_", str_len("llvm_")) != 0) { return 1; }
+    if (emit_gc_name_has_prefix(name, (u64)"llvm.", str_len("llvm.")) != 0) { return 1; }
+    if (emit_gc_name_has_prefix(name, (u64)"parser_", str_len("parser_")) != 0) { return 1; }
+    if (emit_gc_name_has_prefix(name, (u64)"parser.", str_len("parser.")) != 0) { return 1; }
+    if (emit_gc_name_has_prefix(name, (u64)"lexer_", str_len("lexer_")) != 0) { return 1; }
+    if (emit_gc_name_has_prefix(name, (u64)"lexer.", str_len("lexer.")) != 0) { return 1; }
+    if (emit_gc_name_has_prefix(name, (u64)"codegen__", str_len("codegen__")) != 0) { return 1; }
+    if (emit_gc_name_has_prefix(name, (u64)"codegen.", str_len("codegen.")) != 0) { return 1; }
+    return 0;
+}
+
+func emit_gc_auto_slots_disabled() -> u64 {
+    if (g_emit_gc_program_enabled == 0) { return 1; }
+    var name: []u8 = current_func_name_current();
+    if (g_emit_gc_disabled_cached_name_ptr == name.ptr && g_emit_gc_disabled_cached_name_len == name.len) {
+        return g_emit_gc_disabled_cached_value;
+    }
+    g_emit_gc_disabled_cached_name_ptr = name.ptr;
+    g_emit_gc_disabled_cached_name_len = name.len;
+    g_emit_gc_disabled_cached_value = emit_gc_auto_slots_disabled_uncached(name);
+    return g_emit_gc_disabled_cached_value;
+}
+
+func emit_gc_direct_call_name(name: []u8) -> u64 {
+    var fn_ptr: u64 = name.ptr;
+    var fn_len: u64 = name.len;
+    var resolved: *NameInfo = resolve_name(slice(fn_ptr, fn_len));
+    if (resolved != 0) {
+        fn_ptr = resolved.ptr;
+        fn_len = resolved.len;
+    }
+    _cg_emit_direct_call_name(slice(fn_ptr, fn_len), 0, 0);
+    return 0;
+}
+
+func emit_gc_root_slot_call_offset(fn_name: []u8, offset: u64) -> u64 {
+    if (offset == 0) { return 0; }
+    if (emit_gc_auto_slots_disabled() != 0) { return 0; }
+    emit("    lea rax, [rbp");
+    emit_signed_disp(offset);
+    emit("]\n");
+    _cg_emit_mov_user_arg_from_reg(0, 0, slice("rax", 3));
+    emit_gc_direct_call_name(fn_name);
+    return 1;
+}
+
+func emit_gc_root_slot_push_offset(offset: u64) -> u64 {
+    if (offset == 0 || emit_gc_auto_slots_disabled() != 0) { return 0; }
+    emit("    lea rax, [rbp");
+    emit_signed_disp(offset);
+    emit("]\n");
+    _cg_emit_mov_user_arg_from_reg(0, 0, slice("rax", 3));
+    _cg_emit_mov_user_arg_from_reg(1, 0, slice("rbp", 3));
+    emit_gc_direct_call_name(slice("bpp_gc_root_slot_push_owned", str_len("bpp_gc_root_slot_push_owned")));
+    return 1;
+}
+
+func emit_gc_typed_root_slots(ti: *TypeInfo, offset: u64) -> u64 {
+    if (offset == 0 || emit_gc_auto_slots_disabled() != 0) { return 0; }
+    var offsets: *Vec<u64> = new Vec<u64>{0, 0, 0};
+    typeinfo_collect_gc_slot_offsets(ti, 0, offsets);
+    for (var i: u64 = 0; i < offsets.len(); i++) { emit_gc_root_slot_push_offset(offset + offsets.get(i)); }
+    offsets.release_buffer();
+    free((u64)offsets);
+    return 0;
+}
+
+func emit_gc_root_slot_remove_offset(offset: u64) -> u64 {
+    return emit_gc_root_slot_call_offset(slice("bpp_gc_root_slot_remove", str_len("bpp_gc_root_slot_remove")), offset);
+}
+
+func emit_gc_temporary_push_rax() -> u64 {
+    if (emit_gc_auto_slots_disabled() != 0) { return 0; }
+    // This is injected inside expressions whose callers may already hold a
+    // sibling value/address in any scratch register, not an ordinary call site.
+    emit("    push rax\n    push rdx\n    push rbx\n    push rcx\n    push rsi\n    push rdi\n    push r8\n    push r9\n    push r10\n    push r11\n");
+    _cg_emit_mov_user_arg_from_reg(0, 0, slice("rax", 3));
+    _cg_emit_mov_user_arg_from_reg(1, 0, slice("rbp", 3));
+    emit_gc_direct_call_name(slice("bpp_gc_temporary_push", str_len("bpp_gc_temporary_push")));
+    emit("    pop r11\n    pop r10\n    pop r9\n    pop r8\n    pop rdi\n    pop rsi\n    pop rcx\n    pop rbx\n    pop rdx\n    pop rax\n");
+    return 0;
+}
+
+func emit_gc_temporary_typed_offset(ti: *TypeInfo, offset: u64) -> u64 {
+    if (emit_gc_auto_slots_disabled() != 0) { return 0; }
+    var offsets: *Vec<u64> = new Vec<u64>{0, 0, 0};
+    typeinfo_collect_gc_slot_offsets(ti, 0, offsets);
+    emit("    push rax\n    push rdx\n");
+    for (var i: u64 = 0; i < offsets.len(); i++) {
+        emit("    mov rax, [rbp");
+        emit_signed_disp(offset + offsets.get(i));
+        emit("]\n");
+        emit_gc_temporary_push_rax();
+    }
+    emit("    pop rdx\n    pop rax\n");
+    offsets.release_buffer();
+    free((u64)offsets);
+    return 0;
+}
+
+func emit_gc_typed_edges_at_r12(ti: *TypeInfo) -> u64 {
+    if (emit_gc_auto_slots_disabled() != 0) { return 0; }
+    var offsets: *Vec<u64> = new Vec<u64>{0, 0, 0};
+    typeinfo_collect_gc_slot_offsets(ti, 0, offsets);
+    for (var i: u64 = 0; i < offsets.len(); i++) {
+        emit("    lea rax, [r12+");
+        emit_u64(offsets.get(i));
+        emit("]\n");
+        _cg_emit_mov_user_arg_from_reg(0, 0, slice("r12", 3));
+        _cg_emit_mov_user_arg_from_reg(1, 0, slice("rax", 3));
+        emit_gc_direct_call_name(slice("bpp_tag_write_barrier_runtime_slot", str_len("bpp_tag_write_barrier_runtime_slot")));
+    }
+    offsets.release_buffer();
+    free((u64)offsets);
+    return 0;
+}
+
+func emit_variadic_roots_at(pack: *AstVariadicPack, element_index: u64, push_root: u64) -> u64 {
+    if (pack.storage_offset == 0 || emit_gc_auto_slots_disabled() != 0) { return 0; }
+    var offsets: *Vec<u64> = new Vec<u64>{0, 0, 0};
+    typeinfo_collect_gc_slot_offsets(pack.elem_typeinfo, 0, offsets);
+    var base: u64 = pack.storage_offset + element_index * sizeof_type_ex(pack.elem_typeinfo);
+    for (var i: u64 = 0; i < offsets.len(); i++) {
+        if (push_root != 0) { emit_gc_root_slot_push_offset(base + offsets.get(i)); }
+        else { emit_gc_root_slot_remove_offset(base + offsets.get(i)); }
+    }
+    offsets.release_buffer();
+    free((u64)offsets);
+    return 0;
+}
+
+func emit_variadic_call_cleanup(args: *Vec<*AstNode>) -> u64 {
+    if (args == 0 || args.len() == 0) { return 0; }
+    var tail: *AstNode = args.get(args.len() - 1);
+    if (ast_kind(tail) != AST_VARIADIC_PACK) { return 0; }
+    var pack: *AstVariadicPack = (*AstVariadicPack)tail;
+    if (pack.storage_offset == 0) { return 0; }
+    emit("    push rax\n    push rdx\n");
+    for (var i: u64 = 0; i < pack.values_vec.len(); i++) {
+        emit_variadic_roots_at(pack, i, 0);
+    }
+    emit("    pop rdx\n    pop rax\n");
+    pack.storage_offset = 0;
+    return 0;
+}
+
+func emit_variadic_pack(pack: *AstVariadicPack, symtab: *Symtab) -> u64 {
+    typeinfo_from_variadic_pack(pack, symtab);
+    var n: u64 = pack.values_vec.len();
+    if (n == 0) {
+        emit("    xor eax, eax\n    xor edx, edx\n");
+        return 0;
+    }
+    var elem: *TypeInfo = pack.elem_typeinfo;
+    var elem_size: u64 = sizeof_type_ex(elem);
+    var base_offset: u64 = emit_alloc_tmp_struct(symtab, n * elem_size + 8);
+    pack.storage_offset = base_offset;
+    for (var i: u64 = 0; i < n; i++) {
+        emit_typed_value_to_offset(pack.values_vec.get(i), elem, base_offset + i * elem_size, symtab);
+        emit_variadic_roots_at(pack, i, 1);
+    }
+    emit("    lea rax, [rbp");
+    emit_signed_disp(base_offset);
+    emit("]\n    mov rdx, ");
+    emit_u64(n);
+    emit_nl();
+    return 0;
+}
+
 func emit_target_push_slice_arg(arg: *AstNode, arg_kind: u64) -> u64 {
     if (arg_kind == AST_SLICE) {
         var slice_node: *AstSlice = (*AstSlice)arg;
-        emit_expr(slice_node.len_expr);
-        emit("    push rax\n");
         emit_expr(slice_node.ptr_expr);
         emit("    push rax\n");
-    } else if (arg_kind == AST_CALL || arg_kind == AST_METHOD_CALL || arg_kind == AST_CALL_PTR) {
+        emit_expr(slice_node.len_expr);
+        emit("    mov rdx, rax\n    pop rax\n    push rdx\n    push rax\n");
+    } else if (arg_kind == AST_CALL || arg_kind == AST_METHOD_CALL || arg_kind == AST_CALL_PTR || arg_kind == AST_VARIADIC_PACK) {
         emit_expr(arg);
         emit("    push rdx\n");
         emit("    push rax\n");
@@ -840,6 +1123,12 @@ func emit_target_push_slice_arg(arg: *AstNode, arg_kind: u64) -> u64 {
 }
 
 func emit_target_push_struct_arg(arg: *AstNode, arg_kind: u64, struct_size: u64, symtab: *Symtab) -> u64 {
+    if (arg_kind == AST_STRUCT_LITERAL) {
+        var literal_ti: *TypeInfo = get_expr_type_with_symtab(arg, symtab);
+        var literal_offset: u64 = emit_alloc_tmp_struct(symtab, struct_size);
+        emit_typed_value_to_offset(arg, literal_ti, literal_offset, symtab);
+        return emit_push_struct_words_from_tmp(literal_offset, struct_size);
+    }
     if (arg_kind == AST_STACK_CTOR) {
         var tmp_offset_sc: u64 = emit_alloc_tmp_struct(symtab, struct_size);
         emit_stack_ctor_init_to_offset((*AstStackCtor)arg, tmp_offset_sc, symtab);
@@ -862,9 +1151,7 @@ func emit_target_push_struct_arg(arg: *AstNode, arg_kind: u64, struct_size: u64,
         } else if (arg_kind == AST_METHOD_CALL) {
             emit_method_call_sret_to_offset((*AstMethodCall)arg, tmp_offset2, symtab);
         } else {
-            emit_stderr("[ERROR] large call pointer struct argument is unsupported\n");
-            diag_force_stop_pass();
-            return 0;
+            emit_expr_call_ptr((u64)arg, symtab, tmp_offset2);
         }
         emit("    lea rax, [rbp");
         emit_signed_disp(tmp_offset2);
@@ -922,6 +1209,37 @@ func emit_target_push_struct_arg(arg: *AstNode, arg_kind: u64, struct_size: u64,
 }
 
 func _cg_target_push_call_arg(arg: *AstNode, symtab: *Symtab) -> u64 {
+    var words: u64 = emit_target_push_call_arg_core(arg, symtab);
+    return emit_gc_protect_pushed_call_words(words, get_expr_type_with_symtab(arg, symtab), symtab);
+}
+
+func emit_gc_protect_pushed_call_words(words: u64, ti: *TypeInfo, symtab: *Symtab) -> u64 {
+    if (words == 0 || emit_gc_auto_slots_disabled() != 0) { return words; }
+    var offsets: *Vec<u64> = new Vec<u64>{0, 0, 0};
+    typeinfo_collect_gc_slot_offsets(ti, 0, offsets);
+    if (offsets.len() != 0) {
+        // Keep the ABI words on the stack; save their address across calls.
+        var stack_base: u64 = symtab_add(symtab, slice(0, 0), TYPE_U64, 0, 8);
+        emit("    mov [rbp");
+        emit_signed_disp(stack_base);
+        emit("], rsp\n");
+        for (var i: u64 = 0; i < offsets.len(); i++) {
+            emit("    mov rax, [rbp");
+            emit_signed_disp(stack_base);
+            emit("]\n");
+            if (ti.ptr_depth == 0 && (ti.type_kind == TYPE_ARRAY || (ti.type_kind == TYPE_STRUCT && sizeof_type_ex(ti) > 16))) { emit("    mov rax, [rax]\n"); }
+            emit("    mov rax, [rax+");
+            emit_u64(offsets.get(i));
+            emit("]\n");
+            emit_gc_temporary_push_rax();
+        }
+    }
+    offsets.release_buffer();
+    free((u64)offsets);
+    return words;
+}
+
+func emit_target_push_call_arg_core(arg: *AstNode, symtab: *Symtab) -> u64 {
     var arg_kind: u64 = ast_kind(arg);
     if (arg_kind == AST_CALL) {
         var call_arg: *AstCall = (*AstCall)arg;
@@ -1044,7 +1362,8 @@ func emit_call_push_arg_with_param(arg: *AstNode, expected: *Param, symtab: *Sym
     }
 
     var struct_size: u64 = layout_type_sizeof(TYPE_STRUCT, 0, expected.struct_name);
-    return emit_target_push_struct_arg(arg, ast_kind(arg), struct_size, symtab);
+    var words: u64 = emit_target_push_struct_arg(arg, ast_kind(arg), struct_size, symtab);
+    return emit_gc_protect_pushed_call_words(words, expected_ti, symtab);
 }
 
 func emit_index_addr(node: u64, symtab: *Symtab) -> u64 {
@@ -1060,7 +1379,7 @@ func emit_index_addr(node: u64, symtab: *Symtab) -> u64 {
     var bt: *TypeInfo = get_expr_type_with_symtab((*AstNode)base, symtab);
     if (bt != 0) {
         if (bt.ptr_depth > 0) {
-            elem_size = get_pointee_size(bt.type_kind, bt.ptr_depth);
+            elem_size = typeinfo_pointee_size(bt);
             if (bt.is_tagged == 1) { use_tagged_ptr = 1; }
         } else if (bt.type_kind == TYPE_ARRAY) {
             elem_size = typeinfo_elem_size_from_container(bt);
@@ -1092,7 +1411,7 @@ func emit_index_addr(node: u64, symtab: *Symtab) -> u64 {
     }
     emit("    pop rbx\n");
     emit("    add rax, rbx\n");
-    return;
+    return 0;
 }
 
 func emit_try_materialize_operand(operand: u64, op_kind: u64, struct_size: u64, tmp_offset: u64, symtab: *Symtab) -> u64 {
@@ -1115,11 +1434,11 @@ func emit_try_materialize_operand(operand: u64, op_kind: u64, struct_size: u64, 
             emit("]\n");
             emit_copy_bytes_with_regs(slice("rbx", 3), slice("r8", 2), struct_size);
         }
-        return;
+        return 0;
     }
     if (op_kind == AST_STACK_CTOR) {
         emit_stack_ctor_init_to_offset((*AstStackCtor)operand, tmp_offset, symtab);
-        return;
+        return 0;
     }
     if (op_kind == AST_CALL || op_kind == AST_METHOD_CALL || op_kind == AST_CALL_PTR) {
         emit_expr(operand);
@@ -1149,7 +1468,7 @@ func emit_try_materialize_operand(operand: u64, op_kind: u64, struct_size: u64, 
             emit_copy_bytes_with_regs(slice("rbx", 3), slice("r8", 2), struct_size);
         }
     }
-    return;
+    return 0;
 }
 
 func emit_try_emit_fail_return(tmp_offset: u64, check_desc: *FieldDesc, check_off: u64, ret_struct_name: []u8, label_ok: u64, symtab: *Symtab) -> u64 {
@@ -1206,7 +1525,7 @@ func emit_try_emit_fail_return(tmp_offset: u64, check_desc: *FieldDesc, check_of
     emit("    mov rsp, rbp\n");
     emit("    pop rbp\n");
     emit("    ret\n");
-    return;
+    return 0;
 }
 
 func emit_try_emit_value_load(value_desc: *FieldDesc, value_off: u64) -> u64 {
@@ -1241,7 +1560,7 @@ func emit_try_emit_value_load(value_desc: *FieldDesc, value_off: u64) -> u64 {
             if (value_off != 0) { emit("+"); emit_u64(value_off); }
             emit("]\n");
         }
-        return;
+        return 0;
     }
     if (value_size <= 16) {
         emit("    mov rax, [rbx");
@@ -1250,7 +1569,7 @@ func emit_try_emit_value_load(value_desc: *FieldDesc, value_off: u64) -> u64 {
         emit("    mov rdx, [rbx");
         if (value_off + 8 != 0) { emit("+"); emit_u64(value_off + 8); }
         emit("]\n");
-        return;
+        return 0;
     }
     diag_emit_error_tag("codegen", "try", "try value size too large for expression result");
     diag_emit_help("return the try payload through a destination slot or reduce the payload size");
@@ -1337,7 +1656,7 @@ func emit_try_expr(node: u64, symtab: *Symtab) -> u64 {
 
     emit_label_def(label_ok);
     emit_try_emit_value_load(value_desc, value_off);
-    return;
+    return 0;
 }
 
 func emit_number_ctor_name_is(name: []u8, base: []u8) -> u64 {
@@ -1377,65 +1696,65 @@ func emit_number_ctor_returns_number(name: []u8) -> u64 {
     return 0;
 }
 
-func emit_number_canonical_lower_call_name(name: []u8) -> *NameInfo {
-    if (name.ptr == 0 || name.len == 0) { return 0; }
+func emit_number_canonical_lower_call_name(name: []u8) -> NameInfo {
+    if (name.ptr == 0 || name.len == 0) { return NameInfo{0, 0}; }
     if (str_eq(name, slice("number_from_i8", str_len("number_from_i8"))) != 0 ||
         str_eq(name, slice("std_number__number_from_i8", str_len("std_number__number_from_i8"))) != 0) {
-        return new NameInfo{(u64)"std_number__Number_from_i8", str_len("std_number__Number_from_i8")};
+        return NameInfo{(u64)"std_number__Number_from_i8", str_len("std_number__Number_from_i8")};
     }
     if (str_eq(name, slice("number_from_i16", str_len("number_from_i16"))) != 0 ||
         str_eq(name, slice("std_number__number_from_i16", str_len("std_number__number_from_i16"))) != 0) {
-        return new NameInfo{(u64)"std_number__Number_from_i16", str_len("std_number__Number_from_i16")};
+        return NameInfo{(u64)"std_number__Number_from_i16", str_len("std_number__Number_from_i16")};
     }
     if (str_eq(name, slice("number_from_i32", str_len("number_from_i32"))) != 0 ||
         str_eq(name, slice("std_number__number_from_i32", str_len("std_number__number_from_i32"))) != 0) {
-        return new NameInfo{(u64)"std_number__Number_from_i32", str_len("std_number__Number_from_i32")};
+        return NameInfo{(u64)"std_number__Number_from_i32", str_len("std_number__Number_from_i32")};
     }
     if (str_eq(name, slice("number_from_i64", str_len("number_from_i64"))) != 0 ||
         str_eq(name, slice("std_number__number_from_i64", str_len("std_number__number_from_i64"))) != 0) {
-        return new NameInfo{(u64)"std_number__Number_from_i64", str_len("std_number__Number_from_i64")};
+        return NameInfo{(u64)"std_number__Number_from_i64", str_len("std_number__Number_from_i64")};
     }
     if (str_eq(name, slice("number_from_u8", str_len("number_from_u8"))) != 0 ||
         str_eq(name, slice("std_number__number_from_u8", str_len("std_number__number_from_u8"))) != 0) {
-        return new NameInfo{(u64)"std_number__Number_from_u8", str_len("std_number__Number_from_u8")};
+        return NameInfo{(u64)"std_number__Number_from_u8", str_len("std_number__Number_from_u8")};
     }
     if (str_eq(name, slice("number_from_u16", str_len("number_from_u16"))) != 0 ||
         str_eq(name, slice("std_number__number_from_u16", str_len("std_number__number_from_u16"))) != 0) {
-        return new NameInfo{(u64)"std_number__Number_from_u16", str_len("std_number__Number_from_u16")};
+        return NameInfo{(u64)"std_number__Number_from_u16", str_len("std_number__Number_from_u16")};
     }
     if (str_eq(name, slice("number_from_u32", str_len("number_from_u32"))) != 0 ||
         str_eq(name, slice("std_number__number_from_u32", str_len("std_number__number_from_u32"))) != 0) {
-        return new NameInfo{(u64)"std_number__Number_from_u32", str_len("std_number__Number_from_u32")};
+        return NameInfo{(u64)"std_number__Number_from_u32", str_len("std_number__Number_from_u32")};
     }
     if (str_eq(name, slice("number_from_u64", str_len("number_from_u64"))) != 0 ||
         str_eq(name, slice("std_number__number_from_u64", str_len("std_number__number_from_u64"))) != 0) {
-        return new NameInfo{(u64)"std_number__Number_from_u64", str_len("std_number__Number_from_u64")};
+        return NameInfo{(u64)"std_number__Number_from_u64", str_len("std_number__Number_from_u64")};
     }
     if (str_eq(name, slice("number_from_f64", str_len("number_from_f64"))) != 0 ||
         str_eq(name, slice("std_number__number_from_f64", str_len("std_number__number_from_f64"))) != 0) {
-        return new NameInfo{(u64)"std_number__Number_from_f64", str_len("std_number__Number_from_f64")};
+        return NameInfo{(u64)"std_number__Number_from_f64", str_len("std_number__Number_from_f64")};
     }
     if (str_eq(name, slice("number_from_rational", str_len("number_from_rational"))) != 0 ||
         str_eq(name, slice("std_number__number_from_rational", str_len("std_number__number_from_rational"))) != 0) {
-        return new NameInfo{(u64)"std_number__Number_from_rational", str_len("std_number__Number_from_rational")};
+        return NameInfo{(u64)"std_number__Number_from_rational", str_len("std_number__Number_from_rational")};
     }
     if (str_eq(name, slice("number_from_decimal", str_len("number_from_decimal"))) != 0 ||
         str_eq(name, slice("std_number__number_from_decimal", str_len("std_number__number_from_decimal"))) != 0) {
-        return new NameInfo{(u64)"std_number__Number_from_decimal", str_len("std_number__Number_from_decimal")};
+        return NameInfo{(u64)"std_number__Number_from_decimal", str_len("std_number__Number_from_decimal")};
     }
     if (str_eq(name, slice("number_from_bigfloat", str_len("number_from_bigfloat"))) != 0 ||
         str_eq(name, slice("std_number__number_from_bigfloat", str_len("std_number__number_from_bigfloat"))) != 0) {
-        return new NameInfo{(u64)"std_number__Number_from_bigfloat", str_len("std_number__Number_from_bigfloat")};
+        return NameInfo{(u64)"std_number__Number_from_bigfloat", str_len("std_number__Number_from_bigfloat")};
     }
     if (str_eq(name, slice("number_cmp_ptr", str_len("number_cmp_ptr"))) != 0 ||
         str_eq(name, slice("std_number__number_cmp_ptr", str_len("std_number__number_cmp_ptr"))) != 0) {
-        return new NameInfo{(u64)"std_number__Number_cmp_ptr", str_len("std_number__Number_cmp_ptr")};
+        return NameInfo{(u64)"std_number__Number_cmp_ptr", str_len("std_number__Number_cmp_ptr")};
     }
     if (str_eq(name, slice("number_eq_cmp_ptr", str_len("number_eq_cmp_ptr"))) != 0 ||
         str_eq(name, slice("std_number__number_eq_cmp_ptr", str_len("std_number__number_eq_cmp_ptr"))) != 0) {
-        return new NameInfo{(u64)"std_number__Number_eq_cmp_ptr", str_len("std_number__Number_eq_cmp_ptr")};
+        return NameInfo{(u64)"std_number__Number_eq_cmp_ptr", str_len("std_number__Number_eq_cmp_ptr")};
     }
-    return 0;
+    return NameInfo{0, 0};
 }
 
 func emit_number_small_ctor_normalize(kind: u64) -> u64 {
@@ -1472,6 +1791,12 @@ func emit_number_try_inline_small_ctor(call: *AstCall, resolved_name: []u8) -> u
 }
 
 func emit_expr_call(node: u64, symtab: *Symtab) -> u64 {
+    var result: u64 = emit_expr_call_impl(node, symtab);
+    emit_variadic_call_cleanup(((*AstCall)node).args_vec);
+    return result;
+}
+
+func emit_expr_call_impl(node: u64, symtab: *Symtab) -> u64 {
     var call: *AstCall = (*AstCall)node;
     var name: []u8 = call.name;
     var resolved_ptr: u64 = u8_slice_ptr(name);
@@ -1524,7 +1849,7 @@ func emit_expr_call(node: u64, symtab: *Symtab) -> u64 {
         var callee_ident_closure: *AstNode = (*AstNode)ast_ident(name);
         var call_ptr_expr_closure: *AstCallPtr = ast_call_ptr(callee_ident_closure, call.args_vec);
         emit_expr_call_ptr((u64)call_ptr_expr_closure, symtab);
-        return;
+        return 0;
     }
 
     // A local whose declared type is `func(...)` is a value even when its short
@@ -1535,7 +1860,7 @@ func emit_expr_call(node: u64, symtab: *Symtab) -> u64 {
         var callee_ident_func_value: *AstNode = (*AstNode)ast_ident(name);
         var call_ptr_expr_func_value: *AstCallPtr = ast_call_ptr(callee_ident_func_value, call.args_vec);
         emit_expr_call_ptr((u64)call_ptr_expr_func_value, symtab);
-        return;
+        return 0;
     }
 
     if (var_type != 0 || is_global != 0) {
@@ -1545,7 +1870,7 @@ func emit_expr_call(node: u64, symtab: *Symtab) -> u64 {
             var callee_ident: *AstNode = (*AstNode)ast_ident(name);
             var call_ptr_expr: *AstCallPtr = ast_call_ptr(callee_ident, call.args_vec);
             emit_expr_call_ptr((u64)call_ptr_expr, symtab);
-            return;
+            return 0;
         }
     }
 
@@ -1559,26 +1884,29 @@ func emit_expr_call(node: u64, symtab: *Symtab) -> u64 {
     if (typeinfo_validate_call_arguments(args, fn_call_direct, symtab, "typecheck") == 0) { return 0; }
     var nargs: u64 = 0;
     if (args != 0) { nargs = args.len(); }
-    var total_arg_words: u64 = 0;
-    if (nargs != 0) {
-        var i: u64 = nargs;
-        while (i > 0) {
-            i = i - 1;
-            var arg: *AstNode = args.get(i);
-            var param: *Param = emit_call_param_at(fn_call_direct, i);
-            total_arg_words = total_arg_words + emit_call_push_arg_with_param(arg, param, symtab);
-        }
-    }
+    var total_arg_words: u64 = emit_method_push_user_args(args, nargs, fn_call_direct, 0, symtab);
     var stack_words: u64 = _cg_target_pop_arg_regs(total_arg_words);
     var reserve_words: u64 = _cg_target_call_prepare(stack_words, 0);
     emit("    call ");
     emit_len(resolved_ptr, resolved_len);
     emit_nl();
     _cg_target_call_cleanup(stack_words, reserve_words);
-    return;
+    return 0;
 }
 
-func emit_expr_call_ptr(node: u64, symtab: *Symtab) -> u64 {
+func _cg_target_pop_indirect_arg_regs(total_words: u64, sret_offset: u64, sret_is_saved_ptr: u64) -> u64 {
+    if (sret_offset == 0) { return _cg_target_pop_arg_regs(total_words); }
+    _cg_emit_sret_ptr_from_rbp(sret_offset, sret_is_saved_ptr);
+    return _cg_target_pop_arg_regs_sret(total_words);
+}
+
+func emit_expr_call_ptr(node: u64, symtab: *Symtab, sret_offset: u64 = 0, sret_is_saved_ptr: u64 = 0) -> u64 {
+    var result: u64 = emit_expr_call_ptr_impl(node, symtab, sret_offset, sret_is_saved_ptr);
+    emit_variadic_call_cleanup(((*AstCallPtr)node).args_vec);
+    return result;
+}
+
+func emit_expr_call_ptr_impl(node: u64, symtab: *Symtab, sret_offset: u64 = 0, sret_is_saved_ptr: u64 = 0) -> u64 {
     var cp: *AstCallPtr = (*AstCallPtr)node;
     var args3: *Vec<*AstNode> = cp.args_vec;
     var nargs3: u64 = 0;
@@ -1595,100 +1923,16 @@ func emit_expr_call_ptr(node: u64, symtab: *Symtab) -> u64 {
     if (closure_sig_ti != 0) {
         hidden_env_param = 1;
     }
-    var typed_direct_func_ptr: u64 = 0;
-    if (callee_ti != 0 && callee_ti.type_kind == TYPE_FUNC && hidden_env_param == 0) {
-        typed_direct_func_ptr = 1;
-    }
-    if (sig_ti != 0 && sig_ti.fn_params_vec != 0) {
-        var expected_n: u64 = sig_ti.fn_params_vec.len();
-        var param_base_idx: u64 = 0;
-        if (hidden_env_param != 0) {
-            if (expected_n == 0) {
-                diag_emit_error_tag("codegen", "fn-ptr-call", "invalid lambda closure signature for function pointer call");
-                diag_force_stop_pass();
-                return 0;
-            }
-            param_base_idx = 1;
-            expected_n = expected_n - 1;
-        }
-        var fixed_n: u64 = expected_n;
-        var min_n: u64 = expected_n;
-        if (sig_ti.fn_is_variadic != 0 && expected_n > 0) {
-            fixed_n = expected_n - 1;
-            min_n = fixed_n;
-        }
-        if (sig_ti.fn_is_variadic == 0 && nargs3 != expected_n) {
-            diag_emit_error_tag("codegen", "fn-ptr-call", "function pointer call argument count mismatch");
-            diag_emit_labelled_u64("expected: ", expected_n);
-            diag_emit_labelled_u64("got: ", nargs3);
-            diag_force_stop_pass();
-            return 0;
-        }
-        if (sig_ti.fn_is_variadic != 0 && nargs3 < min_n) {
-            diag_emit_error_tag("codegen", "fn-ptr-call", "function pointer call missing required arguments");
-            diag_emit_labelled_u64("expected at least: ", min_n);
-            diag_emit_labelled_u64("got: ", nargs3);
-            diag_force_stop_pass();
-            return 0;
-        }
-
-        for (var i_sig: u64 = 0; i_sig < fixed_n; i_sig++) {
-            var expected_ti: *TypeInfo = sig_ti.fn_params_vec.get(param_base_idx + i_sig);
-            var actual_ti: *TypeInfo = get_expr_type_with_symtab(args3.get(i_sig), symtab);
-            if (expected_ti == 0 || actual_ti == 0) {
-                diag_emit_error_tag("codegen", "fn-ptr-call", "function pointer call argument type mismatch at index");
-                diag_emit_labelled_u64("index: ", i_sig);
-                diag_force_stop_pass();
-                return 0;
-            }
-            var mismatch: u64 = 0;
-            if (typeinfo_expr_is_assignable(args3.get(i_sig), actual_ti, expected_ti) == 0) {
-                mismatch = 1;
-            }
-            if (mismatch != 0) {
-                diag_emit_error_tag("codegen", "fn-ptr-call", "function pointer call argument type mismatch at index");
-                diag_emit_labelled_u64("index: ", i_sig);
-                diag_force_stop_pass();
-                return 0;
-            }
-        }
-        if (sig_ti.fn_is_variadic != 0 && expected_n > 0) {
-            var rest_ti: *TypeInfo = sig_ti.fn_params_vec.get(param_base_idx + expected_n - 1);
-            for (var ri: u64 = fixed_n; ri < nargs3; ri++) {
-                var actual_rest_ti: *TypeInfo = get_expr_type_with_symtab(args3.get(ri), symtab);
-                if (rest_ti == 0 || actual_rest_ti == 0) {
-                    diag_emit_error_tag("codegen", "fn-ptr-call", "function pointer variadic argument type mismatch at index");
-                    diag_emit_labelled_u64("index: ", ri);
-                    diag_force_stop_pass();
-                    return 0;
-                }
-                var mismatch2: u64 = 0;
-                if (typeinfo_func_pointer_variadic_arg_assignable(args3.get(ri), actual_rest_ti, rest_ti) == 0) {
-                    mismatch2 = 1;
-                }
-                if (mismatch2 != 0) {
-                    diag_emit_error_tag("codegen", "fn-ptr-call", "function pointer variadic argument type mismatch at index");
-                    diag_emit_labelled_u64("index: ", ri);
-                    diag_force_stop_pass();
-                    return 0;
-                }
-            }
-        }
-    }
+    if (typeinfo_prepare_indirect_call(cp, symtab, "codegen") == 0) { return 0; }
+    args3 = cp.args_vec;
+    nargs3 = 0;
+    if (args3 != 0) { nargs3 = args3.len(); }
 
     // Preserve callee address across arg evaluation.
     emit_expr(cp.callee);
     emit("    push rax\n");
 
-    var total_arg_words3: u64 = 0;
-    if (nargs3 != 0) {
-        var i3: u64 = nargs3;
-        while (i3 > 0) {
-            i3 = i3 - 1;
-            var arg3: *AstNode = args3.get(i3);
-            total_arg_words3 = total_arg_words3 + _cg_target_push_call_arg(arg3, symtab);
-        }
-    }
+    var total_arg_words3: u64 = emit_method_push_user_args(args3, nargs3, 0, 0, symtab);
 
     if (hidden_env_param != 0) {
         var closure_struct_def: *AstStructDef = 0;
@@ -1737,19 +1981,10 @@ func emit_expr_call_ptr(node: u64, symtab: *Symtab) -> u64 {
         }
         emit("]\n");
         emit("    push r12\n");
-        var stack_words_closure_typed: u64 = _cg_target_pop_arg_regs(total_arg_words3 + 1);
+        var stack_words_closure_typed: u64 = _cg_target_pop_indirect_arg_regs(total_arg_words3 + 1, sret_offset, sret_is_saved_ptr);
         var reserve_words_closure_typed: u64 = _cg_target_call_prepare(stack_words_closure_typed + 1, 0);
         emit("    call r10\n");
         _cg_target_call_cleanup(stack_words_closure_typed + 1, reserve_words_closure_typed);
-        return 0;
-    }
-
-    if (typed_direct_func_ptr != 0) {
-        var stack_words_typed_direct: u64 = _cg_target_pop_arg_regs(total_arg_words3);
-        emit("    pop rax\n");
-        var reserve_words_typed_direct: u64 = _cg_target_call_prepare(stack_words_typed_direct, 0);
-        emit("    call rax\n");
-        _cg_target_call_cleanup(stack_words_typed_direct, reserve_words_typed_direct);
         return 0;
     }
 
@@ -1767,7 +2002,7 @@ func emit_expr_call_ptr(node: u64, symtab: *Symtab) -> u64 {
         emit("    mov r10, [r11]\n");
         emit("    mov r12, [r11+8]\n");
         emit("    push r12\n");
-        var stack_words_closure_raw: u64 = _cg_target_pop_arg_regs(total_arg_words3 + 1);
+        var stack_words_closure_raw: u64 = _cg_target_pop_indirect_arg_regs(total_arg_words3 + 1, sret_offset, sret_is_saved_ptr);
         var reserve_words_closure_raw: u64 = _cg_target_call_prepare(stack_words_closure_raw + 1, 0);
         emit("    call r10\n");
         _cg_target_call_cleanup(stack_words_closure_raw + 1, reserve_words_closure_raw);
@@ -1806,7 +2041,7 @@ func emit_expr_call_ptr(node: u64, symtab: *Symtab) -> u64 {
     emit("    mov r10, [r11]\n");
     emit("    mov r12, [r11+8]\n");
     emit("    push r12\n");
-    var stack_words_closure: u64 = _cg_target_pop_arg_regs(total_arg_words3 + 1);
+    var stack_words_closure: u64 = _cg_target_pop_indirect_arg_regs(total_arg_words3 + 1, sret_offset, sret_is_saved_ptr);
     var reserve_words_closure: u64 = _cg_target_call_prepare(stack_words_closure + 1, 0);
     emit("    call r10\n");
     _cg_target_call_cleanup(stack_words_closure + 1, reserve_words_closure);
@@ -1816,13 +2051,15 @@ func emit_expr_call_ptr(node: u64, symtab: *Symtab) -> u64 {
 
     // Direct function pointer path.
     emit_label_def(label_direct);
-    var stack_words3: u64 = _cg_target_pop_arg_regs(total_arg_words3);
-    emit("    pop rax\n");
-    var reserve_words3: u64 = _cg_target_call_prepare(stack_words3, 0);
+    var stack_words3: u64 = _cg_target_pop_indirect_arg_regs(total_arg_words3, sret_offset, sret_is_saved_ptr);
+    emit("    mov rax, [rsp+");
+    emit_u64(stack_words3 * 8);
+    emit("]\n");
+    var reserve_words3: u64 = _cg_target_call_prepare(stack_words3 + 1, 0);
     emit("    call rax\n");
-    _cg_target_call_cleanup(stack_words3, reserve_words3);
+    _cg_target_call_cleanup(stack_words3 + 1, reserve_words3);
     emit_label_def(label_done);
-    return;
+    return 0;
 }
 
 func emit_expr_stack_ctor(node: u64, symtab: *Symtab) -> u64 {
@@ -1840,7 +2077,7 @@ func emit_expr_stack_ctor(node: u64, symtab: *Symtab) -> u64 {
         emit("    mov rax, [rbp");
         emit_signed_disp(tmp_offset_expr);
         emit("]\n");
-        return;
+        return 0;
     } else if (sc_size <= 16) {
         emit("    mov rax, [rbp");
         emit_signed_disp(tmp_offset_expr);
@@ -1849,7 +2086,7 @@ func emit_expr_stack_ctor(node: u64, symtab: *Symtab) -> u64 {
         var tmp_expr_hi: u64 = tmp_offset_expr + 8;
         emit_signed_disp(tmp_expr_hi);
         emit("]\n");
-        return;
+        return 0;
     }
     emit_stderr("[ERROR] stack constructor expression requires destination for large structs\n");
     diag_force_stop_pass();
@@ -1906,7 +2143,7 @@ func emit_expr_emit_number_storage_local(var_type: *TypeInfo, offset: u64) -> u6
     if (typeinfo_number_storage_is_specialized(var_type) == 0) { return 0; }
     var raw_kind: u64 = var_type.number_storage_kind;
     if (emit_expr_emit_number_storage_raw(raw_kind, offset) == 0) { return 0; }
-    var raw_ti: *TypeInfo = typeinfo_new(raw_kind, 0);
+    var raw_ti: *TypeInfo = typeinfo_make(raw_kind, 0);
     emit_binary_emit_number_from_rax(raw_ti, 0, symtab_current());
     return 1;
 }
@@ -2031,10 +2268,10 @@ func emit_expr_ident(node: u64, symtab: *Symtab) -> u64 {
             diag_emit_error_tag("codegen", "name-resolution", "identifier has no stack slot in current scope");
             diag_emit_labelled_name("identifier: ", name);
             diag_force_stop_pass();
-            return;
+            return 0;
         }
         if (emit_expr_emit_local_typed(var_type, offset0) != 0) {
-            return;
+            return 0;
         }
     }
 
@@ -2051,7 +2288,7 @@ func emit_expr_ident(node: u64, symtab: *Symtab) -> u64 {
         emit("    mov rax, ");
         emit_u64(result.value);
         emit_nl();
-        return;
+        return 0;
     }
 
     if (is_global_var(slice(resolved_ptr, resolved_len))) {
@@ -2059,14 +2296,14 @@ func emit_expr_ident(node: u64, symtab: *Symtab) -> u64 {
         if (ginfo != 0) {
             var gt: *TypeInfo = ginfo.typeinfo_ptr;
             if (emit_expr_emit_global_typed(gt, slice(resolved_ptr, resolved_len)) != 0) {
-                return;
+                return 0;
             }
         }
 
         emit("    mov rax, [rel _gvar_");
         emit_len(resolved_ptr, resolved_len);
         emit("]\n");
-        return;
+        return 0;
     }
 
     var offset: u64 = symtab_find(symtab, name);
@@ -2077,17 +2314,17 @@ func emit_expr_ident(node: u64, symtab: *Symtab) -> u64 {
             emit("    lea rax, [rel ");
             emit_len(resolved_ptr, resolved_len);
             emit("]\n");
-            return;
+            return 0;
         }
         diag_emit_error_tag("codegen", "name-resolution", "undefined identifier");
         diag_emit_labelled_name("identifier: ", name);
         diag_force_stop_pass();
-        return;
+        return 0;
     }
     emit("    mov rax, [rbp");
     emit_signed_disp(offset);
     emit("]\n");
-    return;
+    return 0;
 }
 
 func emit_expr_unary(node: u64, symtab: *Symtab) -> u64 {
@@ -2109,7 +2346,7 @@ func emit_expr_unary(node: u64, symtab: *Symtab) -> u64 {
             _cg_emit_lea_user_arg_from_rsp(1, 0, 8);
             _cg_emit_direct_call_name(slice("std_number__Number_sub_values", str_len("std_number__Number_sub_values")), 0, 2);
             emit("    add rsp, 16\n");
-            return;
+            return 0;
         }
         if (ot != 0 && ot.ptr_depth == 0 && ot.type_kind == TYPE_F64) {
             emit("    mov rbx, 1\n");
@@ -2119,7 +2356,7 @@ func emit_expr_unary(node: u64, symtab: *Symtab) -> u64 {
             emit("    movq xmm0, rax\n");
             emit("    xorpd xmm0, xmm1\n");
             emit("    movq rax, xmm0\n");
-            return;
+            return 0;
         }
         emit("    neg rax\n");
     }
@@ -2137,7 +2374,7 @@ func emit_expr_unary(node: u64, symtab: *Symtab) -> u64 {
             emit("    cmp rax, 0\n");
             emit("    sete al\n");
             emit("    movzx rax, al\n");
-            return;
+            return 0;
         }
         emit("    test rax, rax\n");
         emit("    setz al\n");
@@ -2149,11 +2386,11 @@ func emit_expr_unary(node: u64, symtab: *Symtab) -> u64 {
             _cg_emit_lea_user_arg_from_rsp(0, 0, 0);
             _cg_emit_direct_call_name(slice("std_number__Number_bitnot_values", str_len("std_number__Number_bitnot_values")), 0, 1);
             emit("    add rsp, 8\n");
-            return;
+            return 0;
         }
         emit("    not rax\n");
     }
-    return;
+    return 0;
 }
 
 func emit_expr_addr_of(node: u64, symtab: *Symtab) -> u64 {
@@ -2168,7 +2405,7 @@ func emit_expr_addr_of(node: u64, symtab: *Symtab) -> u64 {
             emit("    lea rax, [rbp");
             emit_signed_disp(offset);
             emit("]\n");
-            return;
+            return 0;
         }
 
         if (sym_func_exists(name) != 0) {
@@ -2182,7 +2419,7 @@ func emit_expr_addr_of(node: u64, symtab: *Symtab) -> u64 {
             emit("    lea rax, [rel ");
             emit_len(resolved_ptr, resolved_len);
             emit("]\n");
-            return;
+            return 0;
         }
 
         if (sym_global_exists(name) != 0) {
@@ -2196,12 +2433,12 @@ func emit_expr_addr_of(node: u64, symtab: *Symtab) -> u64 {
             emit("    lea rax, [rel _gvar_");
             emit_len(resolved_ptr2, resolved_len2);
             emit("]\n");
-            return;
+            return 0;
         }
     }
 
     emit_lvalue(operand);
-    return;
+    return 0;
 }
 
 func emit_expr_deref(node: u64, symtab: *Symtab) -> u64 {
@@ -2219,31 +2456,31 @@ func emit_expr_deref(node: u64, symtab: *Symtab) -> u64 {
     if (ptr_depth == 1) {
         if (base_type == TYPE_BOOL || base_type == TYPE_U8) {
             emit("    movzx rax, byte [rax]\n");
-            return;
+            return 0;
         }
         if (base_type == TYPE_U16) {
             emit("    movzx rax, word [rax]\n");
-            return;
+            return 0;
         }
         if (base_type == TYPE_U32) {
             emit("    mov eax, [rax]\n");
-            return;
+            return 0;
         }
         if (base_type == TYPE_I8) {
             emit("    movsx rax, byte [rax]\n");
-            return;
+            return 0;
         }
         if (base_type == TYPE_I16) {
             emit("    movsx rax, word [rax]\n");
-            return;
+            return 0;
         }
         if (base_type == TYPE_I32) {
             emit("    movsxd rax, dword [rax]\n");
-            return;
+            return 0;
         }
     }
     emit("    mov rax, [rax]\n");
-    return;
+    return 0;
 }
 
 func emit_expr_deref8(node: u64, symtab: *Symtab) -> u64 {
@@ -2257,7 +2494,7 @@ func emit_expr_deref8(node: u64, symtab: *Symtab) -> u64 {
         }
     }
     emit("    movzx rax, byte [rax]\n");
-    return;
+    return 0;
 }
 
 func emit_expr_index(node: u64, symtab: *Symtab) -> u64 {
@@ -2267,32 +2504,32 @@ func emit_expr_index(node: u64, symtab: *Symtab) -> u64 {
         if (et.ptr_depth == 0) {
             if (et.type_kind == TYPE_BOOL || et.type_kind == TYPE_U8) {
                 emit("    movzx rax, byte [rax]\n");
-                return;
+                return 0;
             }
             if (et.type_kind == TYPE_U16) {
                 emit("    movzx rax, word [rax]\n");
-                return;
+                return 0;
             }
             if (et.type_kind == TYPE_U32) {
                 emit("    mov eax, [rax]\n");
-                return;
+                return 0;
             }
             if (et.type_kind == TYPE_I8) {
                 emit("    movsx rax, byte [rax]\n");
-                return;
+                return 0;
             }
             if (et.type_kind == TYPE_I16) {
                 emit("    movsx rax, word [rax]\n");
-                return;
+                return 0;
             }
             if (et.type_kind == TYPE_I32) {
                 emit("    movsxd rax, dword [rax]\n");
-                return;
+                return 0;
             }
         }
     }
     emit("    mov rax, [rax]\n");
-    return;
+    return 0;
 }
 
 func emit_expr_safe_index(node: u64, symtab: *Symtab) -> u64 {
@@ -2313,10 +2550,7 @@ func emit_expr_safe_index(node: u64, symtab: *Symtab) -> u64 {
         return 0;
     }
 
-    var elem_size: u64 = get_pointee_size(bt.type_kind, bt.ptr_depth);
-    if (bt.ptr_depth == 1 && bt.type_kind == TYPE_STRUCT) {
-        elem_size = layout_type_sizeof(bt.type_kind, 0, bt.struct_name);
-    }
+    var elem_size: u64 = typeinfo_pointee_size(bt);
 
     var label_null: u64 = new_label();
     var label_end: u64 = new_label();
@@ -2576,7 +2810,7 @@ func emit_expr_cast(node: u64, symtab: *Symtab) -> u64 {
         return 0;
         }
         var struct_def: *AstStructDef = get_struct_def(src_ti.struct_name);
-        var vptr_name: *NameInfo = trait_build_vptr_field_name(cast.struct_name);
+        var vptr_name: *NameInfo = trait_build_vptr_field_name(trait_impl_vptr_trait_name(impl_info2));
         var field_offset: u64 = 0;
         var field_desc: *FieldDesc = 0;
         var found: u64 = struct_find_field_desc_scoped(struct_def, slice(0, 0), slice(vptr_name.ptr, vptr_name.len), &field_offset, &field_desc);
@@ -2588,7 +2822,7 @@ func emit_expr_cast(node: u64, symtab: *Symtab) -> u64 {
         emit_expr(expr);
         if (src_ti.is_tagged == 1) { emit_tagged_mask(); }
         emit_emit_adjust_rax_add(field_offset);
-        return;
+        return 0;
     }
     if (cast.target_type == TYPE_STRUCT) {
         var src_ti2: *TypeInfo = get_expr_type_with_symtab((*AstNode)expr, symtab);
@@ -2602,7 +2836,7 @@ func emit_expr_cast(node: u64, symtab: *Symtab) -> u64 {
         return 0;
             }
             var struct_def2: *AstStructDef = get_struct_def(cast.struct_name);
-            var vptr_name2: *NameInfo = trait_build_vptr_field_name(src_ti2.struct_name);
+            var vptr_name2: *NameInfo = trait_build_vptr_field_name(trait_impl_vptr_trait_name(impl2));
             var field_offset2: u64 = 0;
             var field_desc2: *FieldDesc = 0;
             var found2: u64 = struct_find_field_desc_scoped(struct_def2, slice(0, 0), slice(vptr_name2.ptr, vptr_name2.len), &field_offset2, &field_desc2);
@@ -2615,7 +2849,7 @@ func emit_expr_cast(node: u64, symtab: *Symtab) -> u64 {
             if (src_ti2.is_tagged == 1) { emit_tagged_mask(); }
             emit_emit_checked_trait_to_struct_guard(impl2.vtable_global);
             emit_emit_adjust_rax_sub(field_offset2);
-            return;
+            return 0;
         }
 
         if (cast.target_ptr_depth > 0 && src_ti2 != 0 && src_ti2.type_kind == TYPE_STRUCT && src_ti2.ptr_depth > 0) {
@@ -2627,7 +2861,7 @@ func emit_expr_cast(node: u64, symtab: *Symtab) -> u64 {
                 emit_emit_checked_struct_downcast_guard(check_info);
             }
             emit_try_adjust_struct_ptr_cast(src_ti2, cast.struct_name);
-            return;
+            return 0;
         }
     }
     var src_ti3: *TypeInfo = get_expr_type_with_symtab((*AstNode)expr, symtab);
@@ -2636,26 +2870,26 @@ func emit_expr_cast(node: u64, symtab: *Symtab) -> u64 {
         var target_kind: u64 = cast.target_type;
         if (src_kind == target_kind) {
             emit_expr(expr);
-            return;
+            return 0;
         }
         if (emit_cast_is_int_scalar(src_kind) != 0 && emit_cast_is_int_scalar(target_kind) != 0) {
             emit_expr(expr);
             emit_cast_emit_int_truncate(target_kind);
-            return;
+            return 0;
         }
         if (emit_cast_is_int_scalar(src_kind) != 0 && target_kind == TYPE_F64) {
             emit_expr(expr);
             emit_cast_emit_int_to_f64(src_kind);
-            return;
+            return 0;
         }
         if (src_kind == TYPE_F64 && emit_cast_is_int_scalar(target_kind) != 0) {
             emit_expr(expr);
             emit_cast_emit_f64_to_int(target_kind);
-            return;
+            return 0;
         }
     }
     emit_expr(expr);
-    return;
+    return 0;
 }
 
 func emit_expr_sizeof(node: u64) -> u64 {
@@ -2687,7 +2921,7 @@ func emit_expr_sizeof(node: u64) -> u64 {
     emit("    mov rax, ");
     emit_u64(size);
     emit_nl();
-    return;
+    return 0;
 }
 
 func emit_expr_sizeof_expr(node: u64, symtab: *Symtab) -> u64 {
@@ -2700,7 +2934,7 @@ func emit_expr_sizeof_expr(node: u64, symtab: *Symtab) -> u64 {
     emit("    mov rax, ");
     emit_u64(size_val);
     emit_nl();
-    return;
+    return 0;
 }
 
 func emit_new_tag_shape_for_new(nw: *AstNew) -> u64 {
@@ -2738,8 +2972,8 @@ func emit_new_gc_alloc_disabled() -> u64 {
 }
 
 func emit_new_alloc_zero(size: u64, shape: u64) -> u64 {
-    var alloc_ptr: u64 = (u64)"bpp_gc_alloc_raw_rooted";
-    var alloc_len: u64 = str_len("bpp_gc_alloc_raw_rooted");
+    var alloc_ptr: u64 = (u64)"bpp_gc_alloc_raw";
+    var alloc_len: u64 = str_len("bpp_gc_alloc_raw");
     var use_gc_alloc: u64 = 1;
     if (emit_new_gc_alloc_disabled() != 0) {
         alloc_ptr = (u64)"heap_alloc";
@@ -2757,6 +2991,7 @@ func emit_new_alloc_zero(size: u64, shape: u64) -> u64 {
         _cg_emit_mov_user_arg_imm_u64(1, 0, shape);
     }
     _cg_emit_direct_call_name(slice(alloc_ptr, alloc_len), 0, 0);
+    if (use_gc_alloc != 0) { emit_gc_temporary_push_rax(); }
     emit("    mov r12, rax\n");
 
     var memset_ptr: u64 = (u64)"memset";
@@ -2775,6 +3010,12 @@ func emit_new_alloc_zero(size: u64, shape: u64) -> u64 {
 }
 
 func emit_new_invoke_constructor(nw: *AstNew, symtab: *Symtab) -> u64 {
+    var result: u64 = emit_new_invoke_constructor_impl(nw, symtab);
+    emit_variadic_call_cleanup(nw.ctor_args_vec);
+    return result;
+}
+
+func emit_new_invoke_constructor_impl(nw: *AstNew, symtab: *Symtab) -> u64 {
     if (nw.ctor_args_vec == 0) {
         return 0;
     }
@@ -2795,6 +3036,9 @@ func emit_new_invoke_constructor(nw: *AstNew, symtab: *Symtab) -> u64 {
         return 0;
     }
     var fn_ctor: *AstFunc = resolved_ctor.fn;
+    nw.ctor_args_vec = lower_normalize_call_args_with_symtab(fn_ctor.name, fn_ctor.params_vec, 1, args, 0, symtab);
+    args = nw.ctor_args_vec;
+    if (typeinfo_validate_call_arguments(args, fn_ctor, symtab, "typecheck") == 0) { return 0; }
     var call_ptr: u64 = u8_slice_ptr(fn_ctor.name);
     var call_len: u64 = u8_slice_len(fn_ctor.name);
     var resolved_name: *NameInfo = resolve_name(slice(call_ptr, call_len));
@@ -2803,29 +3047,21 @@ func emit_new_invoke_constructor(nw: *AstNew, symtab: *Symtab) -> u64 {
         call_len = resolved_name.len;
     }
     var nargs: u64 = args.len();
-    var total_arg_words: u64 = 0;
-    if (nargs != 0) {
-        var ai: u64 = nargs;
-        while (ai > 0) {
-            ai = ai - 1;
-            var arg: *AstNode = args.get(ai);
-            var param: *Param = emit_call_param_at(fn_ctor, ai + 1);
-            total_arg_words = total_arg_words + emit_call_push_arg_with_param(arg, param, symtab);
-        }
-    }
+    emit("    push r12\n");
+    var total_arg_words: u64 = emit_method_push_user_args(args, nargs, fn_ctor, 1, symtab);
+    emit("    mov r12, [rsp+");
+    emit_u64(total_arg_words * 8);
+    emit("]\n");
     emit("    push r12\n");
     total_arg_words = total_arg_words + 1;
     var stack_words: u64 = _cg_target_pop_arg_regs(total_arg_words);
 
+    var reserve_words: u64 = _cg_target_call_prepare(stack_words + 1, 0);
     emit("    call ");
     emit_len(call_ptr, call_len);
     emit_nl();
 
-    if (stack_words > 0) {
-        emit("    add rsp, ");
-        emit_u64(stack_words * 8);
-        emit_nl();
-    }
+    _cg_target_call_cleanup(stack_words + 1, reserve_words);
     return 0;
 }
 
@@ -2867,7 +3103,7 @@ func emit_expr_new(node: u64, symtab: *Symtab) -> u64 {
     emit_new_invoke_constructor(nw, symtab);
 
     emit("    mov rax, r12\n");
-    return;
+    return 0;
 }
 
 func emit_expr_try_immediate(kind: u64, node: u64) -> u64 {
@@ -2901,12 +3137,22 @@ func emit_expr_try_immediate(kind: u64, node: u64) -> u64 {
         return 1;
     }
     if (kind == AST_STRUCT_LITERAL) {
-        emit("    xor eax, eax\n");
+        var lit_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)node, symtab_current());
+        var lit_size: u64 = sizeof_type_ex(lit_ti);
+        var lit_offset: u64 = emit_alloc_tmp_struct(symtab_current(), lit_size);
+        emit_typed_value_to_offset((*AstNode)node, lit_ti, lit_offset, symtab_current());
+        var lit_words: u64 = emit_push_struct_words_from_tmp(lit_offset, lit_size);
+        if (lit_words != 0) { emit("    pop rax\n"); }
+        if (lit_words == 2) { emit("    pop rdx\n"); }
         return 1;
     }
     if (kind == AST_SLICE) {
         emit_stderr("[ERROR] Slice literal cannot be used as rvalue\n");
         diag_force_stop_pass();
+        return 1;
+    }
+    if (kind == AST_VARIADIC_PACK) {
+        emit_variadic_pack((*AstVariadicPack)node, symtab_current());
         return 1;
     }
     return 0;
@@ -2960,6 +3206,20 @@ func emit_expr_dispatch_with_symtab(kind: u64, node: u64, symtab: *Symtab) -> u6
 }
 
 func emit_expr(node: u64) -> u64 {
+    var result: u64 = emit_expr_core(node);
+    if (node != 0 && emit_gc_auto_slots_disabled() == 0) {
+        // These nodes unconditionally produce scalars, even when a surrounding
+        // cast will later reinterpret the value as a pointer. That cast still
+        // performs its own protection; this avoids a redundant type allocation.
+        var kind: u64 = ast_kind(node);
+        if (kind == AST_LITERAL || kind == AST_FLOAT || kind == AST_SIZEOF || kind == AST_SIZEOF_EXPR) { return result; }
+        var ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)node, symtab_current());
+        if (ti != 0 && (ti.ptr_depth != 0 || ti.type_kind == TYPE_FUNC)) { emit_gc_temporary_push_rax(); }
+    }
+    return result;
+}
+
+func emit_expr_core(node: u64) -> u64 {
     if (diag_should_stop_pass() != 0) { return 0; }
     if (node == 0) {
         emit_stderr("[ERROR] codegen received null expression node\n");
@@ -2968,91 +3228,28 @@ func emit_expr(node: u64) -> u64 {
         return 0;
     }
     var kind: u64 = ast_kind(node);
-    if (emit_expr_try_immediate(kind, node) != 0) { return; }
+    if (emit_expr_try_immediate(kind, node) != 0) { return 0; }
     var symtab: *Symtab = symtab_current();
     emit_expr_dispatch_with_symtab(kind, node, symtab);
 }
 
 func emit_struct_literal_init_ptr(init: u64) -> u64 {
     var lit: *AstStructLiteral = (*AstStructLiteral)init;
-    var values: *Vec<*AstNode> = lit.values_vec;
-    var num_values: u64 = values.len();
-    var fields: *Vec<*FieldDesc> = lit.struct_def.fields_vec;
-    var num_fields: u64 = fields.len();
-
-    var impls: *Vec<*TraitImpl> = sym_get_trait_impls();
-    if (impls != 0) {
-        var ni: u64 = impls.len();
-        for (var ti: u64 = 0; ti < ni; ti++) {
-            var impl_info3: *TraitImpl = impls.get(ti);
-            if (!str_eq(impl_info3.impl_struct_name, lit.struct_def.name)) { continue; }
-            var vptr_name: *NameInfo = trait_build_vptr_field_name(impl_info3.trait_name);
-            var field_offset_v: u64 = 0;
-            var field_desc_v: *FieldDesc = 0;
-            var found_v: u64 = struct_find_field_desc_scoped(lit.struct_def, slice(0, 0), slice(vptr_name.ptr, vptr_name.len), &field_offset_v, &field_desc_v);
-            if (found_v == 0) {
-                emit_stderr("[ERROR] vptr field not found for struct literal init\n");
-                diag_force_stop_pass();
-        return 0;
-            }
-            emit("    lea rax, [rel _gvar_");
-            emit_len(u8_slice_ptr(impl_info3.vtable_global), u8_slice_len(impl_info3.vtable_global));
-            emit("]\n");
-            emit("    mov [r12");
-            if (field_offset_v != 0) { emit("+"); emit_u64(field_offset_v); }
-            emit("], rax\n");
-        }
-    }
-
-    var field_offset: u64 = 0;
-    var value_index: u64 = 0;
-    for (var fi: u64 = 0; fi < num_fields && value_index < num_values; fi++) {
-        var field: *FieldDesc = fields.get(fi);
-        var field_size: u64 = layout_field_sizeof(field);
-        if (trait_is_vptr_field_name(field.name) != 0) {
-            field_offset = field_offset + field_size;
-            continue;
-        }
-
-        var value_expr: *AstNode = values.get(value_index);
-        if (field.type_kind == TYPE_SLICE && field.ptr_depth == 0) {
-            if (ast_kind(value_expr) == AST_SLICE) {
-                var sl: *AstSlice = (*AstSlice)value_expr;
-                emit_expr(sl.ptr_expr);
-                emit("    mov [r12");
-                if (field_offset != 0) { emit("+"); emit_u64(field_offset); }
-                emit("], rax\n");
-                emit_expr(sl.len_expr);
-                emit("    mov [r12");
-                var len_field_offset: u64 = field_offset + 8;
-                if (len_field_offset != 0) { emit("+"); emit_u64(len_field_offset); }
-                emit("], rax\n");
-            } else {
-                emit_lvalue(value_expr);
-                emit("    mov rbx, [rax]\n");
-                emit("    mov rcx, [rax+8]\n");
-                emit("    mov [r12");
-                if (field_offset != 0) { emit("+"); emit_u64(field_offset); }
-                emit("], rbx\n");
-                emit("    mov [r12");
-                var len_field_offset2: u64 = field_offset + 8;
-                if (len_field_offset2 != 0) { emit("+"); emit_u64(len_field_offset2); }
-                emit("], rcx\n");
-            }
-            field_offset = field_offset + field_size;
-            value_index = value_index + 1;
-            continue;
-        }
-
-        emit_expr(value_expr);
-
-        emit("    mov [r12");
-        if (field_offset != 0) { emit("+"); emit_u64(field_offset); }
-        emit("], rax\n");
-
-        field_offset = field_offset + field_size;
-        value_index = value_index + 1;
-    }
+    var ti: *TypeInfo = typeinfo_make(TYPE_STRUCT, 0);
+    ti.struct_name = lit.struct_def.name;
+    ti.struct_def = lit.struct_def;
+    var size: u64 = sizeof_type_ex(ti);
+    var symtab: *Symtab = symtab_current();
+    var temporary: u64 = symtab_add(symtab, slice(0, 0), TYPE_STRUCT, 0, size);
+    // Evaluate into independent storage before replacing the destination:
+    // assigning R{old.field, ...} must retain the old value during evaluation.
+    emit("    push r12\n");
+    emit_typed_value_to_offset((*AstNode)init, ti, temporary, symtab);
+    emit("    pop r12\n    mov r8, r12\n    lea rbx, [rbp");
+    emit_signed_disp(temporary);
+    emit("]\n");
+    emit_copy_bytes_with_regs(slice("rbx", 3), slice("r8", 2), size);
+    emit_gc_typed_edges_at_r12(ti);
     return 0;
 }
 
@@ -3252,38 +3449,6 @@ func emit_member_emit_struct_field_at_rax(struct_def: *AstStructDef, parent: []u
     var found: u64 = struct_find_field_desc_scoped(struct_def, slice(lookup_parent_ptr, lookup_parent_len), slice(member.ptr, member.len), &field_offset, &field_desc);
     if (found == 0 && lookup_parent_ptr != 0) {
         found = struct_find_field_desc_scoped(struct_def, slice(0, 0), slice(member.ptr, member.len), &field_offset, &field_desc);
-    }
-    if (found == 0) {
-        // Name collision fallback: prefer the newest same-name type that owns this member.
-        var all_structs: *Vec<*AstStructDef> = typeinfo_get_structs();
-        if (all_structs != 0 && struct_def != 0) {
-            var si: u64 = all_structs.len();
-            while (si > 0) {
-                si = si - 1;
-                var alt_sd: *AstStructDef = all_structs.get(si);
-                if (alt_sd == 0 || alt_sd == struct_def) { continue; }
-                if (str_eq(alt_sd.name, struct_def.name) == 0) { continue; }
-                var alt_parent_ptr: u64 = lookup_parent_ptr;
-                var alt_parent_len: u64 = lookup_parent_len;
-                if (alt_sd.is_union == 1) {
-                    alt_parent_ptr = 0;
-                    alt_parent_len = 0;
-                }
-                var alt_offset: u64 = 0;
-                var alt_desc: *FieldDesc = 0;
-                var alt_found: u64 = struct_find_field_desc_scoped(alt_sd, slice(alt_parent_ptr, alt_parent_len), slice(member.ptr, member.len), &alt_offset, &alt_desc);
-                if (alt_found == 0 && alt_parent_ptr != 0) {
-                    alt_found = struct_find_field_desc_scoped(alt_sd, slice(0, 0), slice(member.ptr, member.len), &alt_offset, &alt_desc);
-                }
-                if (alt_found != 0) {
-                    struct_def = alt_sd;
-                    field_offset = alt_offset;
-                    field_desc = alt_desc;
-                    found = 1;
-                    break;
-                }
-            }
-        }
     }
     if (found == 0) {
         emit_stderr("[ERROR] unknown member: ");
@@ -3672,7 +3837,7 @@ func emit_member_access_expr(node: u64, symtab: *Symtab) -> u64 {
                 emit("    mov rax, ");
                 emit_u64(scoped_const.value);
                 emit_nl();
-                return;
+                return 0;
             }
         }
     }
@@ -3685,49 +3850,49 @@ func emit_member_access_expr(node: u64, symtab: *Symtab) -> u64 {
                 diag_emit_error_tag("codegen", "slice-member", "unknown slice member");
                 diag_emit_labelled_name("member: ", slice(member_ptr, member_len));
                 diag_force_stop_pass();
-                return;
+                return 0;
             }
             emit_lvalue(object);
             emit_member_add_offset_to_rax(slice_member_offset);
             emit("    mov rax, [rax]\n");
-            return;
+            return 0;
         }
         if (ot.ptr_depth > 0 && ot.is_tagged == 1 && u8_slice_ptr(ot.tag_layout) != 0) {
             emit_member_expr_tagged_layout(object, ot, slice(member_ptr, member_len));
-            return;
+            return 0;
         }
         if (ot.ptr_depth > 0 && ot.type_kind == TYPE_STRUCT) {
             emit_member_expr_ptr_struct(object, ot, slice(parent_ptr, parent_len), slice(member_ptr, member_len));
-            return;
+            return 0;
         }
         if (ot.ptr_depth == 0 && ot.type_kind == TYPE_STRUCT && ot.struct_def != 0 && ot.struct_def.is_packed == 1) {
             emit_member_expr_packed_struct(object, ot.struct_def, slice(member_ptr, member_len));
-            return;
+            return 0;
         }
         var ot_obj_kind: u64 = ast_kind(object);
         if (ot.ptr_depth == 0 && ot.type_kind == TYPE_STRUCT &&
             (ot_obj_kind == AST_CALL || ot_obj_kind == AST_METHOD_CALL || ot_obj_kind == AST_CALL_PTR || ot_obj_kind == AST_STACK_CTOR)) {
             emit_member_expr_struct_call_value(object, ot, symtab, slice(parent_ptr, parent_len), slice(member_ptr, member_len));
-            return;
+            return 0;
         }
     }
 
     var obj_kind: u64 = ast_kind(object);
     if (obj_kind == AST_DEREF) {
         emit_member_expr_deref(object, symtab, slice(parent_ptr, parent_len), slice(member_ptr, member_len));
-        return;
+        return 0;
     }
     if (obj_kind == AST_MEMBER_ACCESS) {
         emit_member_expr_nested(object, symtab, slice(parent_ptr, parent_len), slice(member_ptr, member_len));
-        return;
+        return 0;
     }
     if (obj_kind == AST_INDEX) {
         emit_member_expr_indexed(object, symtab, slice(parent_ptr, parent_len), slice(member_ptr, member_len));
-        return;
+        return 0;
     }
     if (obj_kind == AST_IDENT) {
         emit_member_expr_ident(object, symtab, slice(parent_ptr, parent_len), slice(member_ptr, member_len));
-        return;
+        return 0;
     }
 
     emit("    ; ERROR: Member access on non-identifier\n");
@@ -3758,7 +3923,7 @@ func emit_binary_short_circuit_and(left: u64, right: u64) -> u64 {
     emit_label_def(l_false);
     emit("    xor eax, eax\n");
     emit_label_def(l_end);
-    return;
+    return 0;
 }
 
 func emit_binary_short_circuit_or(left: u64, right: u64) -> u64 {
@@ -3782,7 +3947,7 @@ func emit_binary_short_circuit_or(left: u64, right: u64) -> u64 {
     emit_label_def(l_true);
     emit("    mov eax, 1\n");
     emit_label_def(l_end);
-    return;
+    return 0;
 }
 
 func emit_binary_emit_float_op(op: u64) -> u64 {
@@ -4027,7 +4192,7 @@ func emit_binary_emit_int_op(op: u64, use_signed: u64) -> u64 {
         emit("    setne al\n");
         emit("    movzx rax, al\n");
     }
-    return;
+    return 0;
 }
 
 func emit_binary_is_number_type(ti: *TypeInfo) -> u64 {
@@ -4606,12 +4771,12 @@ func emit_binary_expr(node: u64, symtab: *Symtab) -> u64 {
     // Short-circuit evaluation for && and ||
     if (op == TOKEN_ANDAND) {
         emit_binary_short_circuit_and(left, right);
-        return;
+        return 0;
     }
 
     if (op == TOKEN_OROR) {
         emit_binary_short_circuit_or(left, right);
-        return;
+        return 0;
     }
 
     var left_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)left, symtab);
@@ -4619,11 +4784,11 @@ func emit_binary_expr(node: u64, symtab: *Symtab) -> u64 {
 
     if (op == TOKEN_EQEQ || op == TOKEN_BANGEQ || op == TOKEN_LT || op == TOKEN_LTEQ || op == TOKEN_GT || op == TOKEN_GTEQ) {
         if (emit_binary_emit_number_cmp(binary, left_ti, right_ti, symtab, op) != 0) {
-            return;
+            return 0;
         }
     } else {
         if (emit_binary_emit_number_box(binary, left_ti, right_ti, symtab, op) != 0) {
-            return;
+            return 0;
         }
     }
     
@@ -4657,7 +4822,7 @@ func emit_binary_expr(node: u64, symtab: *Symtab) -> u64 {
         else { emit_binary_emit_int_rbx_to_f64(right_ti); }
 
         emit_binary_emit_float_op(op);
-        return;
+        return 0;
     }
     
     // Pointer arithmetic scaling
@@ -4673,7 +4838,7 @@ func emit_binary_expr(node: u64, symtab: *Symtab) -> u64 {
     
     if (ptr_depth > 0) {
         if (op == TOKEN_PLUS || op == TOKEN_MINUS) {
-            var psize: u64 = get_pointee_size(left_ti2.type_kind, ptr_depth);
+            var psize: u64 = typeinfo_pointee_size(left_ti2);
             if (psize > 1) {
                 emit("    imul rbx, ");
                 emit_u64(psize);
@@ -4683,7 +4848,7 @@ func emit_binary_expr(node: u64, symtab: *Symtab) -> u64 {
     }
     
     if (emit_binary_try_strength_reduced_int_op(op, use_signed, left, right) != 0) {
-        return;
+        return 0;
     }
     emit_binary_emit_int_op(op, use_signed);
 }
@@ -4718,7 +4883,7 @@ func emit_lvalue(node: u64) -> u64 {
             emit("    lea rax, [rel _gvar_");
             emit_len(resolved_ptr, resolved_len);
             emit("]\n");
-            return;
+            return 0;
         }
         
         var offset: u64 = symtab_find(symtab, name);
@@ -4726,19 +4891,19 @@ func emit_lvalue(node: u64) -> u64 {
             diag_emit_error_tag("codegen", "name-resolution", "undefined identifier");
             diag_emit_labelled_name("identifier: ", name);
             diag_force_stop_pass();
-            return;
+            return 0;
         }
         
         emit("    lea rax, [rbp");
         emit_signed_disp(offset);
         emit("]\n");
-        return;
+        return 0;
     }
 
     if (kind == AST_CAST) {
         var cast_node: *AstCast = (*AstCast)node;
         emit_lvalue(cast_node.expr);
-        return;
+        return 0;
     }
     
     if (kind == AST_DEREF) {
@@ -4751,7 +4916,7 @@ func emit_lvalue(node: u64) -> u64 {
                 emit_tagged_mask();
             }
         }
-        return;
+        return 0;
     }
     
     if (kind == AST_DEREF8) {
@@ -4764,27 +4929,27 @@ func emit_lvalue(node: u64) -> u64 {
                 emit_tagged_mask();
             }
         }
-        return;
+        return 0;
     }
 
     if (kind == AST_INDEX) {
         emit_index_addr(node, symtab);
-        return;
+        return 0;
     }
 
     if (kind == AST_SAFE_INDEX) {
         emit_stderr("[ERROR] Safe index access cannot be used as lvalue\n");
-        return;
+        return 0;
     }
     
     if (kind == AST_MEMBER_ACCESS) {
         emit_member_access_lvalue(node, symtab);
-        return;
+        return 0;
     }
 
     if (kind == AST_SAFE_MEMBER_ACCESS) {
         emit_stderr("[ERROR] Safe member access cannot be used as lvalue\n");
-        return;
+        return 0;
     }
 }
 
@@ -5120,7 +5285,7 @@ func emit_member_access_lvalue(node: u64, symtab: *Symtab) -> u64 {
             diag_emit_labelled_member("target: ", scope_id2.name, slice(member_ptr, member_len));
             diag_force_stop_pass();
         return 0;
-            return;
+            return 0;
         }
     }
 
@@ -5131,37 +5296,37 @@ func emit_member_access_lvalue(node: u64, symtab: *Symtab) -> u64 {
             diag_emit_error_tag("codegen", "slice-member", "unknown slice member");
             diag_emit_labelled_name("member: ", slice(member_ptr, member_len));
             diag_force_stop_pass();
-            return;
+            return 0;
         }
         emit_lvalue(object);
         emit_member_add_offset_to_rax(slice_member_offset);
-        return;
+        return 0;
     }
     if (obj_ti != 0 && obj_ti.ptr_depth > 0 && obj_ti.type_kind == TYPE_STRUCT) {
         emit_member_lvalue_ptr_struct(object, obj_ti, slice(parent_ptr, parent_len), slice(member_ptr, member_len));
-        return;
+        return 0;
     }
 
     var obj_kind: u64 = ast_kind(object);
 
     if (obj_kind == AST_DEREF) {
         emit_member_lvalue_deref(object, symtab, slice(parent_ptr, parent_len), slice(member_ptr, member_len));
-        return;
+        return 0;
     }
 
     if (obj_kind == AST_MEMBER_ACCESS) {
         emit_member_lvalue_nested(object, symtab, slice(parent_ptr, parent_len), slice(member_ptr, member_len));
-        return;
+        return 0;
     }
 
     if (obj_kind == AST_INDEX) {
         emit_member_lvalue_index(object, symtab, slice(parent_ptr, parent_len), slice(member_ptr, member_len));
-        return;
+        return 0;
     }
 
     if (obj_kind == AST_IDENT) {
         emit_member_lvalue_ident(object, symtab, slice(parent_ptr, parent_len), slice(member_ptr, member_len));
-        return;
+        return 0;
     }
 
     emit("    ; ERROR: Member access on non-identifier in lvalue\n");
@@ -5172,17 +5337,43 @@ func emit_member_access_lvalue(node: u64, symtab: *Symtab) -> u64 {
 // ============================================
 
 func emit_method_push_user_args(args: *Vec<*AstNode>, nargs: u64, fn_sig: *AstFunc, param_base_index: u64, symtab: *Symtab) -> u64 {
-    var total_arg_words: u64 = 0;
-    if (nargs != 0) {
-        var i: u64 = nargs;
-        while (i > 0) {
-            i = i - 1;
-            var arg: *AstNode = args.get(i);
-            var param: *Param = emit_call_param_at(fn_sig, param_base_index + i);
-            total_arg_words = total_arg_words + emit_call_push_arg_with_param(arg, param, symtab);
+    // All calls evaluate arguments once, left to right, independently of the
+    // stack ABI or whether a variadic tail is present.
+    if (nargs > 0) {
+        var offsets: *Vec<u64> = new Vec<u64>{heap_alloc(nargs * sizeof(u64)), 0, nargs};
+        var counts: *Vec<u64> = new Vec<u64>{heap_alloc(nargs * sizeof(u64)), 0, nargs};
+        var total: u64 = 0;
+        for (var ai: u64 = 0; ai < nargs; ai++) {
+            var param: *Param = emit_call_param_at(fn_sig, param_base_index + ai);
+            var words: u64 = emit_call_push_arg_with_param(args.get(ai), param, symtab);
+            var offset: u64 = emit_alloc_tmp_struct(symtab, words * 8);
+            offsets.push(offset);
+            counts.push(words);
+            total = total + words;
+            for (var wi: u64 = 0; wi < words; wi++) {
+                emit("    pop rax\n    mov [rbp");
+                emit_signed_disp(offset + wi * 8);
+                emit("], rax\n");
+            }
         }
+        var reverse: u64 = nargs;
+        while (reverse > 0) {
+            reverse = reverse - 1;
+            var word: u64 = counts.get(reverse);
+            while (word > 0) {
+                word = word - 1;
+                emit("    push qword [rbp");
+                emit_signed_disp(offsets.get(reverse) + word * 8);
+                emit("]\n");
+            }
+        }
+        offsets.release_buffer();
+        free((u64)offsets);
+        counts.release_buffer();
+        free((u64)counts);
+        return total;
     }
-    return total_arg_words;
+    return 0;
 }
 
 func emit_method_push_receiver_from_tmp(tmp_offset: u64) -> u64 {
@@ -5271,7 +5462,7 @@ func emit_find_trait_method_sig(trait_slice: []u8, method: []u8) -> *AstFunc {
     return method_desc.sig;
 }
 
-func emit_method_try_normalize_named_args(method_call: *AstMethodCall, recv_ti: *TypeInfo) -> *AstFunc {
+func emit_method_try_normalize_named_args(method_call: *AstMethodCall, recv_ti: *TypeInfo, symtab: *Symtab) -> *AstFunc {
     if (method_call == 0) { return 0; }
     if (call_has_named_args(method_call.arg_names_vec) == 0) { return 0; }
 
@@ -5312,7 +5503,7 @@ func emit_method_try_normalize_named_args(method_call: *AstMethodCall, recv_ti: 
     }
 
     var params_start: u64 = sym_method_param_start_index(fn_sig);
-    method_call.args_vec = lower_normalize_call_args_for_params(method_call.method, fn_sig.params_vec, params_start, method_call.args_vec, method_call.arg_names_vec);
+    method_call.args_vec = lower_normalize_call_args_with_symtab(method_call.method, fn_sig.params_vec, params_start, method_call.args_vec, method_call.arg_names_vec, symtab);
     method_call.arg_names_vec = 0;
     return fn_sig;
 }
@@ -5328,7 +5519,12 @@ func emit_method_find_virtual_vptr_offset(recv_ti: *TypeInfo, trait_slice: []u8)
     var field_offset: u64 = 0;
     var field_desc: *FieldDesc = 0;
     var found: u64 = struct_find_field_desc_scoped(struct_def, slice(0, 0), slice(vptr_name.ptr, vptr_name.len), &field_offset, &field_desc);
-    if (found == 0) { return COMPILER_NOT_FOUND_U64; }
+    if (found == 0) {
+        var struct_identity: *NameInfo = sym_get_struct_canonical_name(struct_def);
+        diag_emit_labelled_name("resolved receiver: ", slice(struct_identity.ptr, struct_identity.len));
+        diag_emit_labelled_name("required vptr: ", slice(vptr_name.ptr, vptr_name.len));
+        return COMPILER_NOT_FOUND_U64;
+    }
     return field_offset;
 }
 
@@ -5585,6 +5781,12 @@ func emit_safe_method_call_struct_ptr(method_call: *AstMethodCall, recv_ti: *Typ
 }
 
 func emit_safe_method_call(node: u64, symtab: *Symtab) -> u64 {
+    var result: u64 = emit_safe_method_call_impl(node, symtab);
+    emit_variadic_call_cleanup(((*AstMethodCall)node).args_vec);
+    return result;
+}
+
+func emit_safe_method_call_impl(node: u64, symtab: *Symtab) -> u64 {
     var method_call: *AstMethodCall = (*AstMethodCall)node;
     var receiver: u64 = method_call.receiver;
 
@@ -5593,7 +5795,7 @@ func emit_safe_method_call(node: u64, symtab: *Symtab) -> u64 {
         emit_stderr("[ERROR] Safe method call receiver type not found\n");
         return 0;
     }
-    emit_method_try_normalize_named_args(method_call, recv_ti);
+    emit_method_try_normalize_named_args(method_call, recv_ti, symtab);
 
     var args: *Vec<*AstNode> = method_call.args_vec;
     var nargs: u64 = 0;
@@ -5607,13 +5809,19 @@ func emit_safe_method_call(node: u64, symtab: *Symtab) -> u64 {
 }
 
 func emit_method_call(node: u64, symtab: *Symtab) -> u64 {
+    var result: u64 = emit_method_call_impl(node, symtab);
+    emit_variadic_call_cleanup(((*AstMethodCall)node).args_vec);
+    return result;
+}
+
+func emit_method_call_impl(node: u64, symtab: *Symtab) -> u64 {
     var method_call: *AstMethodCall = (*AstMethodCall)node;
     var receiver: u64 = method_call.receiver;
     var method_ptr: u64 = u8_slice_ptr(method_call.method);
     var method_len: u64 = u8_slice_len(method_call.method);
 
     var recv_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)receiver, symtab);
-    emit_method_try_normalize_named_args(method_call, recv_ti);
+    emit_method_try_normalize_named_args(method_call, recv_ti, symtab);
 
     var args: *Vec<*AstNode> = method_call.args_vec;
     var nargs: u64 = 0;
@@ -5692,7 +5900,7 @@ func emit_method_call(node: u64, symtab: *Symtab) -> u64 {
     }
     if ((type_info == 0 || type_info.type_kind != TYPE_STRUCT || (u8_slice_ptr(type_info.struct_name) == 0 || u8_slice_len(type_info.struct_name) == 0)) &&
         emit_binary_expr_is_number((*AstNode)receiver, recv_ti, symtab) != 0) {
-        if (type_info == 0) { type_info = typeinfo_new(0, 0); }
+        if (type_info == 0) { type_info = typeinfo_make(0, 0); }
         type_info.type_kind = TYPE_STRUCT;
         type_info.ptr_depth = 0;
         type_info.struct_name = slice((u64)"std_number__Number", 18);
@@ -5713,7 +5921,7 @@ func emit_method_call(node: u64, symtab: *Symtab) -> u64 {
             nl = nresolved.len;
         }
         if (typeinfo_find_func(slice(np, nl)) != 0 || typeinfo_find_func(slice(nmi.ptr, nmi.len)) != 0) {
-            if (type_info == 0) { type_info = typeinfo_new(0, 0); }
+            if (type_info == 0) { type_info = typeinfo_make(0, 0); }
             type_info.type_kind = TYPE_STRUCT;
             type_info.ptr_depth = 0;
             type_info.struct_name = slice((u64)"std_number__Number", 18);
@@ -5881,7 +6089,7 @@ func emit_method_call(node: u64, symtab: *Symtab) -> u64 {
                 var member_expr: *AstMemberAccess = ast_member_access((*AstNode)receiver, slice(method_ptr, method_len));
                 var call_ptr_expr: *AstCallPtr = ast_call_ptr((*AstNode)member_expr, args);
                 emit_expr_call_ptr((u64)call_ptr_expr, symtab);
-                return;
+                return 0;
             }
         }
         emit_stderr("[ERROR] Method not found: ");
