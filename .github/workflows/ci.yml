@@ -274,6 +274,52 @@ jobs:
             -TimingJsonPath "build/timings/windows-tests-${{ matrix.shard }}.json" `
             -Quiet
 
+      - name: Diagnose Windows compiler crash
+        if: ${{ failure() && matrix.shard == 0 }}
+        shell: pwsh
+        run: |
+          . ./tools/windows_process.ps1
+          $compiler = (Resolve-Path 'bin/stage1.exe').Path
+          $source = (Resolve-Path 'test/source/04_bool_and_signed_int_primitives_success.bpp').Path
+          $outputDir = Join-Path $env:RUNNER_TEMP 'bpp-compiler-diagnostic'
+          New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+          $counts = @{}
+          for ($i = 0; $i -lt 80; $i++) {
+            $result = Invoke-BppLimitedProcess -FilePath $compiler `
+              -ArgumentList @('--target', 'windows-x86_64', '-O1', '--timings-json',
+                (Join-Path $outputDir 'timing.json'), '-asm', $source) `
+              -StdoutPath (Join-Path $outputDir 'compile.asm') `
+              -StderrPath (Join-Path $outputDir 'compile.err') `
+              -WorkingDirectory (Get-Location).Path -MemoryLimitBytes 4294967296
+            $key = [string]$result.ExitCode
+            if (-not $counts.ContainsKey($key)) { $counts[$key] = 0 }
+            $counts[$key]++
+          }
+          $counts | ConvertTo-Json | Write-Host
+          $debugger = Get-Command gdb.exe -ErrorAction SilentlyContinue
+          if ($debugger) {
+            $commands = Join-Path $outputDir 'crash.gdb'
+            @'
+          set pagination off
+          run
+          bt
+          info registers rsp rbp rcx rdx r8 r9 rax
+          x/16gx $rsp
+          '@ | Set-Content -LiteralPath $commands -Encoding ascii
+            $result = Invoke-BppLimitedProcess -FilePath $debugger.Source `
+              -ArgumentList @('--batch', '-x', $commands, '--args', $compiler,
+                '--target', 'windows-x86_64', '-O1', '--timings-json',
+                (Join-Path $outputDir 'timing-gdb.json'), '-asm', $source) `
+              -StdoutPath (Join-Path $outputDir 'gdb.out') `
+              -StderrPath (Join-Path $outputDir 'gdb.err') `
+              -WorkingDirectory (Get-Location).Path -MemoryLimitBytes 4294967296
+            Write-Host "GDB exit: $($result.ExitCode)"
+            Get-Content (Join-Path $outputDir 'gdb.out') |
+              Select-String 'received signal|exited normally|^#\d|rsp\s|rbp\s' |
+              Select-Object -Last 25 | Write-Host
+            Get-Content (Join-Path $outputDir 'gdb.err') -Tail 10 | Write-Host
+          }
+
       - name: Publish Windows timing summary
         if: always()
         shell: pwsh
