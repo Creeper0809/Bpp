@@ -9,6 +9,7 @@ import std.vec;
 import std.util;
 import std.str;
 import types;
+import opt;
 import ast;
 import compiler;
 import compiler.trait_runtime;
@@ -388,6 +389,55 @@ func emit_condition(node: u64) -> u64 {
     var mark: u64 = emit_gc_temporary_begin();
     emit_expr(node);
     emit_gc_temporary_end(mark);
+    return 0;
+}
+
+func emit_condition_jump_false(node: u64, label: u64) -> u64 {
+    if (opt_get_level() >= 1 && emit_gc_current_function_needs_frame() == 0 &&
+        node != 0 && ast_kind(node) == AST_BINARY) {
+        var binary: *AstBinary = (*AstBinary)node;
+        var op: u64 = binary.op;
+        if (op == TOKEN_LT || op == TOKEN_GT || op == TOKEN_LTEQ ||
+            op == TOKEN_GTEQ || op == TOKEN_EQEQ || op == TOKEN_BANGEQ) {
+            var symtab: *Symtab = symtab_current();
+            var left_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)binary.left, symtab);
+            var right_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)binary.right, symtab);
+            if (left_ti != 0 && right_ti != 0 && left_ti.ptr_depth == 0 && right_ti.ptr_depth == 0 &&
+                (left_ti.type_kind == TYPE_I64 || left_ti.type_kind == TYPE_U64) &&
+                (right_ti.type_kind == TYPE_I64 || right_ti.type_kind == TYPE_U64)) {
+                emit_expr(binary.left);
+                if (emit_binary_try_simple_rhs_to_rbx(binary.right, right_ti, symtab) == 0) {
+                    emit("    push rax\n");
+                    emit_expr(binary.right);
+                    emit("    mov rbx, rax\n    pop rax\n");
+                }
+                emit("    cmp rax, rbx\n");
+                var signed_cmp: u64 = left_ti.type_kind == TYPE_I64;
+                if (op == TOKEN_EQEQ) { emit("    jne "); }
+                else if (op == TOKEN_BANGEQ) { emit("    je "); }
+                else if (op == TOKEN_LT) {
+                    if (signed_cmp != 0) { emit("    jge "); }
+                    else { emit("    jae "); }
+                } else if (op == TOKEN_GT) {
+                    if (signed_cmp != 0) { emit("    jle "); }
+                    else { emit("    jbe "); }
+                } else if (op == TOKEN_LTEQ) {
+                    if (signed_cmp != 0) { emit("    jg "); }
+                    else { emit("    ja "); }
+                } else {
+                    if (signed_cmp != 0) { emit("    jl "); }
+                    else { emit("    jb "); }
+                }
+                emit_label(label);
+                emit_nl();
+                return 1;
+            }
+        }
+    }
+    emit_condition(node);
+    emit("    test rax, rax\n    jz ");
+    emit_label(label);
+    emit_nl();
     return 0;
 }
 
@@ -1757,6 +1807,53 @@ func emit_assign_try_index_setter(target: u64, value: u64, symtab: *Symtab) -> u
     return 1;
 }
 
+func emit_assign_is_pure_integer_expr(node: u64, symtab: *Symtab, depth: u64) -> u64 {
+    if (node == 0 || depth > 16) { return 0; }
+    var ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)node, symtab);
+    if (ti == 0 || ti.ptr_depth != 0 ||
+        (ti.type_kind != TYPE_I64 && ti.type_kind != TYPE_U64)) { return 0; }
+    var kind: u64 = ast_kind(node);
+    if (kind == AST_LITERAL || kind == AST_IDENT) { return 1; }
+    if (kind == AST_INDEX) {
+        var idx: *AstIndex = (*AstIndex)node;
+        if (idx.base == 0 || ast_kind(idx.base) != AST_IDENT) { return 0; }
+        var base_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)idx.base, symtab);
+        if (base_ti == 0 || base_ti.ptr_depth != 0 || base_ti.type_kind != TYPE_ARRAY) { return 0; }
+        return emit_assign_is_pure_integer_expr(idx.index, symtab, depth + 1);
+    }
+    if (kind == AST_BINARY) {
+        var binary: *AstBinary = (*AstBinary)node;
+        if (binary.op != TOKEN_PLUS && binary.op != TOKEN_MINUS && binary.op != TOKEN_STAR &&
+            binary.op != TOKEN_AMPERSAND && binary.op != TOKEN_PIPE && binary.op != TOKEN_CARET) { return 0; }
+        return emit_assign_is_pure_integer_expr(binary.left, symtab, depth + 1) != 0 &&
+               emit_assign_is_pure_integer_expr(binary.right, symtab, depth + 1) != 0;
+    }
+    return 0;
+}
+
+func emit_assign_try_pure_index_compound(target: u64, value: u64, target_ti: *TypeInfo, symtab: *Symtab) -> u64 {
+    if (opt_get_level() < 1 || target == 0 || value == 0 ||
+        ast_kind(target) != AST_INDEX || ast_kind(value) != AST_BINARY || target_ti == 0 ||
+        target_ti.ptr_depth != 0 ||
+        (target_ti.type_kind != TYPE_I64 && target_ti.type_kind != TYPE_U64)) { return 0; }
+    var binary: *AstBinary = (*AstBinary)value;
+    if (binary.left != target ||
+        (binary.op != TOKEN_PLUS && binary.op != TOKEN_MINUS && binary.op != TOKEN_STAR &&
+         binary.op != TOKEN_AMPERSAND && binary.op != TOKEN_PIPE && binary.op != TOKEN_CARET)) { return 0; }
+    if (emit_assign_is_pure_integer_expr(target, symtab, 0) == 0 ||
+        emit_assign_is_pure_integer_expr(binary.right, symtab, 0) == 0) { return 0; }
+    // The parser shares the lvalue node with the left operand of a compound
+    // assignment. For a pure fixed-array index, the same address can be reused.
+    emit("    push r12\n");
+    emit_lvalue(target);
+    emit("    mov r12, rax\n");
+    emit_expr(binary.right);
+    emit("    mov rbx, rax\n    mov rax, [r12]\n");
+    emit_binary_emit_int_op(binary.op, target_ti.type_kind == TYPE_I64);
+    emit("    mov [r12], rax\n    pop r12\n");
+    return 1;
+}
+
 func emit_assign_stmt(node: u64, symtab: *Symtab) -> u64 {
     emit_assign_stmt_core(node, symtab);
     var assignment: *AstAssign = (*AstAssign)node;
@@ -1845,6 +1942,9 @@ func emit_assign_stmt_core(node: u64, symtab: *Symtab) -> u64 {
     if (emit_assign_try_array_copy(target, value, symtab) != 0) {
         return 0;
     }
+    if (emit_assign_try_pure_index_compound(target, value, target_type_info, symtab) != 0) {
+        return 0;
+    }
     // NOTE: operator []= dispatch is temporarily disabled in assignment codegen.
 
     if (target_type_info != 0 && target_type_info.type_kind == TYPE_STRUCT && target_type_info.ptr_depth == 0) {
@@ -1894,6 +1994,25 @@ func emit_assign_stmt_core(node: u64, symtab: *Symtab) -> u64 {
         return 0;
     }
     
+    if (opt_get_level() >= 1 && target_kind == AST_IDENT && target_type_info != 0 &&
+        value_type_info != 0 && target_type_info.ptr_depth == 0 && value_type_info.ptr_depth == 0 &&
+        (target_type_info.type_kind == TYPE_I64 || target_type_info.type_kind == TYPE_U64) &&
+        (value_type_info.type_kind == TYPE_I64 || value_type_info.type_kind == TYPE_U64)) {
+        var scalar_ident: *AstIdent = (*AstIdent)target;
+        var scalar_offset: u64 = symtab_find(symtab, scalar_ident.name);
+        var scalar_resolved: *NameInfo = resolve_name(scalar_ident.name);
+        var scalar_name: []u8 = scalar_ident.name;
+        if (scalar_resolved != 0) { scalar_name = slice(scalar_resolved.ptr, scalar_resolved.len); }
+        // Keep the established global/alias resolution path unchanged.
+        if (scalar_offset != 0 && is_global_var(scalar_name) == 0) {
+            emit_expr(value);
+            emit("    mov [rbp");
+            emit_signed_disp(scalar_offset);
+            emit("], rax\n");
+            return 0;
+        }
+    }
+
     emit_expr(value);
     emit_assign_apply_tagged_mask_if_needed(target_type_info, value_type_info);
     emit("    push rax\n");
@@ -2124,11 +2243,7 @@ func emit_if_stmt(node: u64) -> u64 {
     var else_label: u64 = new_label();
     var end_label: u64 = new_label();
     
-    emit_condition(cond);
-    emit("    test rax, rax\n");
-    emit("    jz ");
-    emit_label(else_label);
-    emit_nl();
+    emit_condition_jump_false(cond, else_label);
     
     emit_block(then_blk);
     
@@ -2156,11 +2271,7 @@ func emit_while_stmt(node: u64) -> u64 {
     
     emit_label_def(start_label);
     
-    emit_condition(cond);
-    emit("    test rax, rax\n");
-    emit("    jz ");
-    emit_label(end_label);
-    emit_nl();
+    emit_condition_jump_false(cond, end_label);
     
     var g_loop_labels: *Vec<u64> = loop_labels();
     var g_loop_continue_labels: *Vec<u64> = continue_labels();
@@ -2197,11 +2308,7 @@ func emit_for_stmt(node: u64) -> u64 {
     emit_label_def(start_label);
     
     if (cond != 0) {
-        emit_condition(cond);
-        emit("    test rax, rax\n");
-        emit("    jz ");
-        emit_label(end_label);
-        emit_nl();
+        emit_condition_jump_false(cond, end_label);
     }
     
     var g_loop_labels: *Vec<u64> = loop_labels();

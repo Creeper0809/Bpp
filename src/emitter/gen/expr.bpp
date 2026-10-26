@@ -9,6 +9,7 @@ import std.vec;
 import std.util;
 import std.str;
 import types;
+import opt;
 import ast;
 import compiler;
 import compiler.trait_runtime;
@@ -1390,6 +1391,19 @@ func emit_index_addr(node: u64, symtab: *Symtab) -> u64 {
         }
     }
 
+    // A fixed identifier array has a stable address. Materialize it after the
+    // index so a nested call/index cannot force a base-address spill.
+    if (opt_get_level() >= 1 && use_array_addr == 1 && ast_kind(base) == AST_IDENT &&
+        (elem_size == 1 || elem_size == 2 || elem_size == 4 || elem_size == 8)) {
+        emit_expr(index);
+        emit("    mov rbx, rax\n");
+        emit_lvalue(base);
+        emit("    lea rax, [rax+rbx*");
+        emit_u64(elem_size);
+        emit("]\n");
+        return 0;
+    }
+
     if (use_array_addr == 1) {
         emit_lvalue(base);
     } else if (use_slice_ptr == 1) {
@@ -1404,6 +1418,13 @@ func emit_index_addr(node: u64, symtab: *Symtab) -> u64 {
 
     emit("    push rax\n");
     emit_expr(index);
+    if (opt_get_level() >= 1 && (elem_size == 1 || elem_size == 2 || elem_size == 4 || elem_size == 8)) {
+        emit("    pop rbx\n");
+        emit("    lea rax, [rbx+rax*");
+        emit_u64(elem_size);
+        emit("]\n");
+        return 0;
+    }
     if (elem_size != 1) {
         emit("    imul rax, ");
         emit_u64(elem_size);
@@ -4762,6 +4783,133 @@ func emit_binary_emit_int_rbx_to_f64(ti: *TypeInfo) -> u64 {
     return 0;
 }
 
+func emit_binary_try_simple_rhs_to_rbx(node: u64, ti: *TypeInfo, symtab: *Symtab) -> u64 {
+    if (opt_get_level() < 1 || node == 0 || ti == 0 || ti.ptr_depth != 0) { return 0; }
+    if (ti.type_kind != TYPE_I64 && ti.type_kind != TYPE_U64) { return 0; }
+    if (ast_kind(node) == AST_LITERAL) {
+        var lit: *AstLiteral = (*AstLiteral)node;
+        emit("    mov rbx, ");
+        emit_u64(lit.value);
+        emit_nl();
+        return 1;
+    }
+    if (ast_kind(node) != AST_IDENT) { return 0; }
+    var ident: *AstIdent = (*AstIdent)node;
+    var local_ti: *TypeInfo = symtab_get_type(symtab, ident.name);
+    if (local_ti == 0 || local_ti.ptr_depth != 0 ||
+        (local_ti.type_kind != TYPE_I64 && local_ti.type_kind != TYPE_U64)) { return 0; }
+    var offset: u64 = symtab_find(symtab, ident.name);
+    if (offset == 0) { return 0; }
+    emit("    mov rbx, [rbp");
+    emit_signed_disp(offset);
+    emit("]\n");
+    return 1;
+}
+
+func emit_fast_int_reg(slot: u64) -> []u8 {
+    if (slot == 0) { return slice("rax", 3); }
+    if (slot == 1) { return slice("r8", 2); }
+    if (slot == 2) { return slice("r9", 2); }
+    if (slot == 3) { return slice("r10", 3); }
+    return slice("r11", 3);
+}
+
+func emit_fast_int_tree_cost(node: u64, symtab: *Symtab, depth: u64) -> u64 {
+    if (node == 0 || depth > 16) { return 0; }
+    var ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)node, symtab);
+    if (ti == 0 || ti.ptr_depth != 0 ||
+        (ti.type_kind != TYPE_I64 && ti.type_kind != TYPE_U64)) { return 0; }
+    var kind: u64 = ast_kind(node);
+    if (kind == AST_LITERAL) { return 1; }
+    if (kind == AST_IDENT) {
+        var ident: *AstIdent = (*AstIdent)node;
+        var local_ti: *TypeInfo = symtab_get_type(symtab, ident.name);
+        if (local_ti == 0 || local_ti.ptr_depth != 0 ||
+            (local_ti.type_kind != TYPE_I64 && local_ti.type_kind != TYPE_U64) ||
+            symtab_find(symtab, ident.name) == 0) { return 0; }
+        var resolved: *NameInfo = resolve_name(ident.name);
+        var resolved_name: []u8 = ident.name;
+        if (resolved != 0) { resolved_name = slice(resolved.ptr, resolved.len); }
+        var constant: ConstResult = const_find(resolved_name);
+        if (constant.found != 0 || is_global_var(resolved_name) != 0) { return 0; }
+        return 1;
+    }
+    if (kind == AST_INDEX) {
+        var idx: *AstIndex = (*AstIndex)node;
+        if (idx.base == 0 || ast_kind(idx.base) != AST_IDENT) { return 0; }
+        var base_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)idx.base, symtab);
+        if (base_ti == 0 || base_ti.ptr_depth != 0 || base_ti.type_kind != TYPE_ARRAY ||
+            typeinfo_elem_size_from_container(base_ti) != 8) { return 0; }
+        var index_cost: u64 = emit_fast_int_tree_cost(idx.index, symtab, depth + 1);
+        if (index_cost == 0) { return 0; }
+        return index_cost + 1;
+    }
+    if (kind == AST_BINARY) {
+        var binary: *AstBinary = (*AstBinary)node;
+        if (binary.op != TOKEN_PLUS && binary.op != TOKEN_MINUS && binary.op != TOKEN_STAR &&
+            binary.op != TOKEN_AMPERSAND && binary.op != TOKEN_PIPE && binary.op != TOKEN_CARET) { return 0; }
+        var left_cost: u64 = emit_fast_int_tree_cost(binary.left, symtab, depth + 1);
+        var right_cost: u64 = emit_fast_int_tree_cost(binary.right, symtab, depth + 1);
+        if (left_cost == 0 || right_cost == 0) { return 0; }
+        if (left_cost > right_cost + 1) { return left_cost; }
+        return right_cost + 1;
+    }
+    return 0;
+}
+
+func emit_fast_int_tree(node: u64, slot: u64, symtab: *Symtab) -> u64 {
+    var reg: []u8 = emit_fast_int_reg(slot);
+    var kind: u64 = ast_kind(node);
+    if (kind == AST_LITERAL) {
+        emit("    mov "); emit_len(u8_slice_ptr(reg), u8_slice_len(reg)); emit(", ");
+        emit_u64(((*AstLiteral)node).value); emit_nl();
+        return 0;
+    }
+    if (kind == AST_IDENT) {
+        var ident: *AstIdent = (*AstIdent)node;
+        emit("    mov "); emit_len(u8_slice_ptr(reg), u8_slice_len(reg)); emit(", [rbp");
+        emit_signed_disp(symtab_find(symtab, ident.name)); emit("]\n");
+        return 0;
+    }
+    if (kind == AST_INDEX) {
+        var idx: *AstIndex = (*AstIndex)node;
+        emit_fast_int_tree(idx.index, slot, symtab);
+        var base_reg: []u8 = emit_fast_int_reg(slot + 1);
+        var ident: *AstIdent = (*AstIdent)idx.base;
+        var resolved_ptr: u64 = u8_slice_ptr(ident.name);
+        var resolved_len: u64 = u8_slice_len(ident.name);
+        var resolved: *NameInfo = resolve_name(ident.name);
+        if (resolved != 0) {
+            resolved_ptr = resolved.ptr;
+            resolved_len = resolved.len;
+        }
+        emit("    lea "); emit_len(u8_slice_ptr(base_reg), u8_slice_len(base_reg));
+        if (is_global_var(slice(resolved_ptr, resolved_len)) != 0) {
+            emit(", [rel _gvar_"); emit_len(resolved_ptr, resolved_len); emit("]\n");
+        } else {
+            emit(", [rbp"); emit_signed_disp(symtab_find(symtab, ident.name)); emit("]\n");
+        }
+        emit("    mov "); emit_len(u8_slice_ptr(reg), u8_slice_len(reg)); emit(", [");
+        emit_len(u8_slice_ptr(base_reg), u8_slice_len(base_reg));
+        emit("+"); emit_len(u8_slice_ptr(reg), u8_slice_len(reg)); emit("*8]\n");
+        return 0;
+    }
+    var binary: *AstBinary = (*AstBinary)node;
+    emit_fast_int_tree(binary.left, slot, symtab);
+    emit_fast_int_tree(binary.right, slot + 1, symtab);
+    emit("    ");
+    if (binary.op == TOKEN_PLUS) { emit("add "); }
+    else if (binary.op == TOKEN_MINUS) { emit("sub "); }
+    else if (binary.op == TOKEN_STAR) { emit("imul "); }
+    else if (binary.op == TOKEN_AMPERSAND) { emit("and "); }
+    else if (binary.op == TOKEN_PIPE) { emit("or "); }
+    else { emit("xor "); }
+    emit_len(u8_slice_ptr(reg), u8_slice_len(reg)); emit(", ");
+    var right_reg: []u8 = emit_fast_int_reg(slot + 1);
+    emit_len(u8_slice_ptr(right_reg), u8_slice_len(right_reg)); emit_nl();
+    return 0;
+}
+
 func emit_binary_expr(node: u64, symtab: *Symtab) -> u64 {
     var binary: *AstBinary = (*AstBinary)node;
     var op: u64 = binary.op;
@@ -4779,6 +4927,16 @@ func emit_binary_expr(node: u64, symtab: *Symtab) -> u64 {
         return 0;
     }
 
+    if (opt_get_level() >= 1 &&
+        (op == TOKEN_PLUS || op == TOKEN_MINUS || op == TOKEN_STAR ||
+         op == TOKEN_AMPERSAND || op == TOKEN_PIPE || op == TOKEN_CARET)) {
+        var reg_cost: u64 = emit_fast_int_tree_cost(node, symtab, 0);
+        if (reg_cost > 0 && reg_cost <= 5) {
+            emit_fast_int_tree(node, 0, symtab);
+            return 0;
+        }
+    }
+
     var left_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)left, symtab);
     var right_ti: *TypeInfo = get_expr_type_with_symtab((*AstNode)right, symtab);
 
@@ -4794,10 +4952,12 @@ func emit_binary_expr(node: u64, symtab: *Symtab) -> u64 {
     
     // Standard binary: evaluate both sides
     emit_expr(left);
-    emit("    push rax\n");
-    emit_expr(right);
-    emit("    mov rbx, rax\n");
-    emit("    pop rax\n");
+    if (emit_binary_try_simple_rhs_to_rbx(right, right_ti, symtab) == 0) {
+        emit("    push rax\n");
+        emit_expr(right);
+        emit("    mov rbx, rax\n");
+        emit("    pop rax\n");
+    }
 
     var l_is_f: u64 = 0;
     var r_is_f: u64 = 0;
