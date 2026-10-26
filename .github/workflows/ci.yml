@@ -337,6 +337,66 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+  windows-crash-repro:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download compiler from failed validation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          gh run download 40416620742 --repo Creeper0809/Bpp `
+            --name windows-selfhost-compiler --dir bin
+
+      - name: Inspect CreateFile crash stack
+        shell: pwsh
+        run: |
+          . ./tools/windows_process.ps1
+          $debugger = (Get-Command gdb.exe).Source
+          $compiler = (Resolve-Path 'bin/stage1.exe').Path
+          $source = (Resolve-Path 'test/source/04_bool_and_signed_int_primitives_success.bpp').Path
+          $output = Join-Path $env:RUNNER_TEMP 'bpp-gdb-stack.out'
+          $errors = Join-Path $env:RUNNER_TEMP 'bpp-gdb-stack.err'
+          $commands = Join-Path $env:RUNNER_TEMP 'bpp-gdb-stack.commands'
+          @'
+          set pagination off
+          run
+          bt
+          info registers rsp rbp rcx rdx r8 r9 rax
+          x/20gx $rsp
+          frame 3
+          info registers rsp rbp rcx rdx r8 r9 rax
+          x/20i $pc-80
+          x/8gx $rbp
+          python
+          import gdb
+          p = int(gdb.parse_and_eval('$rbp'))
+          for i in range(25):
+              try:
+                  b = bytes(gdb.selected_inferior().read_memory(p, 16))
+                  prev = int.from_bytes(b[:8], 'little')
+                  ret = int.from_bytes(b[8:], 'little')
+                  print('frame', i, hex(p), 'mod16', p % 16, 'ret', hex(ret))
+                  if prev <= p or prev - p > 1000000: break
+                  p = prev
+              except Exception as e:
+                  print(e)
+                  break
+          end
+          '@ | Set-Content -LiteralPath $commands -Encoding ascii
+          $result = Invoke-BppLimitedProcess -FilePath $debugger `
+            -ArgumentList @('--batch', '-x', $commands, '--args', $compiler,
+              '--target', 'windows-x86_64', '-O1', '--timings-json',
+              (Join-Path $env:RUNNER_TEMP 'bpp-timing.json'), '-asm', $source) `
+            -StdoutPath $output -StderrPath $errors `
+            -WorkingDirectory (Get-Location).Path -MemoryLimitBytes 4294967296
+          Write-Host "GDB exit: $($result.ExitCode)"
+          Get-Content $output -Tail 100
+          Get-Content $errors -Tail 20
+
   validation-gate:
     if: always()
     needs:
